@@ -40,38 +40,65 @@ IUCN_LABELS = {
 }
 
 
+_GBIF_OFFSET_CAP = 9_700   # GBIF hard-caps offset at ~10 000; stay safely under
+
+def _fetch_year(year: int, remaining: int) -> list[dict]:
+    """Fetch up to *remaining* occurrences for a single calendar year."""
+    results: list[dict] = []
+    offset = 0
+    while len(results) < remaining:
+        limit = min(_PAGE_SIZE, remaining - len(results))
+        params = {
+            "datasetKey": _DOF_DATASET_KEY,
+            "limit": limit,
+            "offset": offset,
+            "basisOfRecord": "HUMAN_OBSERVATION",
+            "year": year,
+        }
+        resp = requests.get(
+            f"{_GBIF_BASE}/occurrence/search", params=params, timeout=_TIMEOUT
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        batch = data.get("results", [])
+        results.extend(batch)
+        offset += len(batch)
+        if data.get("endOfRecords", True) or not batch or offset >= _GBIF_OFFSET_CAP:
+            break
+    return results
+
+
 def fetch_dof_occurrences(max_records: int = 5000) -> list[dict]:
     """
     Fetch occurrence records from the DOF GBIF dataset.
 
-    max_records caps total records fetched (default 5 000 — enough for a demo;
-    the full dataset is ~millions of rows).
+    The GBIF occurrence search API caps the offset at ~10 000 per query, so
+    fetching more than that requires batching by year.  We iterate recent years
+    newest-first until *max_records* is reached.
+
+    max_records caps total records fetched (default 5 000; use a higher value
+    like 50 000 to get a broader sample — each year contributes up to ~9 700).
     """
-    results = []
-    offset = 0
+    from datetime import date as _date
+    current_year = _date.today().year
+    years = list(range(current_year, current_year - 30, -1))  # up to 30 years back
+
+    results: list[dict] = []
+    seen_keys: set = set()
 
     with tqdm(total=max_records, unit="rec", desc="Fetching DOFbasen") as pbar:
-        while len(results) < max_records:
-            limit = min(_PAGE_SIZE, max_records - len(results))
-            params = {
-                "datasetKey": _DOF_DATASET_KEY,
-                "limit": limit,
-                "offset": offset,
-                "basisOfRecord": "HUMAN_OBSERVATION",
-            }
-            resp = requests.get(
-                f"{_GBIF_BASE}/occurrence/search", params=params, timeout=_TIMEOUT
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            batch = data.get("results", [])
-            results.extend(batch)
-            pbar.update(len(batch))
-            if data.get("endOfRecords", True) or not batch:
+        for year in years:
+            if len(results) >= max_records:
                 break
-            offset += len(batch)
+            batch = _fetch_year(year, max_records - len(results))
+            for rec in batch:
+                key = rec.get("key") or rec.get("gbifID")
+                if key and key not in seen_keys:
+                    seen_keys.add(key)
+                    results.append(rec)
+            pbar.update(len(batch))
 
-    return results
+    return results[:max_records]
 
 
 def _obs_uri(gbif_key: int | str) -> URIRef:

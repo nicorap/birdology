@@ -7,8 +7,28 @@ result row dicts for easy consumption.
 from __future__ import annotations
 
 import math
+import unicodedata
 
 from rdflib import ConjunctiveGraph, Graph
+
+
+def _accent_fold(s: str) -> str:
+    """Decompose accents and strip combining characters: 'mésange' → 'mesange'.
+
+    Handles French, Danish, and other Latin-script accents so users can type
+    without accents and still get results.  Characters outside the ASCII range
+    that are not decomposable (e.g. ø, æ, ß) are kept as-is.
+    """
+    return unicodedata.normalize("NFD", s).encode("ascii", "ignore").decode("ascii").lower()
+
+
+def _name_matches(name: str, query: str) -> bool:
+    """Case- and accent-insensitive substring match."""
+    q_fold = _accent_fold(query)
+    return (
+        query.lower() in name.lower()
+        or q_fold in _accent_fold(name)
+    )
 
 _PREFIXES = """
 PREFIX bird: <https://birdology.org/ontology/>
@@ -29,30 +49,33 @@ def _rows(results) -> list[dict]:
 
 
 def find_species_by_name(g: Graph | ConjunctiveGraph, name: str) -> list[dict]:
-    """Find species whose English, Danish, French, or scientific name contains *name*."""
+    """Find species whose English, Danish, French, or scientific name contains *name*.
+
+    Comparison is case- and accent-insensitive ('mesange' matches 'Mésange').
+    """
     q = (
         _PREFIXES
-        + f"""
+        + """
 SELECT DISTINCT ?species ?scientificName ?commonNameEn ?commonNameDa ?commonNameFr ?eBirdCode
-WHERE {{
+WHERE {
     ?species a bird:Species .
     ?species dwc:scientificName ?scientificName .
-    OPTIONAL {{ ?species bird:commonNameEn  ?commonNameEn }}
-    OPTIONAL {{ ?species bird:commonNameDa  ?commonNameDa }}
-    OPTIONAL {{ ?species bird:commonNameFr  ?commonNameFr }}
-    OPTIONAL {{ ?species bird:eBirdCode     ?eBirdCode }}
-    FILTER (
-        CONTAINS(LCASE(STR(?scientificName)), LCASE("{name}")) ||
-        CONTAINS(LCASE(STR(?commonNameEn)),   LCASE("{name}")) ||
-        CONTAINS(LCASE(STR(?commonNameDa)),   LCASE("{name}")) ||
-        CONTAINS(LCASE(STR(?commonNameFr)),   LCASE("{name}"))
-    )
-}}
+    OPTIONAL { ?species bird:commonNameEn  ?commonNameEn }
+    OPTIONAL { ?species bird:commonNameDa  ?commonNameDa }
+    OPTIONAL { ?species bird:commonNameFr  ?commonNameFr }
+    OPTIONAL { ?species bird:eBirdCode     ?eBirdCode }
+}
 ORDER BY ?scientificName
-LIMIT 50
 """
     )
-    return _rows(g.query(q))
+    rows = _rows(g.query(q))
+    return [
+        r for r in rows
+        if any(
+            _name_matches(r.get(field, ""), name)
+            for field in ("scientificName", "commonNameEn", "commonNameDa", "commonNameFr")
+        )
+    ][:50]
 
 
 def list_danish_species(g: Graph | ConjunctiveGraph) -> list[dict]:
@@ -124,33 +147,39 @@ def recent_danish_observations(
 
     Returns rows sorted by date descending.
     """
-    species_filter = ""
-    if species_name:
-        species_filter = f'FILTER ( CONTAINS(LCASE(STR(?scientificName)), LCASE("{species_name}")) )'
-
     q = (
         _PREFIXES
-        + f"""
-SELECT ?scientificName ?date ?count ?locality ?lat ?lon
-WHERE {{
+        + """
+SELECT ?scientificName ?commonNameEn ?commonNameDa ?commonNameFr ?date ?count ?locality ?lat ?lon
+WHERE {
     ?species a bird:Species ;
              bird:hasObservation ?obs ;
              dwc:scientificName  ?scientificName .
+    OPTIONAL { ?species bird:commonNameEn ?commonNameEn }
+    OPTIONAL { ?species bird:commonNameDa ?commonNameDa }
+    OPTIONAL { ?species bird:commonNameFr ?commonNameFr }
     ?obs bird:observedOn ?date .
-    OPTIONAL {{ ?obs bird:individualCount ?count }}
-    OPTIONAL {{
+    OPTIONAL { ?obs bird:individualCount ?count }
+    OPTIONAL {
         ?obs bird:observedAt ?loc .
-        OPTIONAL {{ ?loc bird:locality  ?locality }}
-        OPTIONAL {{ ?loc bird:latitude  ?lat }}
-        OPTIONAL {{ ?loc bird:longitude ?lon }}
-    }}
-    {species_filter}
-}}
+        OPTIONAL { ?loc bird:locality  ?locality }
+        OPTIONAL { ?loc bird:latitude  ?lat }
+        OPTIONAL { ?loc bird:longitude ?lon }
+    }
+}
 ORDER BY DESC(?date)
-LIMIT 100
 """
     )
-    return _rows(g.query(q))
+    rows = _rows(g.query(q))
+    if species_name:
+        rows = [
+            r for r in rows
+            if any(
+                _name_matches(r.get(field, ""), species_name)
+                for field in ("scientificName", "commonNameEn", "commonNameDa", "commonNameFr")
+            )
+        ]
+    return rows[:100]
 
 
 # Assistens Kirkegård, Nørrebro, Copenhagen

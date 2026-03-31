@@ -15,14 +15,23 @@ pytest tests/
 python scripts/build_graph.py --dof-max 5000
 
 # Build with fewer DOF records (faster for development)
-python scripts/build_graph.py --dof-max 500 --no-danish
+python scripts/build_graph.py --dof-max 500
+
+# Get more observations — DOF is batched by year (up to ~9 700/year)
+python scripts/build_graph.py --dof-max 50000
 
 # Query the saved graph
 python scripts/query_graph.py --summary
 python scripts/query_graph.py --species "Robin"
 python scripts/query_graph.py --family "Turdidae"
 python scripts/query_graph.py --danish
-python scripts/query_graph.py --obs "Erithacus"
+python scripts/query_graph.py --obs "Erithacus"  # also accepts Danish/French/English names
+python scripts/query_graph.py --obs "Rødhals"
+
+# Run reasoner (pure-Python parallel rules — seconds, not minutes)
+python scripts/reason.py
+python scripts/reason.py --workers 4   # default: cpu_count
+python scripts/query_graph.py --input output/birdology_reasoned.ttl --summary
 
 # Rare/cool birds near Assistens Kirkegård, Nørrebro (hardcoded)
 python scripts/query_graph.py --cemetery
@@ -47,7 +56,7 @@ The project builds an OWL/RDF knowledge graph of birds and saves it as a Turtle 
 |------|------|
 | `namespaces.py` | All `rdflib.Namespace` objects. Import from here; never hardcode URIs elsewhere. |
 | `schema.py` | `build_schema()` — declares OWL classes and properties into a `Graph`. The single source of truth for the ontology shape. |
-| `graph.py` | `build_graph(ebird_key)` orchestrates schema + ingestion → `ConjunctiveGraph`. `save_graph` / `load_graph` handle Turtle I/O. |
+| `graph.py` | `build_graph(ebird_key)` orchestrates schema + ingestion → plain `Graph`. `save_graph` / `load_graph` handle Turtle I/O. |
 | `queries.py` | Reusable SPARQL functions that take a graph and return `list[dict]`. |
 | `ingestion/ebird.py` | Calls eBird API v2 (`/ref/taxonomy/ebird`), converts records → RDF via `taxonomy_to_rdf()`. |
 | `ingestion/gbif_dof.py` | Calls GBIF API for DOFbasen dataset (key `95db4db8`), converts occurrences → RDF via `occurrences_to_rdf()`. |
@@ -61,6 +70,20 @@ The project builds an OWL/RDF knowledge graph of birds and saves it as a Turtle 
 **Species URI scheme**: eBird species → `taxon:species/{eBirdCode}`. DOF occurrence → species node at `taxon:species/sci/{slug_of_scientificName}`. When eBird data is loaded first, the DOF occurrences link to a separate node; a SPARQL reasoner or `owl:sameAs` closure unifies them.
 
 **DOF access**: DOFbasen has no public REST API. Data is accessed via the GBIF public API (no auth required) using dataset key `95db4db8-f762-11e1-a439-00145eb45e9a`.
+
+**GBIF offset cap**: The GBIF occurrence search API silently rejects offsets > 10 000. `fetch_dof_occurrences` works around this by iterating year-by-year (newest first), fetching up to `_GBIF_OFFSET_CAP` (9 700) records per year.
+
+**Reasoner**: `scripts/reason.py` applies four inference rules in pure Python using `concurrent.futures.ProcessPoolExecutor` for the transitive `parentTaxon` closure (the expensive rule). No Java/OWL reasoner required — runs in seconds on the full 11k-species graph.
+
+## Tests
+
+```
+tests/test_schema.py       — OWL class/property declarations
+tests/test_ingestion.py    — eBird + DOF RDF conversion, cross-source linking
+tests/test_queries.py      — all SPARQL query functions with an in-memory fixture graph
+tests/test_reasoner.py     — each inference rule in isolation (idempotency, correctness)
+tests/test_gbif_batching.py — year-batching, offset-cap, deduplication (mocked HTTP)
+```
 
 ## External APIs
 

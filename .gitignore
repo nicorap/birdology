@@ -1,0 +1,18 @@
+.env
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+data/
+output/
+.DS_Store
+
+# Reasoner temp file
+output/_birdology_tmp.owl
+
+# IDE
+.idea/
+.vscode/
