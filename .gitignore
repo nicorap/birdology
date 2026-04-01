@@ -16,3 +16,6 @@ output/_birdology_tmp.owl
 # IDE
 .idea/
 .vscode/
+
+# Oxigraph binary store cache
+output/.birdology*_oxi/
