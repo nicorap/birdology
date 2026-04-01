@@ -83,6 +83,20 @@ def save_graph(g: Graph, path: str | Path) -> None:
     print(f"Saved → {path}  ({path.stat().st_size / 1024:.1f} KB)")
 
 
+def load_graph_rdflib(path: str | Path) -> Graph:
+    """Load a Turtle file into a plain rdflib Graph (always — no Oxigraph).
+
+    Use this when you need a mutable graph for writing triples (e.g. the
+    reasoner).  Use load_graph() for read-only querying.
+    """
+    path = Path(path)
+    g = Graph()
+    _bind_prefixes(g)
+    g.parse(str(path), format="turtle")
+    print(f"Loaded {path}  ({len(g):,} triples)")
+    return g
+
+
 def load_graph(path: str | Path) -> "Graph | OxiGraph":
     """Load a Turtle file, using a fast Oxigraph binary cache when available.
 

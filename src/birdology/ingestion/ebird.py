@@ -169,3 +169,20 @@ def add_localized_names(g: Graph, records: list[dict], locale: str) -> None:
 # Keep backwards-compatible alias
 def add_danish_names(g: Graph, records: list[dict]) -> None:
     add_localized_names(g, records, "da")
+
+
+def fetch_recent_denmark(api_key: str, days: int = 30) -> list[dict]:
+    """Return species recently reported in Denmark via eBird.
+
+    Each dict has at minimum: speciesCode, comName, sciName, obsDt, howMany.
+    Uses the eBird recent-observations endpoint for region DK.
+    Raises requests.HTTPError on API failure.
+    """
+    resp = requests.get(
+        f"{_EBIRD_BASE}/data/obs/DK/recent",
+        headers={"x-ebirdapitoken": api_key},
+        params={"maxResults": 10000, "back": min(days, 30), "cat": "species", "detail": "simple"},
+        timeout=_TIMEOUT,
+    )
+    resp.raise_for_status()
+    return resp.json()

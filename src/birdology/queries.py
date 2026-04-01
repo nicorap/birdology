@@ -414,6 +414,104 @@ WHERE {{
     return merged
 
 
+def currently_present(
+    g: Graph | ConjunctiveGraph,
+    month: int | None = None,
+) -> list[dict]:
+    """Species typically present in Denmark in *month* (default: current month).
+
+    Requires the graph to have been through the reasoner (Rule 5) so that
+    bird:typicallyPresentInMonth triples exist.  Falls back gracefully to
+    species that have any observation if no migration data is found.
+
+    Returns rows sorted by migration status then scientific name.
+    """
+    import datetime
+    if month is None:
+        month = datetime.date.today().month
+
+    q = (
+        _PREFIXES
+        + f"""
+SELECT DISTINCT ?species ?scientificName ?commonNameDa ?commonNameFr ?commonNameEn
+                ?eBirdCode ?status ?migStatus
+WHERE {{
+    ?species a bird:Species ;
+             dwc:scientificName ?scientificName ;
+             bird:typicallyPresentInMonth {month} .
+    {_CANONICAL_SPECIES}
+    OPTIONAL {{ ?species bird:commonNameDa      ?commonNameDa }}
+    OPTIONAL {{ ?species bird:commonNameFr      ?commonNameFr }}
+    OPTIONAL {{ ?species bird:commonNameEn      ?commonNameEn }}
+    OPTIONAL {{ ?species bird:eBirdCode         ?eBirdCode }}
+    OPTIONAL {{ ?species bird:conservationStatus ?status }}
+    OPTIONAL {{ ?species bird:migrationStatus   ?migStatus }}
+}}
+ORDER BY ?migStatus ?scientificName
+"""
+    )
+    return _rows(g.query(q))
+
+
+def observations_for_map(
+    g: Graph | ConjunctiveGraph,
+    species_filter: str | None = None,
+    family_filter: str | None = None,
+    order_filter: str | None = None,
+) -> list[dict]:
+    """Return all observations with coordinates for map rendering.
+
+    Each row contains: scientificName, commonNameEn, commonNameDa, commonNameFr, status,
+    lat, lon, date (optional), count (optional), locality (optional).
+
+    Optional filters narrow by species name (any language/scientific),
+    family string, or order string.
+    """
+    family_clause = ""
+    if family_filter:
+        family_clause = f'?species dwc:family ?fam . FILTER(CONTAINS(LCASE(STR(?fam)), "{family_filter.lower()}"))'
+    order_clause = ""
+    if order_filter:
+        order_clause = f'?species dwc:order ?ord . FILTER(CONTAINS(LCASE(STR(?ord)), "{order_filter.lower()}"))'
+
+    q = (
+        _PREFIXES
+        + f"""
+SELECT ?species ?scientificName ?commonNameEn ?commonNameDa ?commonNameFr ?status
+       ?lat ?lon ?date ?count ?locality
+WHERE {{
+    ?species a bird:Species ;
+             dwc:scientificName ?scientificName ;
+             bird:hasObservation ?obs .
+    {_CANONICAL_SPECIES}
+    ?obs bird:observedAt ?loc .
+    ?loc bird:latitude  ?lat ;
+         bird:longitude ?lon .
+    OPTIONAL {{ ?species bird:commonNameEn      ?commonNameEn }}
+    OPTIONAL {{ ?species bird:commonNameDa      ?commonNameDa }}
+    OPTIONAL {{ ?species bird:commonNameFr      ?commonNameFr }}
+    OPTIONAL {{ ?species bird:conservationStatus ?status }}
+    OPTIONAL {{ ?obs bird:observedOn      ?date }}
+    OPTIONAL {{ ?obs bird:individualCount ?count }}
+    OPTIONAL {{ ?loc bird:locality        ?locality }}
+    {family_clause}
+    {order_clause}
+}}
+ORDER BY ?scientificName DESC(?date)
+"""
+    )
+    rows = _rows(g.query(q))
+
+    if species_filter:
+        rows = [
+            r for r in rows
+            if _name_matches(r.get("scientificName", ""), species_filter)
+            or _name_matches(r.get("commonNameEn", ""), species_filter)
+            or _name_matches(r.get("commonNameDa", ""), species_filter)
+        ]
+    return rows
+
+
 def taxonomy_summary(g: Graph | ConjunctiveGraph) -> dict:
     """Return counts of Orders, Families, Genera, Species, and Observations."""
     counts = {}

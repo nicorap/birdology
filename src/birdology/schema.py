@@ -87,8 +87,12 @@ def build_schema() -> Graph:
          "French common name (nom commun français)."),
 
         # Ecology / traits
-        (BIRD.conservationStatus, "conservationStatus", BIRD.Species,      XSD.string,
+        (BIRD.conservationStatus,    "conservationStatus",    BIRD.Species, XSD.string,
          "IUCN Red List status (e.g. LC, NT, VU, EN, CR)."),
+        (BIRD.migrationStatus,       "migrationStatus",       BIRD.Species, XSD.string,
+         "Inferred migratory behaviour in Denmark: Resident, SummerVisitor, WinterVisitor, PassageMigrant, PartialMigrant."),
+        (BIRD.typicallyPresentInMonth, "typicallyPresentInMonth", BIRD.Species, XSD.integer,
+         "Calendar month (1–12) when the species is typically present in Denmark, derived from observation records."),
 
         # Observation fields
         (BIRD.observedOn,         "observedOn",         BIRD.Observation,  XSD.date,

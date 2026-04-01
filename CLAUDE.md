@@ -44,6 +44,15 @@ python scripts/query_graph.py --nearby 55.6918 12.5559
 python scripts/visualize.py
 python scripts/visualize.py --mode graph --family "Turdidae"
 python scripts/visualize.py --mode stats
+
+# Desktop dashboard (PySide6 GUI — wraps all CLI features)
+python scripts/dashboard.py
+
+# Leaflet map of observation locations (output/birdology_map.html)
+python scripts/visualize.py --mode map
+python scripts/visualize.py --mode map --species "Rødhals"
+python scripts/visualize.py --mode map --family "Turdidae"
+python scripts/visualize.py --mode all   # graph + stats + map
 ```
 
 ## Architecture

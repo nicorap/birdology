@@ -80,7 +80,7 @@ def _print_watch(rows: list[dict], location_label: str) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="Query the Birdology knowledge graph.")
-    parser.add_argument("--input", default="output/birdology.ttl",
+    parser.add_argument("--input", default="output/birdology_reasoned.ttl",
                         help="Path to the Turtle graph file")
     parser.add_argument("--species", metavar="NAME",
                         help="Find species by name (scientific or common)")

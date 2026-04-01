@@ -40,7 +40,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from rdflib import Graph, URIRef
 from rdflib.namespace import OWL, RDF, RDFS
 
-from birdology.graph import load_graph, save_graph
+from birdology.graph import load_graph_rdflib as load_graph, save_graph
+from birdology.migration import infer_migration_status
 from birdology.namespaces import BIRD
 
 DWC_SCI = URIRef("http://rs.tdwg.org/dwc/terms/scientificName")
@@ -211,7 +212,11 @@ def run_reasoner(input_path: str, output_path: str, n_workers: int) -> None:
     n4 = _materialise_same_as(g)
     print(f"  +{n4:,} triples")
 
-    total_new = n1 + n2 + n3 + n4
+    print("Rule 5 — migration status from observation months…")
+    n5 = infer_migration_status(g)
+    print(f"  +{n5:,} triples")
+
+    total_new = n1 + n2 + n3 + n4 + n5
     print(f"\nTotal inferred: +{total_new:,} triples  ({len(g):,} total)")
 
     # ── Report class counts before / after ──────────────────────────────────
