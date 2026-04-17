@@ -87,7 +87,12 @@ def _ancestors_for_batch(args: tuple[list[str], dict[str, list[str]]]) -> list[t
 
 
 def _materialise_transitive_parent_taxon(g: Graph, n_workers: int) -> int:
-    """Add direct parentTaxon links for all transitive ancestors, in parallel."""
+    """Add direct parentTaxon links for all transitive ancestors.
+
+    Uses subprocess workers when available, but falls back to a sequential path
+    when only one worker is requested or multiprocessing is unavailable in the
+    current runtime.
+    """
     pt = URIRef(PARENT_TAXON)
 
     # Serialise the parentTaxon graph as plain dicts (picklable for subprocess)
@@ -107,10 +112,18 @@ def _materialise_transitive_parent_taxon(g: Graph, n_workers: int) -> int:
     ]
 
     new_pairs: list[tuple[str, str]] = []
-    with ProcessPoolExecutor(max_workers=n_workers) as pool:
-        futures = {pool.submit(_ancestors_for_batch, b): b for b in batches}
-        for fut in as_completed(futures):
-            new_pairs.extend(fut.result())
+    if n_workers <= 1:
+        for batch in batches:
+            new_pairs.extend(_ancestors_for_batch(batch))
+    else:
+        try:
+            with ProcessPoolExecutor(max_workers=n_workers) as pool:
+                futures = {pool.submit(_ancestors_for_batch, b): b for b in batches}
+                for fut in as_completed(futures):
+                    new_pairs.extend(fut.result())
+        except (NotImplementedError, PermissionError):
+            for batch in batches:
+                new_pairs.extend(_ancestors_for_batch(batch))
 
     added = 0
     for s_str, o_str in new_pairs:
