@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Birdology — Graph-RAG</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #0f1117;
+    color: #e0e0e0;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  header {
+    background: #1a1d27;
+    border-bottom: 1px solid #2a2d3a;
+    padding: 16px 24px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  header h1 { font-size: 20px; font-weight: 600; color: #f0f0f0; }
+
+  header .badge {
+    font-size: 11px;
+    background: #2d5a3d;
+    color: #7dcea0;
+    padding: 3px 8px;
+    border-radius: 10px;
+  }
+
+  #new-chat-btn {
+    margin-left: auto;
+    background: transparent;
+    border: 1px solid #3a3d4a;
+    color: #a0a8c0;
+    padding: 6px 14px;
+    border-radius: 8px;
+    font-size: 13px;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+
+  #new-chat-btn:hover { border-color: #7dcea0; color: #7dcea0; }
+
+  #chat-container {
+    flex: 1;
+    overflow-y: auto;
+    padding: 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  .message {
+    max-width: 800px;
+    width: 100%;
+    margin: 0 auto;
+    line-height: 1.6;
+  }
+
+  .message.user {
+    background: #1e3a5f;
+    border-radius: 16px 16px 4px 16px;
+    padding: 12px 18px;
+    align-self: flex-end;
+    margin-left: auto;
+    margin-right: 0;
+    max-width: 600px;
+    width: fit-content;
+  }
+
+  .message.assistant {
+    background: #1a1d27;
+    border: 1px solid #2a2d3a;
+    border-radius: 4px 16px 16px 16px;
+    padding: 18px 22px;
+  }
+
+  .message.assistant h3 {
+    color: #7dcea0;
+    margin: 16px 0 8px 0;
+    font-size: 15px;
+  }
+
+  .message.assistant h3:first-child { margin-top: 0; }
+  .message.assistant ul, .message.assistant ol { padding-left: 20px; margin: 6px 0; }
+  .message.assistant li { margin: 4px 0; }
+  .message.assistant strong { color: #f0f0f0; }
+  .message.assistant em { color: #a0a8c0; }
+
+  .message.assistant code {
+    background: #252830;
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-size: 13px;
+  }
+
+  .message.assistant hr {
+    border: none;
+    border-top: 1px solid #2a2d3a;
+    margin: 14px 0;
+  }
+
+  .tool-call {
+    font-size: 12px;
+    color: #7dcea0;
+    background: #1a2e23;
+    border: 1px solid #2d5a3d;
+    border-radius: 6px;
+    padding: 6px 12px;
+    margin: 4px auto;
+    max-width: 800px;
+    width: 100%;
+    font-family: monospace;
+  }
+
+  .typing {
+    max-width: 800px;
+    width: 100%;
+    margin: 0 auto;
+    color: #666;
+    font-style: italic;
+    padding: 8px 0;
+  }
+
+  #input-area {
+    background: #1a1d27;
+    border-top: 1px solid #2a2d3a;
+    padding: 16px 24px;
+  }
+
+  #input-form {
+    max-width: 800px;
+    margin: 0 auto;
+    display: flex;
+    gap: 10px;
+  }
+
+  #user-input {
+    flex: 1;
+    background: #252830;
+    border: 1px solid #3a3d4a;
+    border-radius: 12px;
+    padding: 12px 18px;
+    color: #e0e0e0;
+    font-size: 15px;
+    outline: none;
+    transition: border-color 0.2s;
+  }
+
+  #user-input:focus { border-color: #7dcea0; }
+  #user-input::placeholder { color: #555; }
+
+  #send-btn {
+    background: #2d5a3d;
+    color: #7dcea0;
+    border: none;
+    border-radius: 12px;
+    padding: 12px 24px;
+    font-size: 15px;
+    cursor: pointer;
+    font-weight: 600;
+    transition: background 0.2s;
+  }
+
+  #send-btn:hover { background: #3a7a50; }
+  #send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .welcome {
+    max-width: 800px;
+    margin: 40px auto;
+    text-align: center;
+    color: #666;
+  }
+
+  .welcome h2 { font-size: 28px; color: #7dcea0; margin-bottom: 12px; }
+  .welcome p { margin: 6px 0; font-size: 14px; }
+
+  .examples {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    justify-content: center;
+    margin-top: 20px;
+  }
+
+  .example-btn {
+    background: #252830;
+    border: 1px solid #3a3d4a;
+    border-radius: 8px;
+    padding: 8px 14px;
+    color: #a0a8c0;
+    font-size: 13px;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+
+  .example-btn:hover { border-color: #7dcea0; color: #7dcea0; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Birdology</h1>
+  <span class="badge">Graph-RAG</span>
+  <button id="new-chat-btn">Nouvelle conversation</button>
+</header>
+
+<div id="chat-container">
+  <div class="welcome">
+    <h2>Birdology Graph-RAG</h2>
+    <p>Posez vos questions sur les oiseaux du Danemark.</p>
+    <p>Le chatbot interroge le graphe de connaissances (11 000+ especes, observations DOF).</p>
+    <div class="examples">
+      <button class="example-btn">Quels oiseaux pres de Copenhague ?</button>
+      <button class="example-btn">Combien d'especes dans le graphe ?</button>
+      <button class="example-btn">Parle-moi des Turdides</button>
+      <button class="example-btn">Oiseaux menaces au Danemark</button>
+    </div>
+  </div>
+</div>
+
+<div id="input-area">
+  <div id="input-form">
+    <input type="text" id="user-input" placeholder="Posez votre question..." autocomplete="off" />
+    <button type="button" id="send-btn">Envoyer</button>
+  </div>
+</div>
+
+<script>
+var chatContainer = document.getElementById('chat-container');
+var userInput = document.getElementById('user-input');
+var sendBtn = document.getElementById('send-btn');
+var newChatBtn = document.getElementById('new-chat-btn');
+var firstMsg = true;
+var busy = false;
+
+// Session ID — persists across page reloads within the same tab
+var sessionId = sessionStorage.getItem('birdology_session');
+if (!sessionId) {
+  sessionId = 'sess_' + Math.random().toString(36).substring(2) + Date.now().toString(36);
+  sessionStorage.setItem('birdology_session', sessionId);
+}
+
+document.querySelectorAll('.example-btn').forEach(function(btn) {
+  btn.addEventListener('click', function() {
+    userInput.value = btn.textContent;
+    doSend();
+  });
+});
+
+sendBtn.addEventListener('click', function() { doSend(); });
+
+userInput.addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') doSend();
+});
+
+newChatBtn.addEventListener('click', function() {
+  if (busy) return;
+  // Reset server-side session
+  fetch('/api/reset', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session_id: sessionId })
+  });
+  // Generate new session ID
+  sessionId = 'sess_' + Math.random().toString(36).substring(2) + Date.now().toString(36);
+  sessionStorage.setItem('birdology_session', sessionId);
+  // Clear chat UI
+  chatContainer.innerHTML = '';
+  var welcome = document.createElement('div');
+  welcome.className = 'welcome';
+  welcome.innerHTML = '<h2>Birdology Graph-RAG</h2>'
+    + '<p>Posez vos questions sur les oiseaux du Danemark.</p>'
+    + '<p>Le chatbot interroge le graphe de connaissances (11 000+ especes, observations DOF).</p>'
+    + '<div class="examples">'
+    + '<button class="example-btn">Quels oiseaux pres de Copenhague ?</button>'
+    + '<button class="example-btn">Combien d\'especes dans le graphe ?</button>'
+    + '<button class="example-btn">Parle-moi des Turdides</button>'
+    + '<button class="example-btn">Oiseaux menaces au Danemark</button>'
+    + '</div>';
+  chatContainer.appendChild(welcome);
+  // Re-bind example buttons
+  welcome.querySelectorAll('.example-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      userInput.value = btn.textContent;
+      doSend();
+    });
+  });
+  firstMsg = true;
+  userInput.focus();
+});
+
+function doSend() {
+  if (busy) return;
+  var text = userInput.value.trim();
+  if (!text) return;
+
+  if (firstMsg) {
+    var w = document.querySelector('.welcome');
+    if (w) w.remove();
+    firstMsg = false;
+  }
+
+  addMsg('user', text);
+  userInput.value = '';
+  busy = true;
+  sendBtn.disabled = true;
+  showTyping();
+
+  var controller = new AbortController();
+  var timeoutId = setTimeout(function() { controller.abort(); }, 180000);
+  fetch('/api/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message: text, session_id: sessionId }),
+    signal: controller.signal
+  })
+  .then(function(res) {
+    if (!res.ok) return res.text().then(function(t) { throw new Error('Serveur: ' + res.status); });
+    return res.json();
+  })
+  .then(function(data) {
+    hideTyping();
+    if (data.tool_calls) {
+      data.tool_calls.forEach(function(tc) {
+        addTool(tc.name, tc.args);
+      });
+    }
+    addMsg('assistant', data.answer || 'Pas de reponse.');
+  })
+  .catch(function(err) {
+    hideTyping();
+    addMsg('assistant', 'Erreur: ' + err.message);
+  })
+  .finally(function() {
+    clearTimeout(timeoutId);
+    busy = false;
+    sendBtn.disabled = false;
+    userInput.focus();
+  });
+}
+
+function addMsg(role, content) {
+  var div = document.createElement('div');
+  div.className = 'message ' + role;
+  if (role === 'assistant') {
+    div.innerHTML = mdToHtml(content);
+  } else {
+    div.textContent = content;
+  }
+  chatContainer.appendChild(div);
+  chatContainer.scrollTop = chatContainer.scrollHeight;
+}
+
+function addTool(name, args) {
+  var div = document.createElement('div');
+  div.className = 'tool-call';
+  div.textContent = 'tool: ' + name + '(' + JSON.stringify(args) + ')';
+  chatContainer.appendChild(div);
+  chatContainer.scrollTop = chatContainer.scrollHeight;
+}
+
+function showTyping() {
+  var div = document.createElement('div');
+  div.className = 'typing';
+  div.id = 'typing-ind';
+  div.textContent = 'Recherche dans le graphe...';
+  chatContainer.appendChild(div);
+  chatContainer.scrollTop = chatContainer.scrollHeight;
+}
+
+function hideTyping() {
+  var el = document.getElementById('typing-ind');
+  if (el) el.remove();
+}
+
+function mdToHtml(text) {
+  var lines = text.split('\n');
+  var html = [];
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i];
+    // Escape HTML
+    line = line.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    // Headers
+    if (line.match(/^### /)) { line = '<h3>' + line.substring(4) + '</h3>'; }
+    else if (line.match(/^## /)) { line = '<h3>' + line.substring(3) + '</h3>'; }
+    // HR
+    else if (line.match(/^---$/)) { line = '<hr>'; }
+    // List items
+    else if (line.match(/^\d+\.\s/)) { line = '<li>' + line.replace(/^\d+\.\s+/, '') + '</li>'; }
+    else if (line.match(/^[-\u2022]\s/)) { line = '<li>' + line.replace(/^[-\u2022]\s+/, '') + '</li>'; }
+    // Bold and italic
+    line = line.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+    line = line.replace(/\*(.+?)\*/g, '<em>$1</em>');
+    // Inline code
+    line = line.replace(/`(.+?)`/g, '<code>$1</code>');
+    html.push(line);
+  }
+  return html.join('<br>');
+}
+
+userInput.focus();
+</script>
+</body>
+</html>

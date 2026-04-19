@@ -1,3 +1,6 @@
+anthropic>=0.40.0
+flask>=3.0.0
+openai>=1.0.0
 rdflib>=7.0.0
 pyoxigraph>=0.5.0
 requests>=2.31.0

@@ -11,6 +11,10 @@ pip install -r requirements.txt
 # Run tests (no API key needed)
 pytest tests/
 
+# Run a single test file or test function
+pytest tests/test_queries.py
+pytest tests/test_ingestion.py::test_cross_source_linking
+
 # Build the knowledge graph (requires EBIRD_API_KEY in .env)
 python scripts/build_graph.py --dof-max 5000
 
@@ -27,6 +31,7 @@ python scripts/query_graph.py --family "Turdidae"
 python scripts/query_graph.py --danish
 python scripts/query_graph.py --obs "Erithacus"  # also accepts Danish/French/English names
 python scripts/query_graph.py --obs "Rødhals"
+python scripts/query_graph.py --order "Passeriformes"
 
 # Run reasoner (pure-Python parallel rules — seconds, not minutes)
 python scripts/reason.py
@@ -44,6 +49,17 @@ python scripts/query_graph.py --nearby 55.6918 12.5559
 python scripts/visualize.py
 python scripts/visualize.py --mode graph --family "Turdidae"
 python scripts/visualize.py --mode stats
+
+# Graph-RAG chat — ask questions in natural language
+python scripts/chat.py                                          # Ollama + mistral (default)
+python scripts/chat.py --model llama3                           # Ollama + different model
+python scripts/chat.py --backend anthropic                      # Claude (needs ANTHROPIC_API_KEY)
+python scripts/chat.py --input output/birdology_reasoned.ttl    # richer migration data
+
+# Graph-RAG web chat (opens in browser at http://localhost:5000)
+python scripts/web_chat.py
+python scripts/web_chat.py --port 8080
+python scripts/web_chat.py --input output/birdology_reasoned.ttl
 
 # Desktop dashboard (PySide6 GUI — wraps all CLI features)
 python scripts/dashboard.py
@@ -67,6 +83,7 @@ The project builds an OWL/RDF knowledge graph of birds and saves it as a Turtle 
 | `schema.py` | `build_schema()` — declares OWL classes and properties into a `Graph`. The single source of truth for the ontology shape. |
 | `graph.py` | `build_graph(ebird_key)` orchestrates schema + ingestion → plain `Graph`. `save_graph` / `load_graph` handle Turtle I/O. |
 | `queries.py` | Reusable SPARQL functions that take a graph and return `list[dict]`. |
+| `migration.py` | `infer_migration_status()` — classifies each observed species as Resident/SummerVisitor/WinterVisitor/PassageMigrant/PartialMigrant from DOF month data; adds `bird:migrationStatus` and `bird:typicallyPresentInMonth` triples. |
 | `ingestion/ebird.py` | Calls eBird API v2 (`/ref/taxonomy/ebird`), converts records → RDF via `taxonomy_to_rdf()`. |
 | `ingestion/gbif_dof.py` | Calls GBIF API for DOFbasen dataset (key `95db4db8`), converts occurrences → RDF via `occurrences_to_rdf()`. |
 
