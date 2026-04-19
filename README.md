@@ -43,6 +43,15 @@ python scripts/visualize.py                     # → output/birdology_danish.ht
 python scripts/reason.py                        # → output/birdology_reasoned.ttl
 python scripts/reason.py --workers 8            # explicit parallelism
 python scripts/query_graph.py --input output/birdology_reasoned.ttl --summary
+
+# 7. Graph-RAG chat (natural language Q&A over the knowledge graph)
+python scripts/chat.py                          # Ollama + mistral (default)
+python scripts/chat.py --backend anthropic      # Claude (needs ANTHROPIC_API_KEY)
+python scripts/chat.py --ask "Quels oiseaux près de Copenhague ?"
+
+# 8. Web chat UI (browser-based, with session history)
+python scripts/web_chat.py                      # → http://localhost:5000
+python scripts/web_chat.py --port 8080
 ```
 
 ## Scripts
@@ -53,6 +62,8 @@ python scripts/query_graph.py --input output/birdology_reasoned.ttl --summary
 | `scripts/query_graph.py` | SPARQL queries: species lookup, family/order drill-down, Danish sightings, cemetery watch |
 | `scripts/visualize.py` | Interactive pyvis HTML graph + IUCN stats PNG |
 | `scripts/reason.py` | Parallel pure-Python reasoner → materialised `output/birdology_reasoned.ttl` |
+| `scripts/chat.py` | Graph-RAG chat — LLM queries the graph via tool-calling (Ollama / Anthropic) |
+| `scripts/web_chat.py` | Flask web UI for the Graph-RAG chat with session history |
 
 ## Query examples
 
@@ -95,6 +106,7 @@ pytest tests/          # 55 tests, no API key or network required
 | `test_queries.py` | All SPARQL functions with an in-memory graph fixture |
 | `test_reasoner.py` | Each inference rule: correctness, idempotency, parallel vs sequential |
 | `test_gbif_batching.py` | Year-batching, offset-cap enforcement, deduplication (mocked HTTP) |
+| `test_chat.py` | Graph-RAG tool definitions, formatting, and all 8 tools against in-memory graph |
 
 ## What the reasoner adds
 
@@ -107,6 +119,32 @@ Running `scripts/reason.py` materialises:
 - **Domain inference** — nodes with `bird:eBirdCode` are typed `bird:Species` even
   if the type triple is missing.
 - **`owl:sameAs` closure** — properties on GBIF IRIs propagate to eBird IRIs.
+
+## Graph-RAG chat
+
+The chat interface lets you query the knowledge graph in natural language. The LLM
+has 8 tools that execute SPARQL queries and live API calls:
+
+| Tool | Description |
+|------|-------------|
+| `find_species` | Search by name (English, Danish, French, scientific) |
+| `species_by_family` | List species in a taxonomic family |
+| `species_by_order` | List species in a taxonomic order |
+| `recent_observations` | DOFbasen observations from the graph |
+| `nearby_birds` | Species observed near GPS coordinates |
+| `currently_present` | Species typically present in a given month |
+| `taxonomy_summary` | Graph statistics (orders, families, species, observations) |
+| `live_observations` | **Real-time** eBird sightings in Denmark (last 1–30 days) |
+
+The web UI (`scripts/web_chat.py`) adds conversation history per session, automatic
+retry on transient API errors, and a "new conversation" button.
+
+Configure the LLM backend via `.env`:
+```bash
+LLM_BASE_URL=https://ollama.com/v1   # or http://localhost:11434/v1 for local
+LLM_API_KEY=your_key
+LLM_MODEL=mistral-large-3:675b
+```
 
 ## Output files
 
