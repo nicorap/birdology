@@ -118,14 +118,23 @@ def find_species_by_name(g: Graph | ConjunctiveGraph, name: str) -> list[dict]:
     q = (
         _PREFIXES
         + f"""
-SELECT DISTINCT ?species ?scientificName ?commonNameEn ?commonNameDa ?commonNameFr ?eBirdCode
+SELECT DISTINCT ?species ?scientificName ?commonNameEn ?commonNameDa ?commonNameFr
+       ?eBirdCode ?thumbnail ?rangeMap ?massGrams ?wingspanMm ?habitat
+       ?conservationStatus ?migrationStatus
 WHERE {{
     ?species a bird:Species .
     ?species dwc:scientificName ?scientificName .
-    OPTIONAL {{ ?species bird:commonNameEn  ?commonNameEn }}
-    OPTIONAL {{ ?species bird:commonNameDa  ?commonNameDa }}
-    OPTIONAL {{ ?species bird:commonNameFr  ?commonNameFr }}
-    OPTIONAL {{ ?species bird:eBirdCode     ?eBirdCode }}
+    OPTIONAL {{ ?species bird:commonNameEn       ?commonNameEn }}
+    OPTIONAL {{ ?species bird:commonNameDa       ?commonNameDa }}
+    OPTIONAL {{ ?species bird:commonNameFr       ?commonNameFr }}
+    OPTIONAL {{ ?species bird:eBirdCode          ?eBirdCode }}
+    OPTIONAL {{ ?species bird:thumbnailUrl       ?thumbnail }}
+    OPTIONAL {{ ?species bird:rangeMapUrl        ?rangeMap }}
+    OPTIONAL {{ ?species bird:massGrams          ?massGrams }}
+    OPTIONAL {{ ?species bird:wingspanMm         ?wingspanMm }}
+    OPTIONAL {{ ?species bird:habitat            ?habitat }}
+    OPTIONAL {{ ?species bird:conservationStatus ?conservationStatus }}
+    OPTIONAL {{ ?species bird:migrationStatus    ?migrationStatus }}
     {name_filter}
 }}
 ORDER BY ?scientificName
@@ -161,7 +170,7 @@ def species_by_family(g: Graph | ConjunctiveGraph, family_name: str) -> list[dic
     q = (
         _PREFIXES
         + f"""
-SELECT DISTINCT ?species ?scientificName ?commonNameEn ?commonNameDa ?eBirdCode
+SELECT DISTINCT ?species ?scientificName ?commonNameEn ?commonNameDa ?eBirdCode ?thumbnail
 WHERE {{
     ?species a bird:Species ;
              dwc:scientificName ?scientificName ;
@@ -169,6 +178,7 @@ WHERE {{
     OPTIONAL {{ ?species bird:commonNameEn ?commonNameEn }}
     OPTIONAL {{ ?species bird:commonNameDa ?commonNameDa }}
     OPTIONAL {{ ?species bird:eBirdCode   ?eBirdCode }}
+    OPTIONAL {{ ?species bird:thumbnailUrl ?thumbnail }}
     FILTER ( CONTAINS(LCASE(STR(?family)), LCASE("{family_name}")) )
 }}
 ORDER BY ?scientificName

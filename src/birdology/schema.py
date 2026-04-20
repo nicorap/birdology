@@ -94,6 +94,38 @@ def build_schema() -> Graph:
         (BIRD.typicallyPresentInMonth, "typicallyPresentInMonth", BIRD.Species, XSD.integer,
          "Calendar month (1–12) when the species is typically present in Denmark, derived from observation records."),
 
+        # Wikidata traits
+        (BIRD.massGrams,      "massGrams",      BIRD.Species, XSD.decimal,
+         "Body mass in grams (from Wikidata P2067)."),
+        (BIRD.wingspanMm,     "wingspanMm",     BIRD.Species, XSD.decimal,
+         "Wingspan in millimetres (from Wikidata P2050)."),
+        (BIRD.habitat,        "habitat",        BIRD.Species, XSD.string,
+         "Habitat type (from Wikidata P2974), e.g. 'forest', 'wetland'."),
+        (BIRD.range,          "range",          BIRD.Species, XSD.string,
+         "Geographic range (from Wikidata P9714), e.g. 'Europe', 'Africa'."),
+        (BIRD.dielCycle,      "dielCycle",      BIRD.Species, XSD.string,
+         "Diel activity pattern: 'diurnality', 'nocturnality' (from Wikidata P9566)."),
+
+        # DBpedia data
+        (BIRD.thumbnailUrl,   "thumbnailUrl",   BIRD.Species, XSD.anyURI,
+         "Wikimedia Commons thumbnail URL (from DBpedia)."),
+        (BIRD.rangeMapUrl,    "rangeMapUrl",    BIRD.Species, XSD.anyURI,
+         "Wikimedia Commons range map URL (from DBpedia)."),
+
+        # IUCN Red List traits
+        (BIRD.iucnCategory,   "iucnCategory",   BIRD.Species, XSD.string,
+         "IUCN Red List category code (LC/NT/VU/EN/CR/EW/EX/DD/NE) from IUCN API v4."),
+        (BIRD.populationTrend, "populationTrend", BIRD.Species, XSD.string,
+         "Population trend: Increasing, Stable, Decreasing, Unknown (from IUCN)."),
+        (BIRD.iucnHabitat,    "iucnHabitat",    BIRD.Species, XSD.string,
+         "IUCN habitat classification (e.g. 'Forest - Boreal', 'Marine Neritic')."),
+        (BIRD.threat,         "threat",         BIRD.Species, XSD.string,
+         "Threat description from IUCN (e.g. 'Hunting & trapping', 'Habitat loss')."),
+        (BIRD.movementPattern, "movementPattern", BIRD.Species, XSD.string,
+         "Movement pattern: Full Migrant, Altitudinal Migrant, Nomadic, Sedentary (from IUCN)."),
+        (BIRD.system,         "system",         BIRD.Species, XSD.string,
+         "Ecological system: Terrestrial, Freshwater, Marine (from IUCN)."),
+
         # Observation fields
         (BIRD.observedOn,         "observedOn",         BIRD.Observation,  XSD.date,
          "ISO 8601 date of the observation."),

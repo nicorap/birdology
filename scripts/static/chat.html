@@ -108,6 +108,64 @@
     margin: 14px 0;
   }
 
+  .message.assistant a {
+    color: #7dcea0;
+    text-decoration: underline;
+    text-decoration-color: #3a5a4a;
+    transition: color 0.2s;
+  }
+
+  .message.assistant a:hover { color: #a0e8c0; }
+
+  .message.assistant img {
+    max-width: 280px;
+    max-height: 220px;
+    border-radius: 10px;
+    margin: 8px 4px;
+    border: 1px solid #2a2d3a;
+    object-fit: cover;
+    cursor: pointer;
+  }
+
+  .message.assistant img:hover { border-color: #7dcea0; }
+
+  .message.assistant .bird-gallery {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin: 10px 0;
+  }
+
+  .message.assistant table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 10px 0;
+    font-size: 13px;
+  }
+
+  .message.assistant th {
+    background: #252830;
+    color: #7dcea0;
+    padding: 8px 12px;
+    text-align: left;
+    border-bottom: 2px solid #3a3d4a;
+    font-weight: 600;
+  }
+
+  .message.assistant td {
+    padding: 6px 12px;
+    border-bottom: 1px solid #2a2d3a;
+    color: #d0d0d0;
+  }
+
+  .message.assistant tr:hover td { background: #1e2130; }
+
+  .source-tag {
+    font-size: 11px;
+    color: #6a7a8a;
+    font-style: italic;
+  }
+
   .tool-call {
     font-size: 12px;
     color: #7dcea0;
@@ -384,27 +442,114 @@ function hideTyping() {
 
 function mdToHtml(text) {
   var lines = text.split('\n');
-  var html = [];
+  var out = '';
+  var inTable = false;
+
   for (var i = 0; i < lines.length; i++) {
     var line = lines[i];
+
+    // Skip empty lines
+    if (line.trim() === '') continue;
+
+    // Detect table separator row (---|---|---) — skip it
+    if (line.match(/^\|?\s*[-:]+[-| :]+$/)) continue;
+
+    // Table row
+    if (line.match(/^\|(.+)\|$/)) {
+      var cells = line.split('|').filter(function(c, idx, arr) {
+        return idx > 0 && idx < arr.length - 1;
+      });
+      if (!inTable) {
+        out += '<table><tr>' + cells.map(function(c) {
+          return '<th>' + inlineFormat(c.trim()) + '</th>';
+        }).join('') + '</tr>';
+        inTable = true;
+      } else {
+        out += '<tr>' + cells.map(function(c) {
+          return '<td>' + inlineFormat(c.trim()) + '</td>';
+        }).join('') + '</tr>';
+      }
+      continue;
+    }
+
+    // Close table if we just left one
+    if (inTable) { out += '</table>'; inTable = false; }
+
     // Escape HTML
     line = line.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    // Headers
-    if (line.match(/^### /)) { line = '<h3>' + line.substring(4) + '</h3>'; }
-    else if (line.match(/^## /)) { line = '<h3>' + line.substring(3) + '</h3>'; }
-    // HR
-    else if (line.match(/^---$/)) { line = '<hr>'; }
-    // List items
-    else if (line.match(/^\d+\.\s/)) { line = '<li>' + line.replace(/^\d+\.\s+/, '') + '</li>'; }
-    else if (line.match(/^[-\u2022]\s/)) { line = '<li>' + line.replace(/^[-\u2022]\s+/, '') + '</li>'; }
-    // Bold and italic
-    line = line.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-    line = line.replace(/\*(.+?)\*/g, '<em>$1</em>');
-    // Inline code
-    line = line.replace(/`(.+?)`/g, '<code>$1</code>');
-    html.push(line);
+
+    // Block elements — no <br> needed
+    if (line.match(/^#### /)) { out += '<h4 style="color:#7dcea0;font-size:14px;margin:12px 0 4px">' + inlineFormat(line.substring(5)) + '</h4>'; continue; }
+    if (line.match(/^### /))  { out += '<h3>' + inlineFormat(line.substring(4)) + '</h3>'; continue; }
+    if (line.match(/^## /))   { out += '<h3>' + inlineFormat(line.substring(3)) + '</h3>'; continue; }
+    if (line.match(/^# /))    { out += '<h3>' + inlineFormat(line.substring(2)) + '</h3>'; continue; }
+    if (line.match(/^---$/))  { out += '<hr>'; continue; }
+    if (line.match(/^\d+\.\s/)) { out += '<li>' + inlineFormat(line.replace(/^\d+\.\s+/, '')) + '</li>'; continue; }
+    if (line.match(/^[-\u2022]\s/)) { out += '<li>' + inlineFormat(line.replace(/^[-\u2022]\s+/, '')) + '</li>'; continue; }
+
+    // Inline text — add <br> before it (paragraph break)
+    if (out.length > 0 && !out.endsWith('<br>')) out += '<br>';
+    out += inlineFormat(line);
   }
-  return html.join('<br>');
+
+  if (inTable) out += '</table>';
+  return out;
+}
+
+function inlineFormat(line) {
+  // Custom bird-img tag (injected by server, avoids parentheses issues)
+  line = line.replace(/&lt;bird-img name="([^"]*)" src="([^"]*)"&gt;/g,
+    '<img src="$2" alt="$1" title="$1" onclick="window.open(this.src,\'_blank\')">');
+  // Images and links: handle URLs with parentheses (e.g. Puffin_(Fratercula_arctica).jpg)
+  line = parseMarkdownLinks(line);
+  // Bold and italic
+  line = line.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  line = line.replace(/\*(.+?)\*/g, '<em>$1</em>');
+  // Inline code
+  line = line.replace(/`(.+?)`/g, '<code>$1</code>');
+  return line;
+}
+
+function parseMarkdownLinks(line) {
+  // Parse ![alt](url) and [text](url) handling balanced parentheses in URLs
+  var result = '';
+  var i = 0;
+  while (i < line.length) {
+    var isImg = false;
+    // Check for ![ (image) or [ (link)
+    if (line[i] === '!' && line[i+1] === '[') {
+      isImg = true;
+      i++; // skip !
+    }
+    if (line[i] === '[') {
+      var closeB = line.indexOf(']', i+1);
+      if (closeB !== -1 && line[closeB+1] === '(') {
+        var text = line.substring(i+1, closeB);
+        // Find matching ) counting balanced parens
+        var start = closeB + 2;
+        var depth = 1;
+        var j = start;
+        while (j < line.length && depth > 0) {
+          if (line[j] === '(') depth++;
+          else if (line[j] === ')') depth--;
+          if (depth > 0) j++;
+        }
+        if (depth === 0) {
+          var url = line.substring(start, j);
+          if (isImg) {
+            result += '<img src="' + url + '" alt="' + text + '" title="' + text + '" onclick="window.open(this.src,\'_blank\')">';
+          } else {
+            result += '<a href="' + url + '" target="_blank" rel="noopener">' + text + '</a>';
+          }
+          i = j + 1;
+          continue;
+        }
+      }
+    }
+    result += line[i];
+    i++;
+  }
+  return result;
 }
 
 userInput.focus();

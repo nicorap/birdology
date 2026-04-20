@@ -73,6 +73,28 @@ def _get_session(session_id: str) -> list[dict]:
         return sess["messages"]
 
 
+def _extract_thumbnails(tool_result: str, out: list) -> None:
+    """Parse tool JSON results and collect (name, thumbnail_url) pairs."""
+    try:
+        data = json.loads(tool_result)
+    except (json.JSONDecodeError, TypeError):
+        return
+    if not isinstance(data, list):
+        return
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        thumb = item.get("thumbnail")
+        if thumb and thumb.startswith("http"):
+            name = (item.get("commonNameEn")
+                    or item.get("commonNameFr")
+                    or item.get("scientificName")
+                    or "")
+            # Avoid duplicates
+            if not any(u == thumb for _, u in out):
+                out.append((name, thumb))
+
+
 @app.route("/")
 def index():
     html = (STATIC_DIR / "chat.html").read_text(encoding="utf-8")
@@ -105,6 +127,7 @@ def api_chat():
     messages = list(history)
 
     tool_calls_log = []
+    thumbnails_seen = []  # collect thumbnail URLs from tool results
     max_rounds = 5
 
     try:
@@ -130,6 +153,18 @@ def api_chat():
 
             if not msg.tool_calls:
                 answer = msg.content or ""
+                # Append photo gallery only for thumbnails NOT already in the answer
+                if thumbnails_seen:
+                    already = answer  # check against raw answer text
+                    new_thumbs = [
+                        (name, url) for name, url in thumbnails_seen[:4]
+                        if url not in already
+                    ]
+                    if new_thumbs:
+                        gallery = "\n\n"
+                        for name, url in new_thumbs:
+                            gallery += f'<bird-img name="{name}" src="{url}">\n'
+                        answer += gallery
                 # Persist only the final assistant text to session history
                 history.append({"role": "assistant", "content": answer})
                 return jsonify({
@@ -149,6 +184,9 @@ def api_chat():
 
                 tool_calls_log.append({"name": fn_name, "args": fn_args})
                 result = _run_tool(fn_name, fn_args, GRAPH)
+
+                # Extract thumbnails from tool results
+                _extract_thumbnails(result, thumbnails_seen)
 
                 messages.append({
                     "role": "tool",
