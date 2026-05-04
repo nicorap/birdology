@@ -25,11 +25,14 @@ from flask import Flask, request, jsonify, Response
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from birdology.graph import load_graph
+from birdology.queries import observations_for_map
 from chat import (
     SYSTEM_PROMPT,
     TOOLS_OPENAI,
     _run_tool,
 )
+
+_PANEL_CACHE: dict[str, object] = {}
 
 load_dotenv()
 
@@ -206,6 +209,66 @@ def api_chat():
         if history and history[-1].get("role") == "user":
             history.pop()
         return jsonify({"answer": f"Erreur serveur: {e}"}), 200
+
+
+@app.route("/api/observations")
+def api_observations():
+    if "observations" not in _PANEL_CACHE:
+        rows = observations_for_map(GRAPH)
+        out = []
+        for r in rows:
+            try:
+                lat = float(r.get("lat", ""))
+                lon = float(r.get("lon", ""))
+            except (TypeError, ValueError):
+                continue
+            out.append({
+                "scientificName": r.get("scientificName", ""),
+                "commonName": r.get("commonNameFr") or r.get("commonNameEn") or r.get("commonNameDa") or "",
+                "lat": lat,
+                "lon": lon,
+                "date": r.get("date", ""),
+                "locality": r.get("locality", ""),
+                "count": r.get("count", ""),
+            })
+        _PANEL_CACHE["observations"] = out
+    return jsonify(_PANEL_CACHE["observations"])
+
+
+@app.route("/api/species")
+def api_species():
+    if "species" not in _PANEL_CACHE:
+        q = """
+PREFIX bird: <https://birdology.org/ontology/>
+PREFIX dwc: <http://rs.tdwg.org/dwc/terms/>
+SELECT ?species ?scientificName ?commonNameEn ?commonNameFr ?commonNameDa ?thumbnail
+       (COUNT(?obs) AS ?obsCount)
+WHERE {
+    ?species a bird:Species ;
+             dwc:scientificName ?scientificName ;
+             bird:hasObservation ?obs ;
+             bird:thumbnailUrl ?thumbnail .
+    FILTER(STRSTARTS(STR(?species), "https://birdology.org/taxon/species/"))
+    OPTIONAL { ?species bird:commonNameEn ?commonNameEn }
+    OPTIONAL { ?species bird:commonNameFr ?commonNameFr }
+    OPTIONAL { ?species bird:commonNameDa ?commonNameDa }
+}
+GROUP BY ?species ?scientificName ?commonNameEn ?commonNameFr ?commonNameDa ?thumbnail
+ORDER BY DESC(?obsCount)
+LIMIT 30
+"""
+        results = GRAPH.query(q)
+        out = []
+        for row in results:
+            d = {str(var): str(row[var]) for var in results.vars if row[var] is not None}
+            out.append({
+                "scientificName": d.get("scientificName", ""),
+                "commonName": d.get("commonNameFr") or d.get("commonNameEn") or d.get("commonNameDa") or "",
+                "thumbnail": d.get("thumbnail", ""),
+                "obsCount": int(d.get("obsCount", "0") or 0),
+            })
+        _PANEL_CACHE["species"] = out
+    return jsonify(_PANEL_CACHE["species"])
 
 
 @app.route("/api/reset", methods=["POST"])

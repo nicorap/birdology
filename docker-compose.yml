@@ -1,0 +1,50 @@
+services:
+  web:
+    build: .
+    image: birdology:latest
+    ports:
+      - "5000:5000"
+    env_file: .env
+    volumes:
+      - graph-data:/app/output
+    restart: unless-stopped
+    depends_on:
+      updater-init:
+        condition: service_completed_successfully
+
+  # Run once on first boot so the web service has a graph to load.
+  updater-init:
+    image: birdology:latest
+    build: .
+    env_file: .env
+    volumes:
+      - graph-data:/app/output
+    entrypoint: ["bash", "scripts/update_graph.sh"]
+    restart: "no"
+
+  # Daily rebuild. Triggered by ofelia via labels — the container itself
+  # sleeps until ofelia execs scripts/update_graph.sh inside it.
+  updater:
+    image: birdology:latest
+    build: .
+    env_file: .env
+    volumes:
+      - graph-data:/app/output
+    entrypoint: ["sleep", "infinity"]
+    restart: unless-stopped
+    labels:
+      ofelia.enabled: "true"
+      ofelia.job-exec.daily-rebuild.schedule: "0 0 4 * * *"  # 04:00 UTC daily
+      ofelia.job-exec.daily-rebuild.command: "bash scripts/update_graph.sh"
+
+  ofelia:
+    image: mcuadros/ofelia:latest
+    command: daemon --docker
+    depends_on:
+      - updater
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: unless-stopped
+
+volumes:
+  graph-data:

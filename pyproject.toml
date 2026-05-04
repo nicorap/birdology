@@ -1,0 +1,40 @@
+[project]
+name = "birdology"
+version = "0.1.0"
+description = "OWL/RDF knowledge graph of birds"
+requires-python = ">=3.11"
+dependencies = [
+    "rdflib>=7.0.0",
+    "pyoxigraph>=0.5.0",
+    "requests>=2.31.0",
+    "python-dotenv>=1.0.0",
+    "tqdm>=4.66.0",
+]
+
+[project.optional-dependencies]
+server = [
+    "flask>=3.0.0",
+    "anthropic>=0.40.0",
+    "openai>=1.0.0",
+    "gunicorn>=21.2.0",
+]
+gui = [
+    "PySide6>=6.6.0",
+]
+viz = [
+    "matplotlib>=3.8.0",
+    "pyvis>=0.3.2",
+    "networkx>=3.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

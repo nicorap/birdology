@@ -5,15 +5,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
+# Install dependencies (uv reads pyproject.toml; creates .venv automatically)
+uv sync                              # core deps only
+uv sync --extra server               # core + Flask/openai/anthropic
+uv sync --extra server --extra gui --extra viz   # everything (GUI + viz)
 
-# Run tests (no API key needed)
-pytest tests/
+# Run any command in the project venv
+uv run pytest tests/
+uv run python scripts/build_graph.py --dof-max 5000
+
+# Add a new dependency
+uv add rdflib                        # to [project.dependencies]
+uv add --optional server flask       # to a specific extra
+uv add --dev pytest                  # to dev group
 
 # Run a single test file or test function
-pytest tests/test_queries.py
-pytest tests/test_ingestion.py::test_cross_source_linking
+uv run pytest tests/test_queries.py
+uv run pytest tests/test_ingestion.py::test_cross_source_linking
 
 # Build the knowledge graph (requires EBIRD_API_KEY in .env)
 python scripts/build_graph.py --dof-max 5000
