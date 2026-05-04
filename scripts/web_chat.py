@@ -246,9 +246,9 @@ SELECT ?species ?scientificName ?commonNameEn ?commonNameFr ?commonNameDa ?thumb
 WHERE {
     ?species a bird:Species ;
              dwc:scientificName ?scientificName ;
-             bird:hasObservation ?obs ;
-             bird:thumbnailUrl ?thumbnail .
+             bird:hasObservation ?obs .
     FILTER(STRSTARTS(STR(?species), "https://birdology.org/taxon/species/"))
+    OPTIONAL { ?species bird:thumbnailUrl ?thumbnail }
     OPTIONAL { ?species bird:commonNameEn ?commonNameEn }
     OPTIONAL { ?species bird:commonNameFr ?commonNameFr }
     OPTIONAL { ?species bird:commonNameDa ?commonNameDa }
