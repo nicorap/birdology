@@ -39,6 +39,18 @@ from birdology.queries import (
 load_dotenv()
 
 DEFAULT_TTL = Path(__file__).parent.parent / "output" / "birdology.ttl"
+_WIKI_INDEX_DIR = Path(__file__).parent.parent / "data" / "wiki_index"
+
+# Lazy singleton — only loaded when the tool is first called
+_wiki_rag = None
+
+
+def _get_wiki_rag():
+    global _wiki_rag
+    if _wiki_rag is None:
+        from birdology.wiki_rag import WikiRAG
+        _wiki_rag = WikiRAG(index_dir=_WIKI_INDEX_DIR)
+    return _wiki_rag
 
 # ---------------------------------------------------------------------------
 # Tool definitions (OpenAI function-calling format — works for both backends)
@@ -218,6 +230,31 @@ TOOLS_OPENAI = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_wikipedia",
+            "description": (
+                "Search Wikipedia articles about bird species for detailed information on "
+                "behavior, habitat, diet, courtship, song, breeding, migration, and ecology. "
+                "Use this when the user asks about how a bird behaves, where it lives, "
+                "what it eats, how it sings, or any natural history question."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "Natural language query, e.g. 'European Robin courtship behavior', "
+                            "'Barn Swallow migration route', 'Great Tit song description'"
+                        ),
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
 ]
 
 # Anthropic format (converted from OpenAI format)
@@ -263,12 +300,14 @@ a markdown image: `![species name](url)`. Show max 3 photos per response.
 - Wikidata traits: mass (g), wingspan (mm), habitat, range, diel cycle
 - DBpedia: thumbnails (photos), range maps, owl:sameAs links
 - Live eBird data (1-30 days) via `live_observations`
+- Wikipedia articles (behavior, habitat, song, breeding, ecology) via `search_wikipedia`
 
 ## Tool usage
 - Use `live_observations` for real-time data (what's being seen NOW).
 - Use graph tools for taxonomy, historical observations, species info.
+- Use `search_wikipedia` for behavior, habitat, song, courtship, diet, ecology questions.
 - Always query tools first. Never answer from memory alone.
-- Combine tools when needed (e.g. find_species + recent_observations).
+- Combine tools when needed (e.g. find_species + search_wikipedia).
 
 ## Response language
 Answer in the user's language. Include scientific name + Danish name when relevant."""
@@ -340,6 +379,18 @@ def _run_tool(name: str, inputs: dict, graph) -> str:
 
     if name == "taxonomy_summary":
         return json.dumps(taxonomy_summary(graph), ensure_ascii=False, indent=2)
+
+    if name == "search_wikipedia":
+        rag = _get_wiki_rag()
+        if not rag.is_built():
+            return (
+                "Wikipedia index not built yet. "
+                "Run: python scripts/build_wiki_index.py"
+            )
+        results = rag.search(inputs["query"], n_results=4)
+        if not results:
+            return "No Wikipedia results found for this query."
+        return json.dumps(results, ensure_ascii=False, indent=2)
 
     return f"Unknown tool: {name}"
 
