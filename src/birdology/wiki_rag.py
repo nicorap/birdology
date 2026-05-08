@@ -15,6 +15,7 @@ _DEFAULT_INDEX_DIR = Path("data/wiki_index")
 _COLLECTION_NAME = "bird_wikipedia"
 _CHUNK_SIZE = 500  # chars
 _REQUEST_DELAY = 0.15  # seconds between Wikipedia requests
+_HEADERS = {"User-Agent": "Birdology/1.0 (https://github.com/nicorap/birdology; educational)"}
 
 
 def _search_wikipedia_title(query: str, lang: str = "en") -> Optional[str]:
@@ -28,7 +29,7 @@ def _search_wikipedia_title(query: str, lang: str = "en") -> Optional[str]:
         "format": "json",
     }
     try:
-        r = requests.get(url, params=params, timeout=10)
+        r = requests.get(url, params=params, timeout=10, headers=_HEADERS)
         r.raise_for_status()
         hits = r.json().get("query", {}).get("search", [])
         return hits[0]["title"] if hits else None
@@ -49,7 +50,7 @@ def _fetch_wikipedia_extract(title: str, lang: str = "en") -> Optional[str]:
         "redirects": True,
     }
     try:
-        r = requests.get(url, params=params, timeout=15)
+        r = requests.get(url, params=params, timeout=15, headers=_HEADERS)
         r.raise_for_status()
         pages = r.json().get("query", {}).get("pages", {})
         page = next(iter(pages.values()))
