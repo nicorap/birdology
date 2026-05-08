@@ -68,6 +68,48 @@ def _fetch_year(year: int, remaining: int) -> list[dict]:
     return results
 
 
+def fetch_dof_occurrences_since(
+    since: date,
+    max_records: int = 10000,
+) -> list[dict]:
+    """Fetch DOF occurrences with eventDate >= *since*.
+
+    Uses the GBIF `eventDate` range filter to only return new records.
+    """
+    results: list[dict] = []
+    seen_keys: set = set()
+    offset = 0
+    since_str = since.isoformat()
+
+    with tqdm(total=max_records, unit="rec", desc="Fetching new DOFbasen") as pbar:
+        while len(results) < max_records:
+            limit = min(_PAGE_SIZE, max_records - len(results))
+            params = {
+                "datasetKey": _DOF_DATASET_KEY,
+                "limit": limit,
+                "offset": offset,
+                "basisOfRecord": "HUMAN_OBSERVATION",
+                "eventDate": f"{since_str},*",
+            }
+            resp = requests.get(
+                f"{_GBIF_BASE}/occurrence/search", params=params, timeout=_TIMEOUT
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            batch = data.get("results", [])
+            for rec in batch:
+                key = rec.get("key") or rec.get("gbifID")
+                if key and key not in seen_keys:
+                    seen_keys.add(key)
+                    results.append(rec)
+            pbar.update(len(batch))
+            offset += len(batch)
+            if data.get("endOfRecords", True) or not batch or offset >= _GBIF_OFFSET_CAP:
+                break
+
+    return results[:max_records]
+
+
 def fetch_dof_occurrences(max_records: int = 5000) -> list[dict]:
     """
     Fetch occurrence records from the DOF GBIF dataset.

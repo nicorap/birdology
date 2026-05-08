@@ -271,6 +271,294 @@ LIMIT 30
     return jsonify(_PANEL_CACHE["species"])
 
 
+@app.route("/api/dashboard")
+def api_dashboard():
+    """Return dashboard data: rare species (eBird live) and hotspots."""
+    rare_rows = _dashboard_rare()
+    hotspot_rows = _dashboard_hotspots()
+    return jsonify({
+        "rare": rare_rows,
+        "hotspots": hotspot_rows,
+    })
+
+
+def _dashboard_rare() -> list[dict]:
+    """Fetch recent notable observations from eBird live API, cross-reference
+    with IUCN status from the graph. Falls back to graph data if no API key."""
+    api_key = os.getenv("EBIRD_API_KEY", "")
+    if not api_key:
+        return _dashboard_rare_fallback()
+
+    try:
+        from birdology.ingestion.ebird import fetch_recent_denmark
+        raw = fetch_recent_denmark(api_key, days=14)
+    except Exception:
+        return _dashboard_rare_fallback()
+
+    # Build a sciName → IUCN status lookup from the graph
+    iucn_q = """
+    PREFIX bird: <https://birdology.org/ontology/>
+    PREFIX dwc: <http://rs.tdwg.org/dwc/terms/>
+    SELECT ?scientificName ?status ?commonNameFr WHERE {
+        ?sp a bird:Species ;
+            dwc:scientificName ?scientificName ;
+            bird:conservationStatus ?status .
+        FILTER(?status IN ("CR", "EN", "VU", "NT"))
+        OPTIONAL { ?sp bird:commonNameFr ?commonNameFr }
+    }
+    """
+    iucn_map = {}  # sciName → {status, commonNameFr}
+    for row in GRAPH.query(iucn_q):
+        iucn_map[str(row.scientificName)] = {
+            "status": str(row.status),
+            "commonNameFr": str(row.commonNameFr) if row.commonNameFr else None,
+        }
+
+    iucn_rank = {"CR": 0, "EN": 1, "VU": 2, "NT": 3}
+    results = []
+    seen = set()
+    for obs in raw:
+        sci = obs.get("sciName", "")
+        info = iucn_map.get(sci)
+        if not info or sci in seen:
+            continue
+        seen.add(sci)
+        results.append({
+            "scientificName": sci,
+            "commonNameEn": obs.get("comName"),
+            "commonNameFr": info.get("commonNameFr"),
+            "status": info["status"],
+            "date": obs.get("obsDt"),
+            "locality": obs.get("locName"),
+        })
+
+    results.sort(key=lambda r: (iucn_rank.get(r["status"], 99), r["scientificName"]))
+    return results[:12]
+
+
+def _dashboard_rare_fallback() -> list[dict]:
+    """Graph-only fallback for rare species when eBird API is unavailable."""
+    q = """
+    PREFIX bird: <https://birdology.org/ontology/>
+    PREFIX dwc: <http://rs.tdwg.org/dwc/terms/>
+    SELECT DISTINCT ?species ?scientificName ?commonNameEn ?commonNameFr ?status ?date ?locality
+    WHERE {
+        ?species a bird:Species ;
+                 dwc:scientificName ?scientificName ;
+                 bird:conservationStatus ?status ;
+                 bird:hasObservation ?obs .
+        FILTER(STRSTARTS(STR(?species), "https://birdology.org/taxon/species/"))
+        FILTER(?status IN ("CR", "EN", "VU", "NT"))
+        ?obs bird:observedOn ?date .
+        OPTIONAL { ?obs bird:observedAt ?loc . ?loc bird:locality ?locality }
+        OPTIONAL { ?species bird:commonNameEn ?commonNameEn }
+        OPTIONAL { ?species bird:commonNameFr ?commonNameFr }
+    }
+    ORDER BY ?status DESC(?date)
+    LIMIT 20
+    """
+    rows = []
+    seen = set()
+    for row in GRAPH.query(q):
+        sp = str(row.species)
+        if sp in seen:
+            continue
+        seen.add(sp)
+        rows.append({
+            "scientificName": str(row.scientificName),
+            "commonNameEn": str(row.commonNameEn) if row.commonNameEn else None,
+            "commonNameFr": str(row.commonNameFr) if row.commonNameFr else None,
+            "status": str(row.status),
+            "date": str(row.date) if row.date else None,
+            "locality": str(row.locality) if row.locality else None,
+        })
+    return rows
+
+
+def _dashboard_hotspots() -> list[dict]:
+    """Compute hotspots on-the-fly from observation counts per location.
+
+    Returns up to 30 locations with lat/lon for the Leaflet map.
+    """
+    q = """
+    PREFIX bird: <https://birdology.org/ontology/>
+    SELECT ?loc ?locality ?lat ?lon (COUNT(?obs) AS ?n) WHERE {
+        ?obs bird:observedAt ?loc .
+        ?loc a bird:Location ;
+             bird:latitude ?lat ;
+             bird:longitude ?lon .
+        OPTIONAL { ?loc bird:locality ?locality }
+    }
+    GROUP BY ?loc ?locality ?lat ?lon
+    HAVING (COUNT(?obs) >= 5)
+    ORDER BY DESC(?n)
+    LIMIT 30
+    """
+    rows = []
+    for row in GRAPH.query(q):
+        lat = str(row.lat) if row.lat else None
+        lon = str(row.lon) if row.lon else None
+        if lat and lon:
+            rows.append({
+                "locality": str(row.locality) if row.locality else None,
+                "lat": lat,
+                "lon": lon,
+                "count": int(str(row.n)),
+            })
+    return rows
+
+
+@app.route("/api/weekend")
+def api_weekend():
+    """Suggest where to go and what to see this weekend.
+
+    Combines: nearest hotspots + species present this month + migration status.
+    Accepts ?lat=...&lon=... query params (user geolocation); defaults to
+    Copenhagen center (55.6761, 12.5683) if not provided.
+    """
+    import datetime
+    import math
+
+    try:
+        user_lat = float(request.args.get("lat", 55.6761))
+        user_lon = float(request.args.get("lon", 12.5683))
+    except (TypeError, ValueError):
+        user_lat, user_lon = 55.6761, 12.5683
+
+    month = datetime.date.today().month
+
+    # 1) Get all hotspot locations with coords (low threshold to include sparse areas)
+    hotspot_q = """
+    PREFIX bird: <https://birdology.org/ontology/>
+    SELECT ?loc ?locality ?lat ?lon (COUNT(?obs) AS ?n) WHERE {
+        ?obs bird:observedAt ?loc .
+        ?loc a bird:Location ;
+             bird:latitude ?lat ;
+             bird:longitude ?lon .
+        OPTIONAL { ?loc bird:locality ?locality }
+    }
+    GROUP BY ?loc ?locality ?lat ?lon
+    ORDER BY DESC(?n)
+    LIMIT 100
+    """
+    hotspots = []
+    for row in GRAPH.query(hotspot_q):
+        lat = row.lat
+        lon = row.lon
+        if lat is None or lon is None:
+            continue
+        try:
+            flat, flon = float(str(lat)), float(str(lon))
+        except (TypeError, ValueError):
+            continue
+        dlat = math.radians(flat - user_lat)
+        dlon = math.radians(flon - user_lon)
+        a = (math.sin(dlat / 2) ** 2
+             + math.cos(math.radians(user_lat))
+             * math.cos(math.radians(flat))
+             * math.sin(dlon / 2) ** 2)
+        dist_km = 6371 * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+        hotspots.append({
+            "loc": str(row.loc),
+            "locality": str(row.locality) if row.locality else None,
+            "lat": flat,
+            "lon": flon,
+            "count": int(str(row.n)),
+            "dist_km": round(dist_km, 1),
+        })
+
+    hotspots.sort(key=lambda h: h["dist_km"])
+    top_hotspots = hotspots[:5]
+
+    if not top_hotspots:
+        return jsonify({"spots": []})
+
+    # 2) For each hotspot, find species observed there that are present this month
+    spots = []
+    for hs in top_hotspots:
+        species_q = f"""
+        PREFIX bird: <https://birdology.org/ontology/>
+        PREFIX dwc: <http://rs.tdwg.org/dwc/terms/>
+        SELECT DISTINCT ?species ?scientificName ?commonNameFr ?commonNameEn
+                        ?migStatus ?status ?thumbnail
+        WHERE {{
+            ?species a bird:Species ;
+                     dwc:scientificName ?scientificName ;
+                     bird:hasObservation ?obs ;
+                     bird:typicallyPresentInMonth {month} .
+            ?obs bird:observedAt <{hs["loc"]}> .
+            FILTER(STRSTARTS(STR(?species), "https://birdology.org/taxon/species/"))
+            OPTIONAL {{ ?species bird:commonNameFr      ?commonNameFr }}
+            OPTIONAL {{ ?species bird:commonNameEn      ?commonNameEn }}
+            OPTIONAL {{ ?species bird:migrationStatus   ?migStatus }}
+            OPTIONAL {{ ?species bird:conservationStatus ?status }}
+            OPTIONAL {{ ?species bird:thumbnail         ?thumbnail }}
+        }}
+        ORDER BY ?migStatus ?scientificName
+        """
+        birds = []
+        seen = set()
+        for row in GRAPH.query(species_q):
+            sci = str(row.scientificName)
+            if sci in seen:
+                continue
+            seen.add(sci)
+            birds.append({
+                "scientificName": sci,
+                "commonNameFr": str(row.commonNameFr) if row.commonNameFr else None,
+                "commonNameEn": str(row.commonNameEn) if row.commonNameEn else None,
+                "migrationStatus": str(row.migStatus) if row.migStatus else None,
+                "conservationStatus": str(row.status) if row.status else None,
+                "thumbnail": str(row.thumbnail) if row.thumbnail else None,
+            })
+
+        # If no typicallyPresentInMonth data, fall back to all species at this location
+        if not birds:
+            fallback_q = f"""
+            PREFIX bird: <https://birdology.org/ontology/>
+            PREFIX dwc: <http://rs.tdwg.org/dwc/terms/>
+            SELECT DISTINCT ?species ?scientificName ?commonNameFr ?commonNameEn
+                            ?migStatus ?status ?thumbnail
+            WHERE {{
+                ?species a bird:Species ;
+                         dwc:scientificName ?scientificName ;
+                         bird:hasObservation ?obs .
+                ?obs bird:observedAt <{hs["loc"]}> .
+                FILTER(STRSTARTS(STR(?species), "https://birdology.org/taxon/species/"))
+                OPTIONAL {{ ?species bird:commonNameFr      ?commonNameFr }}
+                OPTIONAL {{ ?species bird:commonNameEn      ?commonNameEn }}
+                OPTIONAL {{ ?species bird:migrationStatus   ?migStatus }}
+                OPTIONAL {{ ?species bird:conservationStatus ?status }}
+                OPTIONAL {{ ?species bird:thumbnail         ?thumbnail }}
+            }}
+            ORDER BY ?scientificName
+            """
+            for row in GRAPH.query(fallback_q):
+                sci = str(row.scientificName)
+                if sci in seen:
+                    continue
+                seen.add(sci)
+                birds.append({
+                    "scientificName": sci,
+                    "commonNameFr": str(row.commonNameFr) if row.commonNameFr else None,
+                    "commonNameEn": str(row.commonNameEn) if row.commonNameEn else None,
+                    "migrationStatus": str(row.migStatus) if row.migStatus else None,
+                    "conservationStatus": str(row.status) if row.status else None,
+                    "thumbnail": str(row.thumbnail) if row.thumbnail else None,
+                })
+
+        spots.append({
+            "locality": hs["locality"],
+            "lat": hs["lat"],
+            "lon": hs["lon"],
+            "dist_km": hs["dist_km"],
+            "obs_count": hs["count"],
+            "species": birds[:15],
+        })
+
+    return jsonify({"month": month, "spots": spots})
+
+
 @app.route("/api/reset", methods=["POST"])
 def api_reset():
     """Clear conversation history for a session."""

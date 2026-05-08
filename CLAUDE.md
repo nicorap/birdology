@@ -32,6 +32,9 @@ python scripts/build_graph.py --dof-max 500
 # Get more observations — DOF is batched by year (up to ~9 700/year)
 python scripts/build_graph.py --dof-max 50000
 
+# Incremental update (fetch only new observations since last build)
+python scripts/build_graph.py --update --dof-max 5000
+
 # Query the saved graph
 python scripts/query_graph.py --summary
 python scripts/query_graph.py --species "Robin"
@@ -46,6 +49,14 @@ python scripts/reason.py
 python scripts/reason.py --workers 4   # default: cpu_count
 python scripts/query_graph.py --input output/birdology_reasoned.ttl --summary
 
+# Enrichment pipelines (run after build_graph.py)
+python scripts/enrich_wikidata.py   # Wikidata descriptions & links
+python scripts/enrich_dbpedia.py    # DBpedia linked data
+python scripts/enrich_iucn.py       # IUCN Red List conservation status
+python scripts/enrich_elton.py      # EltonTraits diet & foraging strata (CC0)
+python scripts/enrich_elton.py --download-only   # just cache data/EltonTraits_birds.txt
+python scripts/enrich_elton.py --elton data/EltonTraits_birds.txt  # local file
+
 # Rare/cool birds near Assistens Kirkegård, Nørrebro (hardcoded)
 python scripts/query_graph.py --cemetery
 python scripts/query_graph.py --cemetery --radius 5.0   # wider search
@@ -57,6 +68,8 @@ python scripts/query_graph.py --nearby 55.6918 12.5559
 python scripts/visualize.py
 python scripts/visualize.py --mode graph --family "Turdidae"
 python scripts/visualize.py --mode stats
+python scripts/visualize.py --mode map
+python scripts/visualize.py --mode all   # graph + stats + map
 
 # Graph-RAG chat — ask questions in natural language
 python scripts/chat.py                                          # Ollama + mistral (default)
@@ -71,12 +84,6 @@ python scripts/web_chat.py --input output/birdology_reasoned.ttl
 
 # Desktop dashboard (PySide6 GUI — wraps all CLI features)
 python scripts/dashboard.py
-
-# Leaflet map of observation locations (output/birdology_map.html)
-python scripts/visualize.py --mode map
-python scripts/visualize.py --mode map --species "Rødhals"
-python scripts/visualize.py --mode map --family "Turdidae"
-python scripts/visualize.py --mode all   # graph + stats + map
 ```
 
 ## Architecture
@@ -88,12 +95,16 @@ The project builds an OWL/RDF knowledge graph of birds and saves it as a Turtle 
 | File | Role |
 |------|------|
 | `namespaces.py` | All `rdflib.Namespace` objects. Import from here; never hardcode URIs elsewhere. |
-| `schema.py` | `build_schema()` — declares OWL classes and properties into a `Graph`. The single source of truth for the ontology shape. |
-| `graph.py` | `build_graph(ebird_key)` orchestrates schema + ingestion → plain `Graph`. `save_graph` / `load_graph` handle Turtle I/O. |
-| `queries.py` | Reusable SPARQL functions that take a graph and return `list[dict]`. |
+| `schema.py` | `build_schema()` — declares OWL classes and properties into a `Graph`. The single source of truth for the ontology shape. Includes `GraphMeta` class for metadata tracking. |
+| `graph.py` | `build_graph(ebird_key)` orchestrates schema + ingestion → plain `Graph`. `update_graph()` does incremental refresh (fetches only records since `lastFetchDate` metadata). `save_graph` / `load_graph` handle Turtle I/O. |
+| `queries.py` | 14 reusable SPARQL functions (`find_species_by_name`, `species_by_family`, `species_by_order`, `nearby_watch`, `currently_present`, `taxonomy_summary`, etc.) that take a graph and return `list[dict]`. |
 | `migration.py` | `infer_migration_status()` — classifies each observed species as Resident/SummerVisitor/WinterVisitor/PassageMigrant/PartialMigrant from DOF month data; adds `bird:migrationStatus` and `bird:typicallyPresentInMonth` triples. |
 | `ingestion/ebird.py` | Calls eBird API v2 (`/ref/taxonomy/ebird`), converts records → RDF via `taxonomy_to_rdf()`. |
 | `ingestion/gbif_dof.py` | Calls GBIF API for DOFbasen dataset (key `95db4db8`), converts occurrences → RDF via `occurrences_to_rdf()`. |
+| `ingestion/wikidata.py` | Wikidata SPARQL enrichment — descriptions and external links. |
+| `ingestion/dbpedia.py` | DBpedia linked data enrichment. |
+| `ingestion/iucn.py` | IUCN Red List conservation status enrichment. |
+| `ingestion/elton.py` | EltonTraits 1.0 enrichment — diet percentages and foraging strata. Downloads `data/EltonTraits_birds.txt` from figshare (CC0) on first run. |
 
 ### Key design decisions
 
@@ -107,16 +118,27 @@ The project builds an OWL/RDF knowledge graph of birds and saves it as a Turtle 
 
 **GBIF offset cap**: The GBIF occurrence search API silently rejects offsets > 10 000. `fetch_dof_occurrences` works around this by iterating year-by-year (newest first), fetching up to `_GBIF_OFFSET_CAP` (9 700) records per year.
 
-**Reasoner**: `scripts/reason.py` applies four inference rules in pure Python using `concurrent.futures.ProcessPoolExecutor` for the transitive `parentTaxon` closure (the expensive rule). No Java/OWL reasoner required — runs in seconds on the full 11k-species graph.
+**Reasoner**: `scripts/reason.py` applies 8 inference rules in pure Python using `concurrent.futures.ProcessPoolExecutor` for the transitive `parentTaxon` closure (the expensive rule). No Java/OWL reasoner required — runs in seconds on the full 11k-species graph. Rules: (1) transitive parentTaxon closure, (2) SubClass propagation, (3) domain inference, (4) `owl:sameAs` closure, (5) migration status from observation months, (6) co-occurrence linking (species sharing 3+ location/date events get `bird:frequentlyCoOccursWith`), (7) local population trend via linear regression on yearly counts (`bird:populationTrendLocal`), (8) hotspot detection (`bird:isHotspot` + `bird:observationCount` on high-activity locations).
+
+**Graph metadata**: Graphs store a metadata node (`taxon:_meta`) with `bird:lastFetchDate`, enabling incremental updates via `update_graph()` / `--update` flag.
+
+**Graph-RAG chat**: Tool-based architecture (not retrieval-based). The LLM gets 8 tools that execute SPARQL queries and live eBird API calls. Backends: Ollama (OpenAI-compatible, default) and Anthropic Claude API. Web UI uses Flask with in-memory session history (2-hour TTL). Web chat also exposes `GET /api/dashboard` (rare species + hotspots) and `GET /api/weekend` (birding recommendations).
+
+**LLM configuration** via `.env`: `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`.
 
 ## Tests
 
 ```
-tests/test_schema.py       — OWL class/property declarations
-tests/test_ingestion.py    — eBird + DOF RDF conversion, cross-source linking
-tests/test_queries.py      — all SPARQL query functions with an in-memory fixture graph
-tests/test_reasoner.py     — each inference rule in isolation (idempotency, correctness)
+tests/test_schema.py        — OWL class/property declarations
+tests/test_ingestion.py     — eBird + DOF RDF conversion, cross-source linking
+tests/test_queries.py       — all SPARQL query functions with an in-memory fixture graph
+tests/test_reasoner.py      — each inference rule in isolation (idempotency, correctness)
 tests/test_gbif_batching.py — year-batching, offset-cap, deduplication (mocked HTTP)
+tests/test_chat.py          — Graph-RAG tool definitions, formatting, all 8 tools
+tests/test_wikidata.py      — Wikidata enrichment
+tests/test_dbpedia.py       — DBpedia enrichment
+tests/test_iucn.py          — IUCN enrichment
+tests/test_graph_quality.py — graph validation
 ```
 
 ## External APIs
@@ -125,5 +147,10 @@ tests/test_gbif_batching.py — year-batching, offset-cap, deduplication (mocked
 |-----|------|-------------|
 | eBird API v2 (`api.ebird.org/v2`) | `x-ebirdapitoken` header | `EBIRD_API_KEY` |
 | GBIF (`api.gbif.org/v1`) | None (public) | — |
+| Wikidata SPARQL (`query.wikidata.org`) | None (public) | — |
 
 Get an eBird key at https://ebird.org/api/keygen (free, requires an eBird account).
+
+## CI
+
+GitHub Actions (`.github/workflows/tests.yml`): runs `pytest -q` on Python 3.11 / Ubuntu on push to main and PRs.

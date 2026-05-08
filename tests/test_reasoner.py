@@ -19,6 +19,9 @@ from reason import (
     _materialise_subclass_types,
     _materialise_domain_types,
     _materialise_same_as,
+    _materialise_co_occurrence,
+    _materialise_population_trend,
+    _materialise_hotspots,
 )
 
 
@@ -177,3 +180,160 @@ def test_sameAs_does_not_copy_sameAs_itself():
     # No new sameAs triples should be created
     new_sameAs = list(g.subject_objects(OWL.sameAs))
     assert len(new_sameAs) == 1
+
+
+# ── Rule 6: co-occurrence ────────────────────────────────────────────────────
+
+from birdology.namespaces import OBS, LOC
+
+
+def _co_occurrence_graph() -> Graph:
+    """Two species observed at the same (location, date) on 3 events."""
+    g = Graph()
+    sp_a = TAXON["species/robi"]
+    sp_b = TAXON["species/meru"]
+    sp_c = TAXON["species/pama"]  # only 1 shared event with sp_a
+    g.add((sp_a, RDF.type, BIRD.Species))
+    g.add((sp_b, RDF.type, BIRD.Species))
+    g.add((sp_c, RDF.type, BIRD.Species))
+
+    for i in range(3):
+        loc = LOC[f"loc{i}"]
+        date = Literal(f"2024-06-{10 + i:02d}", datatype=XSD.date)
+        # sp_a and sp_b always together
+        for sp in [sp_a, sp_b]:
+            obs = OBS[f"{sp.split('/')[-1]}_obs{i}"]
+            g.add((sp, BIRD.hasObservation, obs))
+            g.add((obs, BIRD.observedAt, loc))
+            g.add((obs, BIRD.observedOn, date))
+        # sp_c only on first event
+        if i == 0:
+            obs_c = OBS[f"pama_obs{i}"]
+            g.add((sp_c, BIRD.hasObservation, obs_c))
+            g.add((obs_c, BIRD.observedAt, loc))
+            g.add((obs_c, BIRD.observedOn, date))
+    return g
+
+
+def test_co_occurrence_links_frequent_pairs():
+    g = _co_occurrence_graph()
+    n = _materialise_co_occurrence(g, threshold=3)
+    sp_a = TAXON["species/robi"]
+    sp_b = TAXON["species/meru"]
+    assert n >= 2  # symmetric pair
+    assert (sp_a, BIRD.frequentlyCoOccursWith, sp_b) in g
+    assert (sp_b, BIRD.frequentlyCoOccursWith, sp_a) in g
+
+
+def test_co_occurrence_skips_infrequent_pairs():
+    g = _co_occurrence_graph()
+    _materialise_co_occurrence(g, threshold=3)
+    sp_a = TAXON["species/robi"]
+    sp_c = TAXON["species/pama"]
+    # sp_a and sp_c only share 1 event — below threshold
+    assert (sp_a, BIRD.frequentlyCoOccursWith, sp_c) not in g
+
+
+def test_co_occurrence_idempotent():
+    g = _co_occurrence_graph()
+    n1 = _materialise_co_occurrence(g, threshold=3)
+    n2 = _materialise_co_occurrence(g, threshold=3)
+    assert n1 > 0
+    assert n2 == 0
+
+
+# ── Rule 7: local population trend ──────────────────────────────────────────
+
+def _trend_graph(yearly_counts: dict[int, int]) -> tuple[Graph, object]:
+    """Build a graph with observations spread across years."""
+    g = Graph()
+    sp = TAXON["species/trend_bird"]
+    g.add((sp, RDF.type, BIRD.Species))
+    obs_idx = 0
+    for year, count in yearly_counts.items():
+        for j in range(count):
+            obs = OBS[f"trend_obs{obs_idx}"]
+            loc = LOC["trend_loc"]
+            g.add((sp, BIRD.hasObservation, obs))
+            g.add((obs, BIRD.observedOn, Literal(f"{year}-06-15", datatype=XSD.date)))
+            g.add((obs, BIRD.observedAt, loc))
+            obs_idx += 1
+    return g, sp
+
+
+def test_trend_increasing():
+    # Strong upward trend: 2, 4, 8, 16
+    g, sp = _trend_graph({2020: 2, 2021: 4, 2022: 8, 2023: 16})
+    n = _materialise_population_trend(g, min_years=3)
+    assert n == 1
+    assert (sp, BIRD.populationTrendLocal, Literal("Increasing")) in g
+
+
+def test_trend_decreasing():
+    # Strong downward trend: 20, 10, 5, 2
+    g, sp = _trend_graph({2020: 20, 2021: 10, 2022: 5, 2023: 2})
+    n = _materialise_population_trend(g, min_years=3)
+    assert n == 1
+    assert (sp, BIRD.populationTrendLocal, Literal("Decreasing")) in g
+
+
+def test_trend_stable():
+    # Flat: 10, 10, 10, 10
+    g, sp = _trend_graph({2020: 10, 2021: 10, 2022: 10, 2023: 10})
+    n = _materialise_population_trend(g, min_years=3)
+    assert n == 1
+    assert (sp, BIRD.populationTrendLocal, Literal("Stable")) in g
+
+
+def test_trend_skips_insufficient_years():
+    g, sp = _trend_graph({2020: 5, 2021: 10})
+    n = _materialise_population_trend(g, min_years=3)
+    assert n == 0
+    assert (sp, BIRD.populationTrendLocal, None) not in g
+
+
+def test_trend_idempotent():
+    g, sp = _trend_graph({2020: 2, 2021: 4, 2022: 8, 2023: 16})
+    n1 = _materialise_population_trend(g, min_years=3)
+    n2 = _materialise_population_trend(g, min_years=3)
+    assert n1 > 0
+    assert n2 == 0
+
+
+# ── Rule 8: hotspot locations ────────────────────────────────────────────────
+
+def _hotspot_graph(n_obs: int) -> tuple[Graph, object]:
+    """Build a graph with n_obs observations at the same location."""
+    g = Graph()
+    loc = LOC["hotspot_loc"]
+    g.add((loc, RDF.type, BIRD.Location))
+    sp = TAXON["species/robi"]
+    g.add((sp, RDF.type, BIRD.Species))
+    for i in range(n_obs):
+        obs = OBS[f"hot_obs{i}"]
+        g.add((obs, RDF.type, BIRD.Observation))
+        g.add((obs, BIRD.observedAt, loc))
+        g.add((sp, BIRD.hasObservation, obs))
+    return g, loc
+
+
+def test_hotspot_marks_busy_location():
+    g, loc = _hotspot_graph(25)
+    n = _materialise_hotspots(g, threshold=20)
+    assert n >= 2
+    assert (loc, BIRD.isHotspot, Literal(True)) in g
+
+
+def test_hotspot_skips_quiet_location():
+    g, loc = _hotspot_graph(5)
+    n = _materialise_hotspots(g, threshold=20)
+    assert n == 0
+    assert (loc, BIRD.isHotspot, Literal(True)) not in g
+
+
+def test_hotspot_idempotent():
+    g, loc = _hotspot_graph(25)
+    n1 = _materialise_hotspots(g, threshold=20)
+    n2 = _materialise_hotspots(g, threshold=20)
+    assert n1 > 0
+    assert n2 == 0

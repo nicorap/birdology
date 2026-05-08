@@ -23,7 +23,7 @@ import os
 
 load_dotenv()
 
-from birdology.graph import build_graph, save_graph  # noqa: E402
+from birdology.graph import build_graph, save_graph, update_graph  # noqa: E402
 
 
 def main():
@@ -32,7 +32,15 @@ def main():
                         help="Max DOFbasen occurrences to fetch (default: 5000)")
     parser.add_argument("--output", default="output/birdology.ttl",
                         help="Output Turtle file path (default: output/birdology.ttl)")
+    parser.add_argument("--update", action="store_true",
+                        help="Incremental update: only fetch new observations since last build")
     args = parser.parse_args()
+
+    if args.update:
+        api_key = os.getenv("EBIRD_API_KEY")
+        g = update_graph(args.output, max_new_records=args.dof_max, ebird_api_key=api_key)
+        save_graph(g, args.output)
+        return
 
     api_key = os.getenv("EBIRD_API_KEY")
     if not api_key:

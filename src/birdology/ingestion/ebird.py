@@ -186,3 +186,93 @@ def fetch_recent_denmark(api_key: str, days: int = 30) -> list[dict]:
     )
     resp.raise_for_status()
     return resp.json()
+
+
+def ebird_observations_to_rdf(
+    records: list[dict],
+    sci_name_index: dict[str, URIRef] | None = None,
+) -> Graph:
+    """Convert eBird recent-observation records to RDF.
+
+    Field mapping (eBird → RDF):
+        speciesCode → species URI via taxon:species/{code}
+        sciName     → dwc:scientificName
+        obsDt       → bird:observedOn
+        howMany     → bird:individualCount
+        locName     → bird:locality
+        lat / lng   → bird:latitude / bird:longitude
+        subId       → observation URI (obs:{subId}_{speciesCode})
+    """
+    from datetime import date as _date
+
+    from ..namespaces import LOC, OBS
+
+    g = Graph()
+    g.bind("bird", BIRD)
+    g.bind("dwc", DWC)
+    g.bind("obs", OBS)
+    g.bind("loc", LOC)
+    g.bind("ebird", EBIRD)
+    g.bind("taxon", TAXON)
+
+    for rec in tqdm(records, desc="Converting eBird obs to RDF", unit="rec", leave=False):
+        species_code = rec.get("speciesCode", "")
+        sci_name = rec.get("sciName", "").strip()
+        if not species_code or not sci_name:
+            continue
+
+        # Build a unique observation URI from submission + species
+        sub_id = rec.get("subId", "")
+        obs_key = f"ebird_{sub_id}_{species_code}" if sub_id else f"ebird_{species_code}_{rec.get('obsDt', '')}"
+        obs_uri = OBS[obs_key]
+
+        # Match to existing species node: prefer speciesCode, fall back to sci name
+        sp_uri = _species_uri(species_code)
+        # If the species code isn't in the graph but the sci name is, link via index
+        if sci_name_index:
+            binomial = " ".join(sci_name.split()[:2])
+            if binomial in sci_name_index:
+                sp_uri = sci_name_index[binomial]
+
+        # ── Observation ──────────────────────────────────────────────────────
+        g.add((obs_uri, RDF.type, BIRD.Observation))
+        g.add((obs_uri, DWC.scientificName, Literal(sci_name)))
+        g.add((obs_uri, BIRD.eBirdCode, Literal(species_code)))
+
+        obs_dt = rec.get("obsDt", "")
+        if obs_dt:
+            try:
+                d = _date.fromisoformat(obs_dt[:10])
+                g.add((obs_uri, BIRD.observedOn, Literal(d, datatype=XSD.date)))
+            except ValueError:
+                pass
+
+        how_many = rec.get("howMany")
+        if how_many is not None:
+            try:
+                g.add((obs_uri, BIRD.individualCount, Literal(int(how_many), datatype=XSD.integer)))
+            except (TypeError, ValueError):
+                pass
+
+        # ── Location ─────────────────────────────────────────────────────────
+        lat = rec.get("lat")
+        lng = rec.get("lng")
+        if lat is not None and lng is not None:
+            try:
+                lat_f, lng_f = float(lat), float(lng)
+                loc_key = f"{lat_f:.4f}_{lng_f:.4f}".replace("-", "N").replace(".", "p")
+                loc_uri = LOC[loc_key]
+                g.add((loc_uri, RDF.type, BIRD.Location))
+                g.add((loc_uri, BIRD.latitude, Literal(lat_f, datatype=XSD.decimal)))
+                g.add((loc_uri, BIRD.longitude, Literal(lng_f, datatype=XSD.decimal)))
+                loc_name = rec.get("locName")
+                if loc_name:
+                    g.add((loc_uri, BIRD.locality, Literal(str(loc_name))))
+                g.add((obs_uri, BIRD.observedAt, loc_uri))
+            except (TypeError, ValueError):
+                pass
+
+        # ── Link observation to species ───────────────────────────────────────
+        g.add((sp_uri, BIRD.hasObservation, obs_uri))
+
+    return g

@@ -38,8 +38,21 @@
   header h1 { font-size: 20px; font-weight: 600; color: #f0f0f0; }
   header .badge { font-size: 11px; background: #2d5a3d; color: #7dcea0; padding: 3px 8px; border-radius: 10px; }
 
-  #new-chat-btn {
+  #weekend-btn {
     margin-left: auto;
+    background: #2d5a3d;
+    border: none;
+    color: #7dcea0;
+    padding: 6px 14px;
+    border-radius: 8px;
+    font-size: 13px;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+  #weekend-btn:hover { background: #3a7a50; }
+  #weekend-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  #new-chat-btn {
     background: transparent;
     border: 1px solid #3a3d4a;
     color: #a0a8c0;
@@ -141,6 +154,128 @@
   #send-btn:hover { background: #3a7a50; }
   #send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
+  /* ── Dashboard (collapsible, inside left column) ────────────────── */
+  #dashboard {
+    background: #1a1d27;
+    border-bottom: 1px solid #2a2d3a;
+    overflow: hidden;
+    transition: max-height 0.3s ease;
+  }
+  #dashboard.collapsed { max-height: 42px; }
+  #dashboard.expanded { max-height: 600px; overflow-y: auto; }
+
+  #dashboard-toggle {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 16px;
+    cursor: pointer;
+    user-select: none;
+    font-size: 13px;
+    color: #a0a8c0;
+  }
+  #dashboard-toggle:hover { color: #7dcea0; }
+  #dashboard-toggle .arrow { transition: transform 0.3s; font-size: 10px; }
+  #dashboard.expanded #dashboard-toggle .arrow { transform: rotate(90deg); }
+
+  #dashboard-content {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    padding: 0 16px 14px;
+  }
+
+  .dash-card {
+    background: #252830;
+    border: 1px solid #2a2d3a;
+    border-radius: 10px;
+    padding: 12px;
+  }
+  .dash-card h3 { font-size: 12px; color: #7dcea0; margin-bottom: 8px; font-weight: 600; }
+  .dash-card .dash-empty { color: #555; font-size: 12px; font-style: italic; }
+
+  .dash-item {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    padding: 3px 0;
+    font-size: 12px;
+    border-bottom: 1px solid #1a1d27;
+  }
+  .dash-item:last-child { border-bottom: none; }
+  .dash-item .name { color: #e0e0e0; flex: 1; }
+  .dash-item .detail { color: #888; font-size: 11px; }
+
+  .iucn-badge {
+    font-size: 10px;
+    font-weight: 700;
+    padding: 1px 5px;
+    border-radius: 4px;
+    color: #fff;
+  }
+  .iucn-CR { background: #d32f2f; }
+  .iucn-EN { background: #e65100; }
+  .iucn-VU { background: #f9a825; color: #333; }
+  .iucn-NT { background: #1565c0; }
+
+  #hotspot-map {
+    width: 100%;
+    height: 180px;
+    border-radius: 8px;
+    margin-top: 6px;
+  }
+  .hotspot-nearest { font-size: 11px; color: #7dcea0; margin-top: 4px; padding: 3px 0; }
+
+  /* ── Weekend panel ───────────────────────────────────────────────── */
+  #weekend-panel {
+    display: none;
+    background: #1a1d27;
+    border-bottom: 1px solid #2a2d3a;
+    padding: 14px 16px;
+    max-height: 400px;
+    overflow-y: auto;
+  }
+  #weekend-panel.visible { display: block; }
+  #weekend-panel h2 { font-size: 16px; color: #7dcea0; margin-bottom: 10px; }
+
+  .weekend-close {
+    float: right;
+    background: transparent;
+    border: 1px solid #3a3d4a;
+    color: #a0a8c0;
+    padding: 3px 8px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 12px;
+  }
+  .weekend-close:hover { border-color: #7dcea0; color: #7dcea0; }
+
+  .weekend-spot {
+    background: #252830;
+    border: 1px solid #2a2d3a;
+    border-radius: 10px;
+    padding: 12px;
+    margin-bottom: 10px;
+  }
+  .weekend-spot h3 { font-size: 13px; color: #f0f0f0; margin-bottom: 3px; }
+  .weekend-spot .spot-meta { font-size: 11px; color: #888; margin-bottom: 8px; }
+
+  .weekend-species { display: flex; flex-wrap: wrap; gap: 5px; }
+
+  .species-chip {
+    font-size: 11px;
+    background: #1a1d27;
+    border: 1px solid #2a2d3a;
+    border-radius: 6px;
+    padding: 3px 8px;
+    color: #e0e0e0;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .species-chip .mig-icon { font-size: 10px; }
+  .species-chip img { width: 20px; height: 20px; border-radius: 3px; object-fit: cover; }
+
   /* ── Right column: map + cards ─────────────────────────────────── */
   #panels {
     grid-area: panels;
@@ -171,7 +306,6 @@
 
   #map-panel { border-bottom: 1px solid #2a2d3a; }
   #map { flex: 1; background: #0f1117; }
-  /* Map dark theme tweaks */
   .leaflet-container { background: #1a1d27; }
   .leaflet-popup-content-wrapper, .leaflet-popup-tip {
     background: #1a1d27; color: #e0e0e0; border: 1px solid #2a2d3a;
@@ -182,7 +316,6 @@
   .marker-cluster { background: rgba(125, 206, 160, 0.2); }
   .marker-cluster div { background: rgba(45, 90, 61, 0.85); color: #e0e0e0; font-weight: 600; }
 
-  /* Cards panel */
   #cards-grid {
     flex: 1;
     overflow-y: auto;
@@ -218,6 +351,7 @@
   @media (max-width: 900px) {
     body { grid-template-columns: 1fr; grid-template-areas: "header" "chat" "panels"; grid-template-rows: auto 1fr 60vh; }
     #chat-column { border-right: none; border-bottom: 1px solid #2a2d3a; }
+    #dashboard-content { grid-template-columns: 1fr; }
   }
 </style>
 </head>
@@ -226,10 +360,29 @@
 <header>
   <h1>Birdology</h1>
   <span class="badge">Graph-RAG</span>
+  <button id="weekend-btn">Quoi observer ce week-end ?</button>
   <button id="new-chat-btn">Nouvelle conversation</button>
 </header>
 
 <div id="chat-column">
+  <div id="weekend-panel"></div>
+
+  <div id="dashboard" class="expanded">
+    <div id="dashboard-toggle">
+      <span class="arrow">&#9654;</span> Dashboard
+    </div>
+    <div id="dashboard-content">
+      <div class="dash-card" id="dash-rare">
+        <h3>Especes menacees</h3>
+        <div class="dash-empty">Chargement...</div>
+      </div>
+      <div class="dash-card" id="dash-hotspots">
+        <h3>Hotspots proches de vous</h3>
+        <div class="dash-empty">Chargement...</div>
+      </div>
+    </div>
+  </div>
+
   <div id="chat-container">
     <div class="welcome">
       <h2>Birdology Graph-RAG</h2>
@@ -464,7 +617,7 @@ function parseMarkdownLinks(line) {
   return result;
 }
 
-// ── Map ──────────────────────────────────────────────────────────────────
+// ── Observations map (right panel) ───────────────────────────────────────
 var map = L.map('map', { preferCanvas: true }).setView([56.0, 11.5], 7);
 L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
   attribution: '&copy; OpenStreetMap &copy; CARTO',
@@ -497,7 +650,7 @@ fetch('/api/observations').then(function(r) { return r.json(); }).then(function(
   console.error(e);
 });
 
-// ── Species cards ────────────────────────────────────────────────────────
+// ── Species cards (right panel) ──────────────────────────────────────────
 var cardsGrid = document.getElementById('cards-grid');
 fetch('/api/species').then(function(r) { return r.json(); }).then(function(species) {
   cardsGrid.innerHTML = '';
@@ -523,6 +676,211 @@ fetch('/api/species').then(function(r) { return r.json(); }).then(function(speci
 
 function escapeHtml(s) { return String(s).replace(/[&<>"']/g, function(c) { return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]; }); }
 function escapeAttr(s) { return escapeHtml(s).replace(/\\/g, '\\\\'); }
+
+// ── Dashboard (left column, collapsible) ─────────────────────────────────
+var dashToggle = document.getElementById('dashboard-toggle');
+var dashboard = document.getElementById('dashboard');
+
+dashToggle.addEventListener('click', function() {
+  dashboard.classList.toggle('collapsed');
+  dashboard.classList.toggle('expanded');
+  if (hotspotMap) setTimeout(function() { hotspotMap.invalidateSize(); }, 350);
+});
+
+var hotspotMap = null;
+var userLat = null;
+var userLon = null;
+
+function loadDashboard() {
+  if (navigator.geolocation) {
+    navigator.geolocation.getCurrentPosition(
+      function(pos) {
+        userLat = pos.coords.latitude;
+        userLon = pos.coords.longitude;
+        if (hotspotMap && hotspotMap._hotspotsData) {
+          renderHotspotsMap(hotspotMap._hotspotsData);
+        }
+      },
+      function() {}
+    );
+  }
+
+  fetch('/api/dashboard')
+    .then(function(res) { return res.json(); })
+    .then(function(data) {
+      renderRare(data.rare || []);
+      renderHotspotsMap(data.hotspots || []);
+    })
+    .catch(function() {
+      document.getElementById('dash-rare').innerHTML = '<h3>Especes menacees</h3><div class="dash-empty">Erreur de chargement</div>';
+    });
+}
+
+function renderRare(items) {
+  var card = document.getElementById('dash-rare');
+  var html = '<h3>Especes menacees</h3>';
+  if (!items.length) { html += '<div class="dash-empty">Aucune espece menacee dans le graphe</div>'; }
+  else {
+    items.slice(0, 8).forEach(function(r) {
+      var name = r.commonNameFr || r.commonNameEn || r.scientificName;
+      var loc = r.locality ? ' — ' + r.locality : '';
+      html += '<div class="dash-item">'
+        + '<span class="iucn-badge iucn-' + r.status + '">' + r.status + '</span>'
+        + '<span class="name">' + name + '</span>'
+        + '<span class="detail">' + (r.date || '') + loc + '</span>'
+        + '</div>';
+    });
+  }
+  card.innerHTML = html;
+}
+
+function haversineKm(lat1, lon1, lat2, lon2) {
+  var R = 6371;
+  var dLat = (lat2 - lat1) * Math.PI / 180;
+  var dLon = (lon2 - lon1) * Math.PI / 180;
+  var a = Math.sin(dLat / 2) * Math.sin(dLat / 2)
+        + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180)
+        * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function renderHotspotsMap(items) {
+  var card = document.getElementById('dash-hotspots');
+  card.innerHTML = '<h3>Hotspots proches de vous</h3><div id="hotspot-map"></div><div class="hotspot-nearest" id="nearest-info"></div>';
+
+  if (!items.length) {
+    card.innerHTML = '<h3>Hotspots proches de vous</h3><div class="dash-empty">Aucun hotspot dans le graphe</div>';
+    return;
+  }
+
+  var centerLat = 55.7, centerLon = 10.5, defaultZoom = 7;
+  if (userLat !== null) { centerLat = userLat; centerLon = userLon; defaultZoom = 9; }
+
+  if (hotspotMap) { hotspotMap.remove(); hotspotMap = null; }
+  hotspotMap = L.map('hotspot-map').setView([centerLat, centerLon], defaultZoom);
+  hotspotMap._hotspotsData = items;
+
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '&copy; OpenStreetMap', maxZoom: 18
+  }).addTo(hotspotMap);
+
+  var sorted = items.map(function(h) {
+    var lat = parseFloat(h.lat); var lon = parseFloat(h.lon);
+    var dist = (userLat !== null) ? haversineKm(userLat, userLon, lat, lon) : null;
+    return { lat: lat, lon: lon, locality: h.locality, count: h.count, dist: dist };
+  });
+  if (userLat !== null) sorted.sort(function(a, b) { return a.dist - b.dist; });
+
+  if (userLat !== null) {
+    L.circleMarker([userLat, userLon], { radius: 8, fillColor: '#7dcea0', color: '#fff', weight: 2, fillOpacity: 0.9 })
+      .addTo(hotspotMap).bindPopup('Vous');
+  }
+
+  sorted.forEach(function(h, i) {
+    var maxObs = sorted[0].count;
+    var radius = 6 + 10 * (h.count / maxObs);
+    var color = (userLat !== null && i < 5) ? '#7dcea0' : '#e65100';
+    var fillOpacity = (userLat !== null && i < 5) ? Math.max(0.35, 0.85 - i * 0.1) : 0.5;
+    var name = h.locality || (h.lat.toFixed(2) + ', ' + h.lon.toFixed(2));
+    var distStr = (h.dist !== null) ? ' (' + h.dist.toFixed(0) + ' km)' : '';
+    L.circleMarker([h.lat, h.lon], { radius: radius, fillColor: color, color: '#fff', weight: 1, fillOpacity: fillOpacity })
+      .addTo(hotspotMap).bindPopup('<strong>' + name + '</strong><br>' + h.count + ' observations' + distStr);
+  });
+
+  var infoDiv = document.getElementById('nearest-info');
+  if (userLat !== null && sorted.length > 0) {
+    var top3 = sorted.slice(0, 3).map(function(h) {
+      var name = h.locality || (h.lat.toFixed(2) + ', ' + h.lon.toFixed(2));
+      return name + ' (' + h.dist.toFixed(0) + ' km)';
+    });
+    infoDiv.textContent = 'Les plus proches : ' + top3.join(' · ');
+  } else if (userLat === null) {
+    infoDiv.textContent = 'Activez la geolocalisation pour voir les hotspots proches de vous.';
+  }
+
+  setTimeout(function() { hotspotMap.invalidateSize(); }, 300);
+}
+
+loadDashboard();
+
+// ── Weekend suggestions ──────────────────────────────────────────────────
+var weekendBtn = document.getElementById('weekend-btn');
+var weekendPanel = document.getElementById('weekend-panel');
+
+var migIcons = { 'Resident': '🏠', 'SummerVisitor': '☀️', 'WinterVisitor': '❄️', 'PassageMigrant': '🌊', 'PartialMigrant': '↔️' };
+var migLabels = { 'Resident': 'Resident', 'SummerVisitor': 'Visiteur d\'ete', 'WinterVisitor': 'Visiteur d\'hiver', 'PassageMigrant': 'De passage', 'PartialMigrant': 'Migrateur partiel' };
+var monthNames = ['', 'janvier', 'fevrier', 'mars', 'avril', 'mai', 'juin', 'juillet', 'aout', 'septembre', 'octobre', 'novembre', 'decembre'];
+
+weekendBtn.addEventListener('click', function() {
+  if (weekendPanel.classList.contains('visible')) {
+    weekendPanel.classList.remove('visible');
+    return;
+  }
+  weekendBtn.disabled = true;
+  weekendPanel.innerHTML = '<h2>Chargement...</h2>';
+  weekendPanel.classList.add('visible');
+
+  var url = '/api/weekend';
+  if (userLat !== null) url += '?lat=' + userLat + '&lon=' + userLon;
+
+  fetch(url)
+    .then(function(res) { return res.json(); })
+    .then(function(data) { renderWeekend(data); })
+    .catch(function(err) {
+      weekendPanel.innerHTML = '<h2>Erreur</h2><p>' + err.message + '</p>'
+        + '<button class="weekend-close" onclick="document.getElementById(\'weekend-panel\').classList.remove(\'visible\')">Fermer</button>';
+    })
+    .finally(function() { weekendBtn.disabled = false; });
+});
+
+function renderWeekend(data) {
+  var spots = data.spots || [];
+  var month = data.month || new Date().getMonth() + 1;
+
+  var html = '<button class="weekend-close" id="weekend-close-btn">Fermer</button>';
+  html += '<h2>Quoi observer en ' + monthNames[month] + ' ?</h2>';
+
+  if (!spots.length) {
+    html += '<p style="color:#888">Pas assez de donnees. Lancez <code>python scripts/reason.py</code> pour enrichir le graphe.</p>';
+    weekendPanel.innerHTML = html;
+    document.getElementById('weekend-close-btn').addEventListener('click', function() {
+      weekendPanel.classList.remove('visible');
+    });
+    return;
+  }
+
+  spots.forEach(function(spot) {
+    var name = spot.locality || (spot.lat.toFixed(2) + ', ' + spot.lon.toFixed(2));
+    html += '<div class="weekend-spot">';
+    html += '<h3>' + name + '</h3>';
+    html += '<div class="spot-meta">' + spot.dist_km + ' km · ' + spot.obs_count + ' observations</div>';
+    if (spot.species && spot.species.length) {
+      html += '<div class="weekend-species">';
+      spot.species.forEach(function(sp) {
+        var displayName = sp.commonNameFr || sp.commonNameEn || sp.scientificName;
+        var mig = sp.migrationStatus;
+        var icon = migIcons[mig] || '';
+        var title = migLabels[mig] || '';
+        var iucn = sp.conservationStatus;
+        html += '<div class="species-chip" title="' + sp.scientificName + (title ? ' — ' + title : '') + '">';
+        if (sp.thumbnail) html += '<img src="' + sp.thumbnail + '" alt="">';
+        if (icon) html += '<span class="mig-icon">' + icon + '</span>';
+        html += '<span>' + displayName + '</span>';
+        if (iucn && iucn !== 'LC') html += ' <span class="iucn-badge iucn-' + iucn + '">' + iucn + '</span>';
+        html += '</div>';
+      });
+      html += '</div>';
+    } else {
+      html += '<div style="color:#888;font-size:11px;font-style:italic">Pas de donnees de presence mensuelle</div>';
+    }
+    html += '</div>';
+  });
+
+  weekendPanel.innerHTML = html;
+  document.getElementById('weekend-close-btn').addEventListener('click', function() {
+    weekendPanel.classList.remove('visible');
+  });
+}
 
 userInput.focus();
 </script>

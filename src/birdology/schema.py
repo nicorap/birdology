@@ -27,6 +27,7 @@ def build_schema() -> Graph:
         (BIRD.Species,      "Species",     "A bird species."),
         (BIRD.Observation,  "Observation", "A recorded sighting of a species at a place and time."),
         (BIRD.Location,     "Location",    "A geographic point where an observation was made."),
+        (BIRD.GraphMeta,    "GraphMeta",   "Metadata about the knowledge graph itself."),
     ]
     for uri, label, comment in classes:
         g.add((uri, RDF.type, OWL.Class))
@@ -51,6 +52,8 @@ def build_schema() -> Graph:
          "Links a species to one of its recorded observations."),
         (BIRD.observedAt,     "observedAt",     BIRD.Observation,  BIRD.Location,
          "The location where an observation was made."),
+        (BIRD.frequentlyCoOccursWith, "frequentlyCoOccursWith", BIRD.Species, BIRD.Species,
+         "Links two species frequently observed at the same location and date."),
     ]
     for uri, label, domain, range_, comment in obj_props:
         g.add((uri, RDF.type, OWL.ObjectProperty))
@@ -125,6 +128,8 @@ def build_schema() -> Graph:
          "Movement pattern: Full Migrant, Altitudinal Migrant, Nomadic, Sedentary (from IUCN)."),
         (BIRD.system,         "system",         BIRD.Species, XSD.string,
          "Ecological system: Terrestrial, Freshwater, Marine (from IUCN)."),
+        (BIRD.populationTrendLocal, "populationTrendLocal", BIRD.Species, XSD.string,
+         "Local population trend inferred from observation counts per year: Increasing, Decreasing, or Stable."),
 
         # Observation fields
         (BIRD.observedOn,         "observedOn",         BIRD.Observation,  XSD.date,
@@ -141,6 +146,42 @@ def build_schema() -> Graph:
          "WGS84 decimal longitude."),
         (BIRD.locality,           "locality",           BIRD.Location,     XSD.string,
          "Human-readable locality name."),
+        (BIRD.isHotspot,          "isHotspot",          BIRD.Location,     XSD.boolean,
+         "True if this location has an unusually high number of observations."),
+        (BIRD.observationCount,   "observationCount",   BIRD.Location,     XSD.integer,
+         "Total number of observations recorded at this location."),
+
+        # EltonTraits — diet percentages
+        (BIRD.dietInvertPct,   "dietInvertPct",   BIRD.Species, XSD.decimal,
+         "% diet invertebrates (EltonTraits 1.0)."),
+        (BIRD.dietVertPct,     "dietVertPct",     BIRD.Species, XSD.decimal,
+         "% diet vertebrates incl. fish (EltonTraits 1.0)."),
+        (BIRD.dietFruitPct,    "dietFruitPct",    BIRD.Species, XSD.decimal,
+         "% diet fruit (EltonTraits 1.0)."),
+        (BIRD.dietNectarPct,   "dietNectarPct",   BIRD.Species, XSD.decimal,
+         "% diet nectar (EltonTraits 1.0)."),
+        (BIRD.dietSeedPct,     "dietSeedPct",     BIRD.Species, XSD.decimal,
+         "% diet seeds (EltonTraits 1.0)."),
+        (BIRD.dietScavPct,     "dietScavPct",     BIRD.Species, XSD.decimal,
+         "% diet carrion/scavenging (EltonTraits 1.0)."),
+        (BIRD.dietCategory,    "dietCategory",    BIRD.Species, XSD.string,
+         "5-class diet label: Invertebrate | PlantSeed | FruiNect | VertFishScav | Omnivore (EltonTraits 1.0)."),
+
+        # EltonTraits — foraging strata (% of foraging time)
+        (BIRD.foragingGround,  "foragingGround",  BIRD.Species, XSD.decimal,
+         "% foraging on/near ground (EltonTraits 1.0)."),
+        (BIRD.foragingCanopy,  "foragingCanopy",  BIRD.Species, XSD.decimal,
+         "% foraging in understory+mid+canopy (EltonTraits 1.0)."),
+        (BIRD.foragingAerial,  "foragingAerial",  BIRD.Species, XSD.decimal,
+         "% foraging in flight (EltonTraits 1.0)."),
+        (BIRD.foragingWater,   "foragingWater",   BIRD.Species, XSD.decimal,
+         "% foraging in/around water (EltonTraits 1.0)."),
+        (BIRD.nocturnal,       "nocturnal",       BIRD.Species, XSD.boolean,
+         "True if primarily nocturnal (EltonTraits 1.0)."),
+
+        # Graph metadata
+        (BIRD.lastFetchDate,      "lastFetchDate",      BIRD.GraphMeta,    XSD.date,
+         "Date of the most recent DOFbasen data fetch."),
     ]
     for uri, label, domain, range_, comment in dt_props:
         g.add((uri, RDF.type, OWL.DatatypeProperty))

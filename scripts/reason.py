@@ -37,8 +37,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from rdflib import Graph, URIRef
+from rdflib import Graph, Literal, URIRef
 from rdflib.namespace import OWL, RDF, RDFS
+
+from collections import defaultdict
 
 from birdology.graph import load_graph_rdflib as load_graph, save_graph
 from birdology.migration import infer_migration_status
@@ -195,6 +197,152 @@ def _materialise_same_as(g: Graph) -> int:
     return added
 
 
+# ── Rule 6: Co-occurrence ────────────────────────────────────────────────────
+
+_CO_OCCUR_THRESHOLD = 3  # minimum shared (location, date) pairs to link two species
+
+
+def _materialise_co_occurrence(g: Graph, threshold: int = _CO_OCCUR_THRESHOLD) -> int:
+    """Link species that are frequently observed at the same location and date.
+
+    Two species get a symmetric ``bird:frequentlyCoOccursWith`` link when they
+    share at least *threshold* distinct (location, date) observation events.
+    """
+    # Collect (location, date) → set of species
+    q = """
+    PREFIX bird: <https://birdology.org/ontology/>
+    SELECT ?species ?loc ?date WHERE {
+        ?species a bird:Species ;
+                 bird:hasObservation ?obs .
+        FILTER(STRSTARTS(STR(?species), "https://birdology.org/taxon/species/"))
+        ?obs bird:observedAt ?loc ;
+             bird:observedOn ?date .
+    }
+    """
+    events: dict[tuple[str, str], set[str]] = defaultdict(set)
+    for row in g.query(q):
+        events[(str(row.loc), str(row.date))].add(str(row.species))
+
+    # Count co-occurrences per species pair
+    pair_count: dict[tuple[str, str], int] = defaultdict(int)
+    for species_set in events.values():
+        species_list = sorted(species_set)
+        for i, a in enumerate(species_list):
+            for b in species_list[i + 1:]:
+                pair_count[(a, b)] += 1
+
+    # Add triples for pairs above threshold
+    prop = BIRD.frequentlyCoOccursWith
+    added = 0
+    for (a_str, b_str), count in pair_count.items():
+        if count >= threshold:
+            a, b = URIRef(a_str), URIRef(b_str)
+            if (a, prop, b) not in g:
+                g.add((a, prop, b))
+                added += 1
+            if (b, prop, a) not in g:
+                g.add((b, prop, a))
+                added += 1
+    return added
+
+
+# ── Rule 7: Local population trend ──────────────────────────────────────────
+
+_TREND_MIN_YEARS = 3  # need at least this many distinct years to infer a trend
+
+
+def _materialise_population_trend(g: Graph, min_years: int = _TREND_MIN_YEARS) -> int:
+    """Classify each species' local population trend from observation counts per year.
+
+    Uses simple linear regression on (year, observation_count).
+    A slope significantly positive → Increasing, negative → Decreasing, else Stable.
+    Only species with observations spanning at least *min_years* are classified.
+    """
+    q = """
+    PREFIX bird: <https://birdology.org/ontology/>
+    SELECT ?species ?date WHERE {
+        ?species a bird:Species ;
+                 bird:hasObservation ?obs .
+        FILTER(STRSTARTS(STR(?species), "https://birdology.org/taxon/species/"))
+        ?obs bird:observedOn ?date .
+        FILTER NOT EXISTS { ?species bird:populationTrendLocal ?any }
+    }
+    """
+    # Collect year → count per species
+    yearly: dict[str, dict[int, int]] = defaultdict(lambda: defaultdict(int))
+    for row in g.query(q):
+        try:
+            year = int(str(row.date)[:4])
+            yearly[str(row.species)][year] += 1
+        except (IndexError, ValueError):
+            pass
+
+    added = 0
+    for sp_str, year_counts in yearly.items():
+        if len(year_counts) < min_years:
+            continue
+        # Simple linear regression: slope of obs count vs year
+        years = sorted(year_counts)
+        n = len(years)
+        sum_x = sum(years)
+        sum_y = sum(year_counts[y] for y in years)
+        sum_xy = sum(y * year_counts[y] for y in years)
+        sum_x2 = sum(y * y for y in years)
+        denom = n * sum_x2 - sum_x * sum_x
+        if denom == 0:
+            continue
+        slope = (n * sum_xy - sum_x * sum_y) / denom
+        mean_y = sum_y / n
+        # Normalise slope relative to mean count to get a proportional change
+        if mean_y > 0:
+            relative_slope = slope / mean_y
+        else:
+            continue
+        # Threshold: >10% relative change per year = significant
+        if relative_slope > 0.10:
+            trend = "Increasing"
+        elif relative_slope < -0.10:
+            trend = "Decreasing"
+        else:
+            trend = "Stable"
+        g.add((URIRef(sp_str), BIRD.populationTrendLocal, Literal(trend)))
+        added += 1
+    return added
+
+
+
+# ── Rule 8: Hotspot locations ────────────────────────────────────────────────
+
+_HOTSPOT_THRESHOLD = 20  # minimum observations at a location to be a hotspot
+
+
+def _materialise_hotspots(g: Graph, threshold: int = _HOTSPOT_THRESHOLD) -> int:
+    """Mark locations with many observations as hotspots.
+
+    A location gets bird:isHotspot true and bird:observationCount N
+    when it has at least *threshold* observations linked to it.
+    """
+    q = """
+    PREFIX bird: <https://birdology.org/ontology/>
+    SELECT ?loc (COUNT(?obs) AS ?n) WHERE {
+        ?obs bird:observedAt ?loc .
+        ?loc a bird:Location .
+        FILTER NOT EXISTS { ?loc bird:isHotspot ?any }
+    }
+    GROUP BY ?loc
+    """
+    from rdflib.namespace import XSD as _XSD
+    added = 0
+    for row in g.query(q):
+        count = int(str(row.n))
+        loc = URIRef(str(row.loc))
+        if count >= threshold:
+            g.add((loc, BIRD.isHotspot, Literal(True)))
+            g.add((loc, BIRD.observationCount, Literal(count, datatype=_XSD.integer)))
+            added += 2
+    return added
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def run_reasoner(input_path: str, output_path: str, n_workers: int) -> None:
@@ -229,7 +377,19 @@ def run_reasoner(input_path: str, output_path: str, n_workers: int) -> None:
     n5 = infer_migration_status(g)
     print(f"  +{n5:,} triples")
 
-    total_new = n1 + n2 + n3 + n4 + n5
+    print("Rule 6 — co-occurrence links…")
+    n6 = _materialise_co_occurrence(g)
+    print(f"  +{n6:,} triples")
+
+    print("Rule 7 — local population trends…")
+    n7 = _materialise_population_trend(g)
+    print(f"  +{n7:,} triples")
+
+    print("Rule 8 — hotspot locations…")
+    n8 = _materialise_hotspots(g)
+    print(f"  +{n8:,} triples")
+
+    total_new = n1 + n2 + n3 + n4 + n5 + n6 + n7 + n8
     print(f"\nTotal inferred: +{total_new:,} triples  ({len(g):,} total)")
 
     # ── Report class counts before / after ──────────────────────────────────
