@@ -154,58 +154,6 @@
   #send-btn:hover { background: #3a7a50; }
   #send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
-  /* ── Dashboard (collapsible, inside left column) ────────────────── */
-  #dashboard {
-    background: #1a1d27;
-    border-bottom: 1px solid #2a2d3a;
-    overflow: hidden;
-    transition: max-height 0.3s ease;
-  }
-  #dashboard.collapsed { max-height: 42px; }
-  #dashboard.expanded { max-height: 600px; overflow-y: auto; }
-
-  #dashboard-toggle {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 10px 16px;
-    cursor: pointer;
-    user-select: none;
-    font-size: 13px;
-    color: #a0a8c0;
-  }
-  #dashboard-toggle:hover { color: #7dcea0; }
-  #dashboard-toggle .arrow { transition: transform 0.3s; font-size: 10px; }
-  #dashboard.expanded #dashboard-toggle .arrow { transform: rotate(90deg); }
-
-  #dashboard-content {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 12px;
-    padding: 0 16px 14px;
-  }
-
-  .dash-card {
-    background: #252830;
-    border: 1px solid #2a2d3a;
-    border-radius: 10px;
-    padding: 12px;
-  }
-  .dash-card h3 { font-size: 12px; color: #7dcea0; margin-bottom: 8px; font-weight: 600; }
-  .dash-card .dash-empty { color: #555; font-size: 12px; font-style: italic; }
-
-  .dash-item {
-    display: flex;
-    align-items: baseline;
-    gap: 6px;
-    padding: 3px 0;
-    font-size: 12px;
-    border-bottom: 1px solid #1a1d27;
-  }
-  .dash-item:last-child { border-bottom: none; }
-  .dash-item .name { color: #e0e0e0; flex: 1; }
-  .dash-item .detail { color: #888; font-size: 11px; }
-
   .iucn-badge {
     font-size: 10px;
     font-weight: 700;
@@ -217,14 +165,6 @@
   .iucn-EN { background: #e65100; }
   .iucn-VU { background: #f9a825; color: #333; }
   .iucn-NT { background: #1565c0; }
-
-  #hotspot-map {
-    width: 100%;
-    height: 180px;
-    border-radius: 8px;
-    margin-top: 6px;
-  }
-  .hotspot-nearest { font-size: 11px; color: #7dcea0; margin-top: 4px; padding: 3px 0; }
 
   /* ── Weekend panel ───────────────────────────────────────────────── */
   #weekend-panel {
@@ -351,7 +291,6 @@
   @media (max-width: 900px) {
     body { grid-template-columns: 1fr; grid-template-areas: "header" "chat" "panels"; grid-template-rows: auto 1fr 60vh; }
     #chat-column { border-right: none; border-bottom: 1px solid #2a2d3a; }
-    #dashboard-content { grid-template-columns: 1fr; }
   }
 </style>
 </head>
@@ -366,22 +305,6 @@
 
 <div id="chat-column">
   <div id="weekend-panel"></div>
-
-  <div id="dashboard" class="expanded">
-    <div id="dashboard-toggle">
-      <span class="arrow">&#9654;</span> Dashboard
-    </div>
-    <div id="dashboard-content">
-      <div class="dash-card" id="dash-rare">
-        <h3>Especes menacees</h3>
-        <div class="dash-empty">Chargement...</div>
-      </div>
-      <div class="dash-card" id="dash-hotspots">
-        <h3>Hotspots proches de vous</h3>
-        <div class="dash-empty">Chargement...</div>
-      </div>
-    </div>
-  </div>
 
   <div id="chat-container">
     <div class="welcome">
@@ -406,7 +329,7 @@
 
 <div id="panels">
   <section id="map-panel" class="panel">
-    <div class="panel-header">Observations <span class="count" id="map-count"></span></div>
+    <div class="panel-header">Observations <span class="count" id="map-count"></span> <span id="hotspot-badge"></span></div>
     <div id="map"></div>
   </section>
   <section id="cards-panel" class="panel">
@@ -677,131 +600,38 @@ fetch('/api/species').then(function(r) { return r.json(); }).then(function(speci
 function escapeHtml(s) { return String(s).replace(/[&<>"']/g, function(c) { return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]; }); }
 function escapeAttr(s) { return escapeHtml(s).replace(/\\/g, '\\\\'); }
 
-// ── Dashboard (left column, collapsible) ─────────────────────────────────
-var dashToggle = document.getElementById('dashboard-toggle');
-var dashboard = document.getElementById('dashboard');
-
-dashToggle.addEventListener('click', function() {
-  dashboard.classList.toggle('collapsed');
-  dashboard.classList.toggle('expanded');
-  if (hotspotMap) setTimeout(function() { hotspotMap.invalidateSize(); }, 350);
-});
-
-var hotspotMap = null;
+// ── Hotspots on map ───────────────────────────────────────────────────────
 var userLat = null;
 var userLon = null;
 
-function loadDashboard() {
-  if (navigator.geolocation) {
-    navigator.geolocation.getCurrentPosition(
-      function(pos) {
-        userLat = pos.coords.latitude;
-        userLon = pos.coords.longitude;
-        if (hotspotMap && hotspotMap._hotspotsData) {
-          renderHotspotsMap(hotspotMap._hotspotsData);
-        }
-      },
-      function() {}
-    );
-  }
-
-  fetch('/api/dashboard')
-    .then(function(res) { return res.json(); })
-    .then(function(data) {
-      renderRare(data.rare || []);
-      renderHotspotsMap(data.hotspots || []);
-    })
-    .catch(function() {
-      document.getElementById('dash-rare').innerHTML = '<h3>Especes menacees</h3><div class="dash-empty">Erreur de chargement</div>';
-    });
+if (navigator.geolocation) {
+  navigator.geolocation.getCurrentPosition(
+    function(pos) { userLat = pos.coords.latitude; userLon = pos.coords.longitude; },
+    function() {}
+  );
 }
 
-function renderRare(items) {
-  var card = document.getElementById('dash-rare');
-  var html = '<h3>Especes menacees</h3>';
-  if (!items.length) { html += '<div class="dash-empty">Aucune espece menacee dans le graphe</div>'; }
-  else {
-    items.slice(0, 8).forEach(function(r) {
-      var name = r.commonNameFr || r.commonNameEn || r.scientificName;
-      var loc = r.locality ? ' — ' + r.locality : '';
-      html += '<div class="dash-item">'
-        + '<span class="iucn-badge iucn-' + r.status + '">' + r.status + '</span>'
-        + '<span class="name">' + name + '</span>'
-        + '<span class="detail">' + (r.date || '') + loc + '</span>'
-        + '</div>';
-    });
-  }
-  card.innerHTML = html;
-}
+fetch('/api/dashboard').then(function(r) { return r.json(); }).then(function(data) {
+  var hotspots = data.hotspots || [];
+  if (!hotspots.length) return;
 
-function haversineKm(lat1, lon1, lat2, lon2) {
-  var R = 6371;
-  var dLat = (lat2 - lat1) * Math.PI / 180;
-  var dLon = (lon2 - lon1) * Math.PI / 180;
-  var a = Math.sin(dLat / 2) * Math.sin(dLat / 2)
-        + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180)
-        * Math.sin(dLon / 2) * Math.sin(dLon / 2);
-  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-}
-
-function renderHotspotsMap(items) {
-  var card = document.getElementById('dash-hotspots');
-  card.innerHTML = '<h3>Hotspots proches de vous</h3><div id="hotspot-map"></div><div class="hotspot-nearest" id="nearest-info"></div>';
-
-  if (!items.length) {
-    card.innerHTML = '<h3>Hotspots proches de vous</h3><div class="dash-empty">Aucun hotspot dans le graphe</div>';
-    return;
-  }
-
-  var centerLat = 55.7, centerLon = 10.5, defaultZoom = 7;
-  if (userLat !== null) { centerLat = userLat; centerLon = userLon; defaultZoom = 9; }
-
-  if (hotspotMap) { hotspotMap.remove(); hotspotMap = null; }
-  hotspotMap = L.map('hotspot-map').setView([centerLat, centerLon], defaultZoom);
-  hotspotMap._hotspotsData = items;
-
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    attribution: '&copy; OpenStreetMap', maxZoom: 18
-  }).addTo(hotspotMap);
-
-  var sorted = items.map(function(h) {
+  var maxObs = Math.max.apply(null, hotspots.map(function(h) { return h.count; }));
+  hotspots.forEach(function(h) {
     var lat = parseFloat(h.lat); var lon = parseFloat(h.lon);
-    var dist = (userLat !== null) ? haversineKm(userLat, userLon, lat, lon) : null;
-    return { lat: lat, lon: lon, locality: h.locality, count: h.count, dist: dist };
-  });
-  if (userLat !== null) sorted.sort(function(a, b) { return a.dist - b.dist; });
-
-  if (userLat !== null) {
-    L.circleMarker([userLat, userLon], { radius: 8, fillColor: '#7dcea0', color: '#fff', weight: 2, fillOpacity: 0.9 })
-      .addTo(hotspotMap).bindPopup('Vous');
-  }
-
-  sorted.forEach(function(h, i) {
-    var maxObs = sorted[0].count;
-    var radius = 6 + 10 * (h.count / maxObs);
-    var color = (userLat !== null && i < 5) ? '#7dcea0' : '#e65100';
-    var fillOpacity = (userLat !== null && i < 5) ? Math.max(0.35, 0.85 - i * 0.1) : 0.5;
-    var name = h.locality || (h.lat.toFixed(2) + ', ' + h.lon.toFixed(2));
-    var distStr = (h.dist !== null) ? ' (' + h.dist.toFixed(0) + ' km)' : '';
-    L.circleMarker([h.lat, h.lon], { radius: radius, fillColor: color, color: '#fff', weight: 1, fillOpacity: fillOpacity })
-      .addTo(hotspotMap).bindPopup('<strong>' + name + '</strong><br>' + h.count + ' observations' + distStr);
+    if (isNaN(lat) || isNaN(lon)) return;
+    var radius = 8 + 14 * (h.count / maxObs);
+    var name = h.locality || (lat.toFixed(2) + ', ' + lon.toFixed(2));
+    var popup = '<b>🔥 Hotspot</b><br>' + escapeHtml(name) + '<br>' + h.count + ' observations'
+      + '<br><a href="#" onclick="askAbout(\'' + escapeAttr(name) + '\');return false;">Demander au chat</a>';
+    L.circleMarker([lat, lon], {
+      radius: radius, color: '#f9a825', weight: 2,
+      fillColor: '#e65100', fillOpacity: 0.55
+    }).bindPopup(popup).addTo(map);
   });
 
-  var infoDiv = document.getElementById('nearest-info');
-  if (userLat !== null && sorted.length > 0) {
-    var top3 = sorted.slice(0, 3).map(function(h) {
-      var name = h.locality || (h.lat.toFixed(2) + ', ' + h.lon.toFixed(2));
-      return name + ' (' + h.dist.toFixed(0) + ' km)';
-    });
-    infoDiv.textContent = 'Les plus proches : ' + top3.join(' · ');
-  } else if (userLat === null) {
-    infoDiv.textContent = 'Activez la geolocalisation pour voir les hotspots proches de vous.';
-  }
-
-  setTimeout(function() { hotspotMap.invalidateSize(); }, 300);
-}
-
-loadDashboard();
+  var badge = document.getElementById('hotspot-badge');
+  if (badge) badge.textContent = '· ' + hotspots.length + ' hotspots';
+}).catch(function() {});
 
 // ── Weekend suggestions ──────────────────────────────────────────────────
 var weekendBtn = document.getElementById('weekend-btn');
