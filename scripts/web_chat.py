@@ -492,7 +492,7 @@ def api_weekend():
             OPTIONAL {{ ?species bird:commonNameEn      ?commonNameEn }}
             OPTIONAL {{ ?species bird:migrationStatus   ?migStatus }}
             OPTIONAL {{ ?species bird:conservationStatus ?status }}
-            OPTIONAL {{ ?species bird:thumbnail         ?thumbnail }}
+            OPTIONAL {{ ?species bird:thumbnailUrl      ?thumbnail }}
         }}
         ORDER BY ?migStatus ?scientificName
         """
@@ -529,7 +529,7 @@ def api_weekend():
                 OPTIONAL {{ ?species bird:commonNameEn      ?commonNameEn }}
                 OPTIONAL {{ ?species bird:migrationStatus   ?migStatus }}
                 OPTIONAL {{ ?species bird:conservationStatus ?status }}
-                OPTIONAL {{ ?species bird:thumbnail         ?thumbnail }}
+                OPTIONAL {{ ?species bird:thumbnailUrl      ?thumbnail }}
             }}
             ORDER BY ?scientificName
             """

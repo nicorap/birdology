@@ -216,14 +216,35 @@
   .species-chip .mig-icon { font-size: 10px; }
   .species-chip img { width: 20px; height: 20px; border-radius: 3px; object-fit: cover; }
 
-  /* ── Right column: map + cards ─────────────────────────────────── */
+  /* ── Right column: map (top) + spots | cards (bottom, side by side) */
   #panels {
     grid-area: panels;
     display: grid;
-    grid-template-rows: 1.2fr 1fr;
+    grid-template-columns: 1fr 1fr;
+    grid-template-rows: 1.6fr 1fr;
+    grid-template-areas: "map map" "spots cards";
     min-height: 0;
     min-width: 0;
   }
+  #map-panel    { grid-area: map; }
+  #spots-panel  { grid-area: spots; border-right: 1px solid #2a2d3a; }
+  #cards-panel  { grid-area: cards; }
+
+  /* ── Spots panel ─────────────────────────────────────────────── */
+  #spots-panel .panel-header { display: flex; align-items: center; justify-content: space-between; }
+  #spots-panel-body { flex: 1; overflow-y: auto; padding: 10px 12px; }
+  #spots-refresh-btn {
+    background: transparent; border: 1px solid #3a3d4a; color: #a0a8c0;
+    padding: 2px 8px; border-radius: 5px; cursor: pointer; font-size: 11px;
+  }
+  #spots-refresh-btn:hover { border-color: #7dcea0; color: #7dcea0; }
+  .spot-card {
+    background: #1e2130; border: 1px solid #2a2d3a; border-radius: 8px;
+    padding: 9px 11px; margin-bottom: 8px;
+  }
+  .spot-card h3 { font-size: 12px; color: #f0f0f0; margin: 0 0 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .spot-card .spot-meta { font-size: 10px; color: #666; margin-bottom: 6px; }
+  .spot-chips { display: flex; flex-wrap: wrap; gap: 4px; }
 
   .panel {
     display: flex;
@@ -244,7 +265,7 @@
   }
   .panel-header .count { color: #6a7a8a; font-weight: 400; margin-left: 8px; }
 
-  #map-panel { border-bottom: 1px solid #2a2d3a; }
+  #spots-panel, #cards-panel { border-top: 1px solid #2a2d3a; }
   #map { flex: 1; background: #0f1117; }
   .leaflet-container { background: #1a1d27; }
   .leaflet-popup-content-wrapper, .leaflet-popup-tip {
@@ -259,10 +280,10 @@
   #cards-grid {
     flex: 1;
     overflow-y: auto;
-    padding: 12px;
+    padding: 8px;
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
-    gap: 10px;
+    grid-template-columns: repeat(auto-fill, minmax(100px, 1fr));
+    gap: 7px;
     align-content: start;
   }
   .species-card {
@@ -276,7 +297,7 @@
   .species-card:hover { border-color: #7dcea0; transform: translateY(-2px); }
   .species-card .thumb {
     width: 100%;
-    height: 90px;
+    height: 75px;
     object-fit: cover;
     background: #252830;
     display: block;
@@ -333,10 +354,17 @@
     <div id="map"></div>
   </section>
   <section id="cards-panel" class="panel">
-    <div class="panel-header">Especes <span class="count" id="cards-count"></span></div>
+    <div class="panel-header">Especes du mois <span class="count" id="cards-count"></span></div>
     <div id="cards-grid">
       <div class="panel-loading">Chargement…</div>
     </div>
+  </section>
+  <section id="spots-panel" class="panel">
+    <div class="panel-header">
+      <span>Où observer en <span id="spots-month"></span></span>
+      <button id="spots-refresh-btn">↺</button>
+    </div>
+    <div id="spots-panel-body"><div class="panel-loading">Chargement…</div></div>
   </section>
 </div>
 
@@ -575,27 +603,48 @@ fetch('/api/observations').then(function(r) { return r.json(); }).then(function(
 
 // ── Species cards (right panel) ──────────────────────────────────────────
 var cardsGrid = document.getElementById('cards-grid');
-fetch('/api/species').then(function(r) { return r.json(); }).then(function(species) {
+
+function renderRelevantCards(spots) {
+  // Collect unique species with thumbnails from spots data, prefer those with images
+  var seen = {};
+  var withThumb = [], withoutThumb = [];
+  (spots || []).forEach(function(spot) {
+    (spot.species || []).forEach(function(sp) {
+      if (seen[sp.scientificName]) return;
+      seen[sp.scientificName] = true;
+      if (sp.thumbnail) withThumb.push(sp); else withoutThumb.push(sp);
+    });
+  });
+  var species = withThumb.concat(withoutThumb).slice(0, 10);
+  if (!species.length) {
+    // Fallback: load top species from API
+    fetch('/api/species').then(function(r) { return r.json(); }).then(function(data) {
+      renderCards(data.slice(0, 10));
+    }).catch(function() { cardsGrid.innerHTML = '<div class="panel-loading">Aucune donnee</div>'; });
+    return;
+  }
+  renderCards(species);
+}
+
+function renderCards(species) {
   cardsGrid.innerHTML = '';
-  document.getElementById('cards-count').textContent = species.length + ' affichees';
+  document.getElementById('cards-count').textContent = species.length;
   species.forEach(function(s) {
     var card = document.createElement('div');
     card.className = 'species-card';
-    var name = s.commonName || s.scientificName;
-    var thumb = s.thumbnail ? '<img class="thumb" src="' + escapeAttr(s.thumbnail) + '" alt="" loading="lazy" onerror="this.style.display=\'none\'">' : '<div class="thumb"></div>';
+    var name = s.commonNameFr || s.commonName || s.commonNameEn || s.scientificName;
+    var thumb = s.thumbnail
+      ? '<img class="thumb" src="' + escapeAttr(s.thumbnail) + '" alt="" loading="lazy" onerror="this.style.display=\'none\'">'
+      : '<div class="thumb"></div>';
     card.innerHTML = thumb
       + '<div class="meta">'
       + '<div class="name">' + escapeHtml(name) + '</div>'
       + (s.scientificName && s.scientificName !== name ? '<div class="sci">' + escapeHtml(s.scientificName) + '</div>' : '')
-      + '<div class="obs-count">' + s.obsCount + ' obs.</div>'
       + '</div>';
     card.addEventListener('click', function() { askAbout(name); });
     cardsGrid.appendChild(card);
   });
-}).catch(function(e) {
-  cardsGrid.innerHTML = '<div class="panel-loading">Erreur de chargement</div>';
-  console.error(e);
-});
+}
 
 function escapeHtml(s) { return String(s).replace(/[&<>"']/g, function(c) { return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]; }); }
 function escapeAttr(s) { return escapeHtml(s).replace(/\\/g, '\\\\'); }
@@ -633,13 +682,74 @@ fetch('/api/dashboard').then(function(r) { return r.json(); }).then(function(dat
   if (badge) badge.textContent = '· ' + hotspots.length + ' hotspots';
 }).catch(function() {});
 
-// ── Weekend suggestions ──────────────────────────────────────────────────
-var weekendBtn = document.getElementById('weekend-btn');
-var weekendPanel = document.getElementById('weekend-panel');
-
+// ── Spots panel (right column, auto-load) ────────────────────────────────
 var migIcons = { 'Resident': '🏠', 'SummerVisitor': '☀️', 'WinterVisitor': '❄️', 'PassageMigrant': '🌊', 'PartialMigrant': '↔️' };
 var migLabels = { 'Resident': 'Resident', 'SummerVisitor': 'Visiteur d\'ete', 'WinterVisitor': 'Visiteur d\'hiver', 'PassageMigrant': 'De passage', 'PartialMigrant': 'Migrateur partiel' };
 var monthNames = ['', 'janvier', 'fevrier', 'mars', 'avril', 'mai', 'juin', 'juillet', 'aout', 'septembre', 'octobre', 'novembre', 'decembre'];
+
+function loadSpots() {
+  var body = document.getElementById('spots-panel-body');
+  body.innerHTML = '<div class="panel-loading">Chargement…</div>';
+  var url = '/api/weekend';
+  if (userLat !== null) url += '?lat=' + userLat + '&lon=' + userLon;
+  fetch(url)
+    .then(function(r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+    .then(function(data) { renderSpots(data); })
+    .catch(function(err) {
+      body.innerHTML = '<div style="color:#888;padding:10px;font-size:11px">Erreur: ' + err.message + '</div>';
+    });
+}
+
+function renderSpots(data) {
+  var spots = data.spots || [];
+  var month = data.month || new Date().getMonth() + 1;
+  var monthEl = document.getElementById('spots-month');
+  if (monthEl) monthEl.textContent = monthNames[month] || month;
+
+  var body = document.getElementById('spots-panel-body');
+  if (!spots.length) {
+    body.innerHTML = '<div style="color:#888;padding:10px;font-size:11px">Pas assez de données. Lancez <code>reason.py</code> pour enrichir le graphe.</div>';
+    return;
+  }
+
+  var html = '';
+  spots.forEach(function(spot) {
+    var name = spot.locality || (spot.lat.toFixed(2) + ', ' + spot.lon.toFixed(2));
+    html += '<div class="spot-card">';
+    html += '<h3 title="' + escapeHtml(name) + '">' + escapeHtml(name) + '</h3>';
+    html += '<div class="spot-meta">' + spot.dist_km + ' km · ' + spot.obs_count + ' obs</div>';
+    if (spot.species && spot.species.length) {
+      html += '<div class="spot-chips">';
+      spot.species.slice(0, 12).forEach(function(sp) {
+        var displayName = sp.commonNameFr || sp.commonNameEn || sp.scientificName;
+        var mig = sp.migrationStatus;
+        var icon = migIcons[mig] || '';
+        var iucn = sp.conservationStatus;
+        html += '<div class="species-chip" title="' + escapeHtml(sp.scientificName) + (migLabels[mig] ? ' — ' + migLabels[mig] : '') + '">';
+        if (sp.thumbnail) html += '<img src="' + escapeHtml(sp.thumbnail) + '" alt="" onerror="this.style.display=\'none\'">';
+        if (icon) html += '<span class="mig-icon">' + icon + '</span>';
+        html += '<span>' + escapeHtml(displayName) + '</span>';
+        if (iucn && iucn !== 'LC') html += ' <span class="iucn-badge iucn-' + iucn + '">' + iucn + '</span>';
+        html += '</div>';
+      });
+      if (spot.species.length > 12) html += '<div class="species-chip" style="color:#666">+' + (spot.species.length - 12) + '</div>';
+      html += '</div>';
+    } else {
+      html += '<div style="color:#666;font-size:10px;font-style:italic">Aucune donnee de presence mensuelle</div>';
+    }
+    html += '</div>';
+  });
+  body.innerHTML = html;
+  renderRelevantCards(spots);
+}
+
+document.getElementById('spots-refresh-btn').addEventListener('click', loadSpots);
+// Auto-load after geolocation resolves (or immediately if already set)
+setTimeout(loadSpots, 800);
+
+// ── Weekend suggestions (header button — kept for mobile overlay) ─────────
+var weekendBtn = document.getElementById('weekend-btn');
+var weekendPanel = document.getElementById('weekend-panel');
 
 weekendBtn.addEventListener('click', function() {
   if (weekendPanel.classList.contains('visible')) {
