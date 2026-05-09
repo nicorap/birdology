@@ -154,6 +154,27 @@ def test_recent_observations_no_filter():
     assert len(parsed) >= 1
 
 
+def test_recent_observations_locality_match():
+    g = _make_graph()
+    result = _run_tool("recent_observations", {"locality": "Assistens"}, g)
+    parsed = json.loads(result)
+    assert len(parsed) >= 1
+    assert all("Assistens" in r.get("locality", "") for r in parsed)
+
+
+def test_recent_observations_locality_case_insensitive():
+    g = _make_graph()
+    result = _run_tool("recent_observations", {"locality": "assistens"}, g)
+    parsed = json.loads(result)
+    assert len(parsed) >= 1
+
+
+def test_recent_observations_locality_no_match():
+    g = _make_graph()
+    result = _run_tool("recent_observations", {"locality": "Tivoli"}, g)
+    assert result == "No results found."
+
+
 def test_nearby_birds_default():
     g = _make_graph()
     result = _run_tool("nearby_birds", {}, g)

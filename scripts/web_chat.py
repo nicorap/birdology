@@ -296,108 +296,81 @@ def api_chat_stream():
     def _sse(event: str, payload: object) -> str:
         return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
+    def _llm_call(msgs: list, stream: bool):
+        last_err = None
+        for attempt in range(3):
+            try:
+                r = client.chat.completions.create(
+                    model=model, messages=msgs, tools=TOOLS_OPENAI, stream=stream,
+                )
+                return r
+            except Exception as e:
+                last_err = e
+                if attempt < 2:
+                    time.sleep(2)
+        raise last_err
+
+    def _run_tool_event(fn_name, fn_args, wiki_calls_ref):
+        """Run a tool and return (result, wiki_calls, should_log)."""
+        if fn_name == "search_wikipedia":
+            wiki_calls_ref[0] += 1
+            if wiki_calls_ref[0] > 1:
+                return "search_wikipedia already called once. Do not call it again.", False
+            return _run_tool(fn_name, fn_args, GRAPH), True
+        return _run_tool(fn_name, fn_args, GRAPH), True
+
     def generate():
         history = _get_session(session_id)
         history.append({"role": "user", "content": question})
         messages = list(history)
         tool_calls_log = []
         thumbnails_seen = []
-        wiki_calls = 0
+        wiki_calls = [0]  # mutable ref
         max_rounds = 8
 
         try:
             for _ in range(max_rounds):
-                last_err = None
-                for attempt in range(3):
-                    try:
-                        stream = client.chat.completions.create(
-                            model=model,
-                            messages=messages,
-                            tools=TOOLS_OPENAI,
-                            stream=True,
-                        )
-                        last_err = None
-                        break
-                    except Exception as e:
-                        last_err = e
-                        if attempt < 2:
-                            time.sleep(2)
-                if last_err:
-                    raise last_err
+                # Use non-streaming for tool rounds to avoid Ollama multi-tool
+                # streaming bugs (concatenated names, wrong indices).
+                response = _llm_call(messages, stream=False)
+                msg = response.choices[0].message
 
-                tool_calls_acc: dict[int, dict] = {}
-                content_chunks: list[str] = []
-
-                for chunk in stream:
-                    if not chunk.choices:
-                        continue
-                    delta = chunk.choices[0].delta
-
-                    if delta.content:
-                        content_chunks.append(delta.content)
-                        yield _sse("token", {"text": delta.content})
-
-                    if delta.tool_calls:
-                        for tc_delta in delta.tool_calls:
-                            idx = tc_delta.index
-                            if idx not in tool_calls_acc:
-                                tool_calls_acc[idx] = {"id": tc_delta.id or "", "name": "", "arguments": ""}
-                            if tc_delta.function:
-                                if tc_delta.function.name:
-                                    tool_calls_acc[idx]["name"] += tc_delta.function.name
-                                if tc_delta.function.arguments:
-                                    tool_calls_acc[idx]["arguments"] += tc_delta.function.arguments
-
-                if not tool_calls_acc:
-                    answer = "".join(content_chunks)
+                if not msg.tool_calls:
+                    # Final answer — emit word by word for progressive display.
+                    # We already have the full text (non-streaming call), so we
+                    # split and pace it to feel natural in the UI.
+                    text = msg.content or ""
                     if thumbnails_seen:
                         gallery = "\n\n"
-                        for name, url in thumbnails_seen[:4]:
-                            gallery += f'<bird-img name="{name}" src="{url}">\n'
-                        yield _sse("token", {"text": gallery})
-                        answer += gallery
-                    history.append({"role": "assistant", "content": answer})
+                        for tname, url in thumbnails_seen[:4]:
+                            gallery += f'<bird-img name="{tname}" src="{url}">\n'
+                        text += gallery
+                    import re as _re
+                    for chunk in _re.split(r'(\s+)', text):
+                        if chunk:
+                            yield _sse("token", {"text": chunk})
+                            time.sleep(0.03)  # ~30ms per word — readable pace
+                    history.append({"role": "assistant", "content": text})
                     _save_session(session_id, history)
                     yield _sse("done", {"tool_calls": tool_calls_log})
                     return
 
-                # Reconstruct assistant message with tool calls
-                tc_list = [
-                    {
-                        "id": tool_calls_acc[i]["id"],
-                        "type": "function",
-                        "function": {
-                            "name": tool_calls_acc[i]["name"],
-                            "arguments": tool_calls_acc[i]["arguments"],
-                        },
-                    }
-                    for i in sorted(tool_calls_acc)
-                ]
-                messages.append({"role": "assistant", "content": None, "tool_calls": tc_list})
-
-                for i in sorted(tool_calls_acc):
-                    tc = tool_calls_acc[i]
-                    fn_name = tc["name"]
+                # Tool round — emit tool events as each tool runs
+                messages.append(msg.model_dump(exclude_none=True))
+                for tc in msg.tool_calls:
+                    fn_name = tc.function.name
                     try:
-                        fn_args = json.loads(tc["arguments"] or "{}")
+                        fn_args = json.loads(tc.function.arguments)
                     except json.JSONDecodeError:
                         fn_args = {}
 
-                    if fn_name == "search_wikipedia":
-                        wiki_calls += 1
-                        if wiki_calls > 1:
-                            result = "search_wikipedia already called once. Do not call it again."
-                        else:
-                            tool_calls_log.append({"name": fn_name, "args": fn_args})
-                            yield _sse("tool", {"name": fn_name, "args": fn_args})
-                            result = _run_tool(fn_name, fn_args, GRAPH)
-                    else:
+                    result, should_log = _run_tool_event(fn_name, fn_args, wiki_calls)
+                    if should_log:
                         tool_calls_log.append({"name": fn_name, "args": fn_args})
                         yield _sse("tool", {"name": fn_name, "args": fn_args})
-                        result = _run_tool(fn_name, fn_args, GRAPH)
 
                     _extract_thumbnails(result, thumbnails_seen)
-                    messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
             answer = "(max tool rounds reached)"
             history.append({"role": "assistant", "content": answer})

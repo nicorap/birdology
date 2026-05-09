@@ -211,15 +211,20 @@ def recent_danish_observations(
     g: Graph | ConjunctiveGraph,
     species_name: str | None = None,
     ebird_only: bool = False,
+    locality: str | None = None,
 ) -> list[dict]:
     """
-    List Danish observations from the graph, optionally filtered by species name.
+    List Danish observations from the graph, optionally filtered by species name and/or locality.
 
     If ebird_only=True, only returns observations that came from the eBird API
     (i.e. have bird:eBirdCode on the observation node — typically last 30 days).
     Otherwise returns all observations (DOF + eBird), sorted by date descending.
     """
     ebird_filter = "FILTER EXISTS { ?obs bird:eBirdCode ?any }" if ebird_only else ""
+    locality_filter = (
+        f'FILTER(CONTAINS(LCASE(STR(?locality)), LCASE("{locality}")))'
+        if locality else ""
+    )
 
     if species_name:
         # Step 1: find matching species URIs (cheap — no observation join).
@@ -271,6 +276,7 @@ WHERE {{
         OPTIONAL {{ ?loc bird:longitude ?lon }}
     }}
     OPTIONAL {{ ?obs bird:atypicalReason ?atypicalReason }}
+    {locality_filter}
 }}
 ORDER BY DESC(?date)
 LIMIT 100
@@ -302,6 +308,7 @@ WHERE {{
         OPTIONAL {{ ?loc bird:longitude ?lon }}
     }}
     OPTIONAL {{ ?obs bird:atypicalReason ?atypicalReason }}
+    {locality_filter}
 }}
 ORDER BY DESC(?date)
 LIMIT 100

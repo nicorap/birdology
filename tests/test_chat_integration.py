@@ -99,6 +99,18 @@ class TestToolRouting:
         assert tools[0] == "find_species", \
             f"find_species should be first, got: {tools}"
 
+    def test_location_query_uses_locality_param(self):
+        """'observations à Brøndby Strand' → recent_observations with locality param."""
+        data = _chat("quelles observations à Brøndby Strand ?", "int_loc1")
+        tools = _tool_names(data)
+        assert "recent_observations" in tools, \
+            f"Expected recent_observations, got: {tools}"
+        args = _tool_args(data, "recent_observations")
+        assert args.get("locality"), \
+            f"Expected locality param, got args: {args}"
+        assert "species" not in args or not args.get("species"), \
+            f"Location name passed as species: {args}"
+
     def test_find_species_passes_exact_name(self):
         """find_species should receive the name as given, not translated."""
         data = _chat("observations de l'huitrier pie ?", "int_sp2")

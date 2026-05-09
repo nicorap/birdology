@@ -126,8 +126,8 @@ TOOLS_OPENAI = [
             "name": "recent_observations",
             "description": (
                 "List recent bird observations from the graph (DOF historical + eBird last 30 days), "
-                "sorted by date descending. Optionally filter by species name (any language) "
-                "and/or source. Returns date, locality, GPS, and individual count."
+                "sorted by date descending. Optionally filter by species name (any language), "
+                "locality name, and/or source. Returns date, locality, GPS, and individual count."
             ),
             "parameters": {
                 "type": "object",
@@ -137,6 +137,15 @@ TOOLS_OPENAI = [
                         "description": (
                             "Optional species name filter (English, Danish, French, or scientific). "
                             "Omit to get all recent observations."
+                        ),
+                    },
+                    "locality": {
+                        "type": "string",
+                        "description": (
+                            "Optional location name filter (partial match, case-insensitive). "
+                            "Use this when the user asks about observations at a specific place, "
+                            "e.g. 'Brøndby Strand', 'Utterslev Mose', 'Tivoli'. "
+                            "Do NOT pass a location name as the 'species' parameter."
                         ),
                     },
                     "source": {
@@ -351,9 +360,11 @@ You are Birdology, an ornithologist assistant powered by a knowledge graph (OWL/
 ## STRICT RULES — follow these exactly
 
 1. **ONLY report data returned by your tools.** Never invent dates, statistics, population \
-trends, observations, or localities. If a tool returns no data, say so — do NOT fill in from \
-general knowledge. In particular: never suggest specific birdwatching sites, times, or tips \
-unless the tool explicitly returned that location.
+trends, observations, or localities. **If a tool returns no data, say exactly that** \
+("Je n'ai pas cette information dans mes données.") and stop — do NOT fill in from general \
+knowledge, do NOT suggest alternatives, do NOT describe the species from memory. \
+If you are unsure which tool to use or whether you have the right data, say so and ask the \
+user to clarify rather than guessing.
 2. **Cite your sources.** After each fact, add the source in parentheses: \
 (source: graphe Birdology), (source: eBird live), etc.
 3. **Be concise.** Answer in 1-3 short paragraphs. Use a table only when comparing multiple \
@@ -390,9 +401,13 @@ Pass the exact name the user gave — do not translate it yourself before search
 - For questions about observations, use `recent_observations`. \
 Pass `source="ebird"` when the user asks about recent/last days/this week observations \
 (eBird data = last 30 days stored in the graph). \
-Pass `source="dof"` for historical DOF data. Default `source="all"` for both.
-- Use `live_observations` only when the user asks about what is being seen **right now / today** \
-(real-time eBird feed, may have observations from the last few hours).
+Pass `source="dof"` for historical DOF data. Default `source="all"` for both. \
+**When the user mentions a place name** (e.g. "Brøndby Strand", "Utterslev Mose"), pass it as \
+`locality` — NEVER as `species`. Location names are never species names.
+- Use `live_observations` when the user asks about what is being seen **right now / today / \
+cette semaine**, OR when following up on a species mentioned in a live context (e.g. "pas \
+d'aigle royal ?" after a live dashboard mention → use `live_observations`, not \
+`recent_observations`).
 - **ALWAYS call `search_wikipedia`** when the user asks about behavior, habitat, song, \
 courtship, diet, or ecology of a specific species — even if you already called `find_species`. \
 Call it at most once per question — if it returns no results, say the Wikipedia index does not \
@@ -457,7 +472,12 @@ def _run_tool(name: str, inputs: dict, graph) -> str:
 
     if name == "recent_observations":
         ebird_only = inputs.get("source", "all") == "ebird"
-        return _fmt(recent_danish_observations(graph, inputs.get("species"), ebird_only=ebird_only))
+        return _fmt(recent_danish_observations(
+            graph,
+            inputs.get("species"),
+            ebird_only=ebird_only,
+            locality=inputs.get("locality"),
+        ))
 
     if name == "nearby_birds":
         kwargs: dict = {}
