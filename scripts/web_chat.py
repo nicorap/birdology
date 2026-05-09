@@ -56,10 +56,17 @@ _MAX_HISTORY = 40  # keep last N messages (+ system prompt) to avoid bloating LL
 
 def _get_session(session_id: str) -> list[dict]:
     """Return the message list for a session, creating it if needed."""
+    import datetime
     with _sessions_lock:
         if session_id not in _sessions:
+            today = datetime.date.today()
+            system = SYSTEM_PROMPT + (
+                f"\n\n## Current date\nToday is {today.strftime('%A %d %B %Y')} "
+                f"(month {today.month}). Use this when the user says 'today', 'tomorrow', "
+                f"'this month', etc. — never assume a different month."
+            )
             _sessions[session_id] = {
-                "messages": [{"role": "system", "content": SYSTEM_PROMPT}],
+                "messages": [{"role": "system", "content": system}],
                 "last_seen": time.time(),
             }
         sess = _sessions[session_id]

@@ -145,6 +145,8 @@
   #user-input {
     flex: 1; background: #252830; border: 1px solid #3a3d4a; border-radius: 12px;
     padding: 10px 16px; color: #e0e0e0; font-size: 14px; outline: none;
+    resize: none; overflow-y: hidden; line-height: 1.5; min-height: 42px; max-height: 200px;
+    font-family: inherit;
   }
   #user-input:focus { border-color: #7dcea0; }
   #send-btn {
@@ -382,7 +384,7 @@
 
   <div id="input-area">
     <div id="input-form">
-      <input type="text" id="user-input" placeholder="Posez votre question..." autocomplete="off" />
+      <textarea id="user-input" placeholder="Posez votre question..." autocomplete="off" rows="1"></textarea>
       <button type="button" id="send-btn">Envoyer</button>
     </div>
   </div>
@@ -445,7 +447,13 @@ function bindExamples(root) {
 bindExamples(document);
 
 sendBtn.addEventListener('click', function() { doSend(); });
-userInput.addEventListener('keydown', function(e) { if (e.key === 'Enter') doSend(); });
+userInput.addEventListener('keydown', function(e) {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doSend(); }
+});
+userInput.addEventListener('input', function() {
+  this.style.height = 'auto';
+  this.style.height = Math.min(this.scrollHeight, 200) + 'px';
+});
 
 newChatBtn.addEventListener('click', function() {
   if (busy) return;
