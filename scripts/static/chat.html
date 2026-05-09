@@ -279,7 +279,7 @@
 
   /* ── Map style switcher ──────────────────────────────────────── */
   #map-style-switcher {
-    position: absolute; bottom: 8px; left: 8px; z-index: 1000;
+    position: absolute; bottom: 36px; left: 8px; z-index: 1000;
     display: flex; gap: 4px;
   }
   .map-style-btn {
@@ -288,6 +288,28 @@
     cursor: pointer; font-size: 10px; white-space: nowrap;
   }
   .map-style-btn:hover, .map-style-btn.active { border-color: #7dcea0; color: #7dcea0; }
+
+  /* ── Map legend ──────────────────────────────────────────────── */
+  #map-legend {
+    position: absolute; bottom: 8px; left: 8px; z-index: 1000;
+    background: rgba(20,22,32,0.88); border: 1px solid #3a3d4a;
+    border-radius: 5px; padding: 4px 8px;
+    display: flex; gap: 10px; align-items: center; font-size: 10px; color: #a0a8c0;
+  }
+  .legend-item { display: flex; align-items: center; gap: 4px; }
+  .legend-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+
+  /* ── Map filter buttons ──────────────────────────────────────── */
+  #map-filters {
+    display: flex; gap: 4px; margin-left: auto;
+  }
+  .map-filter-btn {
+    background: rgba(20,22,32,0.7); border: 1px solid #3a3d4a;
+    color: #a0a8c0; padding: 2px 7px; border-radius: 5px;
+    cursor: pointer; font-size: 10px; white-space: nowrap;
+  }
+  .map-filter-btn:hover { border-color: #7dcea0; color: #7dcea0; }
+  .map-filter-btn.active { border-color: #f9a825; color: #f9a825; background: rgba(249,168,37,0.1); }
 
   .panel {
     display: flex;
@@ -393,8 +415,21 @@
 
 <div id="panels">
   <section id="map-panel" class="panel">
-    <div class="panel-header">Observations <span class="count" id="map-count"></span> <span id="hotspot-badge"></span></div>
+    <div class="panel-header" style="display:flex;align-items:center">
+      Observations <span class="count" id="map-count"></span> <span id="hotspot-badge"></span>
+      <div id="map-filters">
+        <button class="map-filter-btn active" data-filter="all">Tout</button>
+        <button class="map-filter-btn" data-filter="atypical">⚠ Atypiques</button>
+        <button class="map-filter-btn" data-filter="rare">⭐ Rares</button>
+      </div>
+    </div>
     <div id="map"></div>
+    <div id="map-legend">
+      <div class="legend-item"><div class="legend-dot" style="background:#7dcea0"></div> Normal</div>
+      <div class="legend-item"><div class="legend-dot" style="background:#f9a825;width:12px;height:12px"></div> Atypique</div>
+      <div class="legend-item"><span style="font-size:12px">⭐</span> Rare</div>
+      <div class="legend-item"><div class="legend-dot" style="background:#e65100;width:14px;height:14px;opacity:0.8"></div> Hotspot</div>
+    </div>
     <div id="map-style-switcher">
       <button class="map-style-btn" data-style="dark">Sombre</button>
       <button class="map-style-btn active" data-style="light">Clair</button>
@@ -653,23 +688,51 @@ document.querySelectorAll('.map-style-btn').forEach(function(btn) {
 var clusters = L.markerClusterGroup({ chunkedLoading: true, maxClusterRadius: 50 });
 map.addLayer(clusters);
 
+// Filter state
+var allObsMarkers = [];   // {marker, isAtypical}
+var currentFilter = 'all';
+
+function applyFilter(filter) {
+  currentFilter = filter;
+  document.querySelectorAll('.map-filter-btn').forEach(function(b) {
+    b.classList.toggle('active', b.getAttribute('data-filter') === filter);
+  });
+  clusters.clearLayers();
+  var visible = allObsMarkers.filter(function(m) {
+    if (filter === 'atypical') return m.isAtypical;
+    if (filter === 'rare') return false; // rare shown via star markers, hide obs layer
+    return true;
+  });
+  clusters.addLayers(visible.map(function(m) { return m.marker; }));
+  // Show/hide rare overlay panel when filtering to rare
+  var rareOverlay = document.getElementById('rare-overlay');
+  if (rareOverlay) rareOverlay.style.display = (filter === 'rare' || rareOverlay._wasVisible) ? 'block' : (rareOverlay._wasVisible ? 'block' : '');
+}
+
+document.querySelectorAll('.map-filter-btn').forEach(function(btn) {
+  btn.addEventListener('click', function() {
+    applyFilter(btn.getAttribute('data-filter'));
+  });
+});
+
 fetch('/api/observations').then(function(r) { return r.json(); }).then(function(obs) {
   document.getElementById('map-count').textContent = obs.length.toLocaleString() + ' points';
   var batch = [];
   obs.forEach(function(o) {
     var name = o.commonName || o.scientificName;
-    var isAtypical = o.atypical && o.atypical.length > 0;
+    var isAtypical = !!(o.atypical && o.atypical.length > 0);
     var popup = '<b>' + escapeHtml(name) + '</b>'
       + (o.scientificName ? '<br><em>' + escapeHtml(o.scientificName) + '</em>' : '')
       + (o.locality ? '<br>' + escapeHtml(o.locality) : '')
       + (o.date ? '<br><small>' + escapeHtml(o.date) + '</small>' : '')
       + (isAtypical ? '<br><span style="color:#f9a825">⚠ ' + escapeHtml(o.atypical) + '</span>' : '')
-      + '<br><a href="#" onclick="askAbout(\'' + escapeAttr(name) + '\');return false;">Demander au chat</a>';
+      + '<br><a href="#" onclick="askAbout(\'' + escapeAttr(name) + '\');return false;">💬 Demander au chat</a>';
     var color = isAtypical ? '#f9a825' : '#7dcea0';
     var fill  = isAtypical ? '#c47a00' : '#2d5a3d';
     var radius = isAtypical ? 6 : 4;
     var m = L.circleMarker([o.lat, o.lon], { radius: radius, color: color, weight: isAtypical ? 2 : 1, fillColor: fill, fillOpacity: 0.8 });
     m.bindPopup(popup);
+    allObsMarkers.push({ marker: m, isAtypical: isAtypical });
     batch.push(m);
   });
   clusters.addLayers(batch);
@@ -872,7 +935,7 @@ function renderSpots(data) {
         var mig = sp.migrationStatus;
         var icon = migIcons[mig] || '';
         var iucn = sp.conservationStatus;
-        html += '<div class="species-chip" title="' + escapeHtml(sp.scientificName) + (migLabels[mig] ? ' — ' + migLabels[mig] : '') + '">';
+        html += '<div class="species-chip" title="' + escapeHtml(sp.scientificName) + (migLabels[mig] ? ' — ' + migLabels[mig] : '') + '" onclick="askAbout(\'' + escapeAttr(displayName) + '\')" style="cursor:pointer">';
         if (sp.thumbnail) html += '<img src="' + escapeHtml(sp.thumbnail) + '" alt="" onerror="this.style.display=\'none\'">';
         if (icon) html += '<span class="mig-icon">' + icon + '</span>';
         html += '<span>' + escapeHtml(displayName) + '</span>';
