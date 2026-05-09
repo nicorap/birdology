@@ -246,6 +246,46 @@
   .spot-card .spot-meta { font-size: 10px; color: #666; margin-bottom: 6px; }
   .spot-chips { display: flex; flex-wrap: wrap; gap: 4px; }
 
+  /* ── Rare species overlay on map ─────────────────────────────── */
+  #rare-overlay {
+    position: absolute; top: 36px; right: 8px; z-index: 1000;
+    background: rgba(20, 22, 32, 0.92);
+    border: 1px solid #7b1a1a;
+    border-radius: 8px;
+    padding: 8px 10px;
+    max-width: 200px;
+    max-height: calc(100% - 50px);
+    overflow-y: auto;
+    font-size: 11px;
+  }
+  #rare-overlay h4 {
+    color: #ff6b6b; margin: 0 0 6px; font-size: 11px;
+    text-transform: uppercase; letter-spacing: 0.5px;
+  }
+  .rare-item {
+    display: flex; align-items: flex-start; gap: 5px;
+    padding: 4px 0; border-bottom: 1px solid #2a1a1a;
+    cursor: pointer;
+  }
+  .rare-item:last-child { border-bottom: none; }
+  .rare-item:hover { color: #ff9999; }
+  .rare-item .rare-name { flex: 1; line-height: 1.3; color: #f0f0f0; }
+  .rare-item .rare-badge { flex-shrink: 0; }
+
+  #map-panel { position: relative; }
+
+  /* ── Map style switcher ──────────────────────────────────────── */
+  #map-style-switcher {
+    position: absolute; bottom: 8px; left: 8px; z-index: 1000;
+    display: flex; gap: 4px;
+  }
+  .map-style-btn {
+    background: rgba(20,22,32,0.88); border: 1px solid #3a3d4a;
+    color: #a0a8c0; padding: 3px 8px; border-radius: 5px;
+    cursor: pointer; font-size: 10px; white-space: nowrap;
+  }
+  .map-style-btn:hover, .map-style-btn.active { border-color: #7dcea0; color: #7dcea0; }
+
   .panel {
     display: flex;
     flex-direction: column;
@@ -352,6 +392,16 @@
   <section id="map-panel" class="panel">
     <div class="panel-header">Observations <span class="count" id="map-count"></span> <span id="hotspot-badge"></span></div>
     <div id="map"></div>
+    <div id="map-style-switcher">
+      <button class="map-style-btn active" data-style="dark">Sombre</button>
+      <button class="map-style-btn" data-style="light">Clair</button>
+      <button class="map-style-btn" data-style="satellite">Satellite</button>
+      <button class="map-style-btn" data-style="topo">Topo</button>
+    </div>
+    <div id="rare-overlay" style="display:none">
+      <h4>⭐ Espèces rares</h4>
+      <div id="rare-list"></div>
+    </div>
   </section>
   <section id="cards-panel" class="panel">
     <div class="panel-header">Especes du mois <span class="count" id="cards-count"></span></div>
@@ -570,10 +620,26 @@ function parseMarkdownLinks(line) {
 
 // ── Observations map (right panel) ───────────────────────────────────────
 var map = L.map('map', { preferCanvas: true }).setView([56.0, 11.5], 7);
-L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-  attribution: '&copy; OpenStreetMap &copy; CARTO',
-  subdomains: 'abcd', maxZoom: 19,
-}).addTo(map);
+
+var tileLayers = {
+  dark:      L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',       { attribution: '&copy; OpenStreetMap &copy; CARTO', subdomains: 'abcd', maxZoom: 19 }),
+  light:     L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',      { attribution: '&copy; OpenStreetMap &copy; CARTO', subdomains: 'abcd', maxZoom: 19 }),
+  satellite: L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { attribution: '&copy; Esri', maxZoom: 19 }),
+  topo:      L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png',                    { attribution: '&copy; OpenStreetMap &copy; OpenTopoMap', maxZoom: 17 }),
+};
+var currentLayer = tileLayers.dark;
+currentLayer.addTo(map);
+
+document.querySelectorAll('.map-style-btn').forEach(function(btn) {
+  btn.addEventListener('click', function() {
+    var style = btn.getAttribute('data-style');
+    map.removeLayer(currentLayer);
+    currentLayer = tileLayers[style];
+    currentLayer.addTo(map);
+    document.querySelectorAll('.map-style-btn').forEach(function(b) { b.classList.remove('active'); });
+    btn.classList.add('active');
+  });
+});
 
 var clusters = L.markerClusterGroup({ chunkedLoading: true, maxClusterRadius: 50 });
 map.addLayer(clusters);
@@ -661,25 +727,65 @@ if (navigator.geolocation) {
 }
 
 fetch('/api/dashboard').then(function(r) { return r.json(); }).then(function(data) {
+  // ── Hotspot markers ──
   var hotspots = data.hotspots || [];
-  if (!hotspots.length) return;
+  if (hotspots.length) {
+    var maxObs = Math.max.apply(null, hotspots.map(function(h) { return h.count; }));
+    hotspots.forEach(function(h) {
+      var lat = parseFloat(h.lat); var lon = parseFloat(h.lon);
+      if (isNaN(lat) || isNaN(lon)) return;
+      var radius = 8 + 14 * (h.count / maxObs);
+      var name = h.locality || (lat.toFixed(2) + ', ' + lon.toFixed(2));
+      var popup = '<b>🔥 Hotspot</b><br>' + escapeHtml(name) + '<br>' + h.count + ' observations'
+        + '<br><a href="#" onclick="askAbout(\'' + escapeAttr(name) + '\');return false;">Demander au chat</a>';
+      L.circleMarker([lat, lon], {
+        radius: radius, color: '#f9a825', weight: 2,
+        fillColor: '#e65100', fillOpacity: 0.55
+      }).bindPopup(popup).addTo(map);
+    });
+    var badge = document.getElementById('hotspot-badge');
+    if (badge) badge.textContent = '· ' + hotspots.length + ' hotspots';
+  }
 
-  var maxObs = Math.max.apply(null, hotspots.map(function(h) { return h.count; }));
-  hotspots.forEach(function(h) {
-    var lat = parseFloat(h.lat); var lon = parseFloat(h.lon);
-    if (isNaN(lat) || isNaN(lon)) return;
-    var radius = 8 + 14 * (h.count / maxObs);
-    var name = h.locality || (lat.toFixed(2) + ', ' + lon.toFixed(2));
-    var popup = '<b>🔥 Hotspot</b><br>' + escapeHtml(name) + '<br>' + h.count + ' observations'
-      + '<br><a href="#" onclick="askAbout(\'' + escapeAttr(name) + '\');return false;">Demander au chat</a>';
-    L.circleMarker([lat, lon], {
-      radius: radius, color: '#f9a825', weight: 2,
-      fillColor: '#e65100', fillOpacity: 0.55
-    }).bindPopup(popup).addTo(map);
+  // ── Rare species: markers + overlay ──
+  var rare = data.rare || [];
+  if (!rare.length) return;
+
+  // Star icon
+  var starIcon = L.divIcon({
+    html: '<div style="font-size:18px;line-height:1;filter:drop-shadow(0 0 4px #ff0000)">⭐</div>',
+    className: '', iconSize: [20, 20], iconAnchor: [10, 10]
   });
 
-  var badge = document.getElementById('hotspot-badge');
-  if (badge) badge.textContent = '· ' + hotspots.length + ' hotspots';
+  rare.forEach(function(r) {
+    if (!r.lat || !r.lon) return;
+    var lat = parseFloat(r.lat); var lon = parseFloat(r.lon);
+    if (isNaN(lat) || isNaN(lon)) return;
+    var name = r.commonNameFr || r.commonNameEn || r.scientificName;
+    var iucn = r.status || '';
+    var popup = '<b>⭐ ' + escapeHtml(name) + '</b>'
+      + (iucn ? ' <span style="background:#c0392b;padding:1px 4px;border-radius:3px;font-size:10px">' + iucn + '</span>' : '')
+      + '<br><em>' + escapeHtml(r.scientificName) + '</em>'
+      + (r.locality ? '<br>' + escapeHtml(r.locality) : '')
+      + (r.date ? '<br><small>' + escapeHtml(r.date) + '</small>' : '')
+      + '<br><a href="#" onclick="askAbout(\'' + escapeAttr(name) + '\');return false;">Demander au chat</a>';
+    L.marker([lat, lon], { icon: starIcon, zIndexOffset: 1000 }).bindPopup(popup).addTo(map);
+  });
+
+  // Overlay list
+  var overlay = document.getElementById('rare-overlay');
+  var list = document.getElementById('rare-list');
+  var html = '';
+  rare.forEach(function(r) {
+    var name = r.commonNameFr || r.commonNameEn || r.scientificName;
+    var iucn = r.status || '';
+    html += '<div class="rare-item" onclick="askAbout(\'' + escapeAttr(name) + '\')" title="' + escapeHtml(r.locality || '') + '">';
+    html += '<span class="rare-name">' + escapeHtml(name) + '</span>';
+    if (iucn) html += '<span class="iucn-badge iucn-' + iucn + ' rare-badge">' + iucn + '</span>';
+    html += '</div>';
+  });
+  list.innerHTML = html;
+  overlay.style.display = 'block';
 }).catch(function() {});
 
 // ── Spots panel (right column, auto-load) ────────────────────────────────

@@ -330,6 +330,8 @@ def _dashboard_rare() -> list[dict]:
             "status": info["status"],
             "date": obs.get("obsDt"),
             "locality": obs.get("locName"),
+            "lat": obs.get("lat"),
+            "lon": obs.get("lng"),
         })
 
     results.sort(key=lambda r: (iucn_rank.get(r["status"], 99), r["scientificName"]))

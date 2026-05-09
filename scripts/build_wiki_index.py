@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Build the Wikipedia RAG index for all bird species in the knowledge graph.
+Build the Wikipedia RAG index for bird species in the knowledge graph.
 
 Fetches English Wikipedia articles for each species, chunks them, embeds
 with Ollama (nomic-embed-text) and stores in ChromaDB at data/wiki_index/.
 
 Usage:
-    python scripts/build_wiki_index.py                         # all species
-    python scripts/build_wiki_index.py --limit 50              # first 50 (test)
+    python scripts/build_wiki_index.py                          # all ~11k species
+    python scripts/build_wiki_index.py --observed-only          # only species with DOF observations (~300)
+    python scripts/build_wiki_index.py --limit 50               # first 50 (test)
     python scripts/build_wiki_index.py --input output/birdology_reasoned.ttl
 """
 from __future__ import annotations
@@ -36,21 +37,45 @@ def main() -> None:
     ap.add_argument("--ollama-url", default="http://localhost:11434", help="Ollama base URL")
     ap.add_argument("--limit", type=int, default=None, help="Max species to index")
     ap.add_argument("--lang", default="en", help="Wikipedia language code (default: en)")
+    ap.add_argument("--observed-only", action="store_true",
+                    help="Only index species that have at least one DOF observation in the graph")
     args = ap.parse_args()
 
     print(f"Loading graph from {args.input} …")
     g = load_graph_rdflib(args.input)
 
-    species_list: list[dict] = []
-    for sp in g.subjects(RDF.type, BIRD.Species):
-        sci = g.value(sp, DWC.scientificName)
-        if not sci:
-            continue
-        common_en = g.value(sp, BIRD.commonNameEn)
-        species_list.append({
-            "scientificName": str(sci),
-            "commonName": str(common_en) if common_en else "",
-        })
+    if args.observed_only:
+        # SPARQL: species with at least one observation
+        from rdflib import Graph as RDFGraph
+        observed_q = """
+        PREFIX bird: <https://birdology.org/ontology/>
+        PREFIX dwc: <http://rs.tdwg.org/dwc/terms/>
+        SELECT DISTINCT ?species ?scientificName ?commonNameEn WHERE {
+            ?species a bird:Species ;
+                     dwc:scientificName ?scientificName ;
+                     bird:hasObservation ?obs .
+            FILTER(STRSTARTS(STR(?species), "https://birdology.org/taxon/species/"))
+            OPTIONAL { ?species bird:commonNameEn ?commonNameEn }
+        }
+        """
+        species_list = [
+            {
+                "scientificName": str(row.scientificName),
+                "commonName": str(row.commonNameEn) if row.commonNameEn else "",
+            }
+            for row in g.query(observed_q)
+        ]
+    else:
+        species_list = []
+        for sp in g.subjects(RDF.type, BIRD.Species):
+            sci = g.value(sp, DWC.scientificName)
+            if not sci:
+                continue
+            common_en = g.value(sp, BIRD.commonNameEn)
+            species_list.append({
+                "scientificName": str(sci),
+                "commonName": str(common_en) if common_en else "",
+            })
 
     if args.limit:
         species_list = species_list[: args.limit]
