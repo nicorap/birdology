@@ -417,14 +417,12 @@
       Observations <span class="count" id="map-count"></span> <span id="hotspot-badge"></span>
       <div id="map-filters">
         <button class="map-filter-btn active" data-filter="all">Tout</button>
-        <button class="map-filter-btn" data-filter="atypical">⚠ Atypiques</button>
         <button class="map-filter-btn" data-filter="rare">⭐ Rares</button>
       </div>
     </div>
     <div id="map"></div>
     <div id="map-legend">
       <div class="legend-item"><div class="legend-dot" style="background:#7dcea0"></div> Normal</div>
-      <div class="legend-item"><div class="legend-dot" style="background:#f9a825;width:12px;height:12px"></div> Atypique</div>
       <div class="legend-item"><span style="font-size:12px">⭐</span> Rare</div>
       <div class="legend-item"><div class="legend-dot" style="background:#e65100;width:14px;height:14px;opacity:0.8"></div> Hotspot</div>
     </div>
@@ -520,7 +518,7 @@ function askAbout(name) {
   doSend();
 }
 
-function doSend() {
+async function doSend() {
   if (busy) return;
   var text = userInput.value.trim();
   if (!text) return;
@@ -539,33 +537,86 @@ function doSend() {
 
   var controller = new AbortController();
   var timeoutId = setTimeout(function() { controller.abort(); }, 180000);
-  fetch('/api/chat', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ message: text, session_id: sessionId }),
-    signal: controller.signal
-  })
-  .then(function(res) {
-    if (!res.ok) return res.text().then(function(t) { throw new Error('Serveur: ' + res.status); });
-    return res.json();
-  })
-  .then(function(data) {
-    hideTyping();
-    if (data.tool_calls) {
-      data.tool_calls.forEach(function(tc) { addTool(tc.name, tc.args); });
+
+  var assistantDiv = null;
+  var rawAnswer = '';
+
+  function ensureAssistantBubble() {
+    if (!assistantDiv) {
+      hideTyping();
+      assistantDiv = document.createElement('div');
+      assistantDiv.className = 'message assistant';
+      chatContainer.appendChild(assistantDiv);
     }
-    addMsg('assistant', data.answer || 'Pas de reponse.');
-  })
-  .catch(function(err) {
+  }
+
+  try {
+    var res = await fetch('/api/chat/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: text, session_id: sessionId }),
+      signal: controller.signal,
+    });
+    if (!res.ok) throw new Error('Serveur: ' + res.status);
+
+    var reader = res.body.getReader();
+    var decoder = new TextDecoder();
+    var buffer = '';
+    var currentEvent = '';
+
+    while (true) {
+      var _ref = await reader.read();
+      if (_ref.done) break;
+      buffer += decoder.decode(_ref.value, { stream: true });
+
+      var lines = buffer.split('\n');
+      buffer = lines.pop();
+
+      for (var i = 0; i < lines.length; i++) {
+        var line = lines[i];
+        if (line.startsWith('event: ')) {
+          currentEvent = line.slice(7).trim();
+        } else if (line.startsWith('data: ')) {
+          var payload;
+          try { payload = JSON.parse(line.slice(6)); } catch(e) { continue; }
+
+          if (currentEvent === 'token') {
+            ensureAssistantBubble();
+            rawAnswer += payload.text;
+            assistantDiv.innerHTML = mdToHtml(rawAnswer);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+          } else if (currentEvent === 'tool') {
+            addTool(payload.name, payload.args);
+          } else if (currentEvent === 'error') {
+            hideTyping();
+            addMsg('assistant', 'Erreur: ' + payload.message);
+          }
+          currentEvent = '';
+        } else if (line === '') {
+          currentEvent = '';
+        }
+      }
+    }
+
+    if (!assistantDiv) {
+      hideTyping();
+      addMsg('assistant', 'Pas de reponse.');
+    }
+  } catch(err) {
     hideTyping();
-    addMsg('assistant', 'Erreur: ' + err.message);
-  })
-  .finally(function() {
+    if (assistantDiv && rawAnswer) {
+      // partial answer already shown — append error note
+      rawAnswer += '\n\n*(connexion interrompue)*';
+      assistantDiv.innerHTML = mdToHtml(rawAnswer);
+    } else {
+      addMsg('assistant', 'Erreur: ' + err.message);
+    }
+  } finally {
     clearTimeout(timeoutId);
     busy = false;
     sendBtn.disabled = false;
     userInput.focus();
-  });
+  }
 }
 
 function addMsg(role, content) {
@@ -697,7 +748,6 @@ function applyFilter(filter) {
   });
   clusters.clearLayers();
   var visible = allObsMarkers.filter(function(m) {
-    if (filter === 'atypical') return m.isAtypical;
     if (filter === 'rare') return false; // rare shown via star markers, hide obs layer
     return true;
   });
@@ -718,19 +768,14 @@ fetch('/api/observations').then(function(r) { return r.json(); }).then(function(
   var batch = [];
   obs.forEach(function(o) {
     var name = o.commonName || o.scientificName;
-    var isAtypical = !!(o.atypical && o.atypical.length > 0);
     var popup = '<b>' + escapeHtml(name) + '</b>'
       + (o.scientificName ? '<br><em>' + escapeHtml(o.scientificName) + '</em>' : '')
       + (o.locality ? '<br>' + escapeHtml(o.locality) : '')
       + (o.date ? '<br><small>' + escapeHtml(o.date) + '</small>' : '')
-      + (isAtypical ? '<br><span style="color:#f9a825">⚠ ' + escapeHtml(o.atypical) + '</span>' : '')
       + '<br><a href="#" onclick="askAbout(\'' + escapeAttr(name) + '\');return false;">💬 Demander au chat</a>';
-    var color = isAtypical ? '#f9a825' : '#7dcea0';
-    var fill  = isAtypical ? '#c47a00' : '#2d5a3d';
-    var radius = isAtypical ? 6 : 4;
-    var m = L.circleMarker([o.lat, o.lon], { radius: radius, color: color, weight: isAtypical ? 2 : 1, fillColor: fill, fillOpacity: 0.8 });
+    var m = L.circleMarker([o.lat, o.lon], { radius: 4, color: '#7dcea0', weight: 1, fillColor: '#2d5a3d', fillOpacity: 0.8 });
     m.bindPopup(popup);
-    allObsMarkers.push({ marker: m, isAtypical: isAtypical });
+    allObsMarkers.push({ marker: m });
     batch.push(m);
   });
   clusters.addLayers(batch);

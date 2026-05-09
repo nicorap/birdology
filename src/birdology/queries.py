@@ -257,7 +257,7 @@ WHERE {{
         obs_q = (
             _PREFIXES
             + f"""
-SELECT ?species ?date ?count ?locality ?lat ?lon
+SELECT ?species ?date ?count ?locality ?lat ?lon ?atypicalReason
 WHERE {{
     {values}
     ?species bird:hasObservation ?obs .
@@ -270,6 +270,7 @@ WHERE {{
         OPTIONAL {{ ?loc bird:latitude  ?lat }}
         OPTIONAL {{ ?loc bird:longitude ?lon }}
     }}
+    OPTIONAL {{ ?obs bird:atypicalReason ?atypicalReason }}
 }}
 ORDER BY DESC(?date)
 LIMIT 100
@@ -286,7 +287,7 @@ LIMIT 100
     q_dates = (
         _PREFIXES
         + f"""
-SELECT ?species ?date ?count ?locality ?lat ?lon
+SELECT ?species ?date ?count ?locality ?lat ?lon ?atypicalReason
 WHERE {{
     ?species a bird:Species ;
              bird:hasObservation ?obs .
@@ -300,6 +301,7 @@ WHERE {{
         OPTIONAL {{ ?loc bird:latitude  ?lat }}
         OPTIONAL {{ ?loc bird:longitude ?lon }}
     }}
+    OPTIONAL {{ ?obs bird:atypicalReason ?atypicalReason }}
 }}
 ORDER BY DESC(?date)
 LIMIT 100

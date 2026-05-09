@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
 import sys
 import threading
 import time
@@ -42,45 +43,92 @@ STATIC_DIR = Path(__file__).parent / "static"
 app = Flask(__name__)
 GRAPH = None  # loaded at startup
 
-# ── Session storage (in-memory) ──────────────────────────────────────────────
+# ── Session storage (SQLite) ──────────────────────────────────────────────────
 # Each session stores its message history so the LLM has conversation context.
 # Sessions expire after 2 hours of inactivity.
+# DB path is set at startup via _init_session_db().
 
-_sessions: dict[str, dict] = {}  # session_id -> {"messages": [...], "last_seen": float}
 _sessions_lock = threading.Lock()
 _SESSION_TTL = 7200  # 2 hours
+_MAX_HISTORY = 40    # keep last N messages (+ system prompt) to avoid bloating LLM context
+_SESSION_DB: Path | None = None  # set by _init_session_db()
 
 
-_MAX_HISTORY = 40  # keep last N messages (+ system prompt) to avoid bloating LLM context
+def _init_session_db(db_path: Path) -> None:
+    global _SESSION_DB
+    _SESSION_DB = db_path
+    with sqlite3.connect(db_path) as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                session_id TEXT PRIMARY KEY,
+                messages   TEXT NOT NULL,
+                last_seen  REAL NOT NULL
+            )
+        """)
+
+
+def _db() -> sqlite3.Connection:
+    return sqlite3.connect(_SESSION_DB)
 
 
 def _get_session(session_id: str) -> list[dict]:
-    """Return the message list for a session, creating it if needed."""
+    """Return the mutable message list for a session, creating it if needed.
+
+    The returned list is a live Python object backed by SQLite; callers must
+    call _save_session() after appending to persist changes.
+    """
     import datetime
     with _sessions_lock:
-        if session_id not in _sessions:
-            today = datetime.date.today()
-            system = SYSTEM_PROMPT + (
-                f"\n\n## Current date\nToday is {today.strftime('%A %d %B %Y')} "
-                f"(month {today.month}). Use this when the user says 'today', 'tomorrow', "
-                f"'this month', etc. — never assume a different month."
-            )
-            _sessions[session_id] = {
-                "messages": [{"role": "system", "content": system}],
-                "last_seen": time.time(),
-            }
-        sess = _sessions[session_id]
-        sess["last_seen"] = time.time()
-        # Trim old messages (keep system prompt + last N)
-        msgs = sess["messages"]
-        if len(msgs) > _MAX_HISTORY + 1:
-            sess["messages"] = msgs[:1] + msgs[-(  _MAX_HISTORY):]
-        # Prune expired sessions while we're here
         now = time.time()
-        expired = [k for k, v in _sessions.items() if now - v["last_seen"] > _SESSION_TTL]
-        for k in expired:
-            del _sessions[k]
-        return sess["messages"]
+        with _db() as con:
+            # Prune expired sessions
+            con.execute("DELETE FROM sessions WHERE last_seen < ?", (now - _SESSION_TTL,))
+
+            row = con.execute(
+                "SELECT messages FROM sessions WHERE session_id = ?", (session_id,)
+            ).fetchone()
+
+            if row is None:
+                today = datetime.date.today()
+                system = SYSTEM_PROMPT + (
+                    f"\n\n## Current date\nToday is {today.strftime('%A %d %B %Y')} "
+                    f"(month {today.month}). Use this when the user says 'today', 'tomorrow', "
+                    f"'this month', etc. — never assume a different month."
+                )
+                msgs: list[dict] = [{"role": "system", "content": system}]
+            else:
+                msgs = json.loads(row[0])
+                # Refresh system prompt date on each new day
+                import datetime as _dt
+                today = _dt.date.today()
+                new_system = SYSTEM_PROMPT + (
+                    f"\n\n## Current date\nToday is {today.strftime('%A %d %B %Y')} "
+                    f"(month {today.month}). Use this when the user says 'today', 'tomorrow', "
+                    f"'this month', etc. — never assume a different month."
+                )
+                if msgs and msgs[0]["role"] == "system":
+                    msgs[0]["content"] = new_system
+
+            # Trim to MAX_HISTORY (keep system prompt + last N)
+            if len(msgs) > _MAX_HISTORY + 1:
+                msgs = msgs[:1] + msgs[-_MAX_HISTORY:]
+
+            con.execute(
+                "INSERT OR REPLACE INTO sessions (session_id, messages, last_seen) VALUES (?,?,?)",
+                (session_id, json.dumps(msgs, ensure_ascii=False), now),
+            )
+
+        return msgs
+
+
+def _save_session(session_id: str, msgs: list[dict]) -> None:
+    """Persist the message list for a session after modification."""
+    with _sessions_lock:
+        with _db() as con:
+            con.execute(
+                "UPDATE sessions SET messages = ?, last_seen = ? WHERE session_id = ?",
+                (json.dumps(msgs, ensure_ascii=False), time.time(), session_id),
+            )
 
 
 def _extract_thumbnails(tool_result: str, out: list) -> None:
@@ -138,6 +186,7 @@ def api_chat():
 
     tool_calls_log = []
     thumbnails_seen = []  # collect thumbnail URLs from tool results
+    wiki_calls = 0  # enforce at-most-once for search_wikipedia
     max_rounds = 8
 
     try:
@@ -177,6 +226,7 @@ def api_chat():
                         answer += gallery
                 # Persist only the final assistant text to session history
                 history.append({"role": "assistant", "content": answer})
+                _save_session(session_id, history)
                 return jsonify({
                     "answer": answer,
                     "tool_calls": tool_calls_log,
@@ -192,8 +242,16 @@ def api_chat():
                 except json.JSONDecodeError:
                     fn_args = {}
 
-                tool_calls_log.append({"name": fn_name, "args": fn_args})
-                result = _run_tool(fn_name, fn_args, GRAPH)
+                if fn_name == "search_wikipedia":
+                    wiki_calls += 1
+                    if wiki_calls > 1:
+                        result = "search_wikipedia already called once. Do not call it again."
+                    else:
+                        tool_calls_log.append({"name": fn_name, "args": fn_args})
+                        result = _run_tool(fn_name, fn_args, GRAPH)
+                else:
+                    tool_calls_log.append({"name": fn_name, "args": fn_args})
+                    result = _run_tool(fn_name, fn_args, GRAPH)
 
                 # Extract thumbnails from tool results
                 _extract_thumbnails(result, thumbnails_seen)
@@ -206,6 +264,7 @@ def api_chat():
 
         answer = "(max tool rounds reached)"
         history.append({"role": "assistant", "content": answer})
+        _save_session(session_id, history)
         return jsonify({
             "answer": answer,
             "tool_calls": tool_calls_log,
@@ -215,7 +274,148 @@ def api_chat():
         # Remove the user message we just added if the request failed
         if history and history[-1].get("role") == "user":
             history.pop()
+            _save_session(session_id, history)
         return jsonify({"answer": f"Erreur serveur: {e}"}), 200
+
+
+@app.route("/api/chat/stream", methods=["POST"])
+def api_chat_stream():
+    data = request.get_json()
+    question = data.get("message", "").strip()
+    session_id = data.get("session_id", "default")
+    if not question:
+        return jsonify({"answer": "Posez une question."}), 400
+
+    base_url = os.getenv("LLM_BASE_URL", "http://localhost:11434/v1")
+    api_key = os.getenv("LLM_API_KEY", "ollama")
+    model = os.getenv("LLM_MODEL", "mistral")
+
+    from openai import OpenAI
+    client = OpenAI(base_url=base_url, api_key=api_key)
+
+    def _sse(event: str, payload: object) -> str:
+        return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    def generate():
+        history = _get_session(session_id)
+        history.append({"role": "user", "content": question})
+        messages = list(history)
+        tool_calls_log = []
+        thumbnails_seen = []
+        wiki_calls = 0
+        max_rounds = 8
+
+        try:
+            for _ in range(max_rounds):
+                last_err = None
+                for attempt in range(3):
+                    try:
+                        stream = client.chat.completions.create(
+                            model=model,
+                            messages=messages,
+                            tools=TOOLS_OPENAI,
+                            stream=True,
+                        )
+                        last_err = None
+                        break
+                    except Exception as e:
+                        last_err = e
+                        if attempt < 2:
+                            time.sleep(2)
+                if last_err:
+                    raise last_err
+
+                tool_calls_acc: dict[int, dict] = {}
+                content_chunks: list[str] = []
+
+                for chunk in stream:
+                    if not chunk.choices:
+                        continue
+                    delta = chunk.choices[0].delta
+
+                    if delta.content:
+                        content_chunks.append(delta.content)
+                        yield _sse("token", {"text": delta.content})
+
+                    if delta.tool_calls:
+                        for tc_delta in delta.tool_calls:
+                            idx = tc_delta.index
+                            if idx not in tool_calls_acc:
+                                tool_calls_acc[idx] = {"id": tc_delta.id or "", "name": "", "arguments": ""}
+                            if tc_delta.function:
+                                if tc_delta.function.name:
+                                    tool_calls_acc[idx]["name"] += tc_delta.function.name
+                                if tc_delta.function.arguments:
+                                    tool_calls_acc[idx]["arguments"] += tc_delta.function.arguments
+
+                if not tool_calls_acc:
+                    answer = "".join(content_chunks)
+                    if thumbnails_seen:
+                        gallery = "\n\n"
+                        for name, url in thumbnails_seen[:4]:
+                            gallery += f'<bird-img name="{name}" src="{url}">\n'
+                        yield _sse("token", {"text": gallery})
+                        answer += gallery
+                    history.append({"role": "assistant", "content": answer})
+                    _save_session(session_id, history)
+                    yield _sse("done", {"tool_calls": tool_calls_log})
+                    return
+
+                # Reconstruct assistant message with tool calls
+                tc_list = [
+                    {
+                        "id": tool_calls_acc[i]["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tool_calls_acc[i]["name"],
+                            "arguments": tool_calls_acc[i]["arguments"],
+                        },
+                    }
+                    for i in sorted(tool_calls_acc)
+                ]
+                messages.append({"role": "assistant", "content": None, "tool_calls": tc_list})
+
+                for i in sorted(tool_calls_acc):
+                    tc = tool_calls_acc[i]
+                    fn_name = tc["name"]
+                    try:
+                        fn_args = json.loads(tc["arguments"] or "{}")
+                    except json.JSONDecodeError:
+                        fn_args = {}
+
+                    if fn_name == "search_wikipedia":
+                        wiki_calls += 1
+                        if wiki_calls > 1:
+                            result = "search_wikipedia already called once. Do not call it again."
+                        else:
+                            tool_calls_log.append({"name": fn_name, "args": fn_args})
+                            yield _sse("tool", {"name": fn_name, "args": fn_args})
+                            result = _run_tool(fn_name, fn_args, GRAPH)
+                    else:
+                        tool_calls_log.append({"name": fn_name, "args": fn_args})
+                        yield _sse("tool", {"name": fn_name, "args": fn_args})
+                        result = _run_tool(fn_name, fn_args, GRAPH)
+
+                    _extract_thumbnails(result, thumbnails_seen)
+                    messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+
+            answer = "(max tool rounds reached)"
+            history.append({"role": "assistant", "content": answer})
+            _save_session(session_id, history)
+            yield _sse("token", {"text": answer})
+            yield _sse("done", {"tool_calls": tool_calls_log})
+
+        except Exception as e:
+            if history and history[-1].get("role") == "user":
+                history.pop()
+                _save_session(session_id, history)
+            yield _sse("error", {"message": str(e)})
+
+    return Response(
+        generate(),
+        content_type="text/event-stream",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+    )
 
 
 @app.route("/api/observations")
@@ -229,6 +429,8 @@ def api_observations():
                 lon = float(r.get("lon", ""))
             except (TypeError, ValueError):
                 continue
+            if r.get("atypicalReason"):
+                continue  # atypical observations not shown on map
             out.append({
                 "scientificName": r.get("scientificName", ""),
                 "commonName": r.get("commonNameFr") or r.get("commonNameEn") or r.get("commonNameDa") or "",
@@ -237,7 +439,6 @@ def api_observations():
                 "date": r.get("date", ""),
                 "locality": r.get("locality", ""),
                 "count": r.get("count", ""),
-                "atypical": r.get("atypicalReason", ""),
             })
         _PANEL_CACHE["observations"] = out
     return jsonify(_PANEL_CACHE["observations"])
@@ -575,7 +776,8 @@ def api_reset():
     data = request.get_json() or {}
     session_id = data.get("session_id", "default")
     with _sessions_lock:
-        _sessions.pop(session_id, None)
+        with _db() as con:
+            con.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
     return jsonify({"status": "ok"})
 
 
@@ -606,6 +808,10 @@ def main():
     if not ttl_path.exists():
         print(f"Error: graph file not found: {ttl_path}", file=sys.stderr)
         sys.exit(1)
+
+    db_path = ttl_path.parent / "sessions.db"
+    _init_session_db(db_path)
+    print(f"Session DB: {db_path}")
 
     print(f"Loading graph from {ttl_path} …")
     GRAPH = load_graph(ttl_path)
