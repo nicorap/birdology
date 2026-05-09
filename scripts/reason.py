@@ -353,55 +353,60 @@ def _materialise_atypical_observations(g: Graph) -> int:
       - species observed outside its typical months (out of season)
       - species has very few historical observations in Denmark (very rare locally)
     Adds bird:atypicalReason to the observation node.
+    Uses direct triple iteration (no SPARQL) for speed on large graphs.
     """
     from rdflib.namespace import XSD as _XSD
+    from collections import defaultdict
 
-    # Build: species → set of typical months
-    typical_months: dict[str, set[int]] = {}
+    OBS_TYPE = BIRD.Observation
+
+    # ── Pass 1: collect all Observation URIs (direct triple scan, fast) ──
+    obs_nodes: set = set(g.subjects(RDF.type, OBS_TYPE))
+
+    # ── Pass 2: build lookup dicts from observation triples ──
+    obs_date: dict = {}      # obs_uri → date string
+    obs_sci: dict = {}       # obs_uri → scientificName string
+    already_tagged: set = set()
+
+    for obs in obs_nodes:
+        date = g.value(obs, BIRD.observedOn)
+        if date:
+            obs_date[obs] = str(date)
+        sci = g.value(obs, DWC_SCI)
+        if sci:
+            obs_sci[obs] = str(sci).split("(")[0].strip()
+        if g.value(obs, BIRD.atypicalReason) is not None:
+            already_tagged.add(obs)
+
+    # ── Pass 3: species → typical months (from typicallyPresentInMonth) ──
+    # Key by species URI string
+    typical_months: dict[str, set[int]] = defaultdict(set)
     for sp, _, month in g.triples((None, BIRD.typicallyPresentInMonth, None)):
-        typical_months.setdefault(str(sp), set()).add(int(str(month)))
+        typical_months[str(sp)].add(int(str(month)))
 
-    # Build: species → total obs count in Denmark
-    obs_count: dict[str, int] = {}
-    q_count = """
-    PREFIX bird: <https://birdology.org/ontology/>
-    PREFIX dwc: <http://rs.tdwg.org/dwc/terms/>
-    SELECT ?sp (COUNT(?obs) AS ?n) WHERE {
-        ?obs a bird:Observation ;
-             bird:hasSpecies ?sp .
-    }
-    GROUP BY ?sp
-    """
-    # Also accept scientificName-based linking
-    q_count2 = """
-    PREFIX bird: <https://birdology.org/ontology/>
-    PREFIX dwc: <http://rs.tdwg.org/dwc/terms/>
-    SELECT ?sci (COUNT(?obs) AS ?n) WHERE {
-        ?obs a bird:Observation ;
-             dwc:scientificName ?sci .
-    }
-    GROUP BY ?sci
-    """
-    for row in g.query(q_count2):
-        obs_count[str(row.sci)] = int(str(row.n))
+    # ── Pass 4: scientificName → species URI (for month lookup) ──
+    sci_to_sp: dict[str, str] = {}
+    for sp, _, sci_lit in g.triples((None, DWC_SCI, None)):
+        if (sp, RDF.type, BIRD.Species) in g:
+            sci_to_sp[str(sci_lit).split("(")[0].strip()] = str(sp)
 
-    # Find observations with a date and a linked species
-    q_obs = """
-    PREFIX bird: <https://birdology.org/ontology/>
-    PREFIX dwc: <http://rs.tdwg.org/dwc/terms/>
-    SELECT ?obs ?sp ?sci ?date WHERE {
-        ?obs a bird:Observation ;
-             bird:observedOn ?date ;
-             dwc:scientificName ?sci .
-        FILTER NOT EXISTS { ?obs bird:atypicalReason ?any }
-        OPTIONAL { ?sp a bird:Species ; dwc:scientificName ?sci }
-    }
-    """
+    # ── Pass 5: obs count per scientificName ──
+    sci_obs_count: dict[str, int] = defaultdict(int)
+    for obs, sci_val in obs_sci.items():
+        binomial = " ".join(sci_val.split()[:2])
+        sci_obs_count[binomial] += 1
+
+    # ── Pass 6: tag atypical observations ──
     added = 0
-    for row in g.query(q_obs):
-        obs_uri = URIRef(str(row.obs))
-        sci = str(row.sci).split("(")[0].strip()  # strip author from e.g. "Parus major (L.)"
-        date_str = str(row.date)
+    for obs in obs_nodes:
+        if obs in already_tagged:
+            continue
+        date_str = obs_date.get(obs)
+        if not date_str:
+            continue
+        sci = obs_sci.get(obs)
+        if not sci:
+            continue
         try:
             month = int(date_str[5:7])
         except (ValueError, IndexError):
@@ -409,21 +414,22 @@ def _materialise_atypical_observations(g: Graph) -> int:
 
         reasons = []
 
-        # Check out-of-season
-        sp_uri = str(row.sp) if row.sp else None
-        months = typical_months.get(sp_uri, set()) if sp_uri else set()
-        if months and month not in months:
-            typical_str = ", ".join(str(m) for m in sorted(months))
-            reasons.append(f"hors saison (typique: mois {typical_str})")
+        # Out-of-season check
+        sp_uri = sci_to_sp.get(sci) or sci_to_sp.get(" ".join(sci.split()[:2]))
+        if sp_uri:
+            months = typical_months.get(sp_uri, set())
+            if months and month not in months:
+                typical_str = ", ".join(str(m) for m in sorted(months))
+                reasons.append(f"hors saison (typique: mois {typical_str})")
 
-        # Check very rare locally (match on first two words of sciName)
+        # Very rare locally check
         binomial = " ".join(sci.split()[:2])
-        count = obs_count.get(sci, obs_count.get(binomial, 0))
+        count = sci_obs_count.get(binomial, 0)
         if 0 < count < _RARE_LOCAL_THRESHOLD:
             reasons.append(f"très rare localement ({count} obs. au Danemark)")
 
         if reasons:
-            g.add((obs_uri, BIRD.atypicalReason, Literal(" | ".join(reasons), datatype=_XSD.string)))
+            g.add((obs, BIRD.atypicalReason, Literal(" | ".join(reasons), datatype=_XSD.string)))
             added += 1
 
     return added
