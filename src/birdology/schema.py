@@ -134,6 +134,8 @@ def build_schema() -> Graph:
         # Observation fields
         (BIRD.observedOn,         "observedOn",         BIRD.Observation,  XSD.date,
          "ISO 8601 date of the observation."),
+        (BIRD.atypicalReason,     "atypicalReason",     BIRD.Observation,  XSD.string,
+         "Why this observation is considered atypical (e.g. 'out of season', 'very rare locally')."),
         (BIRD.individualCount,    "individualCount",    BIRD.Observation,  XSD.integer,
          "Number of individuals recorded."),
         (BIRD.recordedBy,         "recordedBy",         BIRD.Observation,  XSD.string,

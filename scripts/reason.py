@@ -3,7 +3,7 @@
 Materialise inferred facts for the Birdology knowledge graph
 using parallel Python workers.
 
-Four inference rules are applied:
+Nine inference rules are applied:
 
   1. Transitive parentTaxon closure  (parallelised with ProcessPoolExecutor)
        Species → Genus → Family → Order
@@ -343,6 +343,92 @@ def _materialise_hotspots(g: Graph, threshold: int = _HOTSPOT_THRESHOLD) -> int:
     return added
 
 
+# ── Rule 9: Atypical observations ────────────────────────────────────────────
+
+_RARE_LOCAL_THRESHOLD = 5  # species with fewer obs than this = "very rare locally"
+
+
+def _materialise_atypical_observations(g: Graph) -> int:
+    """Tag observations as atypical when:
+      - species observed outside its typical months (out of season)
+      - species has very few historical observations in Denmark (very rare locally)
+    Adds bird:atypicalReason to the observation node.
+    """
+    from rdflib.namespace import XSD as _XSD
+
+    # Build: species → set of typical months
+    typical_months: dict[str, set[int]] = {}
+    for sp, _, month in g.triples((None, BIRD.typicallyPresentInMonth, None)):
+        typical_months.setdefault(str(sp), set()).add(int(str(month)))
+
+    # Build: species → total obs count in Denmark
+    obs_count: dict[str, int] = {}
+    q_count = """
+    PREFIX bird: <https://birdology.org/ontology/>
+    PREFIX dwc: <http://rs.tdwg.org/dwc/terms/>
+    SELECT ?sp (COUNT(?obs) AS ?n) WHERE {
+        ?obs a bird:Observation ;
+             bird:hasSpecies ?sp .
+    }
+    GROUP BY ?sp
+    """
+    # Also accept scientificName-based linking
+    q_count2 = """
+    PREFIX bird: <https://birdology.org/ontology/>
+    PREFIX dwc: <http://rs.tdwg.org/dwc/terms/>
+    SELECT ?sci (COUNT(?obs) AS ?n) WHERE {
+        ?obs a bird:Observation ;
+             dwc:scientificName ?sci .
+    }
+    GROUP BY ?sci
+    """
+    for row in g.query(q_count2):
+        obs_count[str(row.sci)] = int(str(row.n))
+
+    # Find observations with a date and a linked species
+    q_obs = """
+    PREFIX bird: <https://birdology.org/ontology/>
+    PREFIX dwc: <http://rs.tdwg.org/dwc/terms/>
+    SELECT ?obs ?sp ?sci ?date WHERE {
+        ?obs a bird:Observation ;
+             bird:observedOn ?date ;
+             dwc:scientificName ?sci .
+        FILTER NOT EXISTS { ?obs bird:atypicalReason ?any }
+        OPTIONAL { ?sp a bird:Species ; dwc:scientificName ?sci }
+    }
+    """
+    added = 0
+    for row in g.query(q_obs):
+        obs_uri = URIRef(str(row.obs))
+        sci = str(row.sci).split("(")[0].strip()  # strip author from e.g. "Parus major (L.)"
+        date_str = str(row.date)
+        try:
+            month = int(date_str[5:7])
+        except (ValueError, IndexError):
+            continue
+
+        reasons = []
+
+        # Check out-of-season
+        sp_uri = str(row.sp) if row.sp else None
+        months = typical_months.get(sp_uri, set()) if sp_uri else set()
+        if months and month not in months:
+            typical_str = ", ".join(str(m) for m in sorted(months))
+            reasons.append(f"hors saison (typique: mois {typical_str})")
+
+        # Check very rare locally (match on first two words of sciName)
+        binomial = " ".join(sci.split()[:2])
+        count = obs_count.get(sci, obs_count.get(binomial, 0))
+        if 0 < count < _RARE_LOCAL_THRESHOLD:
+            reasons.append(f"très rare localement ({count} obs. au Danemark)")
+
+        if reasons:
+            g.add((obs_uri, BIRD.atypicalReason, Literal(" | ".join(reasons), datatype=_XSD.string)))
+            added += 1
+
+    return added
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def run_reasoner(input_path: str, output_path: str, n_workers: int) -> None:
@@ -389,7 +475,11 @@ def run_reasoner(input_path: str, output_path: str, n_workers: int) -> None:
     n8 = _materialise_hotspots(g)
     print(f"  +{n8:,} triples")
 
-    total_new = n1 + n2 + n3 + n4 + n5 + n6 + n7 + n8
+    print("Rule 9 — atypical observations…")
+    n9 = _materialise_atypical_observations(g)
+    print(f"  +{n9:,} triples")
+
+    total_new = n1 + n2 + n3 + n4 + n5 + n6 + n7 + n8 + n9
     print(f"\nTotal inferred: +{total_new:,} triples  ({len(g):,} total)")
 
     # ── Report class counts before / after ──────────────────────────────────

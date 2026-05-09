@@ -149,8 +149,11 @@ class WikiRAG:
         """Fetch & index one species. Returns number of new chunks added."""
         col = self._get_collection()
 
+        # Strip author from e.g. "Haematopus ostralegus Linnaeus, 1758" → "Haematopus ostralegus"
+        binomial = " ".join(scientific_name.split()[:2])
+
         # Try scientific name first, then "<common> bird"
-        title = _search_wikipedia_title(scientific_name, lang)
+        title = _search_wikipedia_title(binomial, lang)
         if not title and common_name:
             title = _search_wikipedia_title(f"{common_name} bird", lang)
         if not title:
@@ -164,7 +167,7 @@ class WikiRAG:
         if not chunks:
             return 0
 
-        slug = scientific_name.lower().replace(" ", "_")
+        slug = binomial.lower().replace(" ", "_")
         wiki_url = f"https://{lang}.wikipedia.org/wiki/{title.replace(' ', '_')}"
 
         ids, documents, embeddings, metadatas = [], [], [], []

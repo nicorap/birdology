@@ -314,7 +314,9 @@ Pass the exact name the user gave — do not translate it yourself before search
 historical data and recent eBird observations (updated regularly).
 - Use `live_observations` only when the user asks about what is being seen **right now / today** \
 (the graph may lag by a few hours behind the live eBird feed).
-- Use `search_wikipedia` for behavior, habitat, song, courtship, diet, ecology questions.
+- Use `search_wikipedia` for behavior, habitat, song, courtship, diet, ecology questions. \
+Call it at most once per question — if it returns no results, say the Wikipedia index does not \
+yet cover this species, and answer from your own knowledge if you can, clearly labeling it as such.
 - Use graph tools (`species_by_family`, `currently_present`, etc.) for taxonomy and historical data.
 
 ## Response language

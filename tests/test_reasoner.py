@@ -22,6 +22,7 @@ from reason import (
     _materialise_co_occurrence,
     _materialise_population_trend,
     _materialise_hotspots,
+    _materialise_atypical_observations,
 )
 
 
@@ -337,3 +338,85 @@ def test_hotspot_idempotent():
     n2 = _materialise_hotspots(g, threshold=20)
     assert n1 > 0
     assert n2 == 0
+
+
+# ── Rule 9: atypical observations ─────────────────────────────────────────────
+
+def _atypical_graph(obs_month: int, typical_months: list[int], total_obs: int):
+    """Build a minimal graph with one species and one observation."""
+    g = Graph()
+    sp = TAXON["species/atyptest"]
+    obs = OBS["atyptest_obs"]
+    loc = LOC["atyptest_loc"]
+
+    g.add((sp, RDF.type, BIRD.Species))
+    g.add((sp, DWC.scientificName, Literal("Testus atypicus")))
+    g.add((obs, RDF.type, BIRD.Observation))
+    g.add((obs, DWC.scientificName, Literal("Testus atypicus")))
+    g.add((obs, BIRD.observedOn, Literal(f"2026-{obs_month:02d}-15", datatype=XSD.date)))
+    g.add((obs, BIRD.observedAt, loc))
+    g.add((sp, BIRD.hasObservation, obs))
+    g.add((loc, RDF.type, BIRD.Location))
+
+    for m in typical_months:
+        g.add((sp, BIRD.typicallyPresentInMonth, Literal(m, datatype=XSD.integer)))
+
+    # Add extra observations to simulate total_obs count
+    for i in range(total_obs - 1):
+        extra_obs = OBS[f"atyptest_extra{i}"]
+        g.add((extra_obs, RDF.type, BIRD.Observation))
+        g.add((extra_obs, DWC.scientificName, Literal("Testus atypicus")))
+        g.add((extra_obs, BIRD.observedAt, loc))
+        g.add((extra_obs, BIRD.observedOn, Literal("2025-06-01", datatype=XSD.date)))
+
+    return g, sp, obs
+
+
+class TestAtypicalObservations:
+    def test_out_of_season_tagged(self):
+        # Observed in January, typical months are May-August
+        g, sp, obs = _atypical_graph(obs_month=1, typical_months=[5, 6, 7, 8], total_obs=20)
+        n = _materialise_atypical_observations(g)
+        assert n == 1
+        reasons = list(g.objects(obs, BIRD.atypicalReason))
+        assert len(reasons) == 1
+        assert "hors saison" in str(reasons[0])
+
+    def test_in_season_not_tagged(self):
+        # Observed in June, typical months include June — not atypical
+        g, sp, obs = _atypical_graph(obs_month=6, typical_months=[5, 6, 7, 8], total_obs=20)
+        n = _materialise_atypical_observations(g)
+        assert n == 0
+        assert list(g.objects(obs, BIRD.atypicalReason)) == []
+
+    def test_very_rare_locally_tagged(self):
+        # Only 3 total observations in graph — very rare locally (< 5 threshold)
+        g, sp, obs = _atypical_graph(obs_month=6, typical_months=[6], total_obs=3)
+        n = _materialise_atypical_observations(g)
+        # At least the target obs is tagged (extra obs may also be tagged)
+        assert n >= 1
+        reasons = list(g.objects(obs, BIRD.atypicalReason))
+        assert len(reasons) == 1
+        assert "rare" in str(reasons[0])
+
+    def test_both_reasons_combined(self):
+        # Out of season AND very rare locally
+        g, sp, obs = _atypical_graph(obs_month=1, typical_months=[5, 6, 7, 8], total_obs=3)
+        n = _materialise_atypical_observations(g)
+        assert n >= 1
+        reason = str(list(g.objects(obs, BIRD.atypicalReason))[0])
+        assert "hors saison" in reason
+        assert "rare" in reason
+
+    def test_no_typical_months_not_tagged(self):
+        # No typicallyPresentInMonth data → can't be out of season
+        g, sp, obs = _atypical_graph(obs_month=1, typical_months=[], total_obs=20)
+        n = _materialise_atypical_observations(g)
+        assert n == 0
+
+    def test_idempotent(self):
+        g, sp, obs = _atypical_graph(obs_month=1, typical_months=[5, 6, 7, 8], total_obs=20)
+        n1 = _materialise_atypical_observations(g)
+        n2 = _materialise_atypical_observations(g)
+        assert n1 == 1
+        assert n2 == 0

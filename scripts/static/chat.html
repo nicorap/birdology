@@ -657,12 +657,17 @@ fetch('/api/observations').then(function(r) { return r.json(); }).then(function(
   var batch = [];
   obs.forEach(function(o) {
     var name = o.commonName || o.scientificName;
+    var isAtypical = o.atypical && o.atypical.length > 0;
     var popup = '<b>' + escapeHtml(name) + '</b>'
       + (o.scientificName ? '<br><em>' + escapeHtml(o.scientificName) + '</em>' : '')
       + (o.locality ? '<br>' + escapeHtml(o.locality) : '')
       + (o.date ? '<br><small>' + escapeHtml(o.date) + '</small>' : '')
+      + (isAtypical ? '<br><span style="color:#f9a825">⚠ ' + escapeHtml(o.atypical) + '</span>' : '')
       + '<br><a href="#" onclick="askAbout(\'' + escapeAttr(name) + '\');return false;">Demander au chat</a>';
-    var m = L.circleMarker([o.lat, o.lon], { radius: 4, color: '#7dcea0', weight: 1, fillColor: '#2d5a3d', fillOpacity: 0.7 });
+    var color = isAtypical ? '#f9a825' : '#7dcea0';
+    var fill  = isAtypical ? '#c47a00' : '#2d5a3d';
+    var radius = isAtypical ? 6 : 4;
+    var m = L.circleMarker([o.lat, o.lon], { radius: radius, color: color, weight: isAtypical ? 2 : 1, fillColor: fill, fillOpacity: 0.8 });
     m.bindPopup(popup);
     batch.push(m);
   });

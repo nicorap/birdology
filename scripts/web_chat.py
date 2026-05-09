@@ -138,7 +138,7 @@ def api_chat():
 
     tool_calls_log = []
     thumbnails_seen = []  # collect thumbnail URLs from tool results
-    max_rounds = 5
+    max_rounds = 8
 
     try:
         for _ in range(max_rounds):
@@ -237,6 +237,7 @@ def api_observations():
                 "date": r.get("date", ""),
                 "locality": r.get("locality", ""),
                 "count": r.get("count", ""),
+                "atypical": r.get("atypicalReason", ""),
             })
         _PANEL_CACHE["observations"] = out
     return jsonify(_PANEL_CACHE["observations"])

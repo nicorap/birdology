@@ -488,7 +488,7 @@ def observations_for_map(
         _PREFIXES
         + f"""
 SELECT ?species ?scientificName ?commonNameEn ?commonNameDa ?commonNameFr ?status
-       ?lat ?lon ?date ?count ?locality
+       ?lat ?lon ?date ?count ?locality ?atypicalReason
 WHERE {{
     ?species a bird:Species ;
              dwc:scientificName ?scientificName ;
@@ -501,9 +501,10 @@ WHERE {{
     OPTIONAL {{ ?species bird:commonNameDa      ?commonNameDa }}
     OPTIONAL {{ ?species bird:commonNameFr      ?commonNameFr }}
     OPTIONAL {{ ?species bird:conservationStatus ?status }}
-    OPTIONAL {{ ?obs bird:observedOn      ?date }}
-    OPTIONAL {{ ?obs bird:individualCount ?count }}
-    OPTIONAL {{ ?loc bird:locality        ?locality }}
+    OPTIONAL {{ ?obs bird:observedOn            ?date }}
+    OPTIONAL {{ ?obs bird:individualCount       ?count }}
+    OPTIONAL {{ ?loc bird:locality              ?locality }}
+    OPTIONAL {{ ?obs bird:atypicalReason        ?atypicalReason }}
     {family_clause}
     {order_clause}
 }}
