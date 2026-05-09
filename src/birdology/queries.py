@@ -208,13 +208,19 @@ ORDER BY ?family ?scientificName
 
 
 def recent_danish_observations(
-    g: Graph | ConjunctiveGraph, species_name: str | None = None
+    g: Graph | ConjunctiveGraph,
+    species_name: str | None = None,
+    ebird_only: bool = False,
 ) -> list[dict]:
     """
-    List DOFbasen observations, optionally filtered by species name.
+    List Danish observations from the graph, optionally filtered by species name.
 
-    Returns rows sorted by date descending.
+    If ebird_only=True, only returns observations that came from the eBird API
+    (i.e. have bird:eBirdCode on the observation node — typically last 30 days).
+    Otherwise returns all observations (DOF + eBird), sorted by date descending.
     """
+    ebird_filter = "FILTER EXISTS { ?obs bird:eBirdCode ?any }" if ebird_only else ""
+
     if species_name:
         # Step 1: find matching species URIs (cheap — no observation join).
         name_filter = _sparql_name_filter(
@@ -256,6 +262,7 @@ WHERE {{
     {values}
     ?species bird:hasObservation ?obs .
     ?obs bird:observedOn ?date .
+    {ebird_filter}
     OPTIONAL {{ ?obs bird:individualCount ?count }}
     OPTIONAL {{
         ?obs bird:observedAt ?loc .
@@ -285,6 +292,7 @@ WHERE {{
              bird:hasObservation ?obs .
     {_CANONICAL_SPECIES}
     ?obs bird:observedOn ?date .
+    {ebird_filter}
     OPTIONAL {{ ?obs bird:individualCount ?count }}
     OPTIONAL {{
         ?obs bird:observedAt ?loc .

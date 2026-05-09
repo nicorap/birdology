@@ -125,9 +125,9 @@ TOOLS_OPENAI = [
         "function": {
             "name": "recent_observations",
             "description": (
-                "List recent bird observations from DOFbasen (Danish field observations), "
-                "sorted by date descending. Optionally filter by species name (any language). "
-                "Returns date, locality, GPS, and individual count."
+                "List recent bird observations from the graph (DOF historical + eBird last 30 days), "
+                "sorted by date descending. Optionally filter by species name (any language) "
+                "and/or source. Returns date, locality, GPS, and individual count."
             ),
             "parameters": {
                 "type": "object",
@@ -137,6 +137,14 @@ TOOLS_OPENAI = [
                         "description": (
                             "Optional species name filter (English, Danish, French, or scientific). "
                             "Omit to get all recent observations."
+                        ),
+                    },
+                    "source": {
+                        "type": "string",
+                        "enum": ["all", "ebird", "dof"],
+                        "description": (
+                            "Filter by data source: 'ebird' = only eBird observations (last 30 days), "
+                            "'dof' = only DOFbasen historical data, 'all' = both (default)."
                         ),
                     },
                 },
@@ -376,10 +384,12 @@ Never guess the scientific name or English name from memory — always verify vi
 - The `find_species` tool accepts French, Danish, English, and scientific names. \
 Pass the exact name the user gave — do not translate it yourself before searching.
 - If `find_species` returns no match, say so. Do NOT substitute a different species.
-- For questions about observations, use `recent_observations` — the graph contains both DOF \
-historical data and recent eBird observations (updated regularly).
+- For questions about observations, use `recent_observations`. \
+Pass `source="ebird"` when the user asks about recent/last days/this week observations \
+(eBird data = last 30 days stored in the graph). \
+Pass `source="dof"` for historical DOF data. Default `source="all"` for both.
 - Use `live_observations` only when the user asks about what is being seen **right now / today** \
-(the graph may lag by a few hours behind the live eBird feed).
+(real-time eBird feed, may have observations from the last few hours).
 - Use `search_wikipedia` for behavior, habitat, song, courtship, diet, ecology questions. \
 Call it at most once per question — if it returns no results, say the Wikipedia index does not \
 yet cover this species, and answer from your own knowledge if you can, clearly labeling it as such.
@@ -442,7 +452,8 @@ def _run_tool(name: str, inputs: dict, graph) -> str:
         return _fmt(species_by_order(graph, inputs["order"]))
 
     if name == "recent_observations":
-        return _fmt(recent_danish_observations(graph, inputs.get("species")))
+        ebird_only = inputs.get("source", "all") == "ebird"
+        return _fmt(recent_danish_observations(graph, inputs.get("species"), ebird_only=ebird_only))
 
     if name == "nearby_birds":
         kwargs: dict = {}

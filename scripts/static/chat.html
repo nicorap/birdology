@@ -390,8 +390,6 @@
 </header>
 
 <div id="chat-column">
-  <div id="weekend-panel"></div>
-
   <div id="chat-container">
     <div class="welcome">
       <h2>Birdology Graph-RAG</h2>
@@ -957,80 +955,13 @@ document.getElementById('spots-refresh-btn').addEventListener('click', loadSpots
 // Auto-load after geolocation resolves (or immediately if already set)
 setTimeout(loadSpots, 800);
 
-// ── Weekend suggestions (header button — kept for mobile overlay) ─────────
-var weekendBtn = document.getElementById('weekend-btn');
-var weekendPanel = document.getElementById('weekend-panel');
-
-weekendBtn.addEventListener('click', function() {
-  if (weekendPanel.classList.contains('visible')) {
-    weekendPanel.classList.remove('visible');
-    return;
-  }
-  weekendBtn.disabled = true;
-  weekendPanel.innerHTML = '<h2>Chargement...</h2>';
-  weekendPanel.classList.add('visible');
-
-  var url = '/api/weekend';
-  if (userLat !== null) url += '?lat=' + userLat + '&lon=' + userLon;
-
-  fetch(url)
-    .then(function(res) { return res.json(); })
-    .then(function(data) { renderWeekend(data); })
-    .catch(function(err) {
-      weekendPanel.innerHTML = '<h2>Erreur</h2><p>' + err.message + '</p>'
-        + '<button class="weekend-close" onclick="document.getElementById(\'weekend-panel\').classList.remove(\'visible\')">Fermer</button>';
-    })
-    .finally(function() { weekendBtn.disabled = false; });
+// ── Weekend button → pre-fill chat ───────────────────────────────────────
+document.getElementById('weekend-btn').addEventListener('click', function() {
+  userInput.value = 'Où observer ce week-end près de Copenhague ?';
+  userInput.dispatchEvent(new Event('input'));
+  doSend();
 });
 
-function renderWeekend(data) {
-  var spots = data.spots || [];
-  var month = data.month || new Date().getMonth() + 1;
-
-  var html = '<button class="weekend-close" id="weekend-close-btn">Fermer</button>';
-  html += '<h2>Quoi observer en ' + monthNames[month] + ' ?</h2>';
-
-  if (!spots.length) {
-    html += '<p style="color:#888">Pas assez de donnees. Lancez <code>python scripts/reason.py</code> pour enrichir le graphe.</p>';
-    weekendPanel.innerHTML = html;
-    document.getElementById('weekend-close-btn').addEventListener('click', function() {
-      weekendPanel.classList.remove('visible');
-    });
-    return;
-  }
-
-  spots.forEach(function(spot) {
-    var name = spot.locality || (spot.lat.toFixed(2) + ', ' + spot.lon.toFixed(2));
-    html += '<div class="weekend-spot">';
-    html += '<h3>' + name + '</h3>';
-    html += '<div class="spot-meta">' + spot.dist_km + ' km · ' + spot.obs_count + ' observations</div>';
-    if (spot.species && spot.species.length) {
-      html += '<div class="weekend-species">';
-      spot.species.forEach(function(sp) {
-        var displayName = sp.commonNameFr || sp.commonNameEn || sp.scientificName;
-        var mig = sp.migrationStatus;
-        var icon = migIcons[mig] || '';
-        var title = migLabels[mig] || '';
-        var iucn = sp.conservationStatus;
-        html += '<div class="species-chip" title="' + sp.scientificName + (title ? ' — ' + title : '') + '">';
-        if (sp.thumbnail) html += '<img src="' + sp.thumbnail + '" alt="">';
-        if (icon) html += '<span class="mig-icon">' + icon + '</span>';
-        html += '<span>' + displayName + '</span>';
-        if (iucn && iucn !== 'LC') html += ' <span class="iucn-badge iucn-' + iucn + '">' + iucn + '</span>';
-        html += '</div>';
-      });
-      html += '</div>';
-    } else {
-      html += '<div style="color:#888;font-size:11px;font-style:italic">Pas de donnees de presence mensuelle</div>';
-    }
-    html += '</div>';
-  });
-
-  weekendPanel.innerHTML = html;
-  document.getElementById('weekend-close-btn').addEventListener('click', function() {
-    weekendPanel.classList.remove('visible');
-  });
-}
 
 userInput.focus();
 </script>
