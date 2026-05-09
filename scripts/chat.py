@@ -30,8 +30,10 @@ from birdology.queries import (
     currently_present,
     find_species_by_name,
     nearby_watch,
+    observations_by_month,
     recent_danish_observations,
     species_by_family,
+    where_to_watch,
     species_by_order,
     taxonomy_summary,
 )
@@ -218,6 +220,67 @@ TOOLS_OPENAI = [
     {
         "type": "function",
         "function": {
+            "name": "observations_by_month",
+            "description": (
+                "Return bird species historically observed in Denmark during a specific month, "
+                "based on DOF data. Use this for questions like 'quels oiseaux en mars ?', "
+                "'which birds can I see in winter ?', 'oiseaux de printemps'. "
+                "Returns species sorted by observation count with migration status."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "month": {
+                        "type": "integer",
+                        "description": "Month number (1=January, 12=December)",
+                    },
+                    "species_name": {
+                        "type": "string",
+                        "description": "Optional: filter by species name to check if it's present in that month",
+                    },
+                },
+                "required": ["month"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "where_to_watch",
+            "description": (
+                "Return the best birdwatching hotspots near given coordinates, with the species "
+                "expected to be present in a given month. Use this for questions like "
+                "'où observer demain ?', 'où aller observer ce week-end ?', "
+                "'meilleurs endroits pour observer des oiseaux près de Copenhague'. "
+                "Returns top hotspots with distance and list of expected species."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "month": {
+                        "type": "integer",
+                        "description": "Month number (1-12). Defaults to current month.",
+                    },
+                    "lat": {
+                        "type": "number",
+                        "description": "Latitude of the search center (default: Copenhagen 55.676)",
+                    },
+                    "lon": {
+                        "type": "number",
+                        "description": "Longitude of the search center (default: Copenhagen 12.568)",
+                    },
+                    "radius_km": {
+                        "type": "number",
+                        "description": "Search radius in km (default: 30)",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "taxonomy_summary",
             "description": (
                 "Return overall statistics for the knowledge graph: number of orders, families, "
@@ -320,6 +383,10 @@ historical data and recent eBird observations (updated regularly).
 - Use `search_wikipedia` for behavior, habitat, song, courtship, diet, ecology questions. \
 Call it at most once per question — if it returns no results, say the Wikipedia index does not \
 yet cover this species, and answer from your own knowledge if you can, clearly labeling it as such.
+- Use `observations_by_month` for questions about which birds are present in a specific month \
+("oiseaux en mars", "birds in winter", etc.).
+- Use `where_to_watch` for questions about where to go birdwatching ("où observer demain ?", \
+"meilleurs endroits près de Copenhague"). Pass `month` and coordinates if the user provides them.
 - Use graph tools (`species_by_family`, `currently_present`, etc.) for taxonomy and historical data.
 
 ## Response language
@@ -411,7 +478,24 @@ def _run_tool(name: str, inputs: dict, graph) -> str:
             }
             for r in raw
         ]
-        return _fmt(results, limit=40)
+        return _fmt(results, limit=15)
+
+    if name == "observations_by_month":
+        month = int(inputs["month"])
+        species_name = inputs.get("species_name")
+        return _fmt(observations_by_month(graph, month, species_name))
+
+    if name == "where_to_watch":
+        kwargs: dict = {}
+        if "month" in inputs:
+            kwargs["month"] = int(inputs["month"])
+        if "lat" in inputs:
+            kwargs["lat"] = float(inputs["lat"])
+        if "lon" in inputs:
+            kwargs["lon"] = float(inputs["lon"])
+        if "radius_km" in inputs:
+            kwargs["radius_km"] = float(inputs["radius_km"])
+        return _fmt(where_to_watch(graph, **kwargs), limit=10)
 
     if name == "taxonomy_summary":
         return json.dumps(taxonomy_summary(graph), ensure_ascii=False, indent=2)

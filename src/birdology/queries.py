@@ -523,6 +523,178 @@ ORDER BY ?scientificName DESC(?date)
     return rows
 
 
+def observations_by_month(
+    g: Graph | ConjunctiveGraph,
+    month: int,
+    species_name: str | None = None,
+) -> list[dict]:
+    """Historical DOF observations for a given month (1-12), optionally filtered by species.
+
+    Returns rows with: scientificName, commonNameFr, commonNameDa, commonNameEn,
+    migrationStatus, conservationStatus, observationCount, latestDate, locality.
+    Sorted by observation count descending.
+    """
+    import datetime
+
+    species_clause = ""
+    if species_name:
+        name_filter = _sparql_name_filter(
+            "?scientificName", "?commonNameEn", "?commonNameDa", "?commonNameFr",
+            query=species_name,
+        )
+        species_clause = name_filter
+
+    q = (
+        _PREFIXES
+        + f"""
+SELECT ?species ?scientificName ?commonNameFr ?commonNameDa ?commonNameEn
+       ?migStatus ?status (COUNT(?obs) AS ?obsCount) (MAX(?date) AS ?latestDate)
+WHERE {{
+    ?species a bird:Species ;
+             dwc:scientificName ?scientificName ;
+             bird:hasObservation ?obs .
+    {_CANONICAL_SPECIES}
+    ?obs bird:observedOn ?date .
+    FILTER(MONTH(?date) = {month})
+    OPTIONAL {{ ?species bird:commonNameFr      ?commonNameFr }}
+    OPTIONAL {{ ?species bird:commonNameDa      ?commonNameDa }}
+    OPTIONAL {{ ?species bird:commonNameEn      ?commonNameEn }}
+    OPTIONAL {{ ?species bird:migrationStatus   ?migStatus }}
+    OPTIONAL {{ ?species bird:conservationStatus ?status }}
+    {species_clause}
+}}
+GROUP BY ?species ?scientificName ?commonNameFr ?commonNameDa ?commonNameEn ?migStatus ?status
+ORDER BY DESC(?obsCount)
+"""
+    )
+    rows = _rows(g.query(q))
+    for r in rows:
+        r["observationCount"] = r.pop("obsCount", r.get("observationCount", 0))
+    return rows
+
+
+def where_to_watch(
+    g: Graph | ConjunctiveGraph,
+    month: int | None = None,
+    lat: float = ASSISTENS_LAT,
+    lon: float = ASSISTENS_LON,
+    radius_km: float = 30.0,
+    top_n: int = 5,
+) -> list[dict]:
+    """Return the best birdwatching hotspots within *radius_km*, with species expected in *month*.
+
+    Combines bird:isHotspot locations (from reasoner Rule 8) with currently_present(month)
+    to show what you can expect to see at each location.
+
+    Returns list of dicts: locality, lat, lon, dist_km, obsCount, expectedSpecies (list).
+    """
+    import datetime
+    if month is None:
+        month = datetime.date.today().month
+
+    # Step 1: hotspot locations within radius
+    dlat = radius_km / 111.0
+    dlon = radius_km / (111.0 * math.cos(math.radians(lat)))
+    lat_min, lat_max = lat - dlat, lat + dlat
+    lon_min, lon_max = lon - dlon, lon + dlon
+
+    q_hotspots = (
+        _PREFIXES
+        + f"""
+SELECT ?loc ?locality ?lat ?lon ?obsCount WHERE {{
+    ?loc a bird:Location ;
+         bird:isHotspot true ;
+         bird:latitude  ?lat ;
+         bird:longitude ?lon .
+    OPTIONAL {{ ?loc bird:locality        ?locality }}
+    OPTIONAL {{ ?loc bird:observationCount ?obsCount }}
+    FILTER ( xsd:decimal(?lat) >= {lat_min} && xsd:decimal(?lat) <= {lat_max} &&
+             xsd:decimal(?lon) >= {lon_min} && xsd:decimal(?lon) <= {lon_max} )
+}}
+"""
+    )
+    hotspot_rows = _rows(g.query(q_hotspots))
+
+    # Haversine filter + sort by distance
+    spots = []
+    for h in hotspot_rows:
+        try:
+            hlat, hlon = float(str(h.get("lat", 0))), float(str(h.get("lon", 0)))
+        except (TypeError, ValueError):
+            continue
+        dist = _haversine_km(lat, lon, hlat, hlon)
+        if dist > radius_km:
+            continue
+        spots.append({
+            "locality": h.get("locality", f"{hlat:.3f},{hlon:.3f}"),
+            "lat": hlat,
+            "lon": hlon,
+            "dist_km": round(dist, 1),
+            "obsCount": int(str(h.get("obsCount", 0) or 0)),
+            "loc_uri": h.get("loc", ""),
+        })
+    spots.sort(key=lambda s: s["dist_km"])
+    spots = spots[:top_n]
+
+    if not spots:
+        return []
+
+    # Step 2: species expected in month (from typicallyPresentInMonth)
+    expected = currently_present(g, month)
+    # Index expected species by URI
+    expected_set = {r["species"] for r in expected}
+
+    # Step 3: for each hotspot, find species observed there that are also expected this month
+    loc_uris = [s["loc_uri"] for s in spots if s["loc_uri"]]
+    if loc_uris:
+        values = "VALUES ?loc { " + " ".join(f"<{uri}>" for uri in loc_uris) + " }"
+        q_sp = (
+            _PREFIXES
+            + f"""
+SELECT DISTINCT ?loc ?species ?scientificName ?commonNameFr ?commonNameEn ?migStatus WHERE {{
+    {values}
+    ?species a bird:Species ;
+             dwc:scientificName ?scientificName ;
+             bird:hasObservation ?obs .
+    {_CANONICAL_SPECIES}
+    ?obs bird:observedAt ?loc .
+    OPTIONAL {{ ?species bird:commonNameFr    ?commonNameFr }}
+    OPTIONAL {{ ?species bird:commonNameEn    ?commonNameEn }}
+    OPTIONAL {{ ?species bird:migrationStatus ?migStatus }}
+}}
+"""
+        )
+        sp_rows = _rows(g.query(q_sp))
+        # Group by location URI
+        loc_species: dict[str, list[dict]] = {}
+        for r in sp_rows:
+            loc_uri = r.get("loc", "")
+            if r.get("species", "") in expected_set:
+                loc_species.setdefault(loc_uri, []).append(r)
+
+        for spot in spots:
+            sp_list = loc_species.get(spot["loc_uri"], [])
+            sp_list.sort(key=lambda r: (_IUCN_RANK.get(r.get("status", ""), 999), r.get("scientificName", "")))
+            spot["expectedSpecies"] = [
+                {
+                    "scientificName": r.get("scientificName", ""),
+                    "commonNameFr": r.get("commonNameFr", ""),
+                    "commonNameEn": r.get("commonNameEn", ""),
+                    "migrationStatus": r.get("migStatus", ""),
+                }
+                for r in sp_list[:10]
+            ]
+    else:
+        for spot in spots:
+            spot["expectedSpecies"] = []
+
+    # Clean up internal field
+    for spot in spots:
+        spot.pop("loc_uri", None)
+
+    return spots
+
+
 def taxonomy_summary(g: Graph | ConjunctiveGraph) -> dict:
     """Return counts of Orders, Families, Genera, Species, and Observations."""
     counts = {}
