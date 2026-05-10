@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sqlite3
 import sys
 import threading
@@ -153,6 +154,22 @@ def _extract_thumbnails(tool_result: str, out: list) -> None:
                 out.append((name, thumb))
 
 
+_IMG_RE = re.compile(r'!\[([^\]]*)\]\(([^)]+)\)')
+
+
+def _strip_hallucinated_images(text: str, allowed_urls: set) -> str:
+    """Remove markdown images whose URL was not returned by a tool.
+
+    Only URLs that appear literally in tool results (via thumbnails_seen) are
+    allowed through. Everything else — URLs invented by the LLM from memory —
+    is silently removed.
+    """
+    return _IMG_RE.sub(
+        lambda m: m.group(0) if m.group(2) in allowed_urls else "",
+        text,
+    )
+
+
 @app.route("/")
 def index():
     html = (STATIC_DIR / "chat.html").read_text(encoding="utf-8")
@@ -212,9 +229,12 @@ def api_chat():
 
             if not msg.tool_calls:
                 answer = msg.content or ""
+                # Strip any image the LLM invented — only tool-returned URLs allowed
+                allowed_urls = {url for _, url in thumbnails_seen}
+                answer = _strip_hallucinated_images(answer, allowed_urls)
                 # Append photo gallery only for thumbnails NOT already in the answer
                 if thumbnails_seen:
-                    already = answer  # check against raw answer text
+                    already = answer
                     new_thumbs = [
                         (name, url) for name, url in thumbnails_seen[:4]
                         if url not in already
@@ -340,6 +360,9 @@ def api_chat_stream():
                     # We already have the full text (non-streaming call), so we
                     # split and pace it to feel natural in the UI.
                     text = msg.content or ""
+                    # Strip any image the LLM invented — only tool-returned URLs allowed
+                    allowed_urls = {url for _, url in thumbnails_seen}
+                    text = _strip_hallucinated_images(text, allowed_urls)
                     if thumbnails_seen:
                         gallery = "\n\n"
                         for tname, url in thumbnails_seen[:4]:
