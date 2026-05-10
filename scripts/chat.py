@@ -298,6 +298,32 @@ TOOLS_OPENAI = [
     {
         "type": "function",
         "function": {
+            "name": "compare_seasonal",
+            "description": (
+                "Compare what is being seen RIGHT NOW in Denmark (live eBird) against what is "
+                "historically expected for the current month (DOF graph data). "
+                "Returns three structured lists: species seen this week that are unexpected for "
+                "the month (potential rarities), species expected for the month that are absent "
+                "from live data, and species present in both (normal). "
+                "Use this tool — instead of calling live_observations and observations_by_month "
+                "separately — whenever the user asks what can be seen 'right now', 'this week', "
+                "'en ce moment', 'cette semaine', or 'actuellement'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "days": {
+                        "type": "integer",
+                        "description": "Days back for live eBird data (1-14, default: 7)",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "taxonomy_summary",
             "description": (
                 "Return overall statistics for the knowledge graph: number of orders, families, "
@@ -409,14 +435,13 @@ Pass `source="ebird"` when the user asks about recent/last days/this week observ
 Pass `source="dof"` for historical DOF data. Default `source="all"` for both. \
 **When the user mentions a place name** (e.g. "Brøndby Strand", "Utterslev Mose"), pass it as \
 `locality` — NEVER as `species`. Location names are never species names.
-- Use `live_observations` when the user asks about what is being seen **right now / today / \
-cette semaine**, OR when following up on a species mentioned in a live context (e.g. "pas \
-d'aigle royal ?" after a live dashboard mention → use `live_observations`, not \
-`recent_observations`).
-- **When the user asks what can be seen "right now / this week / currently"**, call BOTH \
-`live_observations` AND `observations_by_month` (for the current month). Compare the two: \
-mention species that appear in live data but are unusual for the month (potential rarities), \
-and species expected for the month that are absent from live data.
+- **Use `compare_seasonal`** when the user asks what can be seen **right now / this week / \
+en ce moment / cette semaine / actuellement**. It returns a structured diff: unexpected \
+species (live but not historical → potential rarities), expected-but-absent species \
+(historical but not in live), and normal species (both). Report only what the tool returns — \
+do NOT add species from memory.
+- Use `live_observations` only when following up on a specific species in a live context \
+(e.g. "pas d'aigle royal ?" after a live mention → `live_observations`, not `recent_observations`).
 - **ALWAYS call `search_wikipedia`** when the user asks about behavior, habitat, song, \
 courtship, diet, or ecology of a specific species — even if you already called `find_species`. \
 Call it at most once per question — if it returns no results, say the Wikipedia index does not \
@@ -433,12 +458,12 @@ Answer in the user's language. Include scientific name + Danish name when releva
 ## Examples of correct responses
 
 **User:** "Qu'est-ce qu'on peut voir en ce moment au Danemark ?"
-→ tools: live_observations({"days": 7}), observations_by_month({"month": 5})
+→ tool: compare_seasonal({"days": 7})
 → Correct response:
-"Voici ce qui est observé cette semaine (eBird live) et ce qui est attendu en mai (DOF) :
-**Live cette semaine :** Fauvette à tête noire, Hirondelle rustique, Coucou gris…
-**Attendus en mai mais absents du live :** Bécassine des marais, Martinet noir.
-**Inattendus pour mai :** Aigle royal (1 obs — potentiellement atypique)."
+"Voici le bilan de cette semaine au Danemark (source: eBird live + DOF mai) :
+**Inattendus pour mai (raretés potentielles) :** [liste exacte du champ unexpected_in_live]
+**Attendus mais absents cette semaine :** [liste exacte du champ expected_but_absent]
+**Présents normalement :** [liste exacte du champ normal_present]"
 
 **User:** "Quelles observations dans les 30 derniers jours ?"
 → tool: live_observations({"days": 30})
@@ -531,6 +556,52 @@ def _run_tool(name: str, inputs: dict, graph) -> str:
             for r in raw
         ]
         return _fmt(results, limit=15)
+
+    if name == "compare_seasonal":
+        import datetime as _dt
+        api_key = os.getenv("EBIRD_API_KEY", "")
+        if not api_key:
+            return "Error: EBIRD_API_KEY not set — cannot query eBird live API."
+        days = min(max(int(inputs.get("days", 7)), 1), 14)
+        month = _dt.date.today().month
+        # Fetch live data
+        try:
+            raw_live = fetch_recent_denmark(api_key, days=days)
+        except Exception as e:
+            return f"eBird API error: {e}"
+        live_sci = {r["sciName"] for r in raw_live if r.get("sciName")}
+        live_by_sci = {}
+        for r in raw_live:
+            sci = r.get("sciName", "")
+            if sci and sci not in live_by_sci:
+                live_by_sci[sci] = {
+                    "species": r.get("comName", ""),
+                    "sciName": sci,
+                    "location": r.get("locName", ""),
+                    "date": r.get("obsDt", ""),
+                    "count": r.get("howMany", "X"),
+                }
+        # Fetch historical monthly data
+        historical = observations_by_month(graph, month)
+        hist_sci = {r["sciName"] for r in historical if r.get("sciName")}
+        # Compute diff
+        unexpected = [live_by_sci[s] for s in live_sci - hist_sci if s in live_by_sci]
+        absent = [
+            {"species": r["species"], "sciName": r["sciName"],
+             "migrationStatus": r.get("migrationStatus", ""), "obsCount": r.get("obsCount", 0)}
+            for r in historical if r.get("sciName") and r["sciName"] not in live_sci
+        ][:20]
+        normal = [live_by_sci[s] for s in live_sci & hist_sci if s in live_by_sci]
+        result = {
+            "month": month,
+            "days_checked": days,
+            "live_species_count": len(live_sci),
+            "historical_species_count": len(hist_sci),
+            "unexpected_in_live": unexpected,        # in live, not in history → potential rarities
+            "expected_but_absent": absent,           # in history, not in live → missing this week
+            "normal_present": normal[:20],           # in both → business as usual
+        }
+        return json.dumps(result, ensure_ascii=False, indent=2)
 
     if name == "observations_by_month":
         month = int(inputs["month"])
