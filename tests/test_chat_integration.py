@@ -194,6 +194,28 @@ class TestToolRouting:
             assert date_from.startswith(expected_prefix), \
                 f"date_from should start with {expected_prefix}, got {date_from}"
 
+    def test_date_filter_last_winter(self):
+        """'l'hiver dernier à Skagen' → recent_observations with date_from=2025-12-01, date_to=2026-02-28."""
+        data = _chat("observations l'hiver dernier à Skagen ?", "int_winter1")
+        tools = _tool_names(data)
+        assert "recent_observations" in tools, f"Expected recent_observations, got: {tools}"
+        args = _tool_args(data, "recent_observations")
+        assert args.get("date_from") == "2025-12-01", \
+            f"Expected date_from=2025-12-01, got {args.get('date_from')}"
+        assert args.get("date_to") in ("2026-02-28", "2026-03-01"), \
+            f"Expected date_to=2026-02-28, got {args.get('date_to')}"
+        assert args.get("locality"), f"Expected locality param, got args: {args}"
+
+    def test_rare_species_uses_nearby_birds(self):
+        """'espèces rares près de Copenhague' → nearby_birds called."""
+        data = _chat("espèces rares près de Copenhague ?", "int_rare1")
+        tools = _tool_names(data)
+        assert "nearby_birds" in tools, \
+            f"Expected nearby_birds, got: {tools}"
+        args = _tool_args(data, "nearby_birds")
+        assert args.get("lat") is not None, f"Expected lat param, got args: {args}"
+        assert args.get("lon") is not None, f"Expected lon param, got args: {args}"
+
 
 # ── Anti-hallucination tests ──────────────────────────────────────────────────
 
