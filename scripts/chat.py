@@ -408,6 +408,10 @@ Pass `source="dof"` for historical DOF data. Default `source="all"` for both. \
 cette semaine**, OR when following up on a species mentioned in a live context (e.g. "pas \
 d'aigle royal ?" after a live dashboard mention → use `live_observations`, not \
 `recent_observations`).
+- **When the user asks what can be seen "right now / this week / currently"**, call BOTH \
+`live_observations` AND `observations_by_month` (for the current month). Compare the two: \
+mention species that appear in live data but are unusual for the month (potential rarities), \
+and species expected for the month that are absent from live data.
 - **ALWAYS call `search_wikipedia`** when the user asks about behavior, habitat, song, \
 courtship, diet, or ecology of a specific species — even if you already called `find_species`. \
 Call it at most once per question — if it returns no results, say the Wikipedia index does not \
@@ -422,6 +426,14 @@ yet cover this species, and answer from your own knowledge if you can, clearly l
 Answer in the user's language. Include scientific name + Danish name when relevant.
 
 ## Examples of correct responses
+
+**User:** "Qu'est-ce qu'on peut voir en ce moment au Danemark ?"
+→ tools: live_observations({"days": 7}), observations_by_month({"month": 5})
+→ Correct response:
+"Voici ce qui est observé cette semaine (eBird live) et ce qui est attendu en mai (DOF) :
+**Live cette semaine :** Fauvette à tête noire, Hirondelle rustique, Coucou gris…
+**Attendus en mai mais absents du live :** Bécassine des marais, Martinet noir.
+**Inattendus pour mai :** Aigle royal (1 obs — potentiellement atypique)."
 
 **User:** "Quelles observations dans les 30 derniers jours ?"
 → tool: live_observations({"days": 30})

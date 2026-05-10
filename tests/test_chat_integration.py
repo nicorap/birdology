@@ -144,6 +144,26 @@ class TestToolRouting:
         assert len(wiki_calls) <= 1, \
             f"search_wikipedia called {len(wiki_calls)} times, expected at most 1"
 
+    def test_currently_visible_calls_both_live_and_monthly(self):
+        """'qu'est-ce qu'on voit en ce moment' → live_observations + observations_by_month."""
+        data = _chat("qu'est-ce qu'on peut voir en ce moment au Danemark ?", "int_cross1")
+        tools = _tool_names(data)
+        assert "live_observations" in tools or "recent_observations" in tools, \
+            f"Expected live/recent observations tool, got: {tools}"
+        assert "observations_by_month" in tools, \
+            f"Expected observations_by_month alongside live data, got: {tools}"
+
+    def test_currently_visible_month_matches_today(self):
+        """observations_by_month should use the current month when asked about 'right now'."""
+        import datetime
+        data = _chat("quelles espèces sont présentes cette semaine ?", "int_cross2")
+        if "observations_by_month" in _tool_names(data):
+            args = _tool_args(data, "observations_by_month")
+            month = args.get("month")
+            if month is not None:
+                assert month == datetime.date.today().month, \
+                    f"Expected current month {datetime.date.today().month}, got {month}"
+
 
 # ── Anti-hallucination tests ──────────────────────────────────────────────────
 
