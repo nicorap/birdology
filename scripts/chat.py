@@ -458,15 +458,19 @@ Never guess the scientific name or English name from memory — always verify vi
 Pass the exact name the user gave — do not translate it yourself before searching.
 - If `find_species` returns no match, say so. Do NOT substitute a different species.
 - For questions about observations, use `recent_observations`. \
-Pass `source="ebird"` when the user asks about recent/last days/this week observations \
-(eBird data = last 30 days stored in the graph). \
-Pass `source="dof"` for historical DOF data. Default `source="all"` for both. \
+**Always use `source="all"` by default** — omitting eBird data causes missing results. \
+Only use `source="ebird"` or `source="dof"` when the user explicitly asks for one source. \
 **When the user mentions a place name** (e.g. "Brøndby Strand", "Utterslev Mose"), pass it as \
 `locality` — NEVER as `species`. Location names are never species names. \
-**When the user mentions a time period**, pass `date_from` and/or `date_to` in YYYY-MM-DD format: \
-"ce mois-ci" → `date_from` = first day of current month; \
-"cette année" → `date_from` = first day of current year; \
-"en avril" → `date_from="YYYY-04-01"`, `date_to="YYYY-04-30"`.
+**When the user mentions a time period**, pass `date_from` and/or `date_to` in YYYY-MM-DD format. \
+Today's date is in the system context — use it to compute relative dates precisely: \
+- "ce mois-ci" → `date_from` = first day of current month, `date_to` = today \
+- "cette année" → `date_from` = January 1st of current year, `date_to` = today \
+- "en avril" (no year) → `date_from="YYYY-04-01"`, `date_to="YYYY-04-30"` using current year \
+- "en avril 2024" → `date_from="2024-04-01"`, `date_to="2024-04-30"` \
+- "les 15 derniers jours" → `date_from` = today minus 15 days, `date_to` = today \
+- "l'hiver dernier" → `date_from="YYYY-12-01"`, `date_to="YYYY-02-28"` (adjust year) \
+- "au printemps" → `date_from="YYYY-03-01"`, `date_to="YYYY-05-31"`
 - **Use `compare_seasonal`** when the user asks what can be seen **right now / this week / \
 en ce moment / cette semaine / actuellement**. It returns a structured diff: unexpected \
 species (live but not historical → potential rarities), expected-but-absent species \
