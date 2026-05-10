@@ -188,6 +188,36 @@ def fetch_recent_denmark(api_key: str, days: int = 30) -> list[dict]:
     return resp.json()
 
 
+def fetch_recent_geo(
+    api_key: str,
+    lat: float,
+    lon: float,
+    days: int = 14,
+    radius_km: int = 25,
+) -> list[dict]:
+    """Return species recently reported near given coordinates via eBird.
+
+    Uses the eBird geo recent-observations endpoint (/data/obs/geo/recent).
+    Radius capped at 50 km (eBird API limit).
+    """
+    resp = requests.get(
+        f"{_EBIRD_BASE}/data/obs/geo/recent",
+        headers={"x-ebirdapitoken": api_key},
+        params={
+            "lat": lat,
+            "lng": lon,
+            "dist": min(radius_km, 50),
+            "back": min(days, 30),
+            "maxResults": 10000,
+            "cat": "species",
+            "detail": "simple",
+        },
+        timeout=_TIMEOUT,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
 def ebird_observations_to_rdf(
     records: list[dict],
     sci_name_index: dict[str, URIRef] | None = None,

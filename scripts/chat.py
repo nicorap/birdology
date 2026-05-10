@@ -25,7 +25,7 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from birdology.graph import load_graph
-from birdology.ingestion.ebird import fetch_recent_denmark
+from birdology.ingestion.ebird import fetch_recent_denmark, fetch_recent_geo
 from birdology.queries import (
     currently_present,
     find_species_by_name,
@@ -217,10 +217,11 @@ TOOLS_OPENAI = [
         "function": {
             "name": "live_observations",
             "description": (
-                "Fetch LIVE recent bird observations from eBird for Denmark (last 1-30 days). "
-                "This queries the eBird API in real-time, so results are up-to-date (unlike the "
-                "graph data which may be weeks/months old). Returns species seen recently with "
-                "observation date, location name, coordinates, and count."
+                "Fetch LIVE recent bird observations from eBird (last 1-30 days). "
+                "This queries the eBird API in real-time, so results are up-to-date. "
+                "Without coordinates, returns observations for all of Denmark. "
+                "With lat/lon, returns observations within radius_km of that point — "
+                "use this when the user mentions a specific city or location."
             ),
             "parameters": {
                 "type": "object",
@@ -228,6 +229,18 @@ TOOLS_OPENAI = [
                     "days": {
                         "type": "integer",
                         "description": "Number of days back to search (1-30, default: 14)",
+                    },
+                    "lat": {
+                        "type": "number",
+                        "description": "Latitude for geo search (e.g. 55.6761 for Copenhagen)",
+                    },
+                    "lon": {
+                        "type": "number",
+                        "description": "Longitude for geo search (e.g. 12.5683 for Copenhagen)",
+                    },
+                    "radius_km": {
+                        "type": "integer",
+                        "description": "Search radius in km when lat/lon provided (default: 25, max: 50)",
                     },
                 },
                 "required": [],
@@ -441,7 +454,9 @@ species (live but not historical → potential rarities), expected-but-absent sp
 (historical but not in live), and normal species (both). Report only what the tool returns — \
 do NOT add species from memory.
 - Use `live_observations` only when following up on a specific species in a live context \
-(e.g. "pas d'aigle royal ?" after a live mention → `live_observations`, not `recent_observations`).
+(e.g. "pas d'aigle royal ?" after a live mention → `live_observations`, not `recent_observations`). \
+**When the user mentions a city or place** (e.g. "près de Copenhague", "autour d'Aarhus"), \
+pass `lat`/`lon` coordinates for that place to `live_observations` — do NOT omit them.
 - **ALWAYS call `search_wikipedia`** when the user asks about behavior, habitat, song, \
 courtship, diet, or ecology of a specific species — even if you already called `find_species`. \
 Call it at most once per question — if it returns no results, say the Wikipedia index does not \
@@ -537,9 +552,16 @@ def _run_tool(name: str, inputs: dict, graph) -> str:
         api_key = os.getenv("EBIRD_API_KEY", "")
         if not api_key:
             return "Error: EBIRD_API_KEY not set in .env — cannot query eBird live API."
-        days = inputs.get("days", 14)
+        days = min(max(int(inputs.get("days", 14)), 1), 30)
+        lat = inputs.get("lat")
+        lon = inputs.get("lon")
+        radius_km = int(inputs.get("radius_km", 25))
         try:
-            raw = fetch_recent_denmark(api_key, days=min(max(days, 1), 30))
+            if lat is not None and lon is not None:
+                raw = fetch_recent_geo(api_key, float(lat), float(lon),
+                                       days=days, radius_km=radius_km)
+            else:
+                raw = fetch_recent_denmark(api_key, days=days)
         except Exception as e:
             return f"eBird API error: {e}"
         results = [
