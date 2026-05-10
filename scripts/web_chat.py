@@ -157,11 +157,16 @@ def _extract_thumbnails(tool_result: str, out: list) -> None:
 _IMG_RE = re.compile(r'!\[([^\]]*)\]\(([^)]+)\)')
 
 # Matches padding section headers the LLM adds despite instructions not to
-_REMARQUE_RE = re.compile(
-    r'\n+\*{0,2}(?:Remarque|Remarque finale|À noter|À surveiller|À vérifier)\*{0,2}'
+_PADDING_RE = re.compile(
+    r'\n+\*{0,2}(?:Remarque(?:\s+finale)?|À noter|À surveiller|À vérifier'
+    r'|Photo\s+de\s+r[eé]f[eé]rence|Conseils?|À\s+[eé]viter'
+    r'|[ÉE]quipement(?:\s+recommand[eé])?|Que\s+faire[^?\n]*\??'
+    r'|À\s+ne\s+pas\s+manquer|Esp[eè]ces?\s+[àa]\s+cocher)\*{0,2}'
     r'[^\n]*(?:\n(?!\n).+)*',
     re.IGNORECASE,
 )
+
+_EMOJI_RE = re.compile('[\U0001F300-\U0001F9FF\U00002702-\U000027B0]')
 
 
 def _strip_hallucinated_images(text: str, allowed_urls: set) -> str:
@@ -174,7 +179,12 @@ def _strip_hallucinated_images(text: str, allowed_urls: set) -> str:
 
 def _strip_padding_sections(text: str) -> str:
     """Remove forbidden editorial sections the LLM adds despite prompt rules."""
-    return _REMARQUE_RE.sub("", text).rstrip()
+    return _PADDING_RE.sub("", text).rstrip()
+
+
+def _strip_emojis(text: str) -> str:
+    """Remove emoji characters the LLM inserts despite prompt rules."""
+    return _EMOJI_RE.sub("", text)
 
 
 @app.route("/")
@@ -240,6 +250,7 @@ def api_chat():
                 allowed_urls = {url for _, url in thumbnails_seen}
                 answer = _strip_hallucinated_images(answer, allowed_urls)
                 answer = _strip_padding_sections(answer)
+                answer = _strip_emojis(answer)
                 # Append photo gallery only for thumbnails NOT already in the answer
                 if thumbnails_seen:
                     already = answer
@@ -372,6 +383,7 @@ def api_chat_stream():
                     allowed_urls = {url for _, url in thumbnails_seen}
                     text = _strip_hallucinated_images(text, allowed_urls)
                     text = _strip_padding_sections(text)
+                    text = _strip_emojis(text)
                     if thumbnails_seen:
                         gallery = "\n\n"
                         for tname, url in thumbnails_seen[:4]:
