@@ -265,10 +265,9 @@ def api_chat():
                 answer = _strip_emojis(answer)
                 # Append photo gallery only for thumbnails NOT already in the answer
                 if thumbnails_seen:
-                    already = answer
                     new_thumbs = [
                         (name, url) for name, url in thumbnails_seen[:4]
-                        if url not in already
+                        if _normalize_img_url(url) not in answer and url not in answer
                     ]
                     if new_thumbs:
                         gallery = "\n\n"
@@ -397,10 +396,15 @@ def api_chat_stream():
                     text = _strip_padding_sections(text)
                     text = _strip_emojis(text)
                     if thumbnails_seen:
-                        gallery = "\n\n"
-                        for tname, url in thumbnails_seen[:4]:
-                            gallery += f'<bird-img name="{tname}" src="{url}">\n'
-                        text += gallery
+                        new_thumbs = [
+                            (tname, url) for tname, url in thumbnails_seen[:4]
+                            if _normalize_img_url(url) not in text and url not in text
+                        ]
+                        if new_thumbs:
+                            gallery = "\n\n"
+                            for tname, url in new_thumbs:
+                                gallery += f'<bird-img name="{tname}" src="{url}">\n'
+                            text += gallery
                     import re as _re
                     for chunk in _re.split(r'(\s+)', text):
                         if chunk:
