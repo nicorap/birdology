@@ -374,12 +374,17 @@ mention it explicitly: e.g. "(⚠ atypique : hors-saison)" or "(⚠ atypique : e
 localement)". Do not omit this information.
 5. **No padding.** Do NOT add identification tips, confusion species, validation advice, \
 "what to watch for", or any editorial commentary that was not asked. Do NOT invent sections \
-like "Recommandations" or "À vérifier". Just report the tool results.
+like "Recommandations", "À vérifier", "À noter", "À surveiller". Just report the tool results.
 6. **No emojis** in your responses unless the user uses them.
-7. **Show photos** when available: if the tool returns a `thumbnail` field, include it as \
-a markdown image: `![species name](url)`. Show max 3 photos per response.
+7. **Show photos ONLY from tool results.** If a tool returns a `thumbnail` field, include it \
+as a markdown image: `![species name](url)`. Show max 3 photos per response. \
+**NEVER write a markdown image (`![...]()`) from memory or general knowledge** — only use \
+URLs that appear literally in a tool result.
 8. **Links**: when referencing a species URI or eBird page, use markdown links: \
 `[text](url)`.
+9. **When comparing live vs historical data**, only list species as "expected but absent" if \
+they appear in the tool result for `observations_by_month` or `currently_present`. \
+Do NOT add species from memory.
 
 ## Data available in the graph
 - eBird/Clements taxonomy: 45 orders, 251 families, ~11 000 species
