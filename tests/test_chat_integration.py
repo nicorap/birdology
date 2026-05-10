@@ -164,6 +164,36 @@ class TestToolRouting:
                 assert month == datetime.date.today().month, \
                     f"Expected current month {datetime.date.today().month}, got {month}"
 
+    def test_currently_visible_uses_compare_seasonal(self):
+        """'en ce moment' → compare_seasonal (single tool call)."""
+        data = _chat("qu'est-ce qu'on voit en ce moment au Danemark ?", "int_cross3")
+        tools = _tool_names(data)
+        assert "compare_seasonal" in tools, \
+            f"Expected compare_seasonal, got: {tools}"
+
+    def test_geo_location_passes_coords_to_live(self):
+        """'près de Copenhague' → live_observations with lat/lon."""
+        data = _chat("observations rares près de Copenhague ces 7 derniers jours ?", "int_geo1")
+        tools = _tool_names(data)
+        assert "live_observations" in tools, f"Expected live_observations, got: {tools}"
+        args = _tool_args(data, "live_observations")
+        assert args.get("lat") is not None, f"Expected lat param, got args: {args}"
+        assert args.get("lon") is not None, f"Expected lon param, got args: {args}"
+
+    def test_date_filter_ce_mois_ci(self):
+        """'ce mois-ci' → recent_observations with date_from = first day of current month."""
+        import datetime
+        data = _chat("observations à Brøndby Strand ce mois-ci ?", "int_date1")
+        tools = _tool_names(data)
+        assert "recent_observations" in tools, f"Expected recent_observations, got: {tools}"
+        args = _tool_args(data, "recent_observations")
+        date_from = args.get("date_from", "")
+        if date_from:
+            today = datetime.date.today()
+            expected_prefix = f"{today.year}-{today.month:02d}"
+            assert date_from.startswith(expected_prefix), \
+                f"date_from should start with {expected_prefix}, got {date_from}"
+
 
 # ── Anti-hallucination tests ──────────────────────────────────────────────────
 

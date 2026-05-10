@@ -201,6 +201,46 @@ def test_recent_obs_sorted_newest_first():
     assert dates == sorted(dates, reverse=True)
 
 
+def test_recent_obs_date_from_excludes_older():
+    g = _make_graph()
+    # Robin=2024-04-10, Woodpecker=2024-03-20 — date_from=2024-04-01 should keep only Robin
+    rows = recent_danish_observations(g, date_from="2024-04-01")
+    sci_names = [r["scientificName"] for r in rows]
+    assert "Erithacus rubecula" in sci_names
+    assert "Dendrocopos major" not in sci_names
+
+
+def test_recent_obs_date_to_excludes_newer():
+    g = _make_graph()
+    # date_to=2024-03-31 should keep only Woodpecker
+    rows = recent_danish_observations(g, date_to="2024-03-31")
+    sci_names = [r["scientificName"] for r in rows]
+    assert "Dendrocopos major" in sci_names
+    assert "Erithacus rubecula" not in sci_names
+
+
+def test_recent_obs_date_range():
+    g = _make_graph()
+    # Range covering only April → only Robin
+    rows = recent_danish_observations(g, date_from="2024-04-01", date_to="2024-04-30")
+    assert len(rows) == 1
+    assert rows[0]["scientificName"] == "Erithacus rubecula"
+
+
+def test_recent_obs_date_range_no_match():
+    g = _make_graph()
+    rows = recent_danish_observations(g, date_from="2025-01-01", date_to="2025-12-31")
+    assert rows == []
+
+
+def test_recent_obs_locality_and_date():
+    g = _make_graph()
+    # Locality + date_from together
+    rows = recent_danish_observations(g, locality="Nørrebro", date_from="2024-04-01")
+    assert len(rows) == 1
+    assert rows[0]["scientificName"] == "Erithacus rubecula"
+
+
 # ── species_by_family / species_by_order ─────────────────────────────────────
 
 def test_species_by_family():

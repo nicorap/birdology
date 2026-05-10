@@ -127,7 +127,7 @@ TOOLS_OPENAI = [
             "description": (
                 "List recent bird observations from the graph (DOF historical + eBird last 30 days), "
                 "sorted by date descending. Optionally filter by species name (any language), "
-                "locality name, and/or source. Returns date, locality, GPS, and individual count."
+                "locality name, date range, and/or source. Returns date, locality, GPS, and count."
             ),
             "parameters": {
                 "type": "object",
@@ -146,6 +146,21 @@ TOOLS_OPENAI = [
                             "Use this when the user asks about observations at a specific place, "
                             "e.g. 'Brøndby Strand', 'Utterslev Mose', 'Tivoli'. "
                             "Do NOT pass a location name as the 'species' parameter."
+                        ),
+                    },
+                    "date_from": {
+                        "type": "string",
+                        "description": (
+                            "Start date filter, ISO format YYYY-MM-DD (inclusive). "
+                            "Use for 'ce mois-ci' (first day of current month), "
+                            "'cette année', 'depuis janvier', etc."
+                        ),
+                    },
+                    "date_to": {
+                        "type": "string",
+                        "description": (
+                            "End date filter, ISO format YYYY-MM-DD (inclusive). "
+                            "Combine with date_from for a date range."
                         ),
                     },
                     "source": {
@@ -447,7 +462,11 @@ Pass `source="ebird"` when the user asks about recent/last days/this week observ
 (eBird data = last 30 days stored in the graph). \
 Pass `source="dof"` for historical DOF data. Default `source="all"` for both. \
 **When the user mentions a place name** (e.g. "Brøndby Strand", "Utterslev Mose"), pass it as \
-`locality` — NEVER as `species`. Location names are never species names.
+`locality` — NEVER as `species`. Location names are never species names. \
+**When the user mentions a time period**, pass `date_from` and/or `date_to` in YYYY-MM-DD format: \
+"ce mois-ci" → `date_from` = first day of current month; \
+"cette année" → `date_from` = first day of current year; \
+"en avril" → `date_from="YYYY-04-01"`, `date_to="YYYY-04-30"`.
 - **Use `compare_seasonal`** when the user asks what can be seen **right now / this week / \
 en ce moment / cette semaine / actuellement**. It returns a structured diff: unexpected \
 species (live but not historical → potential rarities), expected-but-absent species \
@@ -533,6 +552,8 @@ def _run_tool(name: str, inputs: dict, graph) -> str:
             inputs.get("species"),
             ebird_only=ebird_only,
             locality=inputs.get("locality"),
+            date_from=inputs.get("date_from"),
+            date_to=inputs.get("date_to"),
         ))
 
     if name == "nearby_birds":
