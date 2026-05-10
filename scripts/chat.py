@@ -647,8 +647,8 @@ def _run_tool(name: str, inputs: dict, graph) -> str:
             "month": month,
             "days_checked": days,
             "live_species_count": len(live_sci),
-            "unexpected_in_live": unexpected,        # in live, not in history → potential rarities
-            "normal_present": normal[:20],           # in both → business as usual
+            "unexpected_in_live": unexpected[:5],    # in live, not in history → potential rarities
+            "normal_present": normal[:5],            # in both → business as usual
         }
         return json.dumps(result, ensure_ascii=False, indent=2)
 

@@ -156,18 +156,25 @@ def _extract_thumbnails(tool_result: str, out: list) -> None:
 
 _IMG_RE = re.compile(r'!\[([^\]]*)\]\(([^)]+)\)')
 
+# Matches padding section headers the LLM adds despite instructions not to
+_REMARQUE_RE = re.compile(
+    r'\n+\*{0,2}(?:Remarque|Remarque finale|À noter|À surveiller|À vérifier)\*{0,2}'
+    r'[^\n]*(?:\n(?!\n).+)*',
+    re.IGNORECASE,
+)
+
 
 def _strip_hallucinated_images(text: str, allowed_urls: set) -> str:
-    """Remove markdown images whose URL was not returned by a tool.
-
-    Only URLs that appear literally in tool results (via thumbnails_seen) are
-    allowed through. Everything else — URLs invented by the LLM from memory —
-    is silently removed.
-    """
+    """Remove markdown images whose URL was not returned by a tool."""
     return _IMG_RE.sub(
         lambda m: m.group(0) if m.group(2) in allowed_urls else "",
         text,
     )
+
+
+def _strip_padding_sections(text: str) -> str:
+    """Remove forbidden editorial sections the LLM adds despite prompt rules."""
+    return _REMARQUE_RE.sub("", text).rstrip()
 
 
 @app.route("/")
@@ -232,6 +239,7 @@ def api_chat():
                 # Strip any image the LLM invented — only tool-returned URLs allowed
                 allowed_urls = {url for _, url in thumbnails_seen}
                 answer = _strip_hallucinated_images(answer, allowed_urls)
+                answer = _strip_padding_sections(answer)
                 # Append photo gallery only for thumbnails NOT already in the answer
                 if thumbnails_seen:
                     already = answer
@@ -363,6 +371,7 @@ def api_chat_stream():
                     # Strip any image the LLM invented — only tool-returned URLs allowed
                     allowed_urls = {url for _, url in thumbnails_seen}
                     text = _strip_hallucinated_images(text, allowed_urls)
+                    text = _strip_padding_sections(text)
                     if thumbnails_seen:
                         gallery = "\n\n"
                         for tname, url in thumbnails_seen[:4]:
