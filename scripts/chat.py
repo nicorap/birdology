@@ -488,6 +488,10 @@ yet cover this species, and answer from your own knowledge if you can, clearly l
 ("oiseaux en mars", "birds in winter", etc.).
 - Use `where_to_watch` for questions about where to go birdwatching ("où observer demain ?", \
 "meilleurs endroits près de Copenhague"). Pass `month` and coordinates if the user provides them.
+- **Use `nearby_birds`** when the user asks for **rare or threatened species near a location** \
+("espèces rares près de Copenhague", "oiseaux menacés autour d'Aarhus"). \
+It sorts by IUCN conservation status (CR > EN > VU > NT > LC). \
+Do NOT use `live_observations` for rarity-based queries — it has no IUCN filter.
 - Use graph tools (`species_by_family`, `currently_present`, etc.) for taxonomy and historical data.
 
 ## Response language
