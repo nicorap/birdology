@@ -462,7 +462,6 @@ Answer in the user's language. Include scientific name + Danish name when releva
 → Correct response:
 "Voici le bilan de cette semaine au Danemark (source: eBird live + DOF mai) :
 **Inattendus pour mai (raretés potentielles) :** [liste exacte du champ unexpected_in_live]
-**Attendus mais absents cette semaine :** [liste exacte du champ expected_but_absent]
 **Présents normalement :** [liste exacte du champ normal_present]"
 
 **User:** "Quelles observations dans les 30 derniers jours ?"
@@ -586,19 +585,12 @@ def _run_tool(name: str, inputs: dict, graph) -> str:
         hist_sci = {r["sciName"] for r in historical if r.get("sciName")}
         # Compute diff
         unexpected = [live_by_sci[s] for s in live_sci - hist_sci if s in live_by_sci]
-        absent = [
-            {"species": r["species"], "sciName": r["sciName"],
-             "migrationStatus": r.get("migrationStatus", ""), "obsCount": r.get("obsCount", 0)}
-            for r in historical if r.get("sciName") and r["sciName"] not in live_sci
-        ][:20]
         normal = [live_by_sci[s] for s in live_sci & hist_sci if s in live_by_sci]
         result = {
             "month": month,
             "days_checked": days,
             "live_species_count": len(live_sci),
-            "historical_species_count": len(hist_sci),
             "unexpected_in_live": unexpected,        # in live, not in history → potential rarities
-            "expected_but_absent": absent,           # in history, not in live → missing this week
             "normal_present": normal[:20],           # in both → business as usual
         }
         return json.dumps(result, ensure_ascii=False, indent=2)
