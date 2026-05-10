@@ -145,6 +145,7 @@ def _extract_thumbnails(tool_result: str, out: list) -> None:
             continue
         thumb = item.get("thumbnail")
         if thumb and thumb.startswith("http"):
+            thumb = _WIDTH_RE.sub("", thumb)  # strip ?width=NNN from DBpedia URLs
             name = (item.get("commonNameEn")
                     or item.get("commonNameFr")
                     or item.get("scientificName")
@@ -154,7 +155,10 @@ def _extract_thumbnails(tool_result: str, out: list) -> None:
                 out.append((name, thumb))
 
 
-_IMG_RE = re.compile(r'!\[([^\]]*)\]\(([^)]+)\)')
+# Supports parentheses inside URLs (e.g. DBpedia FilePath with species names)
+_IMG_RE = re.compile(r'!\[([^\]]*)\]\(((?:[^()]|\([^()]*\))+)\)')
+
+_WIDTH_RE = re.compile(r'\?width=\d+$')
 
 # Matches padding section headers the LLM adds despite instructions not to
 _PADDING_RE = re.compile(
@@ -169,12 +173,20 @@ _PADDING_RE = re.compile(
 _EMOJI_RE = re.compile('[\U0001F300-\U0001F9FF\U00002702-\U000027B0]')
 
 
+def _normalize_img_url(url: str) -> str:
+    """Strip Wikimedia ?width=NNN suffix for comparison."""
+    return _WIDTH_RE.sub("", url)
+
+
 def _strip_hallucinated_images(text: str, allowed_urls: set) -> str:
     """Remove markdown images whose URL was not returned by a tool."""
-    return _IMG_RE.sub(
-        lambda m: m.group(0) if m.group(2) in allowed_urls else "",
-        text,
-    )
+    normalized = {_normalize_img_url(u) for u in allowed_urls}
+
+    def _keep(m):
+        url = m.group(2)
+        return m.group(0) if url in allowed_urls or _normalize_img_url(url) in normalized else ""
+
+    return _IMG_RE.sub(_keep, text)
 
 
 def _strip_padding_sections(text: str) -> str:
