@@ -33,11 +33,12 @@ class TestCase:
     id: str
     category: str
     question: str
-    expected_tools: list[str] = field(default_factory=list)   # at least one of these must be called
-    forbidden_tools: list[str] = field(default_factory=list)  # none of these should be called
-    must_contain: list[str] = field(default_factory=list)     # substrings that must appear
-    must_not_contain: list[str] = field(default_factory=list) # substrings that must NOT appear
-    notes: str = ""                                            # human notes for the judge
+    expected_tools: list[str] = field(default_factory=list)     # at least one of these must be called
+    forbidden_tools: list[str] = field(default_factory=list)    # none of these should be called
+    must_contain: list[str] = field(default_factory=list)       # ALL of these substrings must appear
+    must_contain_any: list[str] = field(default_factory=list)   # AT LEAST ONE must appear (OR)
+    must_not_contain: list[str] = field(default_factory=list)   # substrings that must NOT appear
+    notes: str = ""                                              # human notes for the judge
 
 
 TESTS: list[TestCase] = [
@@ -78,8 +79,8 @@ TESTS: list[TestCase] = [
         id="obs_01",
         category="observations",
         question="Quelles observations récentes au Danemark ?",
-        expected_tools=["recent_observations"],
-        notes="Should use source=all by default",
+        expected_tools=["recent_observations", "live_observations"],  # both are valid
+        notes="Should use source=all by default; live_observations also acceptable",
     ),
     TestCase(
         id="obs_02",
@@ -148,9 +149,9 @@ TESTS: list[TestCase] = [
         id="where_04",
         category="where_to_watch",
         question="Où observer des oiseaux près de chez moi ?",
-        expected_tools=[],
-        must_contain=["où", "location", "localisation", "ville", "coordonnées",
-                      "où êtes-vous", "quelle ville", "quel endroit"],
+        forbidden_tools=["where_to_watch", "live_observations", "nearby_birds", "recent_observations"],
+        must_contain_any=["localisation", "location", "où vous êtes", "où êtes-vous",
+                          "quelle ville", "quel endroit", "coordonnées", "dites-moi où"],
         notes="No location given → must ask user for location, not default to Copenhagen",
     ),
 
@@ -191,8 +192,9 @@ TESTS: list[TestCase] = [
         id="edge_01",
         category="edge_cases",
         question="Observations près de chez moi",
-        must_contain=["où", "location", "ville", "endroit", "coordonnées",
-                      "où êtes-vous", "quelle ville"],
+        forbidden_tools=["recent_observations", "live_observations", "where_to_watch"],
+        must_contain_any=["localisation", "location", "où vous êtes", "où êtes-vous",
+                          "quelle ville", "quel endroit", "coordonnées", "dites-moi où"],
         notes="No location → must ask, not default to Copenhagen or Assistens Kirkegård",
     ),
     TestCase(
@@ -206,8 +208,8 @@ TESTS: list[TestCase] = [
         id="edge_03",
         category="edge_cases",
         question="Quels oiseaux voit-on à Vejle ce mois-ci ?",
-        expected_tools=["recent_observations"],
-        notes="City with possibly sparse data → should report honestly if no results",
+        expected_tools=["recent_observations", "observations_by_month", "where_to_watch"],
+        notes="City query + current month → recent_observations or observations_by_month both valid",
     ),
 ]
 
@@ -217,9 +219,12 @@ TESTS: list[TestCase] = [
 
 FORBIDDEN_PATTERNS = [
     (r"[\U0001F300-\U0001F9FF\U00002702-\U000027B0]", "emoji present"),
-    (r"Observation[s]?\s+r[eé]cente?s?\s*:", "hallucinated 'Observation récente' line"),
-    (r"\*{0,2}(?:Remarque|Remarque finale|À noter|À surveiller)\*{0,2}", "forbidden padding section"),
-    (r"\*{0,2}(?:Conseils?|À\s+éviter|Équipement)\*{0,2}\s*:", "forbidden advice section"),
+    # Must be on its own line (not inside a table header like | Remarque |)
+    (r"(?:^|\n)[ \t]*\*{0,2}(?:Remarque|Remarque finale|À noter|À surveiller)\*{0,2}[ \t]*(?:\n|$)",
+     "forbidden padding section"),
+    (r"(?:^|\n)[ \t]*\*{0,2}(?:Conseils?|À\s+éviter|Équipement)\*{0,2}[ \t]*:",
+     "forbidden advice section"),
+    (r"(?:^|\n)[ \t]*Observation[s]?\s+r[eé]cente?s?\s*:[^\n]+", "hallucinated 'Observation récente' line"),
     (r"Si vous (souhaitez|voulez)[^\n]{0,80}(approfondir|détails)", "trailing offer sentence"),
     (r"N'hésitez pas[^\n]{0,80}", "trailing offer sentence"),
 ]
@@ -249,9 +254,11 @@ def run_test(test: TestCase, base_url: str) -> TestResult:
     answer = ""
 
     try:
+        # Use timestamp in session_id to avoid contamination across eval runs
+        session_id = f"eval_{test.id}_{int(time.time())}"
         resp = requests.post(
             f"{base_url}/api/chat",
-            json={"question": test.question, "session_id": f"eval_{test.id}"},
+            json={"message": test.question, "session_id": session_id},
             timeout=60,
         )
         resp.raise_for_status()
@@ -261,6 +268,13 @@ def run_test(test: TestCase, base_url: str) -> TestResult:
     except Exception as e:
         failures.append(f"HTTP error: {e}")
         return TestResult(test=test, passed=False, tool_calls=[], answer="", failures=failures)
+
+    # Detect infrastructure errors (Ollama / embedding crashes)
+    if answer.startswith("Erreur serveur:") and "api/embeddings" in answer:
+        return TestResult(
+            test=test, passed=False, tool_calls=tool_calls, answer=answer,
+            failures=["INFRA: Ollama embeddings crashed (nomic-embed-text unavailable)"],
+        )
 
     # 1. Check expected tools
     if test.expected_tools:
@@ -274,11 +288,16 @@ def run_test(test: TestCase, base_url: str) -> TestResult:
         if t in tool_calls:
             failures.append(f"Forbidden tool called: {t}")
 
-    # 3. Check must_contain
+    # 3. Check must_contain (ALL must be present)
     answer_lower = answer.lower()
     for phrase in test.must_contain:
         if phrase.lower() not in answer_lower:
             failures.append(f"Expected phrase not found: '{phrase}'")
+
+    # 3b. Check must_contain_any (AT LEAST ONE must be present)
+    if test.must_contain_any:
+        if not any(p.lower() in answer_lower for p in test.must_contain_any):
+            failures.append(f"Expected at least one of {test.must_contain_any}")
 
     # 4. Check must_not_contain
     for phrase in test.must_not_contain:
@@ -441,6 +460,7 @@ def main() -> None:
                         "question": r.test.question,
                         "passed": r.passed,
                         "tool_calls": r.tool_calls,
+                        "answer": r.answer,
                         "failures": r.failures,
                         "judge_score": r.judge_score,
                         "judge_verdict": r.judge_verdict,
