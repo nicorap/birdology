@@ -486,7 +486,9 @@ pass `lat`/`lon` coordinates for that place to `live_observations` — do NOT om
 - **ALWAYS call `search_wikipedia`** when the user asks about behavior, habitat, song, \
 courtship, diet, or ecology of a specific species — even if you already called `find_species`. \
 Call it at most once per question — if it returns no results, say the Wikipedia index does not \
-yet cover this species, and answer from your own knowledge if you can, clearly labeling it as such.
+yet cover this species, and answer from your own knowledge if you can, clearly labeling it as such. \
+**Always write `search_wikipedia` queries in English** (use the English common name or scientific \
+name from `find_species`). The Wikipedia index is in English — French queries reduce recall.
 - Use `observations_by_month` for questions about which birds are present in a specific month \
 ("oiseaux en mars", "birds in winter", etc.).
 - Use `where_to_watch` for questions about where to go birdwatching ("où observer demain ?", \
