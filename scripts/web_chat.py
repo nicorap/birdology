@@ -172,6 +172,15 @@ _PADDING_RE = re.compile(
 
 _EMOJI_RE = re.compile('[\U0001F300-\U0001F9FF\U00002702-\U000027B0]')
 
+# Trailing offer sentences ("Si vous souhaitez...", "N'hésitez pas...", etc.)
+_OFFER_RE = re.compile(
+    r'\n*(?:Si vous (souhaitez|voulez|avez)|N\'h[eé]sitez pas|'
+    r'Je peux (approfondir|vous en dire|vous donner)|'
+    r'Voulez-vous (que je|plus de|des d[eé]tails)|'
+    r'Dites-moi si vous)[^\n]*\.?$',
+    re.IGNORECASE | re.MULTILINE,
+)
+
 
 def _normalize_img_url(url: str) -> str:
     """Strip Wikimedia ?width=NNN suffix for comparison."""
@@ -190,8 +199,10 @@ def _strip_hallucinated_images(text: str, allowed_urls: set) -> str:
 
 
 def _strip_padding_sections(text: str) -> str:
-    """Remove forbidden editorial sections the LLM adds despite prompt rules."""
-    return _PADDING_RE.sub("", text).rstrip()
+    """Remove forbidden editorial sections and trailing offer sentences."""
+    text = _PADDING_RE.sub("", text)
+    text = _OFFER_RE.sub("", text)
+    return text.rstrip()
 
 
 def _strip_emojis(text: str) -> str:
