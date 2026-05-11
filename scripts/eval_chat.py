@@ -214,6 +214,159 @@ TESTS: list[TestCase] = [
 ]
 
 # ---------------------------------------------------------------------------
+# Robustness tests — same intents, different phrasings
+# ---------------------------------------------------------------------------
+
+ROBUSTNESS_TESTS: list[TestCase] = [
+    # Species — alternate phrasings
+    TestCase(
+        id="r_species_01",
+        category="robustness",
+        question="Que sais-tu sur le Rouge-gorge ?",
+        expected_tools=["find_species", "search_wikipedia"],
+        notes="Short name without 'familier' — same routing as species_01",
+    ),
+    TestCase(
+        id="r_species_02",
+        category="robustness",
+        question="Info sur le Balbuzard",
+        expected_tools=["find_species"],
+        notes="Informal 'info sur' phrasing — should still call find_species",
+    ),
+    TestCase(
+        id="r_species_03",
+        category="robustness",
+        question="Comment se nourrit le Pic épeiche ?",
+        expected_tools=["find_species", "search_wikipedia"],
+        notes="Diet question, different phrasing — same routing as species_03",
+    ),
+    TestCase(
+        id="r_species_04",
+        category="robustness",
+        question="Mouette rieuse — habitat et comportement",
+        expected_tools=["find_species", "search_wikipedia"],
+        must_not_contain=["Laughing Gull"],
+        notes="Dash-separated topic — same routing as species_04, no Laughing Gull",
+    ),
+
+    # Observations — alternate phrasings
+    TestCase(
+        id="r_obs_01",
+        category="robustness",
+        question="Quoi de neuf dans les observations au Danemark ?",
+        expected_tools=["recent_observations", "live_observations"],
+        notes="Informal 'quoi de neuf' — same as obs_01",
+    ),
+    TestCase(
+        id="r_obs_02",
+        category="robustness",
+        question="Est-ce qu'on a vu des Cigognes cette année ?",
+        expected_tools=["find_species", "recent_observations", "live_observations"],
+        notes="Implicit time ('cette année') — should filter by current year",
+    ),
+    TestCase(
+        id="r_obs_03",
+        category="robustness",
+        question="Ce qu'on a vu à Utterslev Mose en mai",
+        expected_tools=["recent_observations"],
+        notes="Implicit current month — locality + month filter",
+    ),
+
+    # Live / current — alternate phrasings
+    TestCase(
+        id="r_live_01",
+        category="robustness",
+        question="Qu'est-ce qu'il y a à voir en ce moment ?",
+        expected_tools=["compare_seasonal"],
+        forbidden_tools=["live_observations"],
+        notes="'en ce moment' without 'Danemark' — same as live_01",
+    ),
+    TestCase(
+        id="r_live_02",
+        category="robustness",
+        question="Des espèces inhabituelles cette semaine ?",
+        expected_tools=["compare_seasonal"],
+        notes="'Inhabituelles cette semaine' → compare_seasonal",
+    ),
+
+    # Where to watch — alternate phrasings
+    TestCase(
+        id="r_where_01",
+        category="robustness",
+        question="Bons spots pour observer ce samedi près de Copenhague ?",
+        expected_tools=["where_to_watch"],
+        must_not_contain=["Observation récente :"],
+        notes="'spots' and 'samedi' — same routing as where_01",
+    ),
+    TestCase(
+        id="r_where_02",
+        category="robustness",
+        question="Je veux voir des canards, où aller autour d'Aarhus ?",
+        expected_tools=["where_to_watch"],
+        notes="Species goal + location — should pass Aarhus coordinates",
+    ),
+    TestCase(
+        id="r_where_03",
+        category="robustness",
+        question="Oiseaux menacés autour de Copenhague ?",
+        expected_tools=["nearby_birds"],
+        forbidden_tools=["live_observations"],
+        notes="'menacés' → nearby_birds (IUCN), same as where_03",
+    ),
+    TestCase(
+        id="r_where_04",
+        category="robustness",
+        question="Je suis chez moi, où observer des oiseaux ?",
+        forbidden_tools=["where_to_watch", "live_observations", "nearby_birds", "recent_observations"],
+        must_contain_any=["localisation", "location", "où vous êtes", "où êtes-vous",
+                          "quelle ville", "quel endroit", "coordonnées", "dites-moi où"],
+        notes="'chez moi' without location — must ask, same as where_04",
+    ),
+
+    # Seasonal — alternate phrasings
+    TestCase(
+        id="r_seasonal_01",
+        category="robustness",
+        question="Oiseaux de mars au Danemark ?",
+        expected_tools=["observations_by_month"],
+        notes="Telegraphic phrasing — same as seasonal_01",
+    ),
+    TestCase(
+        id="r_seasonal_02",
+        category="robustness",
+        question="Quels oiseaux hivernent au Danemark ?",
+        expected_tools=["observations_by_month"],
+        notes="'hivernent' → winter months (12, 1, 2)",
+    ),
+
+    # Edge cases — alternate phrasings
+    TestCase(
+        id="r_edge_01",
+        category="robustness",
+        question="Je veux observer depuis chez moi",
+        forbidden_tools=["recent_observations", "live_observations", "where_to_watch"],
+        must_contain_any=["localisation", "location", "où vous êtes", "où êtes-vous",
+                          "quelle ville", "quel endroit", "coordonnées", "dites-moi où"],
+        notes="No location — must ask, same as edge_01",
+    ),
+    TestCase(
+        id="r_edge_02",
+        category="robustness",
+        question="Parle-moi du Gypaète barbu",
+        expected_tools=["find_species"],
+        notes="Rare/absent species — different species than edge_02, same pattern",
+    ),
+    TestCase(
+        id="r_edge_03",
+        category="robustness",
+        question="Qu'est-ce qu'on observe à Vejle en ce moment ?",
+        expected_tools=["recent_observations", "observations_by_month", "where_to_watch",
+                        "live_observations", "compare_seasonal"],
+        notes="'en ce moment' + city — live or recent observations both valid",
+    ),
+]
+
+# ---------------------------------------------------------------------------
 # Forbidden patterns (server-side strips should have removed these)
 # ---------------------------------------------------------------------------
 
@@ -409,6 +562,12 @@ def main() -> None:
     ap.add_argument("--category", help="Only run tests in this category")
     ap.add_argument("--id", help="Only run test with this id")
     ap.add_argument("--delay", type=float, default=1.5, help="Seconds between requests")
+    ap.add_argument(
+        "--suite",
+        choices=["core", "robustness", "all"],
+        default="core",
+        help="Test suite to run: core (default), robustness (phrasings), all",
+    )
     args = ap.parse_args()
 
     anthropic_key = os.getenv("ANTHROPIC_API_KEY", "") if args.judge else ""
@@ -416,7 +575,12 @@ def main() -> None:
         print("WARNING: --judge requires ANTHROPIC_API_KEY — judge disabled")
         args.judge = False
 
-    tests = TESTS
+    if args.suite == "robustness":
+        tests = ROBUSTNESS_TESTS
+    elif args.suite == "all":
+        tests = TESTS + ROBUSTNESS_TESTS
+    else:
+        tests = TESTS
     if args.category:
         tests = [t for t in tests if t.category == args.category]
     if args.id:
