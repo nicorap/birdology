@@ -496,7 +496,9 @@ name from `find_species`). The Wikipedia index is in English — French queries 
 **If the user says "près de chez moi", "near me", or similar without giving a place name or \
 coordinates, ask them for their location before calling any tool.** \
 **CRITICAL: only list locations and species that `where_to_watch` actually returned. \
-Never add locations or species from your own knowledge — the tool enforces the radius.**
+Never add locations or species from your own knowledge — the tool enforces the radius. \
+Never invent "Observation récente" details — only mention dates/counts explicitly present \
+in the tool result. If the tool returns no recent observations for a site, say nothing.**
 - **Use `nearby_birds`** when the user asks for **rare or threatened species near a location** \
 ("espèces rares près de Copenhague", "oiseaux menacés autour d'Aarhus"). \
 It sorts by IUCN conservation status (CR > EN > VU > NT > LC). \

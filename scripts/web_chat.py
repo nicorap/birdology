@@ -172,6 +172,12 @@ _PADDING_RE = re.compile(
 
 _EMOJI_RE = re.compile('[\U0001F300-\U0001F9FF\U00002702-\U000027B0]')
 
+# Hallucinated "Observation récente / Observations récentes" lines in where_to_watch responses
+_OBS_RECENTE_RE = re.compile(
+    r'\n[ \t]*(?:\*\s*)?(?:\*\*)?Observations?\s+r[eé]cente?s?(?:\*\*)?\s*:?[^\n]+',
+    re.IGNORECASE,
+)
+
 # Trailing offer sentences ("Si vous souhaitez...", "N'hésitez pas...", etc.)
 _OFFER_RE = re.compile(
     r'\n*(?:Si vous (souhaitez|voulez|avez)|N\'h[eé]sitez pas|'
@@ -199,8 +205,9 @@ def _strip_hallucinated_images(text: str, allowed_urls: set) -> str:
 
 
 def _strip_padding_sections(text: str) -> str:
-    """Remove forbidden editorial sections and trailing offer sentences."""
+    """Remove forbidden editorial sections, hallucinated obs lines, and trailing offers."""
     text = _PADDING_RE.sub("", text)
+    text = _OBS_RECENTE_RE.sub("", text)
     text = _OFFER_RE.sub("", text)
     return text.rstrip()
 
