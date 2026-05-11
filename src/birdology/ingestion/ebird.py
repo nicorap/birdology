@@ -218,6 +218,48 @@ def fetch_recent_geo(
     return resp.json()
 
 
+def fetch_nearby_hotspots(
+    api_key: str,
+    lat: float,
+    lon: float,
+    dist_km: int = 25,
+) -> list[dict]:
+    """Return eBird hotspots near given coordinates.
+
+    Uses /ref/hotspot/geo. dist_km capped at 200 km.
+    Each result includes locId, locName, lat, lng, latestObsDt, numSpeciesAllTime.
+    """
+    resp = requests.get(
+        f"{_EBIRD_BASE}/ref/hotspot/geo",
+        headers={"x-ebirdapitoken": api_key},
+        params={
+            "lat": lat,
+            "lng": lon,
+            "dist": min(dist_km, 200),
+            "fmt": "json",
+        },
+        timeout=_TIMEOUT,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def fetch_hotspot_species(
+    api_key: str,
+    loc_id: str,
+    days: int = 7,
+) -> list[dict]:
+    """Return recent species observed at an eBird hotspot (by locId)."""
+    resp = requests.get(
+        f"{_EBIRD_BASE}/data/obs/{loc_id}/recent",
+        headers={"x-ebirdapitoken": api_key},
+        params={"back": min(days, 30), "detail": "simple"},
+        timeout=_TIMEOUT,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
 def ebird_observations_to_rdf(
     records: list[dict],
     sci_name_index: dict[str, URIRef] | None = None,

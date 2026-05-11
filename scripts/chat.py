@@ -25,7 +25,12 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from birdology.graph import load_graph
-from birdology.ingestion.ebird import fetch_recent_denmark, fetch_recent_geo
+from birdology.ingestion.ebird import (
+    fetch_recent_denmark,
+    fetch_recent_geo,
+    fetch_nearby_hotspots,
+    fetch_hotspot_species,
+)
 from birdology.queries import (
     currently_present,
     find_species_by_name,
@@ -367,6 +372,35 @@ TOOLS_OPENAI = [
     {
         "type": "function",
         "function": {
+            "name": "live_hotspots",
+            "description": (
+                "Find active birdwatching hotspots near coordinates using live eBird data. "
+                "Returns the top hotspots with their recent species lists. "
+                "Use this when where_to_watch returns few results (large radius or sparse area), "
+                "or when the user asks for spots beyond 50 km where graph data is limited. "
+                "radius_km can be up to 200 km. days = how many days back to look (1-14)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "lat": {"type": "number", "description": "Latitude"},
+                    "lon": {"type": "number", "description": "Longitude"},
+                    "radius_km": {
+                        "type": "integer",
+                        "description": "Search radius in km (max 200, default 50)",
+                    },
+                    "days": {
+                        "type": "integer",
+                        "description": "How many days back to include (1-14, default 7)",
+                    },
+                },
+                "required": ["lat", "lon"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "search_wikipedia",
             "description": (
                 "Search Wikipedia articles about bird species for detailed information on "
@@ -498,8 +532,9 @@ name from `find_species`). The Wikipedia index is in English — French queries 
 **If the user says "près de chez moi", "near me", or similar without giving a place name or \
 coordinates, ask them for their location before calling any tool.** \
 **When the user says "un peu plus loin" or "encore plus loin" after a previous `where_to_watch` \
-call, call `where_to_watch` again with a larger `radius_km` (double the previous radius, \
-e.g. 30→60, 50→100, 100→200). Always call the tool — never answer from memory.** \
+call, use `live_hotspots` with a larger radius (double the previous, e.g. 50→100→200 km). \
+`live_hotspots` uses live eBird data and covers any distance — prefer it over `where_to_watch` \
+for radius > 50 km. Always call a tool — never answer from memory.** \
 **CRITICAL: only list locations and species that `where_to_watch` actually returned. \
 Never add locations or species from your own knowledge — the tool enforces the radius. \
 Never invent "Observation récente" details — only mention dates/counts explicitly present \
@@ -679,6 +714,46 @@ def _run_tool(name: str, inputs: dict, graph) -> str:
         if "radius_km" in inputs:
             kwargs["radius_km"] = float(inputs["radius_km"])
         return _fmt(where_to_watch(graph, **kwargs), limit=10)
+
+    if name == "live_hotspots":
+        api_key = os.getenv("EBIRD_API_KEY", "")
+        if not api_key:
+            return json.dumps({"error": "EBIRD_API_KEY not set"})
+        lat = float(inputs["lat"])
+        lon = float(inputs["lon"])
+        radius_km = min(int(inputs.get("radius_km", 50)), 200)
+        days = min(int(inputs.get("days", 7)), 14)
+        hotspots = fetch_nearby_hotspots(api_key, lat, lon, radius_km)
+        # Sort by most recently active, take top 8
+        hotspots = sorted(
+            hotspots,
+            key=lambda h: h.get("latestObsDt") or "",
+            reverse=True,
+        )[:8]
+        results = []
+        for h in hotspots:
+            try:
+                species = fetch_hotspot_species(api_key, h["locId"], days)
+            except Exception:
+                species = []
+            results.append({
+                "name": h.get("locName", ""),
+                "locId": h.get("locId", ""),
+                "lat": h.get("lat"),
+                "lon": h.get("lng"),
+                "latestObsDate": h.get("latestObsDt"),
+                "allTimeSpeciesCount": h.get("numSpeciesAllTime"),
+                "recentSpecies": [
+                    {
+                        "commonName": s.get("comName", ""),
+                        "scientificName": s.get("sciName", ""),
+                        "count": s.get("howMany"),
+                        "date": s.get("obsDt", ""),
+                    }
+                    for s in species[:20]
+                ],
+            })
+        return json.dumps(results, ensure_ascii=False, indent=2)
 
     if name == "taxonomy_summary":
         return json.dumps(taxonomy_summary(graph), ensure_ascii=False, indent=2)
