@@ -338,9 +338,12 @@ TOOLS_OPENAI = [
                 "Returns three structured lists: species seen this week that are unexpected for "
                 "the month (potential rarities), species expected for the month that are absent "
                 "from live data, and species present in both (normal). "
-                "Use this tool — instead of calling live_observations and observations_by_month "
-                "separately — whenever the user asks what can be seen 'right now', 'this week', "
-                "'en ce moment', 'cette semaine', or 'actuellement'."
+                "Use this tool when the user asks what IS currently being observed or seen: "
+                "'qu'est-ce qu'on voit en ce moment', 'qu'observe-t-on cette semaine', "
+                "'actuellement', 'quelles raretés', 'quoi d'inattendu'. "
+                "Do NOT use it for 'what CAN be seen' (possibility) questions using 'peut voir' "
+                "or 'peut observer' — for those, call live_observations and "
+                "observations_by_month separately."
             ),
             "parameters": {
                 "type": "object",
@@ -510,21 +513,26 @@ Today's date is in the system context — use it to compute relative dates preci
 - "les 15 derniers jours" → `date_from` = today minus 15 days, `date_to` = today \
 - "l'hiver dernier" → `date_from="YYYY-12-01"`, `date_to="YYYY-02-28"` (adjust year) \
 - "au printemps" → `date_from="YYYY-03-01"`, `date_to="YYYY-05-31"`
-- **Use `compare_seasonal`** when the user asks what can be seen **right now / this week / \
-en ce moment / cette semaine / actuellement**. It returns a structured diff: unexpected \
-species (live but not historical → potential rarities), expected-but-absent species \
-(historical but not in live), and normal species (both). Report only what the tool returns — \
-do NOT add species from memory.
-- Use `live_observations` only when following up on a specific species in a live context \
-(e.g. "pas d'aigle royal ?" after a live mention → `live_observations`, not `recent_observations`). \
+- **Use `compare_seasonal`** when the user asks what **is** being seen right now / \
+"qu'est-ce qu'on voit en ce moment" / "qu'observe-t-on cette semaine" / "actuellement". \
+It returns unexpected_in_live (potential rarities), expected_but_absent, and normal_present. \
+Report at most 5 species per category — do NOT dump the full list.
+- **When the user asks what one CAN see** ("qu'est-ce qu'on **peut** voir en ce moment", \
+"que peut-on observer cette semaine"), call **both** `live_observations` (days=7) **and** \
+`observations_by_month` (current month, NOT `currently_present`) to give live + historical context. \
+Report only what the tools return — do NOT add species from memory.
+- Use `live_observations` for recent live sightings, or when following up on a specific species \
+in a live context (e.g. "pas d'aigle royal ?" after a live mention → `live_observations`). \
 **When the user mentions a city or place** (e.g. "près de Copenhague", "autour d'Aarhus"), \
 pass `lat`/`lon` coordinates for that place to `live_observations` — do NOT omit them.
-- **ALWAYS call `search_wikipedia`** when the user asks about behavior, habitat, song, \
-courtship, diet, or ecology of a specific species — even if you already called `find_species`. \
+- **ALWAYS call `search_wikipedia`** when the user asks about behavior (comportement), habitat, \
+song (chant), courtship, diet (régime alimentaire), or ecology of a specific species — \
+**call it even if you did NOT call `find_species` first** (e.g. "décris le comportement du \
+rouge-gorge" → call `search_wikipedia("European Robin")` directly). \
 Call it at most once per question — if it returns no results, say the Wikipedia index does not \
 yet cover this species, and answer from your own knowledge if you can, clearly labeling it as such. \
 **Always write `search_wikipedia` queries in English** (use the English common name or scientific \
-name from `find_species`). The Wikipedia index is in English — French queries reduce recall.
+name). The Wikipedia index is in English — French queries reduce recall.
 - Use `observations_by_month` for questions about which birds are present in a specific month \
 ("oiseaux en mars", "birds in winter", etc.).
 - Use `where_to_watch` for questions about where to go birdwatching ("où observer demain ?", \
@@ -551,15 +559,21 @@ Answer in the user's language. Include scientific name + Danish name when releva
 
 ## Examples of correct responses
 
-**User:** "Qu'est-ce qu'on peut voir en ce moment au Danemark ?"
+**User:** "Qu'est-ce qu'on **peut** voir en ce moment au Danemark ?" / "que peut-on observer cette semaine ?"
+→ tools: live_observations({"days": 7}), observations_by_month({"month": <current_month>})
+→ Correct response:
+"Voici ce qu'on observe actuellement (source: eBird live) : [liste live]
+Espèces typiques pour [mois] (source: graphe Birdology) : [liste DOF]"
+
+**User:** "Qu'est-ce qu'on **voit** en ce moment au Danemark ?" / "quelles raretés cette semaine ?" / "quoi d'inattendu ?" / "surprises de la semaine ?"
 → tool: compare_seasonal({"days": 7})
 → Correct response:
 "Voici le bilan de cette semaine au Danemark (source: eBird live + DOF mai) :
 **Inattendus pour mai (raretés potentielles) :** [liste exacte du champ unexpected_in_live]
 **Présents normalement :** [liste exacte du champ normal_present]"
 
-**User:** "Quelles observations dans les 30 derniers jours ?"
-→ tool: live_observations({"days": 30})
+**User:** "Quelles observations dans les 30 derniers jours ?" / "observations récentes au Danemark ?" / "qu'a-t-on vu cette semaine ?"
+→ tool: live_observations({"days": 30}) or live_observations({"days": 7})
 → Correct response:
 "Voici les espèces récemment observées au Danemark (source: eBird live) :
 | Espèce | Localité | Date | N |
@@ -568,16 +582,20 @@ Answer in the user's language. Include scientific name + Danish name when releva
 | Oie rieuse | Gundsømagle Sø | 2026-05-08 | 93 |
 Limité aux 15 premières observations retournées par l'outil."
 
-**User:** "Parle-moi du rouge-gorge"
+**User:** "Parle-moi du rouge-gorge" / "décris le comportement du rouge-gorge" / "que mange la mésange bleue ?" / "comment chante le merle ?"
 → tools: find_species("rouge-gorge"), search_wikipedia("European Robin")
+  [For behavior/diet/song questions: search_wikipedia is MANDATORY even without find_species]
 → Correct response:
 "Le Rouge-gorge familier (*Erithacus rubecula*, Rødhals) est un résident permanent au Danemark, \
 observé 1 243 fois dans le graphe (source: graphe Birdology). Il fréquente les forêts, haies \
 et jardins, chante dès l'aube et est territorial (source: Wikipedia)."
 
 ❌ NEVER add sections titled "Précautions", "À vérifier", "Recommandations", "Espèces absentes", \
-"Espèces confondues", identification tips, validation advice, or any commentary not explicitly \
-requested by the user. Report only what the tools returned."""
+"Espèces confondues", "À surveiller", "À noter", "Remarque", "Conseil", identification tips, \
+validation advice, or any commentary not explicitly requested by the user. \
+**If a tool returns no data or an empty list, say "Je n'ai pas de données pour cette requête." \
+and stop — do NOT fill in from memory, do NOT suggest alternatives, do NOT list places or \
+species you know about.** Report only what the tools returned."""
 
 # ---------------------------------------------------------------------------
 # Tool execution
