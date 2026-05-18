@@ -338,11 +338,12 @@ TOOLS_OPENAI = [
                 "Returns three structured lists: species seen this week that are unexpected for "
                 "the month (potential rarities), species expected for the month that are absent "
                 "from live data, and species present in both (normal). "
-                "Use this tool when the user asks what IS currently being observed or seen: "
+                "Use this tool ONLY when the user asks about rarities, unexpected species, or an "
+                "explicit comparison between live and historical data: "
                 "'qu'est-ce qu'on voit en ce moment', 'qu'observe-t-on cette semaine', "
-                "'actuellement', 'quelles raretés', 'quoi d'inattendu'. "
-                "Do NOT use it for 'what CAN be seen' (possibility) questions using 'peut voir' "
-                "or 'peut observer' — for those, call live_observations and "
+                "'quelles raretés', 'quoi d'inattendu', 'surprises de la semaine'. "
+                "Do NOT use it for possibility/availability questions ('peut voir', 'peut observer', "
+                "'il y a à voir', 'quoi de neuf') — for those, call live_observations and "
                 "observations_by_month separately."
             ),
             "parameters": {
@@ -513,12 +514,15 @@ Today's date is in the system context — use it to compute relative dates preci
 - "les 15 derniers jours" → `date_from` = today minus 15 days, `date_to` = today \
 - "l'hiver dernier" → `date_from="YYYY-12-01"`, `date_to="YYYY-02-28"` (adjust year) \
 - "au printemps" → `date_from="YYYY-03-01"`, `date_to="YYYY-05-31"`
-- **Use `compare_seasonal`** when the user asks what **is** being seen right now / \
-"qu'est-ce qu'on voit en ce moment" / "qu'observe-t-on cette semaine" / "actuellement". \
+- **Use `compare_seasonal`** ONLY when the user explicitly asks for rarities, unexpected species, \
+or a comparison: "qu'est-ce qu'on voit en ce moment" / "qu'observe-t-on cette semaine" / \
+"quelles raretés" / "quoi d'inattendu" / "surprises". \
 It returns unexpected_in_live (potential rarities), expected_but_absent, and normal_present. \
 Report at most 5 species per category — do NOT dump the full list.
-- **When the user asks what one CAN see** ("qu'est-ce qu'on **peut** voir en ce moment", \
-"que peut-on observer cette semaine"), call **both** `live_observations` (days=7) **and** \
+- **When the user asks what one CAN or MIGHT see, or what there IS to see** \
+("qu'est-ce qu'on **peut** voir", "que peut-on observer", "qu'est-ce qu'**il y a** à voir", \
+"quoi de neuf dans les observations", "que peut-on observer cette semaine"), \
+call **both** `live_observations` (days=7) **and** \
 `observations_by_month` (current month, NOT `currently_present`) to give live + historical context. \
 Report only what the tools return — do NOT add species from memory.
 - Use `live_observations` for recent live sightings, or when following up on a specific species \
@@ -559,7 +563,7 @@ Answer in the user's language. Include scientific name + Danish name when releva
 
 ## Examples of correct responses
 
-**User:** "Qu'est-ce qu'on **peut** voir en ce moment au Danemark ?" / "que peut-on observer cette semaine ?"
+**User:** "Qu'est-ce qu'on **peut** voir en ce moment au Danemark ?" / "que peut-on observer cette semaine ?" / "qu'est-ce qu'**il y a** à voir en ce moment ?" / "quoi de neuf dans les observations ?"
 → tools: live_observations({"days": 7}), observations_by_month({"month": <current_month>})
 → Correct response:
 "Voici ce qu'on observe actuellement (source: eBird live) : [liste live]
