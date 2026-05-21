@@ -699,7 +699,34 @@ function mdToHtml(text) {
   return out;
 }
 
+function renderPhenologySVG(name, dataStr) {
+  var vals = dataStr.split(',').map(Number);
+  var monthLabels = ['J','F','M','A','M','J','J','A','S','O','N','D'];
+  var curMonth = new Date().getMonth(); // 0-based
+  var barW = 16, gap = 5, marginTop = 8, labelH = 14;
+  var totalW = 12 * (barW + gap) - gap;  // 247
+  var barAreaH = 52;
+  var totalH = marginTop + barAreaH + labelH;
+  var maxVal = Math.max.apply(null, vals) || 1;
+  var bars = '';
+  for (var i = 0; i < 12; i++) {
+    var x = i * (barW + gap);
+    var barH = Math.max(Math.round(vals[i] / maxVal * barAreaH), vals[i] > 0 ? 2 : 0);
+    var y = marginTop + barAreaH - barH;
+    var fill = (i === curMonth) ? '#f9a825' : (vals[i] > 0 ? '#7dcea0' : '#2a2d3a');
+    bars += '<rect x="' + x + '" y="' + y + '" width="' + barW + '" height="' + barH + '" fill="' + fill + '" rx="2"/>';
+    bars += '<text x="' + (x + barW / 2) + '" y="' + (totalH - 2) + '" text-anchor="middle" font-size="9" fill="#6a7a8a">' + monthLabels[i] + '</text>';
+  }
+  return '<div style="margin:10px 0 4px">'
+    + '<div style="font-size:11px;color:#7dcea0;margin-bottom:4px">📅 ' + escapeHtml(name) + ' — monthly presence (relative frequency)</div>'
+    + '<svg width="' + totalW + '" height="' + totalH + '" style="display:block;overflow:visible">' + bars + '</svg>'
+    + '<div style="font-size:10px;color:#555;margin-top:3px">■ <span style="color:#f9a825">current month</span> &nbsp; ■ <span style="color:#7dcea0">observed</span> &nbsp; ■ <span style="color:#2a2d3a">absent</span></div>'
+    + '</div>';
+}
+
 function inlineFormat(line) {
+  line = line.replace(/&lt;bird-phenology name="([^"]*)" data="([\d,]+)"&gt;/g,
+    function(_, name, data) { return renderPhenologySVG(name, data); });
   line = line.replace(/&lt;bird-img name="([^"]*)" src="([^"]*)"&gt;/g,
     '<img src="$2" alt="$1" title="$1" onclick="window.open(this.src,\'_blank\')">');
   line = parseMarkdownLinks(line);

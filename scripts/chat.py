@@ -36,6 +36,7 @@ from birdology.queries import (
     find_species_by_name,
     migration_timing,
     nearby_watch,
+    phenology,
     observations_by_month,
     recent_danish_observations,
     species_by_family,
@@ -407,6 +408,32 @@ TOOLS_OPENAI = [
     {
         "type": "function",
         "function": {
+            "name": "phenology",
+            "description": (
+                "Return the monthly observation frequency for a species, normalised by "
+                "observation effort (Option B: relative frequency). Produces a visual "
+                "bar chart tag that is rendered in the UI. "
+                "Use this alongside migration_timing for arrival/departure questions, "
+                "or when the user asks about seasonal presence patterns: "
+                "'phénologie du coucou', 'présence mensuelle de l'hirondelle', "
+                "'seasonal chart for barn swallow', 'which months is the cuckoo here?'. "
+                "Always call find_species first to resolve the name."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "species_name": {
+                        "type": "string",
+                        "description": "Species name in any language or scientific name",
+                    },
+                },
+                "required": ["species_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "migration_timing",
             "description": (
                 "Return arrival and departure timing for a bird species in Denmark, "
@@ -565,6 +592,11 @@ Call it at most once per question — if it returns no results, say the Wikipedi
 yet cover this species, and answer from your own knowledge if you can, clearly labeling it as such. \
 **Always write `search_wikipedia` queries in English** (use the English common name or scientific \
 name). The Wikipedia index is in English — French queries reduce recall.
+- **Use `phenology`** (always together with `migration_timing`) for arrival/departure questions \
+and whenever the user asks about seasonal or monthly presence patterns: \
+"phénologie", "présence mensuelle", "seasonal chart", "which months". \
+`phenology` produces a visual bar chart that is automatically rendered in the UI. \
+Always call `find_species` first, then both `migration_timing` and `phenology`.
 - **Use `migration_timing`** for questions about when a species arrives or departs: \
 "quand arrive l'hirondelle ?", "when does the cuckoo arrive?", "hvornår ankommer storkene?", \
 "quand part le martinet ?", "depuis quand est là le rouge-gorge ?". \
@@ -762,6 +794,12 @@ def _run_tool(name: str, inputs: dict, graph) -> str:
             "unexpected_in_live": unexpected[:5],    # in live, not in history → potential rarities
             "normal_present": normal[:5],            # in both → business as usual
         }
+        return json.dumps(result, ensure_ascii=False, indent=2)
+
+    if name == "phenology":
+        result = phenology(graph, inputs["species_name"])
+        if not result:
+            return json.dumps({"error": "Species not found or no observation data available"})
         return json.dumps(result, ensure_ascii=False, indent=2)
 
     if name == "migration_timing":

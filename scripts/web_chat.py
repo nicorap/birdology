@@ -132,6 +132,18 @@ def _save_session(session_id: str, msgs: list[dict]) -> None:
             )
 
 
+def _extract_phenology_tag(tool_result: str, out: list) -> None:
+    """Extract the <bird-phenology> tag from a phenology tool result."""
+    try:
+        data = json.loads(tool_result)
+    except (json.JSONDecodeError, TypeError):
+        return
+    if isinstance(data, dict):
+        tag = data.get("phenologyTag")
+        if tag:
+            out.append(tag)
+
+
 def _extract_thumbnails(tool_result: str, out: list) -> None:
     """Parse tool JSON results and collect (name, thumbnail_url) pairs."""
     try:
@@ -250,6 +262,7 @@ def api_chat():
 
     tool_calls_log = []
     thumbnails_seen = []  # collect thumbnail URLs from tool results
+    phenology_tags = []   # collect <bird-phenology> tags from phenology tool results
     wiki_calls = 0  # enforce at-most-once for search_wikipedia
     max_rounds = 8
 
@@ -292,6 +305,9 @@ def api_chat():
                         for name, url in new_thumbs:
                             gallery += f'<bird-img name="{name}" src="{url}">\n'
                         answer += gallery
+                # Append phenology chart if one was collected
+                if phenology_tags:
+                    answer += "\n\n" + phenology_tags[0]
                 # Persist only the final assistant text to session history
                 history.append({"role": "assistant", "content": answer})
                 _save_session(session_id, history)
@@ -321,8 +337,9 @@ def api_chat():
                     tool_calls_log.append({"name": fn_name, "args": fn_args})
                     result = _run_tool(fn_name, fn_args, GRAPH)
 
-                # Extract thumbnails from tool results
+                # Extract thumbnails and phenology tags from tool results
                 _extract_thumbnails(result, thumbnails_seen)
+                _extract_phenology_tag(result, phenology_tags)
 
                 messages.append({
                     "role": "tool",
@@ -393,6 +410,7 @@ def api_chat_stream():
         messages = list(history)
         tool_calls_log = []
         thumbnails_seen = []
+        phenology_tags = []
         wiki_calls = [0]  # mutable ref
         max_rounds = 8
 
@@ -423,6 +441,8 @@ def api_chat_stream():
                             for tname, url in new_thumbs:
                                 gallery += f'<bird-img name="{tname}" src="{url}">\n'
                             text += gallery
+                    if phenology_tags:
+                        text += "\n\n" + phenology_tags[0]
                     import re as _re
                     for chunk in _re.split(r'(\s+)', text):
                         if chunk:
@@ -448,6 +468,7 @@ def api_chat_stream():
                         yield _sse("tool", {"name": fn_name, "args": fn_args})
 
                     _extract_thumbnails(result, thumbnails_seen)
+                    _extract_phenology_tag(result, phenology_tags)
                     messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
             answer = "(max tool rounds reached)"

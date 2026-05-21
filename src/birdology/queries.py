@@ -710,6 +710,135 @@ ORDER BY ?year
     }
 
 
+def phenology(g: Graph | ConjunctiveGraph, species_name: str) -> dict:
+    """Monthly presence frequency for a species, normalised by observation effort (Option B).
+
+    For each month 1-12:
+      freq(month) = obs_species(month) / total_obs_all_species(month)
+
+    This removes the summer bias where more birders go out in May-July regardless
+    of what they see. A resident species gets a flat curve; a migrant gets a clear peak.
+
+    Returns dict with:
+      scientificName, commonNameFr, commonNameEn, commonNameDa, migrationStatus,
+      monthlyCounts    (list[int], 12 values — raw obs count for this species),
+      monthlyTotals    (list[int], 12 values — total obs all species that month),
+      monthlyFreq      (list[float], 12 values — ratio, 0.0–1.0),
+      monthlyFreqPct   (list[int], 12 values — normalised to 0–100 relative to peak),
+      peakMonth        (int 1-12),
+      peakMonthName    (str),
+      phenologyTag     (str) — <bird-phenology> tag to inject into the response.
+    Returns empty dict if species not found or no observations.
+    """
+    name_filter = _sparql_name_filter(
+        "?scientificName", "?commonNameEn", "?commonNameDa", "?commonNameFr",
+        query=species_name,
+    )
+
+    # Step 1: species metadata
+    q_meta = (
+        _PREFIXES
+        + f"""
+SELECT DISTINCT ?species ?scientificName ?commonNameFr ?commonNameEn ?commonNameDa ?migStatus
+WHERE {{
+    ?species a bird:Species ;
+             dwc:scientificName ?scientificName .
+    {_CANONICAL_SPECIES}
+    OPTIONAL {{ ?species bird:commonNameFr    ?commonNameFr }}
+    OPTIONAL {{ ?species bird:commonNameEn    ?commonNameEn }}
+    OPTIONAL {{ ?species bird:commonNameDa    ?commonNameDa }}
+    OPTIONAL {{ ?species bird:migrationStatus ?migStatus }}
+    {name_filter}
+}}
+LIMIT 10
+"""
+    )
+    meta_rows = _rows(g.query(q_meta))
+    if not meta_rows:
+        return {}
+    meta = meta_rows[0]
+    species_uri = meta.get("species", "")
+
+    # Step 2: observation count per month for this species
+    q_species = (
+        _PREFIXES
+        + f"""
+SELECT ?month (COUNT(DISTINCT ?obs) AS ?cnt)
+WHERE {{
+    ?species bird:hasObservation ?obs .
+    FILTER(STR(?species) = "{species_uri}")
+    ?obs bird:observedOn ?date .
+    BIND(MONTH(?date) AS ?month)
+}}
+GROUP BY ?month
+"""
+    )
+    species_counts = {
+        int(r["month"]): int(r["cnt"])
+        for r in _rows(g.query(q_species))
+    }
+
+    if not species_counts:
+        return {}
+
+    # Step 3: total observations per month across all species (effort baseline)
+    q_total = (
+        _PREFIXES
+        + """
+SELECT ?month (COUNT(DISTINCT ?obs) AS ?total)
+WHERE {
+    ?species a bird:Species ;
+             bird:hasObservation ?obs .
+    FILTER(STRSTARTS(STR(?species), "https://birdology.org/taxon/species/"))
+    ?obs bird:observedOn ?date .
+    BIND(MONTH(?date) AS ?month)
+}
+GROUP BY ?month
+"""
+    )
+    total_counts = {
+        int(r["month"]): int(r["total"])
+        for r in _rows(g.query(q_total))
+    }
+
+    # Build 12-value arrays
+    monthly_counts = [species_counts.get(m, 0) for m in range(1, 13)]
+    monthly_totals = [total_counts.get(m, 0) for m in range(1, 13)]
+    monthly_freq = [
+        round(monthly_counts[i] / monthly_totals[i], 4) if monthly_totals[i] > 0 else 0.0
+        for i in range(12)
+    ]
+
+    max_freq = max(monthly_freq) if any(f > 0 for f in monthly_freq) else 1.0
+    monthly_freq_pct = [round(f / max_freq * 100) for f in monthly_freq]
+
+    peak_idx = monthly_freq.index(max_freq)
+    peak_month = peak_idx + 1
+
+    display_name = (
+        meta.get("commonNameFr")
+        or meta.get("commonNameEn")
+        or meta.get("scientificName", "")
+    )
+    data_str = ",".join(str(v) for v in monthly_freq_pct)
+    phenology_tag = f'<bird-phenology name="{display_name}" data="{data_str}">'
+
+    return {
+        "scientificName":  meta.get("scientificName", ""),
+        "commonNameFr":    meta.get("commonNameFr", ""),
+        "commonNameEn":    meta.get("commonNameEn", ""),
+        "commonNameDa":    meta.get("commonNameDa", ""),
+        "migrationStatus": meta.get("migStatus", ""),
+        "monthlyCounts":   monthly_counts,
+        "monthlyTotals":   monthly_totals,
+        "monthlyFreq":     monthly_freq,
+        "monthlyFreqPct":  monthly_freq_pct,
+        "peakMonth":       peak_month,
+        "peakMonthName":   _MONTH_NAMES[peak_month],
+        "phenologyTag":    phenology_tag,
+    }
+
+
 def where_to_watch(
     g: Graph | ConjunctiveGraph,
     month: int | None = None,

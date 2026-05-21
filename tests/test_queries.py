@@ -13,6 +13,7 @@ from birdology.queries import (
     list_danish_species,
     migration_timing,
     nearby_watch,
+    phenology,
     recent_danish_observations,
     species_by_family,
     species_by_order,
@@ -425,3 +426,92 @@ def test_migration_timing_unknown_species_returns_empty():
     g = _make_migration_graph()
     r = migration_timing(g, "Nonexistent species ZZZZ")
     assert r == {}
+
+
+# ── phenology ─────────────────────────────────────────────────────────────────
+
+def test_phenology_returns_12_monthly_values():
+    g = _make_migration_graph()
+    r = phenology(g, "Erithacus rubecula")
+    assert len(r["monthlyCounts"]) == 12
+    assert len(r["monthlyTotals"]) == 12
+    assert len(r["monthlyFreq"]) == 12
+    assert len(r["monthlyFreqPct"]) == 12
+
+
+def test_phenology_unknown_species_returns_empty():
+    g = _make_migration_graph()
+    assert phenology(g, "Nonexistent ZZZZ") == {}
+
+
+def test_phenology_species_with_no_observations_returns_empty():
+    # A species in the graph but with no hasObservation triples
+    g = _make_graph()  # Woodpecker has one obs, but let's check a species added manually
+    # Remove woodpecker's observation to simulate no-obs species
+    WOODP_URI = TAXON["species/euwoo1"]
+    OBS_WOODP = OBS["obs_woodp"]
+    g.remove((WOODP_URI, BIRD.hasObservation, OBS_WOODP))
+    r = phenology(g, "Dendrocopos major")
+    assert r == {}
+
+
+def test_phenology_counts_correct_months():
+    g = _make_migration_graph()
+    r = phenology(g, "Erithacus rubecula")
+    # Robin is observed in April (month 4) and September (month 9)
+    # monthlyCounts is 0-indexed from month 1 → index 3 = April, index 8 = September
+    assert r["monthlyCounts"][3] > 0   # April
+    assert r["monthlyCounts"][8] > 0   # September
+    assert r["monthlyCounts"][0] == 0  # January — Robin not observed
+
+
+def test_phenology_relative_frequency_removes_effort_bias():
+    g = _make_migration_graph()
+    r = phenology(g, "Erithacus rubecula")
+    # monthlyFreq = species_obs / total_obs for that month
+    # In May: woodpecker has 2 obs, robin has 0 → robin freq in May = 0
+    assert r["monthlyFreq"][4] == 0.0  # May
+    # In April: woodpecker has 0 obs, robin has 2 → robin freq = 1.0
+    assert r["monthlyFreq"][3] == 1.0  # April (robin is the only species observed)
+
+
+def test_phenology_peak_month_is_most_frequent():
+    g = _make_migration_graph()
+    r = phenology(g, "Erithacus rubecula")
+    # Peak should be April or September (both have robin obs, April has no woodpecker)
+    assert r["peakMonth"] in [4, 9]
+    assert r["peakMonthName"] in ["April", "September"]
+
+
+def test_phenology_freq_pct_peak_is_100():
+    g = _make_migration_graph()
+    r = phenology(g, "Erithacus rubecula")
+    # Normalised to peak=100
+    assert max(r["monthlyFreqPct"]) == 100
+
+
+def test_phenology_phenology_tag_format():
+    g = _make_migration_graph()
+    r = phenology(g, "Erithacus rubecula")
+    tag = r["phenologyTag"]
+    assert tag.startswith("<bird-phenology ")
+    assert 'data="' in tag
+    # 12 comma-separated values
+    data_part = tag.split('data="')[1].split('"')[0]
+    assert len(data_part.split(",")) == 12
+
+
+def test_phenology_by_french_name():
+    g = _make_migration_graph()
+    r = phenology(g, "Rouge-gorge familier")
+    assert r["scientificName"] == "Erithacus rubecula"
+
+
+def test_phenology_resident_has_flat_profile():
+    g = _make_migration_graph()
+    r = phenology(g, "Dendrocopos major")
+    # Woodpecker observed Jan + May → both months have relative freq > 0
+    # Jan: only woodpecker → freq = 1.0; May: only woodpecker → freq = 1.0
+    assert r["monthlyFreq"][0] > 0   # January
+    assert r["monthlyFreq"][4] > 0   # May
+    assert r["monthlyFreqPct"][0] == 100 or r["monthlyFreqPct"][4] == 100
