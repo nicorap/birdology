@@ -34,6 +34,7 @@ from birdology.ingestion.ebird import (
 from birdology.queries import (
     currently_present,
     find_species_by_name,
+    migration_timing,
     nearby_watch,
     observations_by_month,
     recent_danish_observations,
@@ -342,8 +343,9 @@ TOOLS_OPENAI = [
                 "explicit comparison between live and historical data: "
                 "'qu'est-ce qu'on voit en ce moment', 'qu'observe-t-on cette semaine', "
                 "'quelles raretés', 'quoi d'inattendu', 'surprises de la semaine'. "
-                "Do NOT use it for possibility/availability questions ('peut voir', 'peut observer', "
-                "'il y a à voir', 'quoi de neuf') — for those, call live_observations and "
+                "Do NOT use it for possibility/availability/news questions: 'peut voir', "
+                "'peut observer', 'il y a à voir', 'quoi de neuf', 'quelles nouvelles', "
+                "'que s'est-il passé' — for those, call live_observations and "
                 "observations_by_month separately."
             ),
             "parameters": {
@@ -405,6 +407,31 @@ TOOLS_OPENAI = [
     {
         "type": "function",
         "function": {
+            "name": "migration_timing",
+            "description": (
+                "Return arrival and departure timing for a bird species in Denmark, "
+                "based on DOF historical observation data. "
+                "Use this for questions like 'quand arrive l'hirondelle ?', "
+                "'when does the cuckoo arrive?', 'hvornår ankommer storkene?', "
+                "'quand part le rouge-gorge ?', 'depuis quand le martinet est là ?'. "
+                "Returns: presence months, typical arrival month, typical departure month, "
+                "earliest ever recorded date, and yearly first/last observation dates."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "species_name": {
+                        "type": "string",
+                        "description": "Species name in any language or scientific name",
+                    },
+                },
+                "required": ["species_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "search_wikipedia",
             "description": (
                 "Search Wikipedia articles about bird species for detailed information on "
@@ -453,7 +480,7 @@ You are Birdology, an ornithologist assistant powered by a knowledge graph (OWL/
 
 1. **ONLY report data returned by your tools.** Never invent dates, statistics, population \
 trends, observations, or localities. **If a tool returns no data, say exactly that** \
-("Je n'ai pas cette information dans mes données.") and stop — do NOT fill in from general \
+("I don't have this information in my data." / "Je n'ai pas cette information dans mes données." — match the user's language) and stop — do NOT fill in from general \
 knowledge, do NOT suggest alternatives, do NOT describe the species from memory. \
 If you are unsure which tool to use or whether you have the right data, say so and ask the \
 user to clarify rather than guessing.
@@ -519,9 +546,10 @@ or a comparison: "qu'est-ce qu'on voit en ce moment" / "qu'observe-t-on cette se
 "quelles raretés" / "quoi d'inattendu" / "surprises". \
 It returns unexpected_in_live (potential rarities), expected_but_absent, and normal_present. \
 Report at most 5 species per category — do NOT dump the full list.
-- **When the user asks what one CAN or MIGHT see, or what there IS to see** \
-("qu'est-ce qu'on **peut** voir", "que peut-on observer", "qu'est-ce qu'**il y a** à voir", \
-"quoi de neuf dans les observations", "que peut-on observer cette semaine"), \
+- **When the user asks what one CAN or MIGHT see, what there IS to see, or what is NEW in \
+observations** ("qu'est-ce qu'on **peut** voir", "que peut-on observer", \
+"qu'est-ce qu'**il y a** à voir", "**quoi de neuf** dans les observations", \
+"que s'est-il passé", "que peut-on observer cette semaine"), \
 call **both** `live_observations` (days=7) **and** \
 `observations_by_month` (current month, NOT `currently_present`) to give live + historical context. \
 Report only what the tools return — do NOT add species from memory.
@@ -537,6 +565,12 @@ Call it at most once per question — if it returns no results, say the Wikipedi
 yet cover this species, and answer from your own knowledge if you can, clearly labeling it as such. \
 **Always write `search_wikipedia` queries in English** (use the English common name or scientific \
 name). The Wikipedia index is in English — French queries reduce recall.
+- **Use `migration_timing`** for questions about when a species arrives or departs: \
+"quand arrive l'hirondelle ?", "when does the cuckoo arrive?", "hvornår ankommer storkene?", \
+"quand part le martinet ?", "depuis quand est là le rouge-gorge ?". \
+Always call `find_species` first to resolve the name, then call `migration_timing` with the \
+resolved scientific name. Present the result as: arrival month, departure month, months present, \
+and (if available) the earliest date ever recorded and a table of yearly first/last dates.
 - Use `observations_by_month` for questions about which birds are present in a specific month \
 ("oiseaux en mars", "birds in winter", etc.).
 - Use `where_to_watch` for questions about where to go birdwatching ("où observer demain ?", \
@@ -559,7 +593,17 @@ Do NOT use `live_observations` for rarity-based queries — it has no IUCN filte
 - Use graph tools (`species_by_family`, `currently_present`, etc.) for taxonomy and historical data.
 
 ## Response language
-Answer in the user's language. Include scientific name + Danish name when relevant.
+**Always reply in the same language the user wrote in.** Detect automatically:
+- French question → French answer
+- English question → English answer
+- Danish question → Danish answer
+Do NOT mix languages in the same response. For every species mentioned, always include:
+- scientific name (*italics*)
+- French common name if available
+- English common name if available
+- Danish common name if available
+Format: **Common name** (*Genus species* · fr: Nom français · en: English name · da: Dansk navn)
+Omit a language tag only if that name is genuinely missing from the tool result.
 
 ## Examples of correct responses
 
@@ -718,6 +762,12 @@ def _run_tool(name: str, inputs: dict, graph) -> str:
             "unexpected_in_live": unexpected[:5],    # in live, not in history → potential rarities
             "normal_present": normal[:5],            # in both → business as usual
         }
+        return json.dumps(result, ensure_ascii=False, indent=2)
+
+    if name == "migration_timing":
+        result = migration_timing(graph, inputs["species_name"])
+        if not result:
+            return json.dumps({"error": "Species not found or no timing data available"})
         return json.dumps(result, ensure_ascii=False, indent=2)
 
     if name == "observations_by_month":

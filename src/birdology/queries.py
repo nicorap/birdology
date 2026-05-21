@@ -602,6 +602,114 @@ ORDER BY DESC(?obsCount)
     return rows
 
 
+_MONTH_NAMES = [
+    "", "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+]
+
+
+def migration_timing(g: Graph | ConjunctiveGraph, species_name: str) -> dict:
+    """Return arrival / departure timing for a migratory species based on DOF data.
+
+    Returns a dict with:
+      scientificName, commonNameFr, commonNameEn, commonNameDa, migrationStatus,
+      presenceMonths (list[int]), arrivalMonth (int|None), departureMonth (int|None),
+      arrivalMonthName, departureMonthName,
+      earliestRecorded (date str), latestRecorded (date str),
+      yearlyFirstDates (list of {year, firstDate}),  — earliest obs per year
+      yearlyLastDates  (list of {year, lastDate})     — latest obs per year
+    Returns empty dict if species not found or no timing data.
+    """
+    import statistics
+
+    name_filter = _sparql_name_filter(
+        "?scientificName", "?commonNameEn", "?commonNameDa", "?commonNameFr",
+        query=species_name,
+    )
+
+    # 1. Species metadata + presence months
+    q_meta = (
+        _PREFIXES
+        + f"""
+SELECT DISTINCT ?species ?scientificName ?commonNameFr ?commonNameEn ?commonNameDa
+       ?migStatus ?presenceMonth
+WHERE {{
+    ?species a bird:Species ;
+             dwc:scientificName ?scientificName .
+    {_CANONICAL_SPECIES}
+    OPTIONAL {{ ?species bird:commonNameFr      ?commonNameFr }}
+    OPTIONAL {{ ?species bird:commonNameEn      ?commonNameEn }}
+    OPTIONAL {{ ?species bird:commonNameDa      ?commonNameDa }}
+    OPTIONAL {{ ?species bird:migrationStatus   ?migStatus }}
+    OPTIONAL {{ ?species bird:typicallyPresentInMonth ?presenceMonth }}
+    {name_filter}
+}}
+ORDER BY ?presenceMonth
+LIMIT 200
+"""
+    )
+    rows = _rows(g.query(q_meta))
+    if not rows:
+        return {}
+
+    # Collect metadata from first row; gather all presence months
+    meta = rows[0]
+    presence_months = sorted({int(r["presenceMonth"]) for r in rows if r.get("presenceMonth")})
+    species_uri_filter = f'FILTER(STR(?species) = "{meta.get("species", "")}")'
+
+    # 2. Earliest and latest observation date per year for this species
+    q_yearly = (
+        _PREFIXES
+        + f"""
+SELECT ?year (MIN(?date) AS ?firstDate) (MAX(?date) AS ?lastDate)
+WHERE {{
+    ?species a bird:Species ;
+             dwc:scientificName ?scientificName ;
+             bird:hasObservation ?obs .
+    {_CANONICAL_SPECIES}
+    {species_uri_filter}
+    ?obs bird:observedOn ?date .
+    BIND(YEAR(?date) AS ?year)
+}}
+GROUP BY ?year
+ORDER BY ?year
+"""
+    )
+    yearly_rows = _rows(g.query(q_yearly))
+
+    yearly_first = [{"year": r["year"], "firstDate": r["firstDate"]} for r in yearly_rows if r.get("firstDate")]
+    yearly_last  = [{"year": r["year"], "lastDate":  r["lastDate"]}  for r in yearly_rows if r.get("lastDate")]
+
+    # Derive typical arrival/departure from median first/last month across years
+    first_months = [int(r["firstDate"][5:7]) for r in yearly_first if len(r["firstDate"]) >= 7]
+    last_months  = [int(r["lastDate"][5:7])  for r in yearly_last  if len(r["lastDate"])  >= 7]
+
+    arrival_month   = int(statistics.median(first_months)) if first_months else (min(presence_months) if presence_months else None)
+    departure_month = int(statistics.median(last_months))  if last_months  else (max(presence_months) if presence_months else None)
+
+    all_dates = [r["firstDate"] for r in yearly_first] + [r["lastDate"] for r in yearly_last]
+    earliest_recorded = min(all_dates) if all_dates else None
+    latest_recorded   = max(all_dates) if all_dates else None
+
+    return {
+        "scientificName":   meta.get("scientificName", ""),
+        "commonNameFr":     meta.get("commonNameFr", ""),
+        "commonNameEn":     meta.get("commonNameEn", ""),
+        "commonNameDa":     meta.get("commonNameDa", ""),
+        "migrationStatus":  meta.get("migStatus", ""),
+        "presenceMonths":   presence_months,
+        "presenceMonthNames": [_MONTH_NAMES[m] for m in presence_months if 1 <= m <= 12],
+        "arrivalMonth":     arrival_month,
+        "arrivalMonthName": _MONTH_NAMES[arrival_month] if arrival_month and 1 <= arrival_month <= 12 else None,
+        "departureMonth":   departure_month,
+        "departureMonthName": _MONTH_NAMES[departure_month] if departure_month and 1 <= departure_month <= 12 else None,
+        "earliestRecorded": earliest_recorded,
+        "latestRecorded":   latest_recorded,
+        "yearlyFirstDates": yearly_first[-10:],   # last 10 years
+        "yearlyLastDates":  yearly_last[-10:],
+    }
+
+
 def where_to_watch(
     g: Graph | ConjunctiveGraph,
     month: int | None = None,

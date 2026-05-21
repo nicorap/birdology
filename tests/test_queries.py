@@ -11,6 +11,7 @@ from birdology.namespaces import BIRD, DWC, OBS, LOC, TAXON
 from birdology.queries import (
     find_species_by_name,
     list_danish_species,
+    migration_timing,
     nearby_watch,
     recent_danish_observations,
     species_by_family,
@@ -297,3 +298,130 @@ def test_taxonomy_summary_counts():
     assert summary["observations"] == 2
     assert summary["orders"] == 2
     assert summary["families"] == 2
+
+
+# ── migration_timing ──────────────────────────────────────────────────────────
+
+def _make_migration_graph() -> Graph:
+    """
+    Graph with Robin observed in April + September across two years,
+    and Woodpecker observed year-round (January + May).
+    Robin also has bird:typicallyPresentInMonth triples set (as migration.py would).
+    """
+    g = _make_graph()
+
+    ROBIN_URI = TAXON["species/robi"]
+    WOODP_URI = TAXON["species/euwoo1"]
+    LOC_CPH = LOC["loc_cph"]
+
+    # Robin: April (arrival) and September (departure) in two years
+    for obs_id, date_str in [
+        ("obs_robin_apr_2022", "2022-04-05"),
+        ("obs_robin_sep_2022", "2022-09-20"),
+        ("obs_robin_apr_2023", "2023-04-08"),
+        ("obs_robin_sep_2023", "2023-09-18"),
+    ]:
+        obs = OBS[obs_id]
+        g.add((obs, RDF.type, BIRD.Observation))
+        g.add((obs, BIRD.observedOn, Literal(date_str, datatype=XSD.date)))
+        g.add((obs, BIRD.observedAt, LOC_CPH))
+        g.add((ROBIN_URI, BIRD.hasObservation, obs))
+
+    # Robin presence months + migration status (as set by migration.py Rule 5)
+    g.add((ROBIN_URI, BIRD.migrationStatus, Literal("SummerVisitor")))
+    for month in [4, 9]:
+        g.add((ROBIN_URI, BIRD.typicallyPresentInMonth, Literal(month, datatype=XSD.integer)))
+
+    # Woodpecker: year-round (January + May in two years)
+    for obs_id, date_str in [
+        ("obs_woodp_jan_2022", "2022-01-10"),
+        ("obs_woodp_may_2022", "2022-05-15"),
+        ("obs_woodp_jan_2023", "2023-01-08"),
+        ("obs_woodp_may_2023", "2023-05-12"),
+    ]:
+        obs = OBS[obs_id]
+        g.add((obs, RDF.type, BIRD.Observation))
+        g.add((obs, BIRD.observedOn, Literal(date_str, datatype=XSD.date)))
+        g.add((obs, BIRD.observedAt, LOC_CPH))
+        g.add((WOODP_URI, BIRD.hasObservation, obs))
+
+    g.add((WOODP_URI, BIRD.migrationStatus, Literal("Resident")))
+    for month in [1, 5]:
+        g.add((WOODP_URI, BIRD.typicallyPresentInMonth, Literal(month, datatype=XSD.integer)))
+
+    return g
+
+
+def test_migration_timing_returns_species_names():
+    g = _make_migration_graph()
+    r = migration_timing(g, "Erithacus")
+    assert r["scientificName"] == "Erithacus rubecula"
+    assert r["commonNameEn"] == "European Robin"
+    assert r["commonNameFr"] == "Rouge-gorge familier"
+    assert r["commonNameDa"] == "Rødhals"
+
+
+def test_migration_timing_arrival_departure_months():
+    g = _make_migration_graph()
+    r = migration_timing(g, "European Robin")
+    # April is first month observed each year → arrival = April
+    assert r["arrivalMonth"] == 4
+    assert r["arrivalMonthName"] == "April"
+    # September is last month observed each year → departure = September
+    assert r["departureMonth"] == 9
+    assert r["departureMonthName"] == "September"
+
+
+def test_migration_timing_presence_months():
+    g = _make_migration_graph()
+    r = migration_timing(g, "Erithacus rubecula")
+    assert r["presenceMonths"] == [4, 9]
+    assert "April" in r["presenceMonthNames"]
+    assert "September" in r["presenceMonthNames"]
+
+
+def test_migration_timing_migration_status():
+    g = _make_migration_graph()
+    r = migration_timing(g, "Rødhals")
+    assert r["migrationStatus"] == "SummerVisitor"
+
+
+def test_migration_timing_earliest_latest_recorded():
+    g = _make_migration_graph()
+    r = migration_timing(g, "Erithacus")
+    # Earliest overall = 2022-04-05 (from migration fixture)
+    # Latest = 2024-04-10 (from _make_graph() base observation)
+    assert r["earliestRecorded"] == "2022-04-05"
+    assert r["latestRecorded"] == "2024-04-10"
+
+
+def test_migration_timing_yearly_first_dates():
+    g = _make_migration_graph()
+    r = migration_timing(g, "Erithacus")
+    years = [e["year"] for e in r["yearlyFirstDates"]]
+    assert "2022" in years
+    assert "2023" in years
+    # First date in 2022 = April 5
+    first_2022 = next(e for e in r["yearlyFirstDates"] if e["year"] == "2022")
+    assert first_2022["firstDate"] == "2022-04-05"
+
+
+def test_migration_timing_yearly_last_dates():
+    g = _make_migration_graph()
+    r = migration_timing(g, "Erithacus")
+    last_2023 = next(e for e in r["yearlyLastDates"] if e["year"] == "2023")
+    assert last_2023["lastDate"] == "2023-09-18"
+
+
+def test_migration_timing_resident_species():
+    g = _make_migration_graph()
+    r = migration_timing(g, "Dendrocopos major")
+    assert r["migrationStatus"] == "Resident"
+    assert 1 in r["presenceMonths"]
+    assert 5 in r["presenceMonths"]
+
+
+def test_migration_timing_unknown_species_returns_empty():
+    g = _make_migration_graph()
+    r = migration_timing(g, "Nonexistent species ZZZZ")
+    assert r == {}

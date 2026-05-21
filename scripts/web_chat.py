@@ -230,7 +230,7 @@ def api_chat():
     question = data.get("message", "").strip()
     session_id = data.get("session_id", "default")
     if not question:
-        return jsonify({"answer": "Posez une question."}), 400
+        return jsonify({"answer": "Please enter a question."}), 400
 
     base_url = os.getenv("LLM_BASE_URL", "http://localhost:11434/v1")
     api_key = os.getenv("LLM_API_KEY", "ollama")
@@ -352,7 +352,7 @@ def api_chat_stream():
     question = data.get("message", "").strip()
     session_id = data.get("session_id", "default")
     if not question:
-        return jsonify({"answer": "Posez une question."}), 400
+        return jsonify({"answer": "Please enter a question."}), 400
 
     base_url = os.getenv("LLM_BASE_URL", "http://localhost:11434/v1")
     api_key = os.getenv("LLM_API_KEY", "ollama")

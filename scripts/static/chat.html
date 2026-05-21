@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="fr">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -397,28 +397,28 @@
 <header>
   <h1>Birdology</h1>
   <span class="badge">Graph-RAG</span>
-  <button id="weekend-btn">Quoi observer ce week-end ?</button>
-  <button id="new-chat-btn">Nouvelle conversation</button>
+  <button id="weekend-btn">What to watch this weekend?</button>
+  <button id="new-chat-btn">New chat</button>
 </header>
 
 <div id="chat-column">
   <div id="chat-container">
     <div class="welcome">
       <h2>Birdology Graph-RAG</h2>
-      <p>Posez vos questions sur les oiseaux du Danemark.</p>
+      <p>Ask questions about birds in Denmark — in French, English or Danish.</p>
       <div class="examples">
-        <button class="example-btn">Quels oiseaux pres de Copenhague ?</button>
-        <button class="example-btn">Combien d'especes dans le graphe ?</button>
-        <button class="example-btn">Parle-moi des Turdides</button>
-        <button class="example-btn">Oiseaux menaces au Danemark</button>
+        <button class="example-btn">Birds near Copenhagen?</button>
+        <button class="example-btn">How many species in the graph?</button>
+        <button class="example-btn">Tell me about Thrushes</button>
+        <button class="example-btn">Threatened birds in Denmark</button>
       </div>
     </div>
   </div>
 
   <div id="input-area">
     <div id="input-form">
-      <textarea id="user-input" placeholder="Posez votre question..." autocomplete="off" rows="1"></textarea>
-      <button type="button" id="send-btn">Envoyer</button>
+      <textarea id="user-input" placeholder="Ask a question..." autocomplete="off" rows="1"></textarea>
+      <button type="button" id="send-btn">Send</button>
     </div>
   </div>
 </div>
@@ -428,8 +428,8 @@
     <div class="panel-header" style="display:flex;align-items:center">
       Observations <span class="count" id="map-count"></span> <span id="hotspot-badge"></span>
       <div id="map-filters">
-        <button class="map-filter-btn active" data-filter="all">Tout</button>
-        <button class="map-filter-btn" data-filter="rare">⭐ Rares</button>
+        <button class="map-filter-btn active" data-filter="all">All</button>
+        <button class="map-filter-btn" data-filter="rare">⭐ Rare</button>
       </div>
     </div>
     <div id="map"></div>
@@ -437,30 +437,31 @@
       <div class="legend-item"><div class="legend-dot" style="background:#7dcea0"></div> Normal</div>
       <div class="legend-item"><span style="font-size:12px">⭐</span> Rare</div>
       <div class="legend-item"><div class="legend-dot" style="background:#e65100;width:14px;height:14px;opacity:0.8"></div> Hotspot</div>
+
     </div>
     <div id="map-style-switcher">
-      <button class="map-style-btn" data-style="dark">Sombre</button>
-      <button class="map-style-btn active" data-style="light">Clair</button>
+      <button class="map-style-btn" data-style="dark">Dark</button>
+      <button class="map-style-btn active" data-style="light">Light</button>
       <button class="map-style-btn" data-style="satellite">Satellite</button>
       <button class="map-style-btn" data-style="topo">Topo</button>
     </div>
     <div id="rare-overlay" style="display:none">
-      <h4>⭐ Espèces rares</h4>
+      <h4>⭐ Rare species</h4>
       <div id="rare-list"></div>
     </div>
   </section>
   <section id="cards-panel" class="panel">
-    <div class="panel-header">Especes du mois <span class="count" id="cards-count"></span></div>
+    <div class="panel-header">Species this month <span class="count" id="cards-count"></span></div>
     <div id="cards-grid">
-      <div class="panel-loading">Chargement…</div>
+      <div class="panel-loading">Loading...</div>
     </div>
   </section>
   <section id="spots-panel" class="panel">
     <div class="panel-header">
-      <span>Où observer en <span id="spots-month"></span></span>
+      <span>Where to watch in <span id="spots-month"></span></span>
       <button id="spots-refresh-btn">↺</button>
     </div>
-    <div id="spots-panel-body"><div class="panel-loading">Chargement…</div></div>
+    <div id="spots-panel-body"><div class="panel-loading">Loading...</div></div>
   </section>
 </div>
 
@@ -512,12 +513,12 @@ newChatBtn.addEventListener('click', function() {
   var welcome = document.createElement('div');
   welcome.className = 'welcome';
   welcome.innerHTML = '<h2>Birdology Graph-RAG</h2>'
-    + '<p>Posez vos questions sur les oiseaux du Danemark.</p>'
+    + '<p>Ask questions about birds in Denmark — in French, English or Danish.</p>'
     + '<div class="examples">'
-    + '<button class="example-btn">Quels oiseaux pres de Copenhague ?</button>'
-    + '<button class="example-btn">Combien d\'especes dans le graphe ?</button>'
-    + '<button class="example-btn">Parle-moi des Turdides</button>'
-    + '<button class="example-btn">Oiseaux menaces au Danemark</button>'
+    + '<button class="example-btn">Birds near Copenhagen?</button>'
+    + '<button class="example-btn">How many species in the graph?</button>'
+    + '<button class="example-btn">Tell me about Thrushes</button>'
+    + '<button class="example-btn">Threatened birds in Denmark</button>'
     + '</div>';
   chatContainer.appendChild(welcome);
   bindExamples(welcome);
@@ -526,7 +527,7 @@ newChatBtn.addEventListener('click', function() {
 });
 
 function askAbout(name) {
-  userInput.value = 'Parle-moi de ' + name;
+  userInput.value = 'Tell me about ' + name;
   doSend();
 }
 
@@ -577,7 +578,7 @@ async function doSend() {
       body: JSON.stringify({ message: text, session_id: sessionId }),
       signal: controller.signal,
     });
-    if (!res.ok) throw new Error('Serveur: ' + res.status);
+    if (!res.ok) throw new Error('Server: ' + res.status);
 
     var reader = res.body.getReader();
     var decoder = new TextDecoder();
@@ -612,7 +613,7 @@ async function doSend() {
             addTool(payload.name, payload.args);
           } else if (currentEvent === 'error') {
             hideTyping();
-            addMsg('assistant', 'Erreur: ' + payload.message);
+            addMsg('assistant', 'Error: ' + payload.message);
           }
           currentEvent = '';
         } else if (line === '') {
@@ -623,17 +624,17 @@ async function doSend() {
 
     if (!assistantDiv) {
       hideTyping();
-      addMsg('assistant', 'Pas de reponse.');
+      addMsg('assistant', 'No response.');
     } else {
       finalizeAssistantBubble();
     }
   } catch(err) {
     hideTyping();
     if (assistantDiv && rawAnswer) {
-      rawAnswer += '\n\n*(connexion interrompue)*';
+      rawAnswer += '\n\n*(connection interrupted)*';
       finalizeAssistantBubble();
     } else {
-      addMsg('assistant', 'Erreur: ' + err.message);
+      addMsg('assistant', 'Error: ' + err.message);
     }
   } finally {
     clearTimeout(timeoutId);
@@ -664,7 +665,7 @@ function showTyping() {
   var div = document.createElement('div');
   div.className = 'typing';
   div.id = 'typing-ind';
-  div.textContent = 'Recherche dans le graphe...';
+  div.textContent = 'Searching the graph...';
   chatContainer.appendChild(div);
   chatContainer.scrollTop = chatContainer.scrollHeight;
 }
@@ -788,7 +789,7 @@ document.querySelectorAll('.map-filter-btn').forEach(function(btn) {
 });
 
 fetch('/api/observations').then(function(r) { return r.json(); }).then(function(obs) {
-  document.getElementById('map-count').textContent = obs.length.toLocaleString() + ' points';
+  document.getElementById('map-count').textContent = obs.length.toLocaleString() + ' obs';
   var batch = [];
   obs.forEach(function(o) {
     var name = o.commonName || o.scientificName;
@@ -796,7 +797,7 @@ fetch('/api/observations').then(function(r) { return r.json(); }).then(function(
       + (o.scientificName ? '<br><em>' + escapeHtml(o.scientificName) + '</em>' : '')
       + (o.locality ? '<br>' + escapeHtml(o.locality) : '')
       + (o.date ? '<br><small>' + escapeHtml(o.date) + '</small>' : '')
-      + '<br><a href="#" onclick="askAbout(\'' + escapeAttr(name) + '\');return false;">💬 Demander au chat</a>';
+      + '<br><a href="#" onclick="askAbout(\'' + escapeAttr(name) + '\');return false;">💬 Ask the chat</a>';
     var m = L.circleMarker([o.lat, o.lon], { radius: 4, color: '#7dcea0', weight: 1, fillColor: '#2d5a3d', fillOpacity: 0.8 });
     m.bindPopup(popup);
     allObsMarkers.push({ marker: m });
@@ -807,7 +808,7 @@ fetch('/api/observations').then(function(r) { return r.json(); }).then(function(
     try { map.fitBounds(clusters.getBounds(), { padding: [20, 20] }); } catch (e) {}
   }
 }).catch(function(e) {
-  document.getElementById('map-count').textContent = 'erreur';
+  document.getElementById('map-count').textContent = 'error';
   console.error(e);
 });
 
@@ -830,7 +831,7 @@ function renderRelevantCards(spots) {
     // Fallback: load top species from API
     fetch('/api/species').then(function(r) { return r.json(); }).then(function(data) {
       renderCards(data.slice(0, 10));
-    }).catch(function() { cardsGrid.innerHTML = '<div class="panel-loading">Aucune donnee</div>'; });
+    }).catch(function() { cardsGrid.innerHTML = '<div class="panel-loading">No data</div>'; });
     return;
   }
   renderCards(species);
@@ -881,7 +882,7 @@ fetch('/api/dashboard').then(function(r) { return r.json(); }).then(function(dat
       var radius = 8 + 14 * (h.count / maxObs);
       var name = h.locality || (lat.toFixed(2) + ', ' + lon.toFixed(2));
       var popup = '<b>🔥 Hotspot</b><br>' + escapeHtml(name) + '<br>' + h.count + ' observations'
-        + '<br><a href="#" onclick="askAbout(\'' + escapeAttr(name) + '\');return false;">Demander au chat</a>';
+        + '<br><a href="#" onclick="askAbout(\'' + escapeAttr(name) + '\');return false;">Ask the chat</a>';
       L.circleMarker([lat, lon], {
         radius: radius, color: '#f9a825', weight: 2,
         fillColor: '#e65100', fillOpacity: 0.55
@@ -949,7 +950,7 @@ fetch('/api/dashboard').then(function(r) { return r.json(); }).then(function(dat
         + '<br><em>' + escapeHtml(r.scientificName) + '</em>'
         + (r.locality ? '<br>' + escapeHtml(r.locality) : '')
         + (r.date ? '<br><small>' + escapeHtml(r.date) + '</small>' : '')
-        + '<br><a href="#" onclick="askAbout(\'' + escapeAttr(name) + '\');return false;">Demander au chat</a>';
+        + '<br><a href="#" onclick="askAbout(\'' + escapeAttr(name) + '\');return false;">Ask the chat</a>';
       marker = L.marker([lat, lon], { icon: starIcon, zIndexOffset: 1000 }).bindPopup(popup).addTo(map);
       marker.on('click', function() { highlightRare(idx); });
     }
@@ -961,19 +962,19 @@ fetch('/api/dashboard').then(function(r) { return r.json(); }).then(function(dat
 
 // ── Spots panel (right column, auto-load) ────────────────────────────────
 var migIcons = { 'Resident': '🏠', 'SummerVisitor': '☀️', 'WinterVisitor': '❄️', 'PassageMigrant': '🌊', 'PartialMigrant': '↔️' };
-var migLabels = { 'Resident': 'Resident', 'SummerVisitor': 'Visiteur d\'ete', 'WinterVisitor': 'Visiteur d\'hiver', 'PassageMigrant': 'De passage', 'PartialMigrant': 'Migrateur partiel' };
-var monthNames = ['', 'janvier', 'fevrier', 'mars', 'avril', 'mai', 'juin', 'juillet', 'aout', 'septembre', 'octobre', 'novembre', 'decembre'];
+var migLabels = { 'Resident': 'Resident', 'SummerVisitor': 'Summer visitor', 'WinterVisitor': 'Winter visitor', 'PassageMigrant': 'Passage migrant', 'PartialMigrant': 'Partial migrant' };
+var monthNames = ['', 'January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 
 function loadSpots() {
   var body = document.getElementById('spots-panel-body');
-  body.innerHTML = '<div class="panel-loading">Chargement…</div>';
+  body.innerHTML = '<div class="panel-loading">Loading...</div>';
   var url = '/api/weekend';
   if (userLat !== null) url += '?lat=' + userLat + '&lon=' + userLon;
   fetch(url)
     .then(function(r) { if (!r.ok) throw new Error(r.status); return r.json(); })
     .then(function(data) { renderSpots(data); })
     .catch(function(err) {
-      body.innerHTML = '<div style="color:#888;padding:10px;font-size:11px">Erreur: ' + err.message + '</div>';
+      body.innerHTML = '<div style="color:#888;padding:10px;font-size:11px">Error: ' + err.message + '</div>';
     });
 }
 
@@ -985,7 +986,7 @@ function renderSpots(data) {
 
   var body = document.getElementById('spots-panel-body');
   if (!spots.length) {
-    body.innerHTML = '<div style="color:#888;padding:10px;font-size:11px">Pas assez de données. Lancez <code>reason.py</code> pour enrichir le graphe.</div>';
+    body.innerHTML = '<div style="color:#888;padding:10px;font-size:11px">Not enough data. Run <code>reason.py</code> to enrich the graph.</div>';
     return;
   }
 
@@ -1012,7 +1013,7 @@ function renderSpots(data) {
       if (spot.species.length > 12) html += '<div class="species-chip" style="color:#666">+' + (spot.species.length - 12) + '</div>';
       html += '</div>';
     } else {
-      html += '<div style="color:#666;font-size:10px;font-style:italic">Aucune donnee de presence mensuelle</div>';
+      html += '<div style="color:#666;font-size:10px;font-style:italic">No monthly presence data</div>';
     }
     html += '</div>';
   });
@@ -1026,7 +1027,7 @@ setTimeout(loadSpots, 800);
 
 // ── Weekend button → pre-fill chat ───────────────────────────────────────
 document.getElementById('weekend-btn').addEventListener('click', function() {
-  userInput.value = 'Où observer ce week-end près de Copenhague ?';
+  userInput.value = 'Where to watch birds this weekend near Copenhagen?';
   userInput.dispatchEvent(new Event('input'));
   doSend();
 });
