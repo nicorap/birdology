@@ -66,14 +66,43 @@ def _sparql_fold(expr: str) -> str:
     return f"LCASE({expr})"
 
 
+def _sparql_escape(value: str) -> str:
+    """Escape a string for safe interpolation into a SPARQL string literal.
+
+    Every user-supplied value (species/family/locality names, dates, …) that
+    gets spliced into a query string via f"...{value}..." MUST go through this
+    first — otherwise a value containing a quote or backslash could break out
+    of the literal and inject arbitrary SPARQL clauses. Uses the standard
+    SPARQL ECHAR escape sequences (\\, ", ', \\n, \\r, \\t).
+    """
+    return (
+        value.replace("\\", "\\\\")
+             .replace('"', '\\"')
+             .replace("'", "\\'")
+             .replace("\n", "\\n")
+             .replace("\r", "\\r")
+             .replace("\t", "\\t")
+    )
+
+
+def _sparql_int(value: int | str) -> int:
+    """Coerce a value to int before splicing it unquoted into a SPARQL query.
+
+    Numeric literals (e.g. FILTER(MONTH(?date) = {month})) aren't quoted, so
+    string-escaping doesn't help — only a guaranteed-numeric value is safe to
+    interpolate. Raises ValueError for anything that isn't a plain integer.
+    """
+    return int(value)
+
+
 def _sparql_name_filter(*var_exprs: str, query: str) -> str:
     """Build a SPARQL FILTER that matches *query* against any of the given
     variable expressions, both with the original string (covers queries that
     already use accents) and after accent-stripping on the stored side (covers
     accent-free input like 'mesange' matching 'Mésange').
     """
-    q_exact  = query.lower()
-    q_folded = _accent_fold(query)
+    q_exact  = _sparql_escape(query.lower())
+    q_folded = _sparql_escape(_accent_fold(query))
     clauses = []
     for expr in var_exprs:
         # Exact case-insensitive match (fast path for already-accented queries)
@@ -179,7 +208,7 @@ WHERE {{
     OPTIONAL {{ ?species bird:commonNameDa ?commonNameDa }}
     OPTIONAL {{ ?species bird:eBirdCode   ?eBirdCode }}
     OPTIONAL {{ ?species bird:thumbnailUrl ?thumbnail }}
-    FILTER ( CONTAINS(LCASE(STR(?family)), LCASE("{family_name}")) )
+    FILTER ( CONTAINS(LCASE(STR(?family)), LCASE("{_sparql_escape(family_name)}")) )
 }}
 ORDER BY ?scientificName
 """
@@ -199,7 +228,7 @@ WHERE {{
              dwc:order          ?order .
     OPTIONAL {{ ?species bird:commonNameEn ?commonNameEn }}
     OPTIONAL {{ ?species dwc:family        ?family }}
-    FILTER ( CONTAINS(LCASE(STR(?order)), LCASE("{order_name}")) )
+    FILTER ( CONTAINS(LCASE(STR(?order)), LCASE("{_sparql_escape(order_name)}")) )
 }}
 ORDER BY ?family ?scientificName
 """
@@ -227,14 +256,14 @@ def recent_danish_observations(
     """
     ebird_filter = "FILTER EXISTS { ?obs bird:eBirdCode ?any }" if ebird_only else ""
     locality_filter = (
-        f'FILTER(CONTAINS(LCASE(STR(?locality)), LCASE("{locality}")))'
+        f'FILTER(CONTAINS(LCASE(STR(?locality)), LCASE("{_sparql_escape(locality)}")))'
         if locality else ""
     )
     date_filters = ""
     if date_from:
-        date_filters += f'\n    FILTER(?date >= "{date_from}"^^xsd:date)'
+        date_filters += f'\n    FILTER(?date >= "{_sparql_escape(date_from)}"^^xsd:date)'
     if date_to:
-        date_filters += f'\n    FILTER(?date <= "{date_to}"^^xsd:date)'
+        date_filters += f'\n    FILTER(?date <= "{_sparql_escape(date_to)}"^^xsd:date)'
 
     if species_name:
         # Step 1: find matching species URIs (cheap — no observation join).
@@ -468,6 +497,7 @@ def currently_present(
     import datetime
     if month is None:
         month = datetime.date.today().month
+    month = _sparql_int(month)
 
     q = (
         _PREFIXES
@@ -508,10 +538,10 @@ def observations_for_map(
     """
     family_clause = ""
     if family_filter:
-        family_clause = f'?species dwc:family ?fam . FILTER(CONTAINS(LCASE(STR(?fam)), "{family_filter.lower()}"))'
+        family_clause = f'?species dwc:family ?fam . FILTER(CONTAINS(LCASE(STR(?fam)), "{_sparql_escape(family_filter.lower())}"))'
     order_clause = ""
     if order_filter:
-        order_clause = f'?species dwc:order ?ord . FILTER(CONTAINS(LCASE(STR(?ord)), "{order_filter.lower()}"))'
+        order_clause = f'?species dwc:order ?ord . FILTER(CONTAINS(LCASE(STR(?ord)), "{_sparql_escape(order_filter.lower())}"))'
 
     q = (
         _PREFIXES
@@ -564,6 +594,8 @@ def observations_by_month(
     Sorted by observation count descending.
     """
     import datetime
+
+    month = _sparql_int(month)
 
     species_clause = ""
     if species_name:
@@ -655,7 +687,7 @@ LIMIT 200
     # Collect metadata from first row; gather all presence months
     meta = rows[0]
     presence_months = sorted({int(r["presenceMonth"]) for r in rows if r.get("presenceMonth")})
-    species_uri_filter = f'FILTER(STR(?species) = "{meta.get("species", "")}")'
+    species_uri_filter = f'FILTER(STR(?species) = "{_sparql_escape(meta.get("species", ""))}")'
 
     # 2. Earliest and latest observation date per year for this species
     q_yearly = (
@@ -766,7 +798,7 @@ LIMIT 10
 SELECT ?month (COUNT(DISTINCT ?obs) AS ?cnt)
 WHERE {{
     ?species bird:hasObservation ?obs .
-    FILTER(STR(?species) = "{species_uri}")
+    FILTER(STR(?species) = "{_sparql_escape(species_uri)}")
     ?obs bird:observedOn ?date .
     BIND(MONTH(?date) AS ?month)
 }}
