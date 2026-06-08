@@ -3,8 +3,8 @@
 A bird ontology and knowledge graph built with Python, RDFLib, and OWL.
 
 Combines the global eBird/Clements taxonomy (11 000+ species) with Danish field
-observations from DOFbasen via GBIF, and runs an OWL 2 DL reasoner (HermiT) to
-materialise inferred facts across the graph.
+observations from DOFbasen via GBIF, and runs a custom pure-Python parallel
+reasoner to materialise inferred facts across the graph.
 
 ## What's in the graph
 
@@ -19,7 +19,7 @@ materialise inferred facts across the graph.
 ## Quick start
 
 ```bash
-# 1. Install dependencies (Python 3.11+, Java required for reasoner)
+# 1. Install dependencies (Python 3.11+, no Java required)
 pip install -r requirements.txt
 
 # 2. Get a free eBird API key → https://ebird.org/api/keygen
@@ -96,7 +96,7 @@ python scripts/visualize.py --mode stats
 ## Tests
 
 ```bash
-pytest tests/          # 55 tests, no API key or network required
+pytest tests/          # 272 tests, no API key or network required
 ```
 
 | Test file | Coverage |
@@ -106,7 +106,13 @@ pytest tests/          # 55 tests, no API key or network required
 | `test_queries.py` | All SPARQL functions with an in-memory graph fixture |
 | `test_reasoner.py` | Each inference rule: correctness, idempotency, parallel vs sequential |
 | `test_gbif_batching.py` | Year-batching, offset-cap enforcement, deduplication (mocked HTTP) |
-| `test_chat.py` | Graph-RAG tool definitions, formatting, and all 8 tools against in-memory graph |
+| `test_chat.py` | Graph-RAG tool definitions, formatting, and all tools against in-memory graph |
+| `test_chat_integration.py` | End-to-end chat routing scenarios (geo, date, rarity, phrasing variants) |
+| `test_wikidata.py` | Wikidata enrichment |
+| `test_dbpedia.py` | DBpedia enrichment |
+| `test_iucn.py` | IUCN Red List enrichment |
+| `test_elton.py` | EltonTraits diet & foraging-strata enrichment |
+| `test_graph_quality.py` | Graph validation checks |
 
 ## What the reasoner adds
 
@@ -123,18 +129,26 @@ Running `scripts/reason.py` materialises:
 ## Graph-RAG chat
 
 The chat interface lets you query the knowledge graph in natural language. The LLM
-has 8 tools that execute SPARQL queries and live API calls:
+has 16 tools that execute SPARQL queries, live eBird/Wikipedia calls, and graph-derived
+analytics:
 
 | Tool | Description |
 |------|-------------|
 | `find_species` | Search by name (English, Danish, French, scientific) |
 | `species_by_family` | List species in a taxonomic family |
 | `species_by_order` | List species in a taxonomic order |
-| `recent_observations` | DOFbasen observations from the graph |
-| `nearby_birds` | Species observed near GPS coordinates |
-| `currently_present` | Species typically present in a given month |
+| `recent_observations` | DOFbasen + eBird observations from the graph (filterable by species, locality, date range, source) |
+| `nearby_birds` | Species observed near GPS coordinates, sorted by IUCN rarity |
+| `currently_present` | Species typically present in a given month, with migration status |
+| `live_observations` | **Real-time** eBird sightings in Denmark (last 1–30 days), optionally geo-filtered |
+| `observations_by_month` | Species historically observed in a given month, with migration status |
+| `where_to_watch` | Best birdwatching hotspots near coordinates, with species expected that month |
+| `compare_seasonal` | Live vs. historical comparison — surfaces potential rarities and absentees |
 | `taxonomy_summary` | Graph statistics (orders, families, species, observations) |
-| `live_observations` | **Real-time** eBird sightings in Denmark (last 1–30 days) |
+| `live_hotspots` | Active birdwatching hotspots from **live** eBird data (radius up to 200 km) |
+| `phenology` | Monthly observation-frequency chart for a species (relative frequency) |
+| `migration_timing` | Arrival/departure timing for a species, from DOF historical data |
+| `search_wikipedia` | Natural-history info (behavior, habitat, diet, song, breeding) from Wikipedia |
 
 The web UI (`scripts/web_chat.py`) adds conversation history per session, automatic
 retry on transient API errors, and a "new conversation" button.
@@ -151,7 +165,7 @@ LLM_MODEL=mistral-large-3:675b
 | File | Description |
 |------|-------------|
 | `output/birdology.ttl` | Main knowledge graph (Turtle, ~8 MB) |
-| `output/birdology_reasoned.ttl` | Graph with HermiT-inferred triples |
+| `output/birdology_reasoned.ttl` | Graph with reasoner-inferred triples |
 | `output/birdology_danish.html` | Interactive taxonomy browser (open in browser) |
 | `output/birdology_stats.png` | IUCN conservation status distribution |
 
