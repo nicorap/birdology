@@ -8,6 +8,7 @@ build/
 venv/
 data/
 output/
+logs/
 .DS_Store
 
 # Reasoner temp file

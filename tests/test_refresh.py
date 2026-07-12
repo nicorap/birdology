@@ -1,5 +1,8 @@
+import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 import refresh
@@ -45,11 +48,8 @@ def test_reload_step_has_empty_argv():
     assert reload_step.argv == []
 
 
-import subprocess
-import pytest
-
-
-def test_run_plan_executes_steps_in_order():
+def test_run_plan_executes_steps_in_order(monkeypatch, tmp_path):
+    monkeypatch.setattr(refresh, "_LOG_PATH", tmp_path / "refresh.log")
     calls = []
     plan = [refresh.Step("a", ["x"]), refresh.Step("b", ["y"]), refresh.Step("reload_web")]
     refresh.run_plan(
@@ -60,7 +60,8 @@ def test_run_plan_executes_steps_in_order():
     assert calls == [("run", ["x"]), ("run", ["y"]), ("reload", None)]
 
 
-def test_run_plan_aborts_on_first_failure():
+def test_run_plan_aborts_on_first_failure(monkeypatch, tmp_path):
+    monkeypatch.setattr(refresh, "_LOG_PATH", tmp_path / "refresh.log")
     calls = []
 
     def boom(argv, check):
@@ -74,7 +75,6 @@ def test_run_plan_aborts_on_first_failure():
 
 
 def test_main_dry_run_prints_plan_and_runs_nothing(capsys):
-    ran = []
     rc = refresh.main(["--dry-run"])
     out = capsys.readouterr().out
     assert rc == 0
