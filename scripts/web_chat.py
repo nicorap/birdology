@@ -27,7 +27,7 @@ from flask import Flask, request, jsonify, Response
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from birdology.graph import load_graph
-from birdology.queries import observations_for_map, nearby_watch
+from birdology.queries import observations_for_map, nearby_watch, migration_calendar
 from chat import (
     SYSTEM_PROMPT,
     TOOLS_OPENAI,
@@ -555,6 +555,13 @@ LIMIT 30
             })
         _PANEL_CACHE["species"] = out
     return jsonify(_PANEL_CACHE["species"])
+
+
+@app.route("/api/migration-calendar")
+def api_migration_calendar():
+    if "migration_calendar" not in _PANEL_CACHE:
+        _PANEL_CACHE["migration_calendar"] = migration_calendar(GRAPH)
+    return jsonify(_PANEL_CACHE["migration_calendar"])
 
 
 @app.route("/api/dashboard")
