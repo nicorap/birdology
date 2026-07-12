@@ -198,23 +198,24 @@ def test_taxonomy_summary():
     assert parsed["observations"] == 1
 
 
-def test_currently_present_no_data():
-    """Without reasoner data, currently_present returns empty."""
+def test_observations_by_month_defaults_to_current_month():
+    """observations_by_month without month param defaults to current month."""
     g = _make_graph()
-    result = _run_tool("currently_present", {"month": 3}, g)
-    assert result == "No results found."
+    # Should not raise even without month argument
+    result = _run_tool("observations_by_month", {}, g)
+    assert result is not None  # empty graph → "No results found."
 
 
-def test_live_observations_no_key(monkeypatch):
-    """live_observations returns an error message when EBIRD_API_KEY is unset."""
+def test_recent_observations_live_no_key(monkeypatch):
+    """recent_observations with source='live' returns error when EBIRD_API_KEY is unset."""
     monkeypatch.delenv("EBIRD_API_KEY", raising=False)
     g = _make_graph()
-    result = _run_tool("live_observations", {"days": 7}, g)
+    result = _run_tool("recent_observations", {"source": "live", "days": 7}, g)
     assert "EBIRD_API_KEY" in result
 
 
-def test_live_observations_mock(monkeypatch):
-    """live_observations formats eBird API results correctly."""
+def test_recent_observations_live_mock(monkeypatch):
+    """recent_observations with source='live' formats eBird API results correctly."""
     monkeypatch.setenv("EBIRD_API_KEY", "fake_key")
     fake_data = [
         {"comName": "Smew", "sciName": "Mergellus albellus", "obsDt": "2026-04-19",
@@ -223,11 +224,38 @@ def test_live_observations_mock(monkeypatch):
     import chat
     monkeypatch.setattr(chat, "fetch_recent_denmark", lambda key, days: fake_data)
     g = _make_graph()
-    result = _run_tool("live_observations", {"days": 7}, g)
+    result = _run_tool("recent_observations", {"source": "live", "days": 7}, g)
     parsed = json.loads(result)
     assert len(parsed) == 1
     assert parsed[0]["species"] == "Smew"
     assert parsed[0]["date"] == "2026-04-19"
+
+
+def test_recent_observations_live_rare_only(monkeypatch):
+    """rare_only=True filters live results to species with non-LC IUCN status in graph."""
+    monkeypatch.setenv("EBIRD_API_KEY", "fake_key")
+    fake_data = [
+        {"comName": "European Robin", "sciName": "Erithacus rubecula",
+         "obsDt": "2026-04-19", "locName": "CPH", "lat": 55.67, "lng": 12.57, "howMany": 1},
+        {"comName": "Osprey", "sciName": "Pandion haliaetus",
+         "obsDt": "2026-04-19", "locName": "CPH", "lat": 55.67, "lng": 12.57, "howMany": 1},
+    ]
+    import chat
+    monkeypatch.setattr(chat, "fetch_recent_denmark", lambda key, days: fake_data)
+
+    g = _make_graph()
+    # Add Osprey with VU status, Robin stays LC (no status triple → filtered out)
+    OSPREY = TAXON["species/ospr"]
+    g.add((OSPREY, RDF.type, BIRD.Species))
+    g.add((OSPREY, DWC.scientificName, Literal("Pandion haliaetus")))
+    g.add((OSPREY, BIRD.conservationStatus, Literal("VU")))
+
+    result = _run_tool("recent_observations", {"source": "live", "rare_only": True}, g)
+    parsed = json.loads(result)
+    scinames = [r["sciName"] for r in parsed]
+    assert "Pandion haliaetus" in scinames      # VU → kept
+    assert "Erithacus rubecula" not in scinames  # no status in graph → filtered out
+    assert parsed[0]["iucnStatus"] == "VU"
 
 
 def test_unknown_tool():

@@ -129,7 +129,7 @@ Running `scripts/reason.py` materialises:
 ## Graph-RAG chat
 
 The chat interface lets you query the knowledge graph in natural language. The LLM
-has 16 tools that execute SPARQL queries, live eBird/Wikipedia calls, and graph-derived
+has 15 tools that execute SPARQL queries, live eBird/Wikipedia calls, and graph-derived
 analytics:
 
 | Tool | Description |

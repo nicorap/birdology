@@ -32,7 +32,6 @@ from birdology.ingestion.ebird import (
     fetch_hotspot_species,
 )
 from birdology.queries import (
-    currently_present,
     find_species_by_name,
     migration_timing,
     nearby_watch,
@@ -132,9 +131,12 @@ TOOLS_OPENAI = [
         "function": {
             "name": "recent_observations",
             "description": (
-                "List recent bird observations from the graph (DOF historical + eBird last 30 days), "
-                "sorted by date descending. Optionally filter by species name (any language), "
-                "locality name, date range, and/or source. Returns date, locality, GPS, and count."
+                "List bird observations sorted by date descending. "
+                "source='all'|'ebird'|'dof' queries graph data (DOF historical + eBird stored, last 30 days). "
+                "source='live' fetches real-time eBird observations for Denmark (last 1-30 days), "
+                "optionally geo-filtered with lat/lon/radius_km. "
+                "Use source='live' for: recent live sightings, follow-up on a specific species in a live "
+                "context, or when the user asks about a specific city/place (pass lat/lon)."
             ),
             "parameters": {
                 "type": "object",
@@ -152,7 +154,8 @@ TOOLS_OPENAI = [
                             "Optional location name filter (partial match, case-insensitive). "
                             "Use this when the user asks about observations at a specific place, "
                             "e.g. 'Brøndby Strand', 'Utterslev Mose', 'Tivoli'. "
-                            "Do NOT pass a location name as the 'species' parameter."
+                            "Do NOT pass a location name as the 'species' parameter. "
+                            "Not used when source='live' — pass lat/lon instead."
                         ),
                     },
                     "date_from": {
@@ -160,22 +163,62 @@ TOOLS_OPENAI = [
                         "description": (
                             "Start date filter, ISO format YYYY-MM-DD (inclusive). "
                             "Use for 'ce mois-ci' (first day of current month), "
-                            "'cette année', 'depuis janvier', etc."
+                            "'cette année', 'depuis janvier', etc. Not used when source='live'."
                         ),
                     },
                     "date_to": {
                         "type": "string",
                         "description": (
                             "End date filter, ISO format YYYY-MM-DD (inclusive). "
-                            "Combine with date_from for a date range."
+                            "Combine with date_from for a date range. Not used when source='live'."
                         ),
                     },
                     "source": {
                         "type": "string",
-                        "enum": ["all", "ebird", "dof"],
+                        "enum": ["all", "ebird", "dof", "live"],
                         "description": (
-                            "Filter by data source: 'ebird' = only eBird observations (last 30 days), "
-                            "'dof' = only DOFbasen historical data, 'all' = both (default)."
+                            "Data source: 'all' = graph DOF + eBird (default), "
+                            "'ebird' = graph eBird only, 'dof' = DOFbasen only, "
+                            "'live' = real-time eBird API (uses days/lat/lon, ignores date_from/date_to)."
+                        ),
+                    },
+                    "days": {
+                        "type": "integer",
+                        "description": (
+                            "Days back for live eBird data (1-30, default 14). "
+                            "Only used when source='live'."
+                        ),
+                    },
+                    "lat": {
+                        "type": "number",
+                        "description": (
+                            "Latitude for geo filter (e.g. 55.6761 for Copenhagen). "
+                            "Only used when source='live'."
+                        ),
+                    },
+                    "lon": {
+                        "type": "number",
+                        "description": (
+                            "Longitude for geo filter (e.g. 12.5683 for Copenhagen). "
+                            "Only used when source='live'."
+                        ),
+                    },
+                    "radius_km": {
+                        "type": "integer",
+                        "description": (
+                            "Search radius in km when lat/lon provided (default 25, max 50). "
+                            "Only used when source='live'."
+                        ),
+                    },
+                    "rare_only": {
+                        "type": "boolean",
+                        "description": (
+                            "If true, cross-reference live eBird results with the knowledge graph "
+                            "and return only species with IUCN status CR, EN, VU, or NT "
+                            "(i.e. filter out common LC species). "
+                            "Only meaningful when source='live'. "
+                            "Use for: 'espèces rares observées en live', 'raretés eBird', "
+                            "'quelles espèces menacées voit-on en ce moment'."
                         ),
                     },
                 },
@@ -215,68 +258,13 @@ TOOLS_OPENAI = [
     {
         "type": "function",
         "function": {
-            "name": "currently_present",
-            "description": (
-                "List bird species typically present in Denmark in a given month, based on "
-                "historical DOF observations. Requires the reasoned graph for best results. "
-                "Defaults to the current month if not specified. "
-                "Results include migration status (Resident, SummerVisitor, WinterVisitor, etc.)."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "month": {
-                        "type": "integer",
-                        "description": "Month number 1-12. Omit for current month.",
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "live_observations",
-            "description": (
-                "Fetch LIVE recent bird observations from eBird (last 1-30 days). "
-                "This queries the eBird API in real-time, so results are up-to-date. "
-                "Without coordinates, returns observations for all of Denmark. "
-                "With lat/lon, returns observations within radius_km of that point — "
-                "use this when the user mentions a specific city or location."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "days": {
-                        "type": "integer",
-                        "description": "Number of days back to search (1-30, default: 14)",
-                    },
-                    "lat": {
-                        "type": "number",
-                        "description": "Latitude for geo search (e.g. 55.6761 for Copenhagen)",
-                    },
-                    "lon": {
-                        "type": "number",
-                        "description": "Longitude for geo search (e.g. 12.5683 for Copenhagen)",
-                    },
-                    "radius_km": {
-                        "type": "integer",
-                        "description": "Search radius in km when lat/lon provided (default: 25, max: 50)",
-                    },
-                },
-                "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "observations_by_month",
             "description": (
-                "Return bird species historically observed in Denmark during a specific month, "
-                "based on DOF data. Use this for questions like 'quels oiseaux en mars ?', "
-                "'which birds can I see in winter ?', 'oiseaux de printemps'. "
+                "Return bird species historically observed in Denmark during a given month, "
+                "based on DOF data. Defaults to the current month if month is omitted. "
+                "Use this for questions like 'quels oiseaux en mars ?', "
+                "'which birds can I see in winter ?', 'oiseaux de printemps', "
+                "or 'quels oiseaux voit-on en ce moment ?' (omit month). "
                 "Returns species sorted by observation count with migration status."
             ),
             "parameters": {
@@ -284,14 +272,14 @@ TOOLS_OPENAI = [
                 "properties": {
                     "month": {
                         "type": "integer",
-                        "description": "Month number (1=January, 12=December)",
+                        "description": "Month number (1=January, 12=December). Omit to use current month.",
                     },
                     "species_name": {
                         "type": "string",
                         "description": "Optional: filter by species name to check if it's present in that month",
                     },
                 },
-                "required": ["month"],
+                "required": [],
             },
         },
     },
@@ -300,18 +288,20 @@ TOOLS_OPENAI = [
         "function": {
             "name": "where_to_watch",
             "description": (
-                "Return the best birdwatching hotspots near given coordinates, with the species "
-                "expected to be present in a given month. Use this for questions like "
-                "'où observer demain ?', 'où aller observer ce week-end ?', "
-                "'meilleurs endroits pour observer des oiseaux près de Copenhague'. "
-                "Returns top hotspots with distance and list of expected species."
+                "Return the best birdwatching hotspots near given coordinates. "
+                "Without live=True: uses graph data, returns expected species for the month (radius up to ~50 km). "
+                "With live=True: uses real-time eBird API, returns hotspots with recent species lists "
+                "(radius up to 200 km) — use this when the user asks for spots beyond 50 km, "
+                "says 'un peu plus loin'/'encore plus loin', or when graph data returns few results. "
+                "Use for: 'où observer demain ?', 'où aller ce week-end ?', "
+                "'meilleurs endroits près de Copenhague'."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "month": {
                         "type": "integer",
-                        "description": "Month number (1-12). Defaults to current month.",
+                        "description": "Month number (1-12). Defaults to current month. Not used when live=True.",
                     },
                     "lat": {
                         "type": "number",
@@ -323,7 +313,18 @@ TOOLS_OPENAI = [
                     },
                     "radius_km": {
                         "type": "number",
-                        "description": "Search radius in km (default: 30)",
+                        "description": "Search radius in km (default: 30; up to 200 when live=True)",
+                    },
+                    "live": {
+                        "type": "boolean",
+                        "description": (
+                            "If true, fetch hotspots from live eBird API instead of graph data. "
+                            "Supports radius up to 200 km. Use when graph data is sparse or radius > 50 km."
+                        ),
+                    },
+                    "days": {
+                        "type": "integer",
+                        "description": "Days back for live hotspot data (1-14, default 7). Only used when live=True.",
                     },
                 },
                 "required": [],
@@ -346,7 +347,7 @@ TOOLS_OPENAI = [
                 "'quelles raretés', 'quoi d'inattendu', 'surprises de la semaine'. "
                 "Do NOT use it for possibility/availability/news questions: 'peut voir', "
                 "'peut observer', 'il y a à voir', 'quoi de neuf', 'quelles nouvelles', "
-                "'que s'est-il passé' — for those, call live_observations and "
+                "'que s'est-il passé' — for those, call recent_observations(source='live') and "
                 "observations_by_month separately."
             ),
             "parameters": {
@@ -373,35 +374,6 @@ TOOLS_OPENAI = [
                 "type": "object",
                 "properties": {},
                 "required": [],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "live_hotspots",
-            "description": (
-                "Find active birdwatching hotspots near coordinates using live eBird data. "
-                "Returns the top hotspots with their recent species lists. "
-                "Use this when where_to_watch returns few results (large radius or sparse area), "
-                "or when the user asks for spots beyond 50 km where graph data is limited. "
-                "radius_km can be up to 200 km. days = how many days back to look (1-14)."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "lat": {"type": "number", "description": "Latitude"},
-                    "lon": {"type": "number", "description": "Longitude"},
-                    "radius_km": {
-                        "type": "integer",
-                        "description": "Search radius in km (max 200, default 50)",
-                    },
-                    "days": {
-                        "type": "integer",
-                        "description": "How many days back to include (1-14, default 7)",
-                    },
-                },
-                "required": ["lat", "lon"],
             },
         },
     },
@@ -532,7 +504,7 @@ URLs that appear literally in a tool result.
 8. **Links**: when referencing a species URI or eBird page, use markdown links: \
 `[text](url)`.
 9. **When comparing live vs historical data**, only list species as "expected but absent" if \
-they appear in the tool result for `observations_by_month` or `currently_present`. \
+they appear in the tool result for `observations_by_month`. \
 Do NOT add species from memory.
 
 ## Data available in the graph
@@ -543,7 +515,7 @@ Do NOT add species from memory.
 - Migration status: Resident, SummerVisitor, WinterVisitor, PassageMigrant, PartialMigrant
 - Wikidata traits: mass (g), wingspan (mm), habitat, range, diel cycle
 - DBpedia: thumbnails (photos), range maps, owl:sameAs links
-- Live eBird data (1-30 days) via `live_observations`
+- Live eBird data (1-30 days) via `recent_observations` with source='live'
 - Wikipedia articles (behavior, habitat, song, breeding, ecology) via `search_wikipedia`
 
 ## Tool usage
@@ -577,13 +549,13 @@ Report at most 5 species per category — do NOT dump the full list.
 observations** ("qu'est-ce qu'on **peut** voir", "que peut-on observer", \
 "qu'est-ce qu'**il y a** à voir", "**quoi de neuf** dans les observations", \
 "que s'est-il passé", "que peut-on observer cette semaine"), \
-call **both** `live_observations` (days=7) **and** \
-`observations_by_month` (current month, NOT `currently_present`) to give live + historical context. \
+call **both** `recent_observations` (source='live', days=7) **and** \
+`observations_by_month` (current month) to give live + historical context. \
 Report only what the tools return — do NOT add species from memory.
-- Use `live_observations` for recent live sightings, or when following up on a specific species \
-in a live context (e.g. "pas d'aigle royal ?" after a live mention → `live_observations`). \
+- Use `recent_observations` with source='live' for recent live sightings, or when following up \
+on a specific species in a live context (e.g. "pas d'aigle royal ?" after a live mention). \
 **When the user mentions a city or place** (e.g. "près de Copenhague", "autour d'Aarhus"), \
-pass `lat`/`lon` coordinates for that place to `live_observations` — do NOT omit them.
+pass `lat`/`lon` coordinates for that place — do NOT omit them.
 - **ALWAYS call `search_wikipedia`** when the user asks about behavior (comportement), habitat, \
 song (chant), courtship, diet (régime alimentaire), or ecology of a specific species — \
 **call it even if you did NOT call `find_species` first** (e.g. "décris le comportement du \
@@ -610,9 +582,9 @@ and (if available) the earliest date ever recorded and a table of yearly first/l
 **If the user says "près de chez moi", "near me", or similar without giving a place name or \
 coordinates, ask them for their location before calling any tool.** \
 **When the user says "un peu plus loin" or "encore plus loin" after a previous `where_to_watch` \
-call, use `live_hotspots` with a larger radius (double the previous, e.g. 50→100→200 km). \
-`live_hotspots` uses live eBird data and covers any distance — prefer it over `where_to_watch` \
-for radius > 50 km. Always call a tool — never answer from memory.** \
+call, call `where_to_watch` again with `live=True` and a larger radius (double the previous, \
+e.g. 50→100→200 km). `live=True` uses live eBird data and supports any radius — prefer it for \
+radius > 50 km. Always call a tool — never answer from memory.** \
 **CRITICAL: only list locations and species that `where_to_watch` actually returned. \
 Never add locations or species from your own knowledge — the tool enforces the radius. \
 Never invent "Observation récente" details — only mention dates/counts explicitly present \
@@ -620,9 +592,13 @@ in the tool result. If the tool returns no recent observations for a site, say n
 - **Use `nearby_birds`** when the user asks for **rare or threatened species near a location** \
 ("espèces rares près de Copenhague", "oiseaux menacés autour d'Aarhus"). \
 It sorts by IUCN conservation status (CR > EN > VU > NT > LC). \
-Do NOT use `live_observations` for rarity-based queries — it has no IUCN filter. \
+Use `recent_observations(source='live', rare_only=True)` when the user asks for rare/threatened \
+species seen recently in live data ("espèces rares en live", "quelles espèces menacées voit-on"). \
+This cross-references live eBird results with the graph's IUCN data and returns only CR/EN/VU/NT. \
+Use `nearby_birds` instead when the user asks for rare species near a specific location \
+(it uses historical graph data sorted by IUCN status). \
 **If no location is given, ask the user where they are — do NOT default to Copenhagen.**
-- Use graph tools (`species_by_family`, `currently_present`, etc.) for taxonomy and historical data.
+- Use graph tools (`species_by_family`, `observations_by_month`, etc.) for taxonomy and historical data.
 
 ## Response language
 **Always reply in the same language the user wrote in.** Detect automatically:
@@ -640,7 +616,7 @@ Omit a language tag only if that name is genuinely missing from the tool result.
 ## Examples of correct responses
 
 **User:** "Qu'est-ce qu'on **peut** voir en ce moment au Danemark ?" / "que peut-on observer cette semaine ?" / "qu'est-ce qu'**il y a** à voir en ce moment ?" / "quoi de neuf dans les observations ?"
-→ tools: live_observations({"days": 7}), observations_by_month({"month": <current_month>})
+→ tools: recent_observations({"source": "live", "days": 7}), observations_by_month({"month": <current_month>})
 → Correct response:
 "Voici ce qu'on observe actuellement (source: eBird live) : [liste live]
 Espèces typiques pour [mois] (source: graphe Birdology) : [liste DOF]"
@@ -653,7 +629,7 @@ Espèces typiques pour [mois] (source: graphe Birdology) : [liste DOF]"
 **Présents normalement :** [liste exacte du champ normal_present]"
 
 **User:** "Quelles observations dans les 30 derniers jours ?" / "observations récentes au Danemark ?" / "qu'a-t-on vu cette semaine ?"
-→ tool: live_observations({"days": 30}) or live_observations({"days": 7})
+→ tool: recent_observations({"source": "live", "days": 30}) or recent_observations({"source": "live", "days": 7})
 → Correct response:
 "Voici les espèces récemment observées au Danemark (source: eBird live) :
 | Espèce | Localité | Date | N |
@@ -693,6 +669,26 @@ def _fmt(rows: list[dict], limit: int = 25) -> str:
     return out
 
 
+def _iucn_for_scinames(graph, scinames: list[str]) -> dict[str, str]:
+    """Return {scientificName: iucnStatus} for a list of scientific names, via the graph."""
+    if not scinames:
+        return {}
+    values = " ".join(f'"{n}"' for n in set(scinames))
+    q = f"""
+    PREFIX dwc: <http://rs.tdwg.org/dwc/terms/>
+    PREFIX bird: <https://birdology.org/ontology/>
+    SELECT ?scientificName ?status WHERE {{
+        ?sp dwc:scientificName ?scientificName ;
+            bird:conservationStatus ?status .
+        VALUES ?scientificName {{ {values} }}
+    }}
+    """
+    result: dict[str, str] = {}
+    for row in graph.query(q):
+        result[str(row.scientificName)] = str(row.status)
+    return result
+
+
 def _run_tool(name: str, inputs: dict, graph) -> str:
     if name == "find_species":
         return _fmt(find_species_by_name(graph, inputs["name"]))
@@ -704,7 +700,46 @@ def _run_tool(name: str, inputs: dict, graph) -> str:
         return _fmt(species_by_order(graph, inputs["order"]))
 
     if name == "recent_observations":
-        ebird_only = inputs.get("source", "all") == "ebird"
+        source = inputs.get("source", "all")
+        if source == "live":
+            api_key = os.getenv("EBIRD_API_KEY", "")
+            if not api_key:
+                return "Error: EBIRD_API_KEY not set in .env — cannot query eBird live API."
+            days = min(max(int(inputs.get("days", 14)), 1), 30)
+            lat = inputs.get("lat")
+            lon = inputs.get("lon")
+            radius_km = int(inputs.get("radius_km", 25))
+            try:
+                if lat is not None and lon is not None:
+                    raw = fetch_recent_geo(api_key, float(lat), float(lon),
+                                           days=days, radius_km=radius_km)
+                else:
+                    raw = fetch_recent_denmark(api_key, days=days)
+            except Exception as e:
+                return f"eBird API error: {e}"
+            results = [
+                {
+                    "species": r.get("comName", ""),
+                    "sciName": r.get("sciName", ""),
+                    "date": r.get("obsDt", ""),
+                    "location": r.get("locName", ""),
+                    "lat": r.get("lat"),
+                    "lon": r.get("lng"),
+                    "count": r.get("howMany", "X"),
+                }
+                for r in raw
+            ]
+            if inputs.get("rare_only"):
+                scinames = [r["sciName"] for r in results if r["sciName"]]
+                status_map = _iucn_for_scinames(graph, scinames)
+                _RARE = {"CR", "EN", "VU", "NT"}
+                results = [
+                    {**r, "iucnStatus": status_map[r["sciName"]]}
+                    for r in results
+                    if status_map.get(r["sciName"]) in _RARE
+                ]
+            return _fmt(results, limit=15)
+        ebird_only = source == "ebird"
         return _fmt(recent_danish_observations(
             graph,
             inputs.get("species"),
@@ -723,39 +758,6 @@ def _run_tool(name: str, inputs: dict, graph) -> str:
         if "radius_km" in inputs:
             kwargs["radius_km"] = float(inputs["radius_km"])
         return _fmt(nearby_watch(graph, **kwargs))
-
-    if name == "currently_present":
-        return _fmt(currently_present(graph, inputs.get("month")))
-
-    if name == "live_observations":
-        api_key = os.getenv("EBIRD_API_KEY", "")
-        if not api_key:
-            return "Error: EBIRD_API_KEY not set in .env — cannot query eBird live API."
-        days = min(max(int(inputs.get("days", 14)), 1), 30)
-        lat = inputs.get("lat")
-        lon = inputs.get("lon")
-        radius_km = int(inputs.get("radius_km", 25))
-        try:
-            if lat is not None and lon is not None:
-                raw = fetch_recent_geo(api_key, float(lat), float(lon),
-                                       days=days, radius_km=radius_km)
-            else:
-                raw = fetch_recent_denmark(api_key, days=days)
-        except Exception as e:
-            return f"eBird API error: {e}"
-        results = [
-            {
-                "species": r.get("comName", ""),
-                "sciName": r.get("sciName", ""),
-                "date": r.get("obsDt", ""),
-                "location": r.get("locName", ""),
-                "lat": r.get("lat"),
-                "lon": r.get("lng"),
-                "count": r.get("howMany", "X"),
-            }
-            for r in raw
-        ]
-        return _fmt(results, limit=15)
 
     if name == "compare_seasonal":
         import datetime as _dt
@@ -809,11 +811,50 @@ def _run_tool(name: str, inputs: dict, graph) -> str:
         return json.dumps(result, ensure_ascii=False, indent=2)
 
     if name == "observations_by_month":
-        month = int(inputs["month"])
+        import datetime as _dt
+        month = int(inputs["month"]) if "month" in inputs else _dt.date.today().month
         species_name = inputs.get("species_name")
         return _fmt(observations_by_month(graph, month, species_name))
 
     if name == "where_to_watch":
+        if inputs.get("live"):
+            api_key = os.getenv("EBIRD_API_KEY", "")
+            if not api_key:
+                return json.dumps({"error": "EBIRD_API_KEY not set"})
+            lat = float(inputs.get("lat", 55.676))
+            lon = float(inputs.get("lon", 12.568))
+            radius_km = min(int(inputs.get("radius_km", 50)), 200)
+            days = min(int(inputs.get("days", 7)), 14)
+            hotspots = fetch_nearby_hotspots(api_key, lat, lon, radius_km)
+            hotspots = sorted(
+                hotspots,
+                key=lambda h: h.get("latestObsDt") or "",
+                reverse=True,
+            )[:8]
+            results = []
+            for h in hotspots:
+                try:
+                    species = fetch_hotspot_species(api_key, h["locId"], days)
+                except Exception:
+                    species = []
+                results.append({
+                    "name": h.get("locName", ""),
+                    "locId": h.get("locId", ""),
+                    "lat": h.get("lat"),
+                    "lon": h.get("lng"),
+                    "latestObsDate": h.get("latestObsDt"),
+                    "allTimeSpeciesCount": h.get("numSpeciesAllTime"),
+                    "recentSpecies": [
+                        {
+                            "commonName": s.get("comName", ""),
+                            "scientificName": s.get("sciName", ""),
+                            "count": s.get("howMany"),
+                            "date": s.get("obsDt", ""),
+                        }
+                        for s in species[:20]
+                    ],
+                })
+            return json.dumps(results, ensure_ascii=False, indent=2)
         kwargs: dict = {}
         if "month" in inputs:
             kwargs["month"] = int(inputs["month"])
@@ -824,46 +865,6 @@ def _run_tool(name: str, inputs: dict, graph) -> str:
         if "radius_km" in inputs:
             kwargs["radius_km"] = float(inputs["radius_km"])
         return _fmt(where_to_watch(graph, **kwargs), limit=10)
-
-    if name == "live_hotspots":
-        api_key = os.getenv("EBIRD_API_KEY", "")
-        if not api_key:
-            return json.dumps({"error": "EBIRD_API_KEY not set"})
-        lat = float(inputs["lat"])
-        lon = float(inputs["lon"])
-        radius_km = min(int(inputs.get("radius_km", 50)), 200)
-        days = min(int(inputs.get("days", 7)), 14)
-        hotspots = fetch_nearby_hotspots(api_key, lat, lon, radius_km)
-        # Sort by most recently active, take top 8
-        hotspots = sorted(
-            hotspots,
-            key=lambda h: h.get("latestObsDt") or "",
-            reverse=True,
-        )[:8]
-        results = []
-        for h in hotspots:
-            try:
-                species = fetch_hotspot_species(api_key, h["locId"], days)
-            except Exception:
-                species = []
-            results.append({
-                "name": h.get("locName", ""),
-                "locId": h.get("locId", ""),
-                "lat": h.get("lat"),
-                "lon": h.get("lng"),
-                "latestObsDate": h.get("latestObsDt"),
-                "allTimeSpeciesCount": h.get("numSpeciesAllTime"),
-                "recentSpecies": [
-                    {
-                        "commonName": s.get("comName", ""),
-                        "scientificName": s.get("sciName", ""),
-                        "count": s.get("howMany"),
-                        "date": s.get("obsDt", ""),
-                    }
-                    for s in species[:20]
-                ],
-            })
-        return json.dumps(results, ensure_ascii=False, indent=2)
 
     if name == "taxonomy_summary":
         return json.dumps(taxonomy_summary(graph), ensure_ascii=False, indent=2)

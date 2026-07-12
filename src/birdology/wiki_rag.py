@@ -61,6 +61,19 @@ def _fetch_wikipedia_extract(title: str, lang: str = "en") -> Optional[str]:
         return None
 
 
+def _article_matches_species(extract: str, binomial: str) -> bool:
+    """True if *extract* actually appears to be about *binomial*.
+
+    Wikipedia full-text search can surface unrelated articles whose extract
+    happens to contain the genus or epithet (e.g. searching "Troglodytes
+    troglodytes" — the Eurasian wren — returns "Chimpanzee", whose extract
+    mentions "Pan troglodytes"). Requiring the full binomial as a substring
+    filters these false positives out without rejecting genuine matches,
+    since species articles always state their scientific name in the lede.
+    """
+    return binomial.lower() in extract.lower()
+
+
 def _chunk_text(text: str, size: int = _CHUNK_SIZE) -> list[str]:
     """Split *text* into chunks of at most *size* chars, breaking on paragraphs."""
     paragraphs = [p.strip() for p in re.split(r"\n{2,}", text) if len(p.strip()) > 60]
@@ -152,14 +165,22 @@ class WikiRAG:
         # Strip author from e.g. "Haematopus ostralegus Linnaeus, 1758" → "Haematopus ostralegus"
         binomial = " ".join(scientific_name.split()[:2])
 
-        # Try scientific name first, then "<common> bird"
-        title = _search_wikipedia_title(binomial, lang)
-        if not title and common_name:
-            title = _search_wikipedia_title(f"{common_name} bird", lang)
-        if not title:
-            return 0
+        # Resolution order (most reliable to least):
+        # 1. Direct page lookup by binomial — Wikipedia maintains redirects
+        #    from scientific names to common-name articles, so this is exact.
+        # 2. Text search for "<common name> bird" — catches species whose
+        #    scientific names don't have a redirect (rare), but reject results
+        #    where the binomial doesn't appear in the extract to avoid
+        #    false-positive matches from the relevance-ranked search API.
+        extract = _fetch_wikipedia_extract(binomial, lang)
+        title = binomial if extract else None
 
-        extract = _fetch_wikipedia_extract(title, lang)
+        if not extract and common_name:
+            title = _search_wikipedia_title(f"{common_name} bird", lang)
+            extract = _fetch_wikipedia_extract(title, lang) if title else None
+            if extract and not _article_matches_species(extract, binomial):
+                title, extract = None, None
+
         if not extract:
             return 0
 

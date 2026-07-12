@@ -17,5 +17,8 @@ output/_birdology_tmp.owl
 .idea/
 .vscode/
 
+# Claude Code local config
+.claude/
+
 # Oxigraph binary store cache
 output/.birdology*_oxi/
