@@ -8,6 +8,7 @@ build/
 venv/
 data/
 output/
+logs/
 .DS_Store
 
 # Reasoner temp file
@@ -22,3 +23,6 @@ output/_birdology_tmp.owl
 
 # Oxigraph binary store cache
 output/.birdology*_oxi/
+
+# SDD process artifacts
+.superpowers/
