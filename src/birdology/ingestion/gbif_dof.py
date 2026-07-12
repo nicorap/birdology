@@ -24,6 +24,10 @@ _GBIF_BASE = "https://api.gbif.org/v1"
 _DOF_DATASET_KEY = "95db4db8-f762-11e1-a439-00145eb45e9a"
 _TIMEOUT = 30
 _PAGE_SIZE = 300  # GBIF max per request
+# DOFbasen is bird-focused but contains a small fraction of non-avian records
+# (mammals, etc.). Restrict fetches to the GBIF backbone class Aves so only
+# birds enter the graph.
+_AVES_TAXON_KEY = 212
 
 # IUCN Red List categories ordered from most to least threatened
 IUCN_RANK = {"CR": 0, "EN": 1, "VU": 2, "NT": 3, "LC": 4, "DD": 5, "NE": 6}
@@ -53,6 +57,7 @@ def _fetch_year(year: int, remaining: int) -> list[dict]:
             "limit": limit,
             "offset": offset,
             "basisOfRecord": "HUMAN_OBSERVATION",
+            "taxonKey": _AVES_TAXON_KEY,
             "year": year,
         }
         resp = requests.get(
@@ -89,6 +94,7 @@ def fetch_dof_occurrences_since(
                 "limit": limit,
                 "offset": offset,
                 "basisOfRecord": "HUMAN_OBSERVATION",
+                "taxonKey": _AVES_TAXON_KEY,
                 "eventDate": f"{since_str},*",
             }
             resp = requests.get(

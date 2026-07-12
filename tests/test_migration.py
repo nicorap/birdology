@@ -235,3 +235,24 @@ def test_infer_migration_status_handles_empty_months():
     assert added > 0
     statuses = list(g.objects(TAXON["species/robi"], BIRD.migrationStatus))
     assert str(statuses[0]) == "Unknown"
+
+
+def test_infer_migration_status_falls_back_to_graph_months():
+    # GBIF name lookup returns nothing (e.g. synonym mismatch), but the graph
+    # has observation dates → classify from those instead of "Unknown".
+    g = Graph()
+    sp = TAXON["species/gree"]
+    g.add((sp, RDF.type, BIRD.Species))
+    g.add((sp, DWC.scientificName, Literal("Chloris chloris")))
+    for i, month in enumerate((6, 7, 8)):
+        obs = TAXON[f"obs/{i}"]
+        g.add((sp, BIRD.hasObservation, obs))
+        g.add((obs, BIRD.observedOn, Literal(f"2025-{month:02d}-15")))
+
+    with patch("birdology.migration._gbif_months_for_species", return_value=set()):
+        infer_migration_status(g, max_workers=1)
+
+    statuses = list(g.objects(sp, BIRD.migrationStatus))
+    assert str(statuses[0]) == "SummerVisitor"
+    months = {int(str(m)) for m in g.objects(sp, BIRD.typicallyPresentInMonth)}
+    assert months == {6, 7, 8}

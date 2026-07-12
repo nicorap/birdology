@@ -133,6 +133,24 @@ def _gbif_months_for_species(scientific_name: str) -> set[int]:
     return {month for month, n in counts.items() if n >= threshold}
 
 
+def _months_from_graph(g: Graph, species: URIRef) -> set[int]:
+    """Fallback: months this species was observed, taken from the observation
+    dates already ingested into *g*.
+
+    Used when the GBIF name lookup returns nothing — most often because the
+    graph's (eBird) scientific name is a synonym GBIF indexes under a different
+    name (e.g. Chloris chloris vs Carduelis chloris). Also covers GBIF outages.
+    """
+    months: set[int] = set()
+    for obs in g.objects(species, BIRD.hasObservation):
+        for observed_on in g.objects(obs, BIRD.observedOn):
+            try:
+                months.add(int(str(observed_on)[5:7]))
+            except (ValueError, IndexError):
+                continue
+    return months
+
+
 def infer_migration_status(g: Graph, max_workers: int | None = _DEFAULT_WORKERS) -> int:
     """Analyse per-species observation months and add migration triples to *g*.
 
@@ -172,6 +190,10 @@ def infer_migration_status(g: Graph, max_workers: int | None = _DEFAULT_WORKERS)
 
     added = 0
     for species, months in results:
+        if not months:
+            # GBIF name lookup came back empty — fall back to the observation
+            # months already in the graph (handles synonyms / GBIF outages).
+            months = _months_from_graph(g, species)
         status = _classify(months)
         g.add((species, BIRD.migrationStatus, Literal(status)))
         added += 1
