@@ -93,6 +93,7 @@ def _find_web_pid(pgrep=subprocess.run) -> int | None:
 
 def _spawn_web(popen=subprocess.Popen) -> None:
     """Spawn the web_chat.py server against the reasoned graph."""
+    _LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     log_fh = _LOG_PATH.open("a")
     popen(
         ["uv", "run", "python", "scripts/web_chat.py",
@@ -112,8 +113,11 @@ def reload_web_server() -> None:
         log("No running web server — skipping reload.")
         return
     log(f"Reloading web server (pid {pid}) on the reasoned graph…")
-    os.kill(pid, signal.SIGTERM)
-    time.sleep(2)
+    try:
+        os.kill(pid, signal.SIGTERM)
+        time.sleep(2)
+    except ProcessLookupError:
+        log(f"Web server (pid {pid}) already gone; launching a fresh one.")
     _spawn_web()
     log("Web server relaunched.")
 
@@ -136,7 +140,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{step.name}: {' '.join(step.argv)}")
         return 0
     log(f"Refresh started ({'incremental' if args.incremental else 'full'}).")
-    run_plan(plan)
+    try:
+        run_plan(plan)
+    except Exception as e:
+        log(f"✗ Refresh failed: {e}")
+        return 1
     log("Refresh complete.")
     return 0
 

@@ -23,3 +23,6 @@ output/_birdology_tmp.owl
 
 # Oxigraph binary store cache
 output/.birdology*_oxi/
+
+# SDD process artifacts
+.superpowers/

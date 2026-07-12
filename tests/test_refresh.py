@@ -100,3 +100,23 @@ def test_reload_kills_then_spawns_when_server_running(monkeypatch):
     monkeypatch.setattr(refresh.time, "sleep", lambda s: None)
     refresh.reload_web_server()
     assert events == [("kill", 4242), "spawn"]  # kill before spawn
+
+
+def test_spawn_web_targets_reasoned_graph(monkeypatch, tmp_path):
+    monkeypatch.setattr(refresh, "_LOG_PATH", tmp_path / "refresh.log")
+    captured = {}
+    def fake_popen(argv, **kwargs):
+        captured["argv"] = argv
+        return None
+    refresh._spawn_web(popen=fake_popen)
+    assert "--input" in captured["argv"]
+    assert "output/birdology_reasoned.ttl" in captured["argv"]
+
+
+def test_main_returns_nonzero_on_failure(monkeypatch, tmp_path):
+    monkeypatch.setattr(refresh, "_LOG_PATH", tmp_path / "refresh.log")
+    def boom(plan):
+        raise RuntimeError("step failed")
+    monkeypatch.setattr(refresh, "run_plan", boom)
+    rc = refresh.main([])
+    assert rc == 1
