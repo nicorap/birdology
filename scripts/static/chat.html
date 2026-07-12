@@ -17,10 +17,11 @@
     background: #0f1117;
     color: #e0e0e0;
     display: grid;
-    grid-template-rows: auto 1fr;
-    grid-template-columns: minmax(380px, 1fr) 1.3fr;
+    grid-template-rows: auto auto 1fr;
+    grid-template-columns: minmax(380px, 1fr) 1.4fr;
     grid-template-areas:
       "header header"
+      "alerts alerts"
       "chat   panels";
     overflow: hidden;
   }
@@ -344,6 +345,66 @@
 
   #spots-panel, #cards-panel { border-top: 1px solid #2a2d3a; }
   #map { flex: 1; background: #0f1117; }
+
+  /* Alerts strip — horizontal across the top */
+  #alerts-panel {
+    grid-area: alerts;
+    background: #14161e;
+    border-bottom: 1px solid #2a2d3a;
+    display: flex;
+    flex-direction: column;
+    max-height: 110px;
+  }
+  #alerts-panel .panel-header { padding: 6px 14px; font-size: 11px; }
+  #alerts-list {
+    flex: 1;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 6px 12px 8px 12px;
+    display: flex;
+    flex-direction: row;
+    gap: 8px;
+    align-items: stretch;
+  }
+  .alert-row {
+    flex: 0 0 290px;
+    display: grid;
+    grid-template-columns: 38px 1fr auto;
+    gap: 10px;
+    align-items: center;
+    background: #1a1d27;
+    border: 1px solid #2a2d3a;
+    border-left: 3px solid #c0a050;
+    border-radius: 8px;
+    padding: 6px 10px;
+    cursor: pointer;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .alert-row:hover { background: #1e2130; border-left-color: #e8c870; }
+  .alert-row.cr { border-left-color: #d04a4a; }
+  .alert-row.en { border-left-color: #d07a3a; }
+  .alert-row.vu { border-left-color: #c0a050; }
+  .alert-row.nt { border-left-color: #6a8ec0; }
+  .alert-status {
+    font-size: 11px;
+    font-weight: 700;
+    text-align: center;
+    padding: 4px 0;
+    border-radius: 4px;
+    background: #252830;
+    color: #f0f0f0;
+  }
+  .alert-row.cr .alert-status { background: #4a1f1f; color: #ffb0b0; }
+  .alert-row.en .alert-status { background: #4a2f1a; color: #ffc890; }
+  .alert-row.vu .alert-status { background: #3a3520; color: #ffe8a0; }
+  .alert-row.nt .alert-status { background: #1f2f4a; color: #b0d0ff; }
+  .alert-info { min-width: 0; }
+  .alert-info .name { font-size: 13px; color: #f0f0f0; font-weight: 600; line-height: 1.3; }
+  .alert-info .sci { font-size: 11px; color: #7dcea0; font-style: italic; }
+  .alert-info .where { font-size: 11px; color: #8a8a8a; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .alert-date { font-size: 11px; color: #8a8a8a; white-space: nowrap; }
+  .alert-empty { padding: 16px; color: #7dcea0; font-size: 13px; text-align: center; }
+  /* Map dark theme tweaks */
   .leaflet-container { background: #1a1d27; }
   .leaflet-popup-content-wrapper, .leaflet-popup-tip {
     background: #1a1d27; color: #e0e0e0; border: 1px solid #2a2d3a;
@@ -366,7 +427,7 @@
   .species-card {
     background: #1a1d27;
     border: 1px solid #2a2d3a;
-    border-radius: 10px;
+    border-radius: 12px;
     overflow: hidden;
     cursor: pointer;
     transition: border-color 0.15s, transform 0.15s;
@@ -379,15 +440,15 @@
     background: #252830;
     display: block;
   }
-  .species-card .meta { padding: 8px 10px; }
-  .species-card .name { font-size: 12px; color: #f0f0f0; font-weight: 600; line-height: 1.3; }
-  .species-card .sci { font-size: 11px; color: #7dcea0; font-style: italic; margin-top: 2px; }
-  .species-card .obs-count { font-size: 10px; color: #6a7a8a; margin-top: 4px; }
+  .species-card .meta { padding: 10px 12px; }
+  .species-card .name { font-size: 14px; color: #f0f0f0; font-weight: 600; line-height: 1.3; }
+  .species-card .sci { font-size: 12px; color: #7dcea0; font-style: italic; margin-top: 3px; }
+  .species-card .obs-count { font-size: 11px; color: #6a7a8a; margin-top: 5px; }
 
   .panel-loading { padding: 20px; color: #666; font-size: 12px; text-align: center; }
 
   @media (max-width: 900px) {
-    body { grid-template-columns: 1fr; grid-template-areas: "header" "chat" "panels"; grid-template-rows: auto 1fr 60vh; }
+    body { grid-template-columns: 1fr; grid-template-areas: "header" "alerts" "chat" "panels"; grid-template-rows: auto auto 1fr 60vh; }
     #chat-column { border-right: none; border-bottom: 1px solid #2a2d3a; }
   }
 </style>
@@ -422,6 +483,13 @@
     </div>
   </div>
 </div>
+
+<section id="alerts-panel" class="panel">
+  <div class="panel-header">⚠ Especes menacees vues recemment <span class="count" id="alerts-count"></span></div>
+  <div id="alerts-list">
+    <div class="panel-loading">Chargement…</div>
+  </div>
+</section>
 
 <div id="panels">
   <section id="map-panel" class="panel">
@@ -839,7 +907,36 @@ fetch('/api/observations').then(function(r) { return r.json(); }).then(function(
   console.error(e);
 });
 
-// ── Species cards (right panel) ──────────────────────────────────────────
+// ── Rare-nearby alerts ───────────────────────────────────────────────────
+var alertsList = document.getElementById('alerts-list');
+fetch('/api/rare-nearby').then(function(r) { return r.json(); }).then(function(rows) {
+  document.getElementById('alerts-count').textContent = rows.length + ' (25 km Norrebro)';
+  if (!rows.length) {
+    alertsList.innerHTML = '<div class="alert-empty">Aucune espece menacee observee recemment dans un rayon de 25 km.</div>';
+    return;
+  }
+  alertsList.innerHTML = '';
+  rows.forEach(function(r) {
+    var name = r.commonName || r.scientificName;
+    var statusClass = (r.status || '').toLowerCase();
+    var row = document.createElement('div');
+    row.className = 'alert-row ' + statusClass;
+    row.innerHTML = '<div class="alert-status">' + escapeHtml(r.status) + '</div>'
+      + '<div class="alert-info">'
+      +   '<div class="name">' + escapeHtml(name) + '</div>'
+      + (r.scientificName && r.scientificName !== name ? '<div class="sci">' + escapeHtml(r.scientificName) + '</div>' : '')
+      + (r.locality ? '<div class="where">' + escapeHtml(r.locality) + '</div>' : '')
+      + '</div>'
+      + '<div class="alert-date">' + escapeHtml(r.date || '') + '</div>';
+    row.addEventListener('click', function() { askAbout(name); });
+    alertsList.appendChild(row);
+  });
+}).catch(function(e) {
+  alertsList.innerHTML = '<div class="panel-loading">Erreur de chargement</div>';
+  console.error(e);
+});
+
+// ── Species cards ────────────────────────────────────────────────────────
 var cardsGrid = document.getElementById('cards-grid');
 
 function renderRelevantCards(spots) {
