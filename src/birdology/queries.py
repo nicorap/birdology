@@ -1007,3 +1007,87 @@ def taxonomy_summary(g: Graph | ConjunctiveGraph) -> dict:
         rows = list(g.query(q))
         counts[label] = int(rows[0]["n"]) if rows else 0
     return counts
+
+
+def _month_bools(months: set[int]) -> list[bool]:
+    """12-element presence list, index 0 = January."""
+    return [m in months for m in range(1, 13)]
+
+
+def _arrival_departure(months: set[int]) -> tuple[int | None, int | None]:
+    """Cyclic month-granularity arrival/departure edges.
+
+    arrival = smallest present month whose previous month (cyclic) is absent;
+    departure = smallest present month whose next month (cyclic) is absent.
+    Residents (all 12) and empties have neither.
+    """
+    if not months or len(months) == 12:
+        return (None, None)
+    prev_absent = [m for m in range(1, 13) if m in months and ((m - 2) % 12 + 1) not in months]
+    next_absent = [m for m in range(1, 13) if m in months and (m % 12 + 1) not in months]
+    arrival = min(prev_absent) if prev_absent else None
+    departure = min(next_absent) if next_absent else None
+    return (arrival, departure)
+
+
+def migration_calendar(g: "Graph") -> list[dict]:
+    """One row per observed, classified species: month-presence + arrival/departure.
+
+    Grouped by scientificName so owl:sameAs-split nodes merge into a single row.
+    """
+    q = (
+        _PREFIXES
+        + """
+SELECT ?scientificName ?commonNameEn ?commonNameFr ?commonNameDa
+       ?migrationStatus ?thumbnail ?month
+WHERE {
+    ?species a bird:Species ;
+             dwc:scientificName    ?scientificName ;
+             bird:hasObservation   ?obs ;
+             bird:migrationStatus  ?migrationStatus .
+    FILTER(STRSTARTS(STR(?species), "https://birdology.org/taxon/species/"))
+    OPTIONAL { ?species bird:typicallyPresentInMonth ?month }
+    OPTIONAL {
+        { ?species bird:thumbnailUrl ?thumbnail }
+        UNION
+        { ?species owl:sameAs ?alt . ?alt bird:thumbnailUrl ?thumbnail }
+    }
+    OPTIONAL { ?species bird:commonNameEn ?commonNameEn }
+    OPTIONAL { ?species bird:commonNameFr ?commonNameFr }
+    OPTIONAL { ?species bird:commonNameDa ?commonNameDa }
+}
+"""
+    )
+    grouped: dict[str, dict] = {}
+    for row in g.query(q):
+        sci = str(row.scientificName)
+        entry = grouped.setdefault(sci, {
+            "scientificName": sci,
+            "commonName": "",
+            "thumbnail": "",
+            "migrationStatus": str(row.migrationStatus),
+            "months": set(),
+        })
+        if row.month is not None:
+            entry["months"].add(int(str(row.month)))
+        if not entry["thumbnail"] and row.thumbnail is not None:
+            entry["thumbnail"] = str(row.thumbnail)
+        if not entry["commonName"]:
+            name = row.commonNameFr or row.commonNameEn or row.commonNameDa
+            if name is not None:
+                entry["commonName"] = str(name)
+
+    out = []
+    for entry in grouped.values():
+        months = entry["months"]
+        arrival, departure = _arrival_departure(months)
+        out.append({
+            "commonName": entry["commonName"] or entry["scientificName"],
+            "scientificName": entry["scientificName"],
+            "thumbnail": entry["thumbnail"],
+            "migrationStatus": entry["migrationStatus"],
+            "months": _month_bools(months),
+            "arrivalMonth": arrival,
+            "departureMonth": departure,
+        })
+    return out

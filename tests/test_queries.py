@@ -9,8 +9,11 @@ from rdflib.namespace import OWL, RDF, XSD
 
 from birdology.namespaces import BIRD, DWC, OBS, LOC, TAXON
 from birdology.queries import (
+    _arrival_departure,
+    _month_bools,
     find_species_by_name,
     list_danish_species,
+    migration_calendar,
     migration_timing,
     nearby_watch,
     phenology,
@@ -515,3 +518,88 @@ def test_phenology_resident_has_flat_profile():
     assert r["monthlyFreq"][0] > 0   # January
     assert r["monthlyFreq"][4] > 0   # May
     assert r["monthlyFreqPct"][0] == 100 or r["monthlyFreqPct"][4] == 100
+
+
+# ── migration_calendar ────────────────────────────────────────────────────────
+
+def test_arrival_departure_resident_is_none():
+    assert _arrival_departure(set(range(1, 13))) == (None, None)
+
+
+def test_arrival_departure_empty_is_none():
+    assert _arrival_departure(set()) == (None, None)
+
+
+def test_arrival_departure_summer_visitor():
+    # Apr-Sep present
+    assert _arrival_departure({4, 5, 6, 7, 8, 9}) == (4, 9)
+
+
+def test_arrival_departure_winter_wraps_year():
+    # Oct-Mar present (wraps December→January)
+    assert _arrival_departure({10, 11, 12, 1, 2, 3}) == (10, 3)
+
+
+def test_arrival_departure_passage_two_windows_picks_earliest_edges():
+    # spring (Mar-May) + autumn (Sep-Oct)
+    assert _arrival_departure({3, 4, 5, 9, 10}) == (3, 5)
+
+
+def test_month_bools_indexes_january_at_zero():
+    bools = _month_bools({1, 12})
+    assert bools[0] is True and bools[11] is True
+    assert bools[1] is False
+    assert len(bools) == 12
+
+
+def _calendar_fixture_graph():
+    g = Graph()
+
+    def add_species(local, sci, status, months, common_en):
+        sp = TAXON["species/" + local]
+        g.add((sp, RDF.type, BIRD.Species))
+        g.add((sp, DWC.scientificName, Literal(sci)))
+        g.add((sp, BIRD.commonNameEn, Literal(common_en)))
+        g.add((sp, BIRD.migrationStatus, Literal(status)))
+        g.add((sp, BIRD.hasObservation, TAXON["obs/" + local]))
+        for m in months:
+            g.add((sp, BIRD.typicallyPresentInMonth, Literal(m, datatype=XSD.integer)))
+        return sp
+
+    add_species("robi", "Erithacus rubecula", "Resident", range(1, 13), "Robin")
+    add_species("swift", "Apus apus", "SummerVisitor", [5, 6, 7, 8], "Common Swift")
+    return g
+
+
+def test_migration_calendar_row_shape_and_values():
+    g = _calendar_fixture_graph()
+    rows = {r["scientificName"]: r for r in migration_calendar(g)}
+    assert set(rows) == {"Erithacus rubecula", "Apus apus"}
+
+    swift = rows["Apus apus"]
+    assert swift["commonName"] == "Common Swift"
+    assert swift["migrationStatus"] == "SummerVisitor"
+    assert swift["months"] == [False, False, False, False, True, True, True, True, False, False, False, False]
+    assert swift["arrivalMonth"] == 5
+    assert swift["departureMonth"] == 8
+    assert set(swift) == {"commonName", "scientificName", "thumbnail", "migrationStatus", "months", "arrivalMonth", "departureMonth"}
+
+    robin = rows["Erithacus rubecula"]
+    assert robin["arrivalMonth"] is None and robin["departureMonth"] is None
+
+
+def test_migration_calendar_merges_sameas_split_months():
+    # Two nodes with the SAME scientificName, months split across them → one merged row.
+    g = Graph()
+    for local, months in [("gree1", [10, 11, 12]), ("gree2", [1, 2, 3])]:
+        sp = TAXON["species/" + local]
+        g.add((sp, RDF.type, BIRD.Species))
+        g.add((sp, DWC.scientificName, Literal("Chloris chloris")))
+        g.add((sp, BIRD.migrationStatus, Literal("WinterVisitor")))
+        g.add((sp, BIRD.hasObservation, TAXON["obs/" + local]))
+        for m in months:
+            g.add((sp, BIRD.typicallyPresentInMonth, Literal(m, datatype=XSD.integer)))
+    rows = migration_calendar(g)
+    assert len(rows) == 1
+    assert rows[0]["months"] == [True, True, True, False, False, False, False, False, False, True, True, True]
+    assert rows[0]["arrivalMonth"] == 10 and rows[0]["departureMonth"] == 3
