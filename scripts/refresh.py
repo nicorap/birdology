@@ -20,7 +20,14 @@ Cron suggestion:
 from __future__ import annotations
 
 import argparse
+import subprocess
+import sys
 from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+
+_PROJECT_DIR = Path(__file__).resolve().parent.parent
+_LOG_PATH = _PROJECT_DIR / "logs" / "refresh.log"
 
 
 @dataclass(frozen=True)
@@ -64,3 +71,46 @@ def build_plan(args: argparse.Namespace) -> list[Step]:
     if not args.no_reload:
         plan.append(Step("reload_web"))
     return plan
+
+
+def log(msg: str) -> None:
+    line = f"[{datetime.now().isoformat(timespec='seconds')}] {msg}"
+    print(line)
+    _LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with _LOG_PATH.open("a") as fh:
+        fh.write(line + "\n")
+
+
+def reload_web_server() -> None:
+    """Reload the running web server so it picks up the fresh reasoned graph.
+
+    Fully implemented in Task 3.
+    """
+    pass
+
+
+def run_plan(plan, *, runner=subprocess.run, reloader=reload_web_server) -> None:
+    for step in plan:
+        log(f"→ {step.name}")
+        if step.name == "reload_web":
+            reloader()
+        else:
+            runner(step.argv, check=True)
+        log(f"✓ {step.name}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    plan = build_plan(args)
+    if args.dry_run:
+        for step in plan:
+            print(f"{step.name}: {' '.join(step.argv)}")
+        return 0
+    log(f"Refresh started ({'incremental' if args.incremental else 'full'}).")
+    run_plan(plan)
+    log("Refresh complete.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

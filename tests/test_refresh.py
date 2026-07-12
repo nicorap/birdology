@@ -43,3 +43,41 @@ def test_reload_step_has_empty_argv():
     plan = refresh.build_plan(refresh.parse_args([]))
     reload_step = [s for s in plan if s.name == "reload_web"][0]
     assert reload_step.argv == []
+
+
+import subprocess
+import pytest
+
+
+def test_run_plan_executes_steps_in_order():
+    calls = []
+    plan = [refresh.Step("a", ["x"]), refresh.Step("b", ["y"]), refresh.Step("reload_web")]
+    refresh.run_plan(
+        plan,
+        runner=lambda argv, check: calls.append(("run", argv)),
+        reloader=lambda: calls.append(("reload", None)),
+    )
+    assert calls == [("run", ["x"]), ("run", ["y"]), ("reload", None)]
+
+
+def test_run_plan_aborts_on_first_failure():
+    calls = []
+
+    def boom(argv, check):
+        calls.append(argv)
+        raise subprocess.CalledProcessError(1, argv)
+
+    plan = [refresh.Step("a", ["x"]), refresh.Step("b", ["y"])]
+    with pytest.raises(subprocess.CalledProcessError):
+        refresh.run_plan(plan, runner=boom, reloader=lambda: None)
+    assert calls == [["x"]]  # stopped after the first step failed
+
+
+def test_main_dry_run_prints_plan_and_runs_nothing(capsys):
+    ran = []
+    rc = refresh.main(["--dry-run"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "build_graph:" in out
+    assert "reason:" in out
+    assert "reload_web:" in out
