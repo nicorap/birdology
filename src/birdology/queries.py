@@ -1030,32 +1030,32 @@ def _arrival_departure(months: set[int]) -> tuple[int | None, int | None]:
     return (arrival, departure)
 
 
-def migration_calendar(g: "Graph") -> list[dict]:
+def migration_calendar(g: Graph | ConjunctiveGraph) -> list[dict]:
     """One row per observed, classified species: month-presence + arrival/departure.
 
     Grouped by scientificName so owl:sameAs-split nodes merge into a single row.
     """
     q = (
         _PREFIXES
-        + """
+        + f"""
 SELECT ?scientificName ?commonNameEn ?commonNameFr ?commonNameDa
        ?migrationStatus ?thumbnail ?month
-WHERE {
+WHERE {{
     ?species a bird:Species ;
              dwc:scientificName    ?scientificName ;
-             bird:hasObservation   ?obs ;
              bird:migrationStatus  ?migrationStatus .
-    FILTER(STRSTARTS(STR(?species), "https://birdology.org/taxon/species/"))
-    OPTIONAL { ?species bird:typicallyPresentInMonth ?month }
-    OPTIONAL {
-        { ?species bird:thumbnailUrl ?thumbnail }
+    FILTER EXISTS {{ ?species bird:hasObservation [] }}
+    {_CANONICAL_SPECIES}
+    OPTIONAL {{ ?species bird:typicallyPresentInMonth ?month }}
+    OPTIONAL {{
+        {{ ?species bird:thumbnailUrl ?thumbnail }}
         UNION
-        { ?species owl:sameAs ?alt . ?alt bird:thumbnailUrl ?thumbnail }
-    }
-    OPTIONAL { ?species bird:commonNameEn ?commonNameEn }
-    OPTIONAL { ?species bird:commonNameFr ?commonNameFr }
-    OPTIONAL { ?species bird:commonNameDa ?commonNameDa }
-}
+        {{ ?species owl:sameAs ?alt . ?alt bird:thumbnailUrl ?thumbnail }}
+    }}
+    OPTIONAL {{ ?species bird:commonNameEn ?commonNameEn }}
+    OPTIONAL {{ ?species bird:commonNameFr ?commonNameFr }}
+    OPTIONAL {{ ?species bird:commonNameDa ?commonNameDa }}
+}}
 """
     )
     grouped: dict[str, dict] = {}
