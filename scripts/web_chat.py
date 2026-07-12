@@ -27,7 +27,7 @@ from flask import Flask, request, jsonify, Response
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from birdology.graph import load_graph
-from birdology.queries import observations_for_map
+from birdology.queries import observations_for_map, nearby_watch
 from chat import (
     SYSTEM_PROMPT,
     TOOLS_OPENAI,
@@ -522,6 +522,7 @@ def api_species():
         q = """
 PREFIX bird: <https://birdology.org/ontology/>
 PREFIX dwc: <http://rs.tdwg.org/dwc/terms/>
+PREFIX owl: <http://www.w3.org/2002/07/owl#>
 SELECT ?species ?scientificName ?commonNameEn ?commonNameFr ?commonNameDa ?thumbnail
        (COUNT(?obs) AS ?obsCount)
 WHERE {
@@ -529,7 +530,11 @@ WHERE {
              dwc:scientificName ?scientificName ;
              bird:hasObservation ?obs .
     FILTER(STRSTARTS(STR(?species), "https://birdology.org/taxon/species/"))
-    OPTIONAL { ?species bird:thumbnailUrl ?thumbnail }
+    OPTIONAL {
+        { ?species bird:thumbnailUrl ?thumbnail }
+        UNION
+        { ?species owl:sameAs ?alt . ?alt bird:thumbnailUrl ?thumbnail }
+    }
     OPTIONAL { ?species bird:commonNameEn ?commonNameEn }
     OPTIONAL { ?species bird:commonNameFr ?commonNameFr }
     OPTIONAL { ?species bird:commonNameDa ?commonNameDa }
@@ -840,6 +845,33 @@ def api_weekend():
         })
 
     return jsonify({"month": month, "spots": spots})
+
+
+@app.route("/api/rare-nearby")
+def api_rare_nearby():
+    if "rare_nearby" not in _PANEL_CACHE:
+        # Assistens Kirkegård, Nørrebro — 25 km radius covers greater Copenhagen
+        rows = nearby_watch(GRAPH, lat=55.6918, lon=12.5559, radius_km=25.0)
+        threatened = ("CR", "EN", "VU", "NT")
+        out = []
+        for r in rows:
+            status = r.get("status", "")
+            if status not in threatened:
+                continue
+            out.append({
+                "scientificName": r.get("scientificName", ""),
+                "commonName": r.get("commonNameFr") or r.get("commonNameEn") or r.get("commonNameDa") or "",
+                "status": status,
+                "date": r.get("date", ""),
+                "locality": r.get("locality", ""),
+                "count": r.get("count", ""),
+            })
+        # Sort newest first, then rarest first (stable sort preserves date order within each status).
+        rank = {"CR": 0, "EN": 1, "VU": 2, "NT": 3}
+        out.sort(key=lambda x: x.get("date", ""), reverse=True)
+        out.sort(key=lambda x: rank.get(x["status"], 9))
+        _PANEL_CACHE["rare_nearby"] = out
+    return jsonify(_PANEL_CACHE["rare_nearby"])
 
 
 @app.route("/api/reset", methods=["POST"])
