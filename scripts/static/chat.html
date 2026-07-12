@@ -572,6 +572,15 @@
   </section>
 </div>
 
+<div id="calendar-panel">
+  <div class="cal-head">
+    <h2>📅 Migration calendar <span id="cal-count" style="color:#6a7a8a;font-size:13px;font-weight:400"></span></h2>
+    <button class="cal-close" id="cal-close-btn">✕ Close</button>
+  </div>
+  <div id="cal-forecast"></div>
+  <div id="cal-grid-wrap"><div class="panel-loading">Loading…</div></div>
+</div>
+
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
 <script>
@@ -1239,7 +1248,7 @@ function renderCalendar(rows) {
     var thumb = r.thumbnail
       ? '<img src="' + escapeAttr(r.thumbnail) + '" alt="" loading="lazy" onerror="this.style.visibility=\'hidden\'">'
       : '<img alt="" style="visibility:hidden">';
-    html += '<tr class="cal-row" onclick="openCalSpecies(\'' + escapeAttr(r.commonName) + '\')">';
+    html += '<tr class="cal-row" data-name="' + escapeAttr(r.commonName) + '">';
     html += '<td class="cal-name">' + thumb + '<span class="cal-nm">' + escapeHtml(r.commonName)
       + '</span> <span class="cal-sci">' + escapeHtml(r.scientificName) + '</span></td>';
     for (var m = 0; m < 12; m++) {
@@ -1253,6 +1262,9 @@ function renderCalendar(rows) {
   });
   html += '</tbody></table>';
   document.getElementById('cal-grid-wrap').innerHTML = html;
+  document.getElementById('cal-grid-wrap').querySelectorAll('.cal-row').forEach(function(tr) {
+    tr.addEventListener('click', function() { openCalSpecies(tr.dataset.name); });
+  });
   document.getElementById('cal-count').textContent = rows.length + ' species';
 }
 
@@ -1280,13 +1292,5 @@ document.getElementById('cal-close-btn').addEventListener('click', function() {
 
 userInput.focus();
 </script>
-<div id="calendar-panel">
-  <div class="cal-head">
-    <h2>📅 Migration calendar <span id="cal-count" style="color:#6a7a8a;font-size:13px;font-weight:400"></span></h2>
-    <button class="cal-close" id="cal-close-btn">✕ Close</button>
-  </div>
-  <div id="cal-forecast"></div>
-  <div id="cal-grid-wrap"><div class="panel-loading">Loading…</div></div>
-</div>
 </body>
 </html>
