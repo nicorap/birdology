@@ -81,3 +81,22 @@ def test_main_dry_run_prints_plan_and_runs_nothing(capsys):
     assert "build_graph:" in out
     assert "reason:" in out
     assert "reload_web:" in out
+
+
+def test_reload_noop_when_no_server(monkeypatch):
+    events = []
+    monkeypatch.setattr(refresh, "_find_web_pid", lambda: None)
+    monkeypatch.setattr(refresh, "_spawn_web", lambda: events.append("spawn"))
+    monkeypatch.setattr(refresh.os, "kill", lambda pid, sig: events.append(("kill", pid)))
+    refresh.reload_web_server()
+    assert events == []  # nothing to reload
+
+
+def test_reload_kills_then_spawns_when_server_running(monkeypatch):
+    events = []
+    monkeypatch.setattr(refresh, "_find_web_pid", lambda: 4242)
+    monkeypatch.setattr(refresh, "_spawn_web", lambda: events.append("spawn"))
+    monkeypatch.setattr(refresh.os, "kill", lambda pid, sig: events.append(("kill", pid)))
+    monkeypatch.setattr(refresh.time, "sleep", lambda s: None)
+    refresh.reload_web_server()
+    assert events == [("kill", 4242), "spawn"]  # kill before spawn

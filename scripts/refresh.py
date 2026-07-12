@@ -20,8 +20,11 @@ Cron suggestion:
 from __future__ import annotations
 
 import argparse
+import os
+import signal
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -81,12 +84,38 @@ def log(msg: str) -> None:
         fh.write(line + "\n")
 
 
+def _find_web_pid(pgrep=subprocess.run) -> int | None:
+    """Find the PID of the running web_chat.py process, or None if not running."""
+    result = pgrep(["pgrep", "-f", "web_chat.py"], capture_output=True, text=True)
+    pids = [line for line in result.stdout.split() if line.strip()]
+    return int(pids[0]) if pids else None
+
+
+def _spawn_web(popen=subprocess.Popen) -> None:
+    """Spawn the web_chat.py server against the reasoned graph."""
+    log_fh = _LOG_PATH.open("a")
+    popen(
+        ["uv", "run", "python", "scripts/web_chat.py",
+         "--input", "output/birdology_reasoned.ttl"],
+        cwd=str(_PROJECT_DIR), stdout=log_fh, stderr=log_fh,
+        start_new_session=True,
+    )
+
+
 def reload_web_server() -> None:
     """Reload the running web server so it picks up the fresh reasoned graph.
 
     Fully implemented in Task 3.
     """
-    pass
+    pid = _find_web_pid()
+    if pid is None:
+        log("No running web server — skipping reload.")
+        return
+    log(f"Reloading web server (pid {pid}) on the reasoned graph…")
+    os.kill(pid, signal.SIGTERM)
+    time.sleep(2)
+    _spawn_web()
+    log("Web server relaunched.")
 
 
 def run_plan(plan, *, runner=subprocess.run, reloader=reload_web_server) -> None:
