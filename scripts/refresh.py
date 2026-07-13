@@ -21,16 +21,22 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import signal
 import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 
 _PROJECT_DIR = Path(__file__).resolve().parent.parent
 _LOG_PATH = _PROJECT_DIR / "logs" / "refresh.log"
+
+
+def _default_port() -> int:
+    return int(os.environ.get("BIRDOLOGY_PORT", "5000"))
 
 
 @dataclass(frozen=True)
@@ -49,6 +55,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Also rebuild the Wikipedia RAG index (needs Ollama).")
     p.add_argument("--no-reload", action="store_true",
                    help="Do not reload the running web server afterwards.")
+    p.add_argument("--port", type=int, default=None,
+                   help="Port for the relaunched web server. Default: reuse the port "
+                        "the running server is on, else $BIRDOLOGY_PORT, else 5000.")
     p.add_argument("--dry-run", action="store_true",
                    help="Print the resolved step plan without executing.")
     return p.parse_args(argv)
@@ -91,34 +100,54 @@ def _find_web_pid(pgrep=subprocess.run) -> int | None:
     return int(pids[0]) if pids else None
 
 
-def _spawn_web(popen=subprocess.Popen) -> None:
+def _running_web_port(ps=subprocess.run) -> int | None:
+    """Port the running web_chat.py process was started on, or None.
+
+    Reads the port back off the process's own command line. Uses `ps` rather than
+    `pgrep -a`: the -a flag is Linux-only and macOS pgrep silently prints bare PIDs.
+    """
+    pid = _find_web_pid()
+    if pid is None:
+        return None
+    result = ps(["ps", "-o", "args=", "-p", str(pid)], capture_output=True, text=True)
+    match = re.search(r"--port\s+(\d+)", result.stdout or "")
+    return int(match.group(1)) if match else None
+
+
+def _spawn_web(port: int | None = None, popen=subprocess.Popen) -> None:
     """Spawn the web_chat.py server against the reasoned graph."""
     _LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     log_fh = _LOG_PATH.open("a")
+    argv = ["uv", "run", "python", "scripts/web_chat.py",
+            "--input", "output/birdology_reasoned.ttl"]
+    if port is not None:
+        argv += ["--port", str(port)]
     popen(
-        ["uv", "run", "python", "scripts/web_chat.py",
-         "--input", "output/birdology_reasoned.ttl"],
+        argv,
         cwd=str(_PROJECT_DIR), stdout=log_fh, stderr=log_fh,
         start_new_session=True,
     )
 
 
-def reload_web_server() -> None:
+def reload_web_server(port: int | None = None) -> None:
     """Reload the running web server so it picks up the fresh reasoned graph.
 
-    Fully implemented in Task 3.
+    Relaunches on the port the server was already serving on, so a refresh never
+    silently moves it (web_chat's own default of 5000 is unusable on macOS,
+    where AirPlay Receiver holds that port).
     """
     pid = _find_web_pid()
     if pid is None:
         log("No running web server — skipping reload.")
         return
-    log(f"Reloading web server (pid {pid}) on the reasoned graph…")
+    target_port = port or _running_web_port() or _default_port()
+    log(f"Reloading web server (pid {pid}) on the reasoned graph, port {target_port}…")
     try:
         os.kill(pid, signal.SIGTERM)
         time.sleep(2)
     except ProcessLookupError:
         log(f"Web server (pid {pid}) already gone; launching a fresh one.")
-    _spawn_web()
+    _spawn_web(port=target_port)
     log("Web server relaunched.")
 
 
@@ -141,7 +170,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     log(f"Refresh started ({'incremental' if args.incremental else 'full'}).")
     try:
-        run_plan(plan)
+        run_plan(plan, reloader=partial(reload_web_server, args.port))
     except Exception as e:
         log(f"✗ Refresh failed: {e}")
         return 1

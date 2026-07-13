@@ -86,7 +86,7 @@ def test_main_dry_run_prints_plan_and_runs_nothing(capsys):
 def test_reload_noop_when_no_server(monkeypatch):
     events = []
     monkeypatch.setattr(refresh, "_find_web_pid", lambda: None)
-    monkeypatch.setattr(refresh, "_spawn_web", lambda: events.append("spawn"))
+    monkeypatch.setattr(refresh, "_spawn_web", lambda **kw: events.append("spawn"))
     monkeypatch.setattr(refresh.os, "kill", lambda pid, sig: events.append(("kill", pid)))
     refresh.reload_web_server()
     assert events == []  # nothing to reload
@@ -95,7 +95,8 @@ def test_reload_noop_when_no_server(monkeypatch):
 def test_reload_kills_then_spawns_when_server_running(monkeypatch):
     events = []
     monkeypatch.setattr(refresh, "_find_web_pid", lambda: 4242)
-    monkeypatch.setattr(refresh, "_spawn_web", lambda: events.append("spawn"))
+    monkeypatch.setattr(refresh, "_running_web_port", lambda: None)
+    monkeypatch.setattr(refresh, "_spawn_web", lambda **kw: events.append("spawn"))
     monkeypatch.setattr(refresh.os, "kill", lambda pid, sig: events.append(("kill", pid)))
     monkeypatch.setattr(refresh.time, "sleep", lambda s: None)
     refresh.reload_web_server()
@@ -111,6 +112,69 @@ def test_spawn_web_targets_reasoned_graph(monkeypatch, tmp_path):
     refresh._spawn_web(popen=fake_popen)
     assert "--input" in captured["argv"]
     assert "output/birdology_reasoned.ttl" in captured["argv"]
+
+
+# ── port handling (regression: refresh relaunched the server on hardcoded 5000,
+#    which is taken by AirPlay Receiver on macOS, so the server never came back) ──
+
+def test_spawn_web_passes_port(monkeypatch, tmp_path):
+    monkeypatch.setattr(refresh, "_LOG_PATH", tmp_path / "refresh.log")
+    captured = {}
+    def fake_popen(argv, **kwargs):
+        captured["argv"] = argv
+        return None
+    refresh._spawn_web(port=8080, popen=fake_popen)
+    argv = captured["argv"]
+    assert "--port" in argv
+    assert argv[argv.index("--port") + 1] == "8080"
+
+
+def test_running_web_port_parsed_from_process_cmdline(monkeypatch):
+    monkeypatch.setattr(refresh, "_find_web_pid", lambda: 60409)
+    def fake_ps(argv, **kwargs):
+        assert argv[0] == "ps", "must use ps: macOS pgrep ignores -a and prints bare PIDs"
+        class R:
+            stdout = "uv run python scripts/web_chat.py --port 8080 --input output/x.ttl\n"
+        return R()
+    assert refresh._running_web_port(ps=fake_ps) == 8080
+
+
+def test_running_web_port_none_when_no_server(monkeypatch):
+    monkeypatch.setattr(refresh, "_find_web_pid", lambda: None)
+    assert refresh._running_web_port() is None
+
+
+def test_running_web_port_none_when_port_not_in_cmdline(monkeypatch):
+    """Server started without --port is on web_chat's own default, not ours to guess."""
+    monkeypatch.setattr(refresh, "_find_web_pid", lambda: 60409)
+    def fake_ps(argv, **kwargs):
+        class R:
+            stdout = "uv run python scripts/web_chat.py --input output/x.ttl\n"
+        return R()
+    assert refresh._running_web_port(ps=fake_ps) is None
+
+
+def test_reload_reuses_running_server_port(monkeypatch):
+    """A refresh must not move the server to a different port behind the user's back."""
+    captured = {}
+    monkeypatch.setattr(refresh, "_find_web_pid", lambda: 4242)
+    monkeypatch.setattr(refresh, "_running_web_port", lambda: 8080)
+    monkeypatch.setattr(refresh, "_spawn_web", lambda **kw: captured.update(kw))
+    monkeypatch.setattr(refresh.os, "kill", lambda pid, sig: None)
+    monkeypatch.setattr(refresh.time, "sleep", lambda s: None)
+    refresh.reload_web_server()
+    assert captured["port"] == 8080
+
+
+def test_explicit_port_overrides_running_port(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(refresh, "_find_web_pid", lambda: 4242)
+    monkeypatch.setattr(refresh, "_running_web_port", lambda: 8080)
+    monkeypatch.setattr(refresh, "_spawn_web", lambda **kw: captured.update(kw))
+    monkeypatch.setattr(refresh.os, "kill", lambda pid, sig: None)
+    monkeypatch.setattr(refresh.time, "sleep", lambda s: None)
+    refresh.reload_web_server(port=9999)
+    assert captured["port"] == 9999
 
 
 def test_main_returns_nonzero_on_failure(monkeypatch, tmp_path):

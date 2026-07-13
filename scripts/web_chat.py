@@ -12,6 +12,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -53,6 +54,28 @@ _sessions_lock = threading.Lock()
 _SESSION_TTL = 7200  # 2 hours
 _MAX_HISTORY = 40    # keep last N messages (+ system prompt) to avoid bloating LLM context
 _SESSION_DB: Path | None = None  # set by _init_session_db()
+_GRAPH_PATH: Path | None = None  # set at startup; part of the capability fingerprint
+
+
+def _capability_fingerprint() -> str:
+    """Identify what this server can currently answer with.
+
+    Covers the tool set and the graph file. When either changes, conclusions the
+    assistant reached earlier may be stale — in particular its "I don't have this
+    information" answers, which it will otherwise keep repeating from history
+    instead of calling the tool that now exists (see _get_session).
+    """
+    tools = sorted(t["function"]["name"] for t in TOOLS_OPENAI)
+    graph_id = ""
+    ttl = _GRAPH_PATH
+    if ttl is not None:
+        try:
+            st = Path(ttl).stat()
+            graph_id = f"{ttl}:{st.st_mtime_ns}:{st.st_size}"
+        except OSError:
+            graph_id = str(ttl)
+    payload = json.dumps({"tools": tools, "graph": graph_id}, sort_keys=True)
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
 def _init_session_db(db_path: Path) -> None:
@@ -66,6 +89,10 @@ def _init_session_db(db_path: Path) -> None:
                 last_seen  REAL NOT NULL
             )
         """)
+        # Older sessions.db files predate the capabilities column.
+        cols = {r[1] for r in con.execute("PRAGMA table_info(sessions)")}
+        if "capabilities" not in cols:
+            con.execute("ALTER TABLE sessions ADD COLUMN capabilities TEXT")
 
 
 def _db() -> sqlite3.Connection:
@@ -86,37 +113,40 @@ def _get_session(session_id: str) -> list[dict]:
             con.execute("DELETE FROM sessions WHERE last_seen < ?", (now - _SESSION_TTL,))
 
             row = con.execute(
-                "SELECT messages FROM sessions WHERE session_id = ?", (session_id,)
+                "SELECT messages, capabilities FROM sessions WHERE session_id = ?",
+                (session_id,),
             ).fetchone()
 
+            today = datetime.date.today()
+            system = SYSTEM_PROMPT + (
+                f"\n\n## Current date\nToday is {today.strftime('%A %d %B %Y')} "
+                f"(month {today.month}). Use this when the user says 'today', 'tomorrow', "
+                f"'this month', etc. — never assume a different month."
+            )
+            fingerprint = _capability_fingerprint()
+
             if row is None:
-                today = datetime.date.today()
-                system = SYSTEM_PROMPT + (
-                    f"\n\n## Current date\nToday is {today.strftime('%A %d %B %Y')} "
-                    f"(month {today.month}). Use this when the user says 'today', 'tomorrow', "
-                    f"'this month', etc. — never assume a different month."
-                )
                 msgs: list[dict] = [{"role": "system", "content": system}]
+            elif row[1] != fingerprint:
+                # Tools or graph changed since this session was last touched. Its
+                # history may assert that data is missing which now exists, and the
+                # model trusts its own past refusals over any instruction to re-check.
+                # Drop the stale turns rather than let them poison the new answers.
+                print(f"Session {session_id}: capabilities changed — clearing stale history")
+                msgs = [{"role": "system", "content": system}]
             else:
                 msgs = json.loads(row[0])
-                # Refresh system prompt date on each new day
-                import datetime as _dt
-                today = _dt.date.today()
-                new_system = SYSTEM_PROMPT + (
-                    f"\n\n## Current date\nToday is {today.strftime('%A %d %B %Y')} "
-                    f"(month {today.month}). Use this when the user says 'today', 'tomorrow', "
-                    f"'this month', etc. — never assume a different month."
-                )
                 if msgs and msgs[0]["role"] == "system":
-                    msgs[0]["content"] = new_system
+                    msgs[0]["content"] = system  # refresh the date line
 
             # Trim to MAX_HISTORY (keep system prompt + last N)
             if len(msgs) > _MAX_HISTORY + 1:
                 msgs = msgs[:1] + msgs[-_MAX_HISTORY:]
 
             con.execute(
-                "INSERT OR REPLACE INTO sessions (session_id, messages, last_seen) VALUES (?,?,?)",
-                (session_id, json.dumps(msgs, ensure_ascii=False), now),
+                "INSERT OR REPLACE INTO sessions"
+                " (session_id, messages, last_seen, capabilities) VALUES (?,?,?,?)",
+                (session_id, json.dumps(msgs, ensure_ascii=False), now, fingerprint),
             )
 
         return msgs
@@ -893,7 +923,7 @@ def api_reset():
 
 
 def main():
-    global GRAPH
+    global GRAPH, _GRAPH_PATH
 
     parser = argparse.ArgumentParser(description="Birdology Graph-RAG web chat")
     parser.add_argument(
@@ -920,6 +950,7 @@ def main():
         print(f"Error: graph file not found: {ttl_path}", file=sys.stderr)
         sys.exit(1)
 
+    _GRAPH_PATH = ttl_path
     db_path = ttl_path.parent / "sessions.db"
     _init_session_db(db_path)
     print(f"Session DB: {db_path}")
