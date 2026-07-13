@@ -97,6 +97,7 @@ def test_reload_kills_then_spawns_when_server_running(monkeypatch):
     monkeypatch.setattr(refresh, "_find_web_pid", lambda: 4242)
     monkeypatch.setattr(refresh, "_running_web_port", lambda: None)
     monkeypatch.setattr(refresh, "_spawn_web", lambda **kw: events.append("spawn"))
+    monkeypatch.setattr(refresh, "_wait_for_port", lambda port, **kw: True)
     monkeypatch.setattr(refresh.os, "kill", lambda pid, sig: events.append(("kill", pid)))
     monkeypatch.setattr(refresh.time, "sleep", lambda s: None)
     refresh.reload_web_server()
@@ -139,6 +140,17 @@ def test_running_web_port_parsed_from_process_cmdline(monkeypatch):
     assert refresh._running_web_port(ps=fake_ps) == 8080
 
 
+def test_running_web_port_parsed_from_equals_form(monkeypatch):
+    """argparse accepts --port=5001 as readily as --port 5001. Missing the equals form
+    meant falling back to 5000 — the AirPlay-occupied port the fallback exists to avoid."""
+    monkeypatch.setattr(refresh, "_find_web_pid", lambda: 60409)
+    def fake_ps(argv, **kwargs):
+        class R:
+            stdout = "uv run python scripts/web_chat.py --port=5001 --input output/x.ttl\n"
+        return R()
+    assert refresh._running_web_port(ps=fake_ps) == 5001
+
+
 def test_running_web_port_none_when_no_server(monkeypatch):
     monkeypatch.setattr(refresh, "_find_web_pid", lambda: None)
     assert refresh._running_web_port() is None
@@ -160,6 +172,7 @@ def test_reload_reuses_running_server_port(monkeypatch):
     monkeypatch.setattr(refresh, "_find_web_pid", lambda: 4242)
     monkeypatch.setattr(refresh, "_running_web_port", lambda: 8080)
     monkeypatch.setattr(refresh, "_spawn_web", lambda **kw: captured.update(kw))
+    monkeypatch.setattr(refresh, "_wait_for_port", lambda port, **kw: True)
     monkeypatch.setattr(refresh.os, "kill", lambda pid, sig: None)
     monkeypatch.setattr(refresh.time, "sleep", lambda s: None)
     refresh.reload_web_server()
@@ -171,10 +184,84 @@ def test_explicit_port_overrides_running_port(monkeypatch):
     monkeypatch.setattr(refresh, "_find_web_pid", lambda: 4242)
     monkeypatch.setattr(refresh, "_running_web_port", lambda: 8080)
     monkeypatch.setattr(refresh, "_spawn_web", lambda **kw: captured.update(kw))
+    monkeypatch.setattr(refresh, "_wait_for_port", lambda port, **kw: True)
     monkeypatch.setattr(refresh.os, "kill", lambda pid, sig: None)
     monkeypatch.setattr(refresh.time, "sleep", lambda s: None)
     refresh.reload_web_server(port=9999)
     assert captured["port"] == 9999
+
+
+# ── the relaunch must be verified, not assumed ───────────────────────────────
+# reload_web_server logged "Web server relaunched." straight after Popen returned.
+# Popen succeeding only means the process started — if it then failed to bind (port
+# already taken, bad graph path), refresh reported success while the server was down.
+
+def _stub_reload(monkeypatch, spawned):
+    monkeypatch.setattr(refresh, "_find_web_pid", lambda: 4242)
+    monkeypatch.setattr(refresh, "_running_web_port", lambda: 8080)
+    monkeypatch.setattr(refresh, "_spawn_web", lambda **kw: spawned.append(kw))
+    monkeypatch.setattr(refresh.os, "kill", lambda pid, sig: None)
+    monkeypatch.setattr(refresh.time, "sleep", lambda s: None)
+
+
+def test_reload_fails_loudly_when_the_new_server_never_binds(monkeypatch, capsys):
+    spawned = []
+    _stub_reload(monkeypatch, spawned)
+    monkeypatch.setattr(refresh, "_wait_for_port", lambda port, **kw: False)  # never comes up
+
+    with pytest.raises(RuntimeError, match="8080"):
+        refresh.reload_web_server()
+
+    out = capsys.readouterr().out
+    assert spawned, "it must still have tried to spawn"
+    assert "relaunched" not in out.lower(), f"claimed success while the server is down: {out!r}"
+
+
+def test_reload_reports_success_only_once_the_port_accepts(monkeypatch, capsys):
+    spawned = []
+    _stub_reload(monkeypatch, spawned)
+    monkeypatch.setattr(refresh, "_wait_for_port", lambda port, **kw: True)
+
+    refresh.reload_web_server()
+
+    assert "relaunched" in capsys.readouterr().out.lower()
+
+
+def test_reload_checks_the_port_it_actually_spawned_on(monkeypatch):
+    """Verifying the wrong port would make the check meaningless."""
+    spawned, checked = [], []
+    _stub_reload(monkeypatch, spawned)
+    monkeypatch.setattr(refresh, "_wait_for_port",
+                        lambda port, **kw: checked.append(port) or True)
+    refresh.reload_web_server(port=9999)
+    assert spawned[0]["port"] == 9999
+    assert checked == [9999]
+
+
+def test_wait_for_port_retries_until_the_server_is_up(monkeypatch):
+    """The server needs a moment to bind — a single immediate probe would false-alarm."""
+    attempts = []
+
+    def flaky_connect(address, timeout=None):
+        attempts.append(address)
+        if len(attempts) < 3:
+            raise OSError("connection refused")
+        class Sock:
+            def close(self): pass
+        return Sock()
+
+    assert refresh._wait_for_port(8080, connect=flaky_connect, sleep=lambda s: None) is True
+    assert len(attempts) == 3
+    assert attempts[0][1] == 8080
+
+
+def test_wait_for_port_gives_up_when_nothing_ever_binds(monkeypatch):
+    def refused(address, timeout=None):
+        raise OSError("connection refused")
+
+    assert refresh._wait_for_port(
+        8080, attempts=4, connect=refused, sleep=lambda s: None
+    ) is False
 
 
 def test_main_returns_nonzero_on_failure(monkeypatch, tmp_path):

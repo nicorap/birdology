@@ -23,6 +23,7 @@ import argparse
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -110,8 +111,37 @@ def _running_web_port(ps=subprocess.run) -> int | None:
     if pid is None:
         return None
     result = ps(["ps", "-o", "args=", "-p", str(pid)], capture_output=True, text=True)
-    match = re.search(r"--port\s+(\d+)", result.stdout or "")
+    # Both spellings argparse accepts: "--port 5001" and "--port=5001". Matching only
+    # the space form sent us back to the 5000 default — the AirPlay-occupied port this
+    # whole code path exists to avoid.
+    match = re.search(r"--port[=\s]+(\d+)", result.stdout or "")
     return int(match.group(1)) if match else None
+
+
+def _wait_for_port(
+    port: int,
+    host: str = "127.0.0.1",
+    attempts: int = 20,
+    delay: float = 0.5,
+    connect=socket.create_connection,
+    sleep=time.sleep,
+) -> bool:
+    """Poll until something is accepting connections on *port*, or give up.
+
+    The server takes a moment to bind (uv start-up + graph load), so a single probe
+    would false-alarm; and Popen returning tells us only that the process started, not
+    that it came up.
+    """
+    for attempt in range(attempts):
+        try:
+            sock = connect((host, port), timeout=1)
+        except OSError:
+            if attempt < attempts - 1:
+                sleep(delay)
+            continue
+        sock.close()
+        return True
+    return False
 
 
 def _spawn_web(port: int | None = None, popen=subprocess.Popen) -> None:
@@ -148,7 +178,19 @@ def reload_web_server(port: int | None = None) -> None:
     except ProcessLookupError:
         log(f"Web server (pid {pid}) already gone; launching a fresh one.")
     _spawn_web(port=target_port)
-    log("Web server relaunched.")
+
+    # Popen returning means the process started, not that it bound the port. Without
+    # this check a server that died on startup (port taken, missing graph) was still
+    # reported as a successful relaunch, and the refresh looked clean while the site
+    # was down.
+    if not _wait_for_port(target_port):
+        msg = (
+            f"Web server did not come up on port {target_port} — the new process "
+            f"started but never accepted a connection. See {_LOG_PATH}."
+        )
+        log(f"✗ {msg}")
+        raise RuntimeError(msg)
+    log(f"Web server relaunched on port {target_port}.")
 
 
 def run_plan(plan, *, runner=subprocess.run, reloader=reload_web_server) -> None:
