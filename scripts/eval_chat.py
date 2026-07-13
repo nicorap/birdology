@@ -405,6 +405,7 @@ class Turn:
     must_contain: list[str] = field(default_factory=list)
     must_contain_any: list[str] = field(default_factory=list)
     must_not_contain: list[str] = field(default_factory=list)
+    expected_tool_args: dict = field(default_factory=dict)
     notes: str = ""
 
 
@@ -423,6 +424,7 @@ class TurnResult:
     tool_calls: list[str]
     answer: str
     failures: list[str]
+    tool_call_details: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -514,6 +516,7 @@ CONVERSATIONS: list[Conversation] = [
                  expected_tools=["where_to_watch", "nearby_birds"]),
             Turn("et à Aarhus ?",
                  expected_tools=["where_to_watch", "nearby_birds"],
+                 expected_tool_args={"lat": 56.16, "lon": 10.20},
                  notes="Must re-run the tool for the NEW location, not reuse Copenhagen."),
         ],
     ),
@@ -525,6 +528,7 @@ CONVERSATIONS: list[Conversation] = [
                  expected_tools=["observations_by_month"]),
             Turn("et en juin ?",
                  expected_tools=["observations_by_month"],
+                 expected_tool_args={"month": 6},
                  notes="Must re-run for June, not answer from the March result."),
         ],
     ),
@@ -538,6 +542,7 @@ CONVERSATIONS: list[Conversation] = [
                  expected_tools=["observations_by_month"]),
             Turn("Revenons au premier oiseau : est-il menacé ?",
                  expected_tools=["find_species"],
+                 expected_tool_args={"name": "Rouge-gorge"},
                  notes="Must resolve 'le premier oiseau' back to the Robin."),
         ],
     ),
@@ -549,6 +554,7 @@ CONVERSATIONS: list[Conversation] = [
                  expected_tools=["find_species"]),
             Turn("non, je voulais dire le Rouge-queue noir",
                  expected_tools=["find_species"],
+                 expected_tool_args={"name": "Rouge-queue"},
                  notes="Must look up the corrected species, not keep answering about the Robin."),
         ],
     ),
@@ -559,11 +565,36 @@ CONVERSATIONS: list[Conversation] = [
 # Core runner
 # ---------------------------------------------------------------------------
 
-def check_answer(spec, tool_calls: list[str], answer: str) -> list[str]:
+def _arg_matches(expected, actual) -> bool:
+    """One expected-arg value matches one actual-arg value.
+
+    Both numeric → tolerant comparison (abs diff <= 0.5): makes `month: 6` exact-ish
+    while tolerating a model's higher-precision lat/lon (56.16 vs 56.1629), and still
+    rejects a genuinely different location (Copenhagen's 12.57 vs Aarhus's 10.20).
+    Otherwise → case-insensitive substring match.
+    """
+    try:
+        return abs(float(actual) - float(expected)) <= 0.5
+    except (TypeError, ValueError):
+        return str(expected).lower() in str(actual).lower()
+
+
+def _tool_call_matches_expected_args(expected_tool_args: dict, tool_call_details: list[dict]) -> bool:
+    """At least one recorded tool call must match ALL expected args."""
+    for call in tool_call_details:
+        args = call.get("args", {})
+        if all(key in args and _arg_matches(value, args[key]) for key, value in expected_tool_args.items()):
+            return True
+    return False
+
+
+def check_answer(spec, tool_calls: list[str], answer: str, tool_call_details: list[dict] = None) -> list[str]:
     """Evaluate one answer against a spec's assertions.
 
     `spec` is anything exposing expected_tools / forbidden_tools / must_contain /
     must_contain_any / must_not_contain — both TestCase and Turn satisfy this.
+    `expected_tool_args` is optional (only Turn defines it; TestCase does not), read
+    via getattr so single-turn TestCase callers are unaffected.
     Returns the list of failures; empty means the answer passed.
     """
     # Infrastructure failures are not assertion failures — report them alone.
@@ -574,6 +605,14 @@ def check_answer(spec, tool_calls: list[str], answer: str) -> list[str]:
 
     if spec.expected_tools and not any(t in tool_calls for t in spec.expected_tools):
         failures.append(f"Expected one of {spec.expected_tools}, got {tool_calls}")
+
+    expected_tool_args = getattr(spec, "expected_tool_args", {})
+    if expected_tool_args:
+        if not _tool_call_matches_expected_args(expected_tool_args, tool_call_details or []):
+            failures.append(
+                f"Expected a tool call matching args {expected_tool_args}, "
+                f"got {tool_call_details or []}"
+            )
 
     for t in spec.forbidden_tools:
         if t in tool_calls:
@@ -629,8 +668,14 @@ def run_test(test: TestCase, base_url: str) -> TestResult:
     )
 
 
-def _post_message(base_url: str, session_id: str, question: str) -> tuple[str, list[str]]:
-    """POST one message to an existing session. Returns (answer, tool_call_names)."""
+def _post_message(base_url: str, session_id: str, question: str) -> tuple[str, list[dict]]:
+    """POST one message to an existing session.
+
+    Returns (answer, tool_calls), where tool_calls is the list of dicts the server
+    returns as-is — each {"name": str, "args": dict} (see scripts/web_chat.py's
+    tool_calls_log). Argument capture matters: checking tool NAMES alone lets a
+    conversation pass even when the model calls the right tool with stale/wrong args.
+    """
     resp = requests.post(
         f"{base_url}/api/chat",
         json={"message": question, "session_id": session_id},
@@ -638,7 +683,7 @@ def _post_message(base_url: str, session_id: str, question: str) -> tuple[str, l
     )
     resp.raise_for_status()
     data = resp.json()
-    return data.get("answer", ""), [tc["name"] for tc in data.get("tool_calls", [])]
+    return data.get("answer", ""), data.get("tool_calls", [])
 
 
 def run_conversation(
@@ -658,17 +703,20 @@ def run_conversation(
 
     for i, turn in enumerate(conv.turns, 1):
         try:
-            answer, tool_calls = post(base_url, session_id, turn.question)
+            answer, tool_call_details = post(base_url, session_id, turn.question)
         except Exception as e:
             results.append(TurnResult(
                 index=i, turn=turn, passed=False,
                 tool_calls=[], answer="", failures=[f"HTTP error: {e}"],
+                tool_call_details=[],
             ))
         else:
-            failures = check_answer(turn, tool_calls, answer)
+            tool_calls = [tc["name"] for tc in tool_call_details]
+            failures = check_answer(turn, tool_calls, answer, tool_call_details=tool_call_details)
             results.append(TurnResult(
                 index=i, turn=turn, passed=len(failures) == 0,
                 tool_calls=tool_calls, answer=answer, failures=failures,
+                tool_call_details=tool_call_details,
             ))
         if i < len(conv.turns):
             sleep(delay)
