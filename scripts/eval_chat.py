@@ -803,6 +803,33 @@ def print_report(results: list[TestResult], use_judge: bool) -> None:
         print()
 
 
+def print_conversation_report(results: list[ConversationResult]) -> None:
+    passed = sum(1 for r in results if r.passed)
+    total = len(results)
+    print(f"\n{'='*60}")
+    print(f"BIRDOLOGY CONVERSATION EVAL — {passed}/{total} conversations passed")
+    print(f"{'='*60}\n")
+
+    by_category: dict[str, list[ConversationResult]] = {}
+    for r in results:
+        by_category.setdefault(r.conversation.category, []).append(r)
+
+    for cat, cat_results in by_category.items():
+        cat_pass = sum(1 for r in cat_results if r.passed)
+        print(f"  [{cat}] {cat_pass}/{len(cat_results)}")
+        for r in cat_results:
+            icon = "✓" if r.passed else "✗"
+            print(f"    {icon} {r.conversation.id}")
+            for t in r.turns:
+                t_icon = "✓" if t.passed else "✗"
+                tools_str = ", ".join(t.tool_calls) if t.tool_calls else "none"
+                print(f"        {t_icon} turn {t.index}: {t.turn.question[:55]}")
+                print(f"             tools: {tools_str}")
+                for f in t.failures:
+                    print(f"             FAIL: {f}")
+        print()
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -817,9 +844,10 @@ def main() -> None:
     ap.add_argument("--delay", type=float, default=1.5, help="Seconds between requests")
     ap.add_argument(
         "--suite",
-        choices=["core", "robustness", "all"],
+        choices=["core", "robustness", "conversations", "all"],
         default="core",
-        help="Test suite to run: core (default), robustness (phrasings), all",
+        help="Test suite: core (default), robustness (phrasings), "
+             "conversations (multi-turn), all",
     )
     args = ap.parse_args()
 
@@ -838,6 +866,16 @@ def main() -> None:
         tests = [t for t in tests if t.category == args.category]
     if args.id:
         tests = [t for t in tests if t.id == args.id]
+
+    conversations: list[Conversation] = []
+    if args.suite in ("conversations", "all"):
+        conversations = CONVERSATIONS
+    if args.suite == "conversations":
+        tests = []
+    if args.category:
+        conversations = [c for c in conversations if c.category == args.category]
+    if args.id:
+        conversations = [c for c in conversations if c.id == args.id]
 
     # Check server is up
     try:
@@ -866,6 +904,18 @@ def main() -> None:
             time.sleep(args.delay)
 
     print_report(results, args.judge)
+
+    conv_results: list[ConversationResult] = []
+    for i, conv in enumerate(conversations, 1):
+        print(f"  [conv {i}/{len(conversations)}] {conv.id} ({len(conv.turns)} turns)...",
+              end=" ", flush=True)
+        cr = run_conversation(conv, args.url, delay=args.delay)
+        conv_results.append(cr)
+        failed_turns = [t.index for t in cr.turns if not t.passed]
+        print("PASS" if cr.passed else f"FAIL (turns {failed_turns})")
+
+    if conv_results:
+        print_conversation_report(conv_results)
 
     if args.output:
         with open(args.output, "w") as f:

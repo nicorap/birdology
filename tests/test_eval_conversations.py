@@ -340,3 +340,28 @@ def test_robustness_conversations_have_expected_tool_args_pinned():
     assert by_id["conv_month_carryover"].turns[1].expected_tool_args == {"month": 6}
     assert by_id["conv_topic_switch_and_back"].turns[2].expected_tool_args == {"name": "Rouge-gorge"}
     assert by_id["conv_user_correction"].turns[1].expected_tool_args == {"name": "Rouge-queue"}
+
+
+# ---------------------------------------------------------------------------
+# Per-turn conversation reporting
+# ---------------------------------------------------------------------------
+
+from eval_chat import ConversationResult, TurnResult, print_conversation_report
+
+
+def test_report_names_the_failing_turn(capsys):
+    conv = Conversation(id="conv_photo_after_nearby", category="conversation_regression",
+                        turns=[Turn("t1"), Turn("montre moi une photo !")])
+    result = ConversationResult(conversation=conv, turns=[
+        TurnResult(1, conv.turns[0], True, ["nearby_birds"], "ok", []),
+        TurnResult(2, conv.turns[1], False, [], "je n'ai pas de photo",
+                   ["Expected one of ['find_species'], got []"]),
+    ])
+    print_conversation_report([result])
+    out = capsys.readouterr().out
+
+    assert "conv_photo_after_nearby" in out
+    assert "turn 2" in out
+    assert "montre moi une photo !" in out          # the question, so the failure is legible
+    assert "find_species" in out                     # the actual failure text
+    assert "0/1" in out                              # conversation counted as failed
