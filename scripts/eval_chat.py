@@ -399,6 +399,45 @@ class TestResult:
 # Core runner
 # ---------------------------------------------------------------------------
 
+def check_answer(spec, tool_calls: list[str], answer: str) -> list[str]:
+    """Evaluate one answer against a spec's assertions.
+
+    `spec` is anything exposing expected_tools / forbidden_tools / must_contain /
+    must_contain_any / must_not_contain — both TestCase and Turn satisfy this.
+    Returns the list of failures; empty means the answer passed.
+    """
+    # Infrastructure failures are not assertion failures — report them alone.
+    if answer.startswith("Erreur serveur:") and "api/embeddings" in answer:
+        return ["INFRA: Ollama embeddings crashed (nomic-embed-text unavailable)"]
+
+    failures: list[str] = []
+
+    if spec.expected_tools and not any(t in tool_calls for t in spec.expected_tools):
+        failures.append(f"Expected one of {spec.expected_tools}, got {tool_calls}")
+
+    for t in spec.forbidden_tools:
+        if t in tool_calls:
+            failures.append(f"Forbidden tool called: {t}")
+
+    answer_lower = answer.lower()
+    for phrase in spec.must_contain:
+        if phrase.lower() not in answer_lower:
+            failures.append(f"Expected phrase not found: '{phrase}'")
+
+    if spec.must_contain_any and not any(p.lower() in answer_lower for p in spec.must_contain_any):
+        failures.append(f"Expected at least one of {spec.must_contain_any}")
+
+    for phrase in spec.must_not_contain:
+        if phrase.lower() in answer_lower:
+            failures.append(f"Forbidden phrase found: '{phrase}'")
+
+    for pattern, label in FORBIDDEN_PATTERNS:
+        if re.search(pattern, answer, re.IGNORECASE):
+            failures.append(f"Forbidden pattern ({label})")
+
+    return failures
+
+
 def run_test(test: TestCase, base_url: str) -> TestResult:
     failures: list[str] = []
     tool_calls: list[str] = []
@@ -420,46 +459,7 @@ def run_test(test: TestCase, base_url: str) -> TestResult:
         failures.append(f"HTTP error: {e}")
         return TestResult(test=test, passed=False, tool_calls=[], answer="", failures=failures)
 
-    # Detect infrastructure errors (Ollama / embedding crashes)
-    if answer.startswith("Erreur serveur:") and "api/embeddings" in answer:
-        return TestResult(
-            test=test, passed=False, tool_calls=tool_calls, answer=answer,
-            failures=["INFRA: Ollama embeddings crashed (nomic-embed-text unavailable)"],
-        )
-
-    # 1. Check expected tools
-    if test.expected_tools:
-        if not any(t in tool_calls for t in test.expected_tools):
-            failures.append(
-                f"Expected one of {test.expected_tools}, got {tool_calls}"
-            )
-
-    # 2. Check forbidden tools
-    for t in test.forbidden_tools:
-        if t in tool_calls:
-            failures.append(f"Forbidden tool called: {t}")
-
-    # 3. Check must_contain (ALL must be present)
-    answer_lower = answer.lower()
-    for phrase in test.must_contain:
-        if phrase.lower() not in answer_lower:
-            failures.append(f"Expected phrase not found: '{phrase}'")
-
-    # 3b. Check must_contain_any (AT LEAST ONE must be present)
-    if test.must_contain_any:
-        if not any(p.lower() in answer_lower for p in test.must_contain_any):
-            failures.append(f"Expected at least one of {test.must_contain_any}")
-
-    # 4. Check must_not_contain
-    for phrase in test.must_not_contain:
-        if phrase.lower() in answer_lower:
-            failures.append(f"Forbidden phrase found: '{phrase}'")
-
-    # 5. Global forbidden patterns
-    for pattern, label in FORBIDDEN_PATTERNS:
-        if re.search(pattern, answer, re.IGNORECASE):
-            failures.append(f"Forbidden pattern ({label})")
-
+    failures = check_answer(test, tool_calls, answer)
     return TestResult(
         test=test,
         passed=len(failures) == 0,
