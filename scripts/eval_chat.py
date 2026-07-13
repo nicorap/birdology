@@ -395,6 +395,46 @@ class TestResult:
     judge_score: Optional[int] = None   # 1-5
 
 
+@dataclass
+class Turn:
+    """One question in a conversation. Every assertion field is optional: a turn
+    that only exists to set up context asserts nothing."""
+    question: str
+    expected_tools: list[str] = field(default_factory=list)
+    forbidden_tools: list[str] = field(default_factory=list)
+    must_contain: list[str] = field(default_factory=list)
+    must_contain_any: list[str] = field(default_factory=list)
+    must_not_contain: list[str] = field(default_factory=list)
+    notes: str = ""
+
+
+@dataclass
+class Conversation:
+    id: str
+    category: str
+    turns: list[Turn]
+
+
+@dataclass
+class TurnResult:
+    index: int              # 1-based, so failures read as "turn 3"
+    turn: Turn
+    passed: bool
+    tool_calls: list[str]
+    answer: str
+    failures: list[str]
+
+
+@dataclass
+class ConversationResult:
+    conversation: Conversation
+    turns: list[TurnResult]
+
+    @property
+    def passed(self) -> bool:
+        return all(t.passed for t in self.turns)
+
+
 # ---------------------------------------------------------------------------
 # Core runner
 # ---------------------------------------------------------------------------
@@ -467,6 +507,53 @@ def run_test(test: TestCase, base_url: str) -> TestResult:
         answer=answer,
         failures=failures,
     )
+
+
+def _post_message(base_url: str, session_id: str, question: str) -> tuple[str, list[str]]:
+    """POST one message to an existing session. Returns (answer, tool_call_names)."""
+    resp = requests.post(
+        f"{base_url}/api/chat",
+        json={"message": question, "session_id": session_id},
+        timeout=300,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("answer", ""), [tc["name"] for tc in data.get("tool_calls", [])]
+
+
+def run_conversation(
+    conv: Conversation,
+    base_url: str,
+    delay: float = 0.0,
+    post=_post_message,
+    sleep=time.sleep,
+) -> ConversationResult:
+    """Run every turn against ONE session, so the model sees its own history.
+
+    A failing turn does not abort the conversation: whether the assistant recovers
+    on a later turn is exactly what we want to measure.
+    """
+    session_id = f"eval_{conv.id}_{int(time.time())}"
+    results: list[TurnResult] = []
+
+    for i, turn in enumerate(conv.turns, 1):
+        try:
+            answer, tool_calls = post(base_url, session_id, turn.question)
+        except Exception as e:
+            results.append(TurnResult(
+                index=i, turn=turn, passed=False,
+                tool_calls=[], answer="", failures=[f"HTTP error: {e}"],
+            ))
+        else:
+            failures = check_answer(turn, tool_calls, answer)
+            results.append(TurnResult(
+                index=i, turn=turn, passed=len(failures) == 0,
+                tool_calls=tool_calls, answer=answer, failures=failures,
+            ))
+        if i < len(conv.turns):
+            sleep(delay)
+
+    return ConversationResult(conversation=conv, turns=results)
 
 
 # ---------------------------------------------------------------------------

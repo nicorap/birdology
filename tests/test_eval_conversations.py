@@ -54,3 +54,88 @@ def test_check_answer_short_circuits_on_infra_error():
     spec = _case(expected_tools=["find_species"])
     failures = check_answer(spec, [], "Erreur serveur: /api/embeddings failed")
     assert failures == ["INFRA: Ollama embeddings crashed (nomic-embed-text unavailable)"]
+
+
+# --- Multi-turn conversation tests ---
+
+from eval_chat import Conversation, Turn, run_conversation
+
+
+class FakePost:
+    """Stands in for HTTP. Records calls; replays scripted (answer, tool_calls)."""
+
+    def __init__(self, scripted):
+        self.scripted = list(scripted)
+        self.calls = []          # (session_id, question)
+
+    def __call__(self, base_url, session_id, question):
+        self.calls.append((session_id, question))
+        return self.scripted.pop(0)
+
+
+def test_all_turns_share_one_session():
+    """The shared session is the whole point — it is what exercises history."""
+    conv = Conversation(id="c", category="conversation_regression", turns=[
+        Turn("premiere question"),
+        Turn("deuxieme question"),
+        Turn("troisieme question"),
+    ])
+    post = FakePost([("a", []), ("b", []), ("c", [])])
+    run_conversation(conv, "http://x", delay=0, post=post, sleep=lambda s: None)
+
+    session_ids = {sid for sid, _ in post.calls}
+    assert len(session_ids) == 1, f"turns used {len(session_ids)} sessions, must share one"
+    assert [q for _, q in post.calls] == [
+        "premiere question", "deuxieme question", "troisieme question",
+    ]
+
+
+def test_per_turn_assertions_are_evaluated():
+    conv = Conversation(id="c", category="conversation_regression", turns=[
+        Turn("setup"),                                     # asserts nothing
+        Turn("ou a-t-il ete vu ?", expected_tools=["where_seen"]),
+    ])
+    post = FakePost([("bla", ["find_species"]), ("Egå Engsø", ["where_seen"])])
+    result = run_conversation(conv, "http://x", delay=0, post=post, sleep=lambda s: None)
+
+    assert result.turns[0].passed          # setup turn has no assertions
+    assert result.turns[1].passed
+    assert result.passed
+
+
+def test_failing_turn_does_not_abort_the_conversation():
+    """Whether the assistant RECOVERS is exactly what we want to measure."""
+    conv = Conversation(id="c", category="conversation_regression", turns=[
+        Turn("t1", expected_tools=["where_seen"]),   # will fail
+        Turn("t2", expected_tools=["find_species"]),  # must still run, and pass
+    ])
+    post = FakePost([("nope", []), ("photo", ["find_species"])])
+    result = run_conversation(conv, "http://x", delay=0, post=post, sleep=lambda s: None)
+
+    assert len(result.turns) == 2, "later turns must still run after a failure"
+    assert not result.turns[0].passed
+    assert result.turns[1].passed
+    assert not result.passed, "conversation fails if any turn fails"
+
+
+def test_turn_results_are_numbered_from_one():
+    conv = Conversation(id="c", category="x", turns=[Turn("a"), Turn("b")])
+    post = FakePost([("1", []), ("2", [])])
+    result = run_conversation(conv, "http://x", delay=0, post=post, sleep=lambda s: None)
+    assert [t.index for t in result.turns] == [1, 2]
+
+
+def test_http_error_fails_that_turn_but_later_turns_still_run():
+    def boom(base_url, session_id, question):
+        if question == "t1":
+            raise RuntimeError("connection reset")
+        return ("ok", ["find_species"])
+
+    conv = Conversation(id="c", category="x", turns=[
+        Turn("t1"), Turn("t2", expected_tools=["find_species"]),
+    ])
+    result = run_conversation(conv, "http://x", delay=0, post=boom, sleep=lambda s: None)
+
+    assert not result.turns[0].passed
+    assert any("connection reset" in f for f in result.turns[0].failures)
+    assert result.turns[1].passed
