@@ -84,6 +84,11 @@ python scripts/web_chat.py --input output/birdology_reasoned.ttl
 
 # Desktop dashboard (PySide6 GUI — wraps all CLI features)
 python scripts/dashboard.py
+
+# Evaluate the chat system (server must be running)
+python scripts/eval_chat.py --url http://localhost:8080                      # 21 single-turn cases
+python scripts/eval_chat.py --url http://localhost:8080 --suite conversations # multi-turn cases
+python scripts/eval_chat.py --url http://localhost:8080 --suite all --judge   # everything + LLM judge
 ```
 
 ## Architecture
@@ -135,6 +140,7 @@ tests/test_queries.py       — all SPARQL query functions with an in-memory fix
 tests/test_reasoner.py      — each inference rule in isolation (idempotency, correctness)
 tests/test_gbif_batching.py — year-batching, offset-cap, deduplication (mocked HTTP)
 tests/test_chat.py          — Graph-RAG tool definitions, formatting, all 8 tools
+tests/test_eval_conversations.py — eval harness: check_answer + run_conversation (offline, mocked HTTP)
 tests/test_wikidata.py      — Wikidata enrichment
 tests/test_dbpedia.py       — DBpedia enrichment
 tests/test_iucn.py          — IUCN enrichment
