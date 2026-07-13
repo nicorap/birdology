@@ -139,3 +139,41 @@ def test_http_error_fails_that_turn_but_later_turns_still_run():
     assert not result.turns[0].passed
     assert any("connection reset" in f for f in result.turns[0].failures)
     assert result.turns[1].passed
+
+
+# --- Tests for CONVERSATIONS data structure ---
+
+from eval_chat import CONVERSATIONS
+
+
+def test_conversations_have_unique_ids():
+    ids = [c.id for c in CONVERSATIONS]
+    assert len(ids) == len(set(ids))
+
+
+def test_both_conversation_categories_present():
+    cats = {c.category for c in CONVERSATIONS}
+    assert "conversation_regression" in cats
+    assert "conversation_robustness" in cats
+
+
+def test_every_conversation_is_multi_turn_and_within_budget():
+    for c in CONVERSATIONS:
+        assert 2 <= len(c.turns) <= 5, f"{c.id} has {len(c.turns)} turns"
+
+
+def test_every_conversation_asserts_something():
+    """A conversation with no assertions anywhere would silently always pass."""
+    for c in CONVERSATIONS:
+        asserted = any(
+            t.expected_tools or t.forbidden_tools or t.must_contain
+            or t.must_contain_any or t.must_not_contain
+            for t in c.turns
+        )
+        assert asserted, f"{c.id} asserts nothing"
+
+
+def test_regression_conversations_cover_the_known_bugs():
+    ids = {c.id for c in CONVERSATIONS}
+    assert {"conv_photo_after_nearby", "conv_pronoun_where_seen",
+            "conv_refusal_inertia", "conv_no_invented_species"} <= ids

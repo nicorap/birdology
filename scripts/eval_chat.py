@@ -436,6 +436,126 @@ class ConversationResult:
 
 
 # ---------------------------------------------------------------------------
+# Multi-turn conversations
+#
+# Every bug found on 2026-07-13 was multi-turn, and the single-turn suite scored
+# 21/21 throughout. These cases run all turns against one session so the model
+# sees its own history — which is where it actually breaks.
+# ---------------------------------------------------------------------------
+
+CONVERSATIONS: list[Conversation] = [
+    # --- Regressions: these bugs really happened ---
+    Conversation(
+        id="conv_photo_after_nearby",
+        category="conversation_regression",
+        turns=[
+            Turn("Y a-t-il des rapaces près de Nørrebro ?",
+                 expected_tools=["nearby_birds", "where_to_watch"]),
+            Turn("montre moi une photo !",
+                 expected_tools=["find_species"],
+                 must_contain_any=["!["],
+                 notes="nearby_birds used to return no thumbnail, so the model claimed the "
+                       "species had no photo (false) instead of calling find_species."),
+        ],
+    ),
+    Conversation(
+        id="conv_pronoun_where_seen",
+        category="conversation_regression",
+        turns=[
+            Turn("Parle-moi du Chardonneret élégant",
+                 expected_tools=["find_species"]),
+            Turn("ou a t il ete vu la dernière fois ?",
+                 expected_tools=["where_seen"],
+                 must_not_contain=["pas d'information", "pas cette information"],
+                 notes="Pronoun follow-up, deliberately typo'd as the user typed it. "
+                       "The species has 425 observations — a refusal here is always a bug."),
+        ],
+    ),
+    Conversation(
+        id="conv_refusal_inertia",
+        category="conversation_regression",
+        turns=[
+            Turn("Parle-moi du Condor de Californie",
+                 expected_tools=["find_species"]),
+            Turn("où a-t-il été vu ?",
+                 notes="No Danish observations — a refusal here is CORRECT and expected."),
+            Turn("Et le Chardonneret élégant ?",
+                 expected_tools=["find_species"]),
+            Turn("où a-t-il été vu ?",
+                 expected_tools=["where_seen"],
+                 must_not_contain=["pas d'information", "pas cette information"],
+                 notes="The legitimate refusal two turns ago must NOT be inherited here."),
+        ],
+    ),
+    Conversation(
+        id="conv_no_invented_species",
+        category="conversation_regression",
+        turns=[
+            Turn("Parle-moi de l'Épervier d'Europe",
+                 expected_tools=["find_species"]),
+            Turn("montre moi une photo !",
+                 expected_tools=["find_species"],
+                 must_contain_any=["!["]),
+            Turn("il n'y a pas de photo !",
+                 must_not_contain=["albicillatus"],
+                 notes="Under pressure the model invented 'Haliaeetus albicillatus' "
+                       "(the real taxon is Haliaeetus albicilla) to have something to offer."),
+            Turn("montre moi une photo d'un autre rapace alors !",
+                 must_not_contain=["albicillatus"]),
+        ],
+    ),
+
+    # --- Robustness: general multi-turn behaviour ---
+    Conversation(
+        id="conv_location_carryover",
+        category="conversation_robustness",
+        turns=[
+            Turn("Où observer des oiseaux près de Copenhague ?",
+                 expected_tools=["where_to_watch", "nearby_birds"]),
+            Turn("et à Aarhus ?",
+                 expected_tools=["where_to_watch", "nearby_birds"],
+                 notes="Must re-run the tool for the NEW location, not reuse Copenhagen."),
+        ],
+    ),
+    Conversation(
+        id="conv_month_carryover",
+        category="conversation_robustness",
+        turns=[
+            Turn("Quels oiseaux voit-on en mars au Danemark ?",
+                 expected_tools=["observations_by_month"]),
+            Turn("et en juin ?",
+                 expected_tools=["observations_by_month"],
+                 notes="Must re-run for June, not answer from the March result."),
+        ],
+    ),
+    Conversation(
+        id="conv_topic_switch_and_back",
+        category="conversation_robustness",
+        turns=[
+            Turn("Parle-moi du Rouge-gorge familier",
+                 expected_tools=["find_species"]),
+            Turn("Quels oiseaux voit-on en mars au Danemark ?",
+                 expected_tools=["observations_by_month"]),
+            Turn("Revenons au premier oiseau : est-il menacé ?",
+                 expected_tools=["find_species"],
+                 notes="Must resolve 'le premier oiseau' back to the Robin."),
+        ],
+    ),
+    Conversation(
+        id="conv_user_correction",
+        category="conversation_robustness",
+        turns=[
+            Turn("Parle-moi du Rouge-gorge familier",
+                 expected_tools=["find_species"]),
+            Turn("non, je voulais dire le Rouge-queue noir",
+                 expected_tools=["find_species"],
+                 notes="Must look up the corrected species, not keep answering about the Robin."),
+        ],
+    ),
+]
+
+
+# ---------------------------------------------------------------------------
 # Core runner
 # ---------------------------------------------------------------------------
 
