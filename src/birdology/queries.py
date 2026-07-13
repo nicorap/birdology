@@ -7,6 +7,7 @@ result row dicts for easy consumption.
 from __future__ import annotations
 
 import math
+import re
 import unicodedata
 
 from rdflib import ConjunctiveGraph, Graph
@@ -607,17 +608,28 @@ def observation_locations(
         query=species_name,
     )
 
-    # COUNT(DISTINCT ?obs): the reasoner's owl:sameAs closure leaves several
-    # species nodes pointing at the same observation, which would otherwise
-    # multiply every count.
+    # Two things this query has to survive on the reasoned graph:
+    #
+    # 1. The name filter is a substring match, so "Carduelis" matches several
+    #    species. ?species and ?scientificName are therefore in both SELECT and
+    #    GROUP BY: without them, congeners seen at one site collapse into a single
+    #    row and the caller cannot tell whose count — or whose photo — it holds.
+    #
+    # 2. The reasoner's owl:sameAs closure copies every species property onto the
+    #    ebird:/gbif: alias IRIs, so a thumbnail lookup reaching through owl:sameAs
+    #    matches once per alias and multiplies the observation rows: 1+N rows per
+    #    (species, obs). COUNT(DISTINCT ?obs) is immune, SUM(?count) was not — it
+    #    reported 3x the true individual count. The thumbnail is therefore NOT
+    #    joined here at all; it is resolved afterwards, keyed on the species we
+    #    actually return (_thumbnails_for). That keeps this aggregate strictly
+    #    one-row-per-observation, so SUM cannot be inflated by any alias.
     q = (
         _PREFIXES
         + f"""
-SELECT ?locality ?lat ?lon
+SELECT ?species ?scientificName ?locality ?lat ?lon
        (COUNT(DISTINCT ?obs) AS ?obsCount)
        (MAX(?date) AS ?latestDate)
        (SUM(?count) AS ?totalIndividuals)
-       (SAMPLE(?thumb) AS ?thumbnail)
 WHERE {{
     ?species a bird:Species ;
              dwc:scientificName ?scientificName ;
@@ -632,22 +644,57 @@ WHERE {{
     OPTIONAL {{ ?species bird:commonNameEn ?commonNameEn }}
     OPTIONAL {{ ?species bird:commonNameDa ?commonNameDa }}
     OPTIONAL {{ ?species bird:commonNameFr ?commonNameFr }}
-    OPTIONAL {{
-        {{ ?species bird:thumbnailUrl ?thumb }}
-        UNION
-        {{ ?species owl:sameAs ?alt . ?alt bird:thumbnailUrl ?thumb }}
-    }}
     {name_filter}
 }}
-GROUP BY ?loc ?locality ?lat ?lon
+GROUP BY ?species ?scientificName ?loc ?locality ?lat ?lon
 ORDER BY DESC(?obsCount)
 LIMIT {limit}
 """
     )
     rows = _rows(g.query(q))
+    thumbs = _thumbnails_for(g, {r["species"] for r in rows if r.get("species")})
     for r in rows:
         r["observationCount"] = r.pop("obsCount", 0)
+        thumb = thumbs.get(r.get("species"))
+        if thumb:
+            r["thumbnail"] = thumb
     return rows
+
+
+def _thumbnails_for(g: Graph | ConjunctiveGraph, species_uris: set[str]) -> dict[str, str]:
+    """Map species IRI → thumbnail URL, following owl:sameAs to the alias IRIs.
+
+    Split out of the aggregate query on purpose: reaching through owl:sameAs inside
+    an aggregate multiplies the rows being summed (see observation_locations).
+
+    One small query per species, with the IRI inlined. That looks like the naive
+    shape, but it is the fast one: batching the species into a `VALUES ?species`
+    block joined against the owl:sameAs UNION makes Oxigraph evaluate the UNION
+    with an unbound subject — a full scan of the 1.2M-triple store, ~17s — while
+    each inlined lookup resolves off the index in ~0ms. The species set is bounded
+    by the caller's LIMIT (20 by default), so this stays a handful of point reads.
+    """
+    thumbs: dict[str, str] = {}
+    for uri in species_uris:
+        # These IRIs come back out of the graph, but they are being spliced into a
+        # query string — refuse anything that could not be a plain IRI.
+        if not uri or re.search(r'[\s<>"{}|\\^`]', uri):
+            continue
+        q = (
+            _PREFIXES
+            + f"""
+SELECT ?t WHERE {{
+    {{ <{uri}> bird:thumbnailUrl ?t }}
+    UNION
+    {{ <{uri}> owl:sameAs ?alt . ?alt bird:thumbnailUrl ?t }}
+}}
+LIMIT 1
+"""
+        )
+        rows = _rows(g.query(q))
+        if rows and rows[0].get("t"):
+            thumbs[uri] = rows[0]["t"]
+    return thumbs
 
 
 def observations_by_month(

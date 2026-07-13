@@ -685,3 +685,116 @@ def test_thumbnail_absent_species_has_no_thumbnail_key():
     rows = observation_locations(g, "Dendrocopos major")
     assert rows
     assert not rows[0].get("thumbnail")
+
+
+# ── observation_locations must not conflate species ───────────────────────────
+# Regression: ?species was neither selected nor grouped on, and the name filter is
+# a substring match, so a genus-wide query ("Carduelis") fused every matching
+# species observed at one site into a single row — with one arbitrary species'
+# photo (SAMPLE(?thumb)) and the sum of everyone's observation counts.
+
+def _add_congener(g: Graph, slug: str, sci_name: str, thumb: str, obs_id: str) -> None:
+    """Add a species with one observation at the shared Copenhagen fixture location."""
+    sp = TAXON[f"species/{slug}"]
+    obs = OBS[obs_id]
+    g.add((sp, RDF.type, BIRD.Species))
+    g.add((sp, DWC.scientificName, Literal(sci_name)))
+    g.add((sp, BIRD.thumbnailUrl, Literal(thumb)))
+    g.add((obs, RDF.type, BIRD.Observation))
+    g.add((obs, BIRD.observedOn, Literal("2024-06-01", datatype=XSD.date)))
+    g.add((obs, BIRD.individualCount, Literal(1, datatype=XSD.integer)))
+    g.add((obs, BIRD.observedAt, LOC["loc_cph"]))
+    g.add((sp, BIRD.hasObservation, obs))
+
+
+def test_observation_locations_does_not_conflate_two_species_at_one_site():
+    """Two Carduelis species seen at the SAME site must stay two rows.
+
+    Fused into one row, the caller cannot tell whose photo or whose count it has —
+    the row would claim 2 observations of a single, unnamed species.
+    """
+    g = _make_graph()
+    _add_congener(g, "eurgol", "Carduelis carduelis",
+                  "https://example.org/goldfinch.jpg", "obs_goldfinch")
+    _add_congener(g, "comred", "Carduelis flammea",
+                  "https://example.org/redpoll.jpg", "obs_redpoll")
+
+    rows = observation_locations(g, "Carduelis")
+
+    assert len(rows) == 2, f"the two Carduelis species were fused into {len(rows)} row(s): {rows}"
+    by_name = {r["scientificName"]: r for r in rows}
+    assert set(by_name) == {"Carduelis carduelis", "Carduelis flammea"}
+    assert int(by_name["Carduelis carduelis"]["observationCount"]) == 1
+    assert int(by_name["Carduelis flammea"]["observationCount"]) == 1
+    # A species' row must never carry a different species' photo.
+    assert by_name["Carduelis carduelis"]["thumbnail"] == "https://example.org/goldfinch.jpg"
+    assert by_name["Carduelis flammea"]["thumbnail"] == "https://example.org/redpoll.jpg"
+
+
+# ── the reasoned-graph fixture ────────────────────────────────────────────────
+# _make_graph() is a raw build-time graph: no owl:sameAs closure. Production
+# queries run against output/birdology_reasoned.ttl, where reason.py has copied
+# every species property onto its ebird:/gbif: alias IRIs — so any OPTIONAL that
+# can bind through owl:sameAs yields 1+N rows per observation. Aggregates that
+# are not DISTINCT-guarded silently multiply. This fixture reproduces that.
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+from reason import _materialise_same_as  # noqa: E402
+
+EBIRD_NS = "https://ebird.org/species/"
+GBIF_NS = "https://www.gbif.org/species/"
+
+
+def _make_reasoned_graph() -> Graph:
+    """The fixture graph after the real owl:sameAs materialisation the reasoner does."""
+    g = _make_graph()
+    g.add((TAXON["species/robi"], OWL.sameAs, URIRef(EBIRD_NS + "robi")))
+    g.add((TAXON["species/robi"], OWL.sameAs, URIRef(GBIF_NS + "2492467")))
+    _materialise_same_as(g)
+    return g
+
+
+def test_reasoned_fixture_really_fans_out_the_thumbnail():
+    """Guard on the fixture itself: if the alias IRIs stop carrying a copy of
+    bird:thumbnailUrl, this fixture no longer reproduces production and the two
+    tests below would pass for the wrong reason."""
+    g = _make_reasoned_graph()
+    thumb_holders = set(g.subjects(BIRD.thumbnailUrl, None))
+    assert URIRef(EBIRD_NS + "robi") in thumb_holders
+    assert URIRef(GBIF_NS + "2492467") in thumb_holders
+
+
+def test_observation_locations_counts_are_not_inflated_on_the_reasoned_graph():
+    """One observation of 2 robins is 1 observation of 2 birds — on the reasoned
+    graph too. The owl:sameAs fan-out gave 3 rows per observation, so SUM(?count)
+    reported 6 individuals."""
+    g = _make_reasoned_graph()
+    rows = observation_locations(g, "Rødhals")
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert int(row["observationCount"]) == 1
+    assert int(row["totalIndividuals"]) == 2, (
+        f"individualCount=2 reported as {row['totalIndividuals']} — the sameAs fan-out "
+        f"multiplied the SUM"
+    )
+    assert row["thumbnail"] == "https://example.org/robin.jpg?width=300"
+
+
+def test_observation_locations_totals_survive_repeat_visits_on_reasoned_graph():
+    """Aggregation over several observations, each fanned out by the closure."""
+    g = _make_reasoned_graph()
+    robin = TAXON["species/robi"]
+    for i in range(3):
+        obs = OBS[f"obs_robin_extra_{i}"]
+        g.add((obs, RDF.type, BIRD.Observation))
+        g.add((obs, BIRD.observedOn, Literal(f"2024-05-{i + 1:02d}", datatype=XSD.date)))
+        g.add((obs, BIRD.individualCount, Literal(5, datatype=XSD.integer)))
+        g.add((obs, BIRD.observedAt, LOC["loc_cph"]))
+        g.add((robin, BIRD.hasObservation, obs))
+
+    rows = observation_locations(g, "Rødhals")
+    assert len(rows) == 1
+    # 1 original observation of 2 + 3 observations of 5 = 4 observations, 17 birds.
+    assert int(rows[0]["observationCount"]) == 4
+    assert int(rows[0]["totalIndividuals"]) == 17
