@@ -78,6 +78,7 @@ def _make_graph() -> Graph:
     g.add((ROBIN_URI, BIRD.commonNameFr,  Literal("Rouge-gorge familier", lang="fr")))
     g.add((ROBIN_URI, BIRD.eBirdCode,     Literal("robi")))
     g.add((ROBIN_URI, BIRD.conservationStatus, Literal("LC")))
+    g.add((ROBIN_URI, BIRD.thumbnailUrl,  Literal("https://example.org/robin.jpg?width=300")))
 
     g.add((WOODP_URI, DWC.scientificName, Literal("Dendrocopos major")))
     g.add((WOODP_URI, DWC.family,         Literal("Picidae")))
@@ -655,3 +656,32 @@ def test_observation_locations_aggregates_repeat_visits_to_one_row():
     rows = observation_locations(g, "Rødhals")
     assert len(rows) == 1
     assert int(rows[0]["observationCount"]) == 10
+
+
+# ── thumbnails reachable from the tools users actually go through ─────────────
+# Regression: the graph holds a thumbnailUrl for ~9,800 species, but nearby_watch
+# and observation_locations did not return it. After a "birds near Nørrebro"
+# answer the model had no photo in context, claimed it had none for the species,
+# and then invented a species ("Haliaeetus albicillatus") to offer a photo of.
+
+def test_nearby_watch_includes_thumbnail():
+    g = _make_graph()
+    rows = nearby_watch(g, lat=55.694, lon=12.554, radius_km=5)
+    robin = [r for r in rows if r["scientificName"] == "Erithacus rubecula"]
+    assert robin, "robin should be within 5km of the fixture location"
+    assert robin[0].get("thumbnail") == "https://example.org/robin.jpg?width=300"
+
+
+def test_observation_locations_includes_thumbnail():
+    g = _make_graph()
+    rows = observation_locations(g, "Rødhals")
+    assert rows
+    assert rows[0].get("thumbnail") == "https://example.org/robin.jpg?width=300"
+
+
+def test_thumbnail_absent_species_has_no_thumbnail_key():
+    """A species with no photo must simply omit it — never a placeholder."""
+    g = _make_graph()
+    rows = observation_locations(g, "Dendrocopos major")
+    assert rows
+    assert not rows[0].get("thumbnail")

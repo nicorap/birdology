@@ -460,7 +460,7 @@ WHERE {{
     q_names = (
         _PREFIXES
         + f"""
-SELECT ?species ?scientificName ?commonNameFr ?commonNameDa ?commonNameEn ?status
+SELECT ?species ?scientificName ?commonNameFr ?commonNameDa ?commonNameEn ?status ?thumbnail
 WHERE {{
     {values}
     ?species dwc:scientificName ?scientificName .
@@ -468,6 +468,11 @@ WHERE {{
     OPTIONAL {{ ?species bird:commonNameDa      ?commonNameDa }}
     OPTIONAL {{ ?species bird:commonNameEn      ?commonNameEn }}
     OPTIONAL {{ ?species bird:conservationStatus ?status }}
+    OPTIONAL {{
+        {{ ?species bird:thumbnailUrl ?thumbnail }}
+        UNION
+        {{ ?species owl:sameAs ?alt . ?alt bird:thumbnailUrl ?thumbnail }}
+    }}
 }}
 """
     )
@@ -612,6 +617,7 @@ SELECT ?locality ?lat ?lon
        (COUNT(DISTINCT ?obs) AS ?obsCount)
        (MAX(?date) AS ?latestDate)
        (SUM(?count) AS ?totalIndividuals)
+       (SAMPLE(?thumb) AS ?thumbnail)
 WHERE {{
     ?species a bird:Species ;
              dwc:scientificName ?scientificName ;
@@ -626,6 +632,11 @@ WHERE {{
     OPTIONAL {{ ?species bird:commonNameEn ?commonNameEn }}
     OPTIONAL {{ ?species bird:commonNameDa ?commonNameDa }}
     OPTIONAL {{ ?species bird:commonNameFr ?commonNameFr }}
+    OPTIONAL {{
+        {{ ?species bird:thumbnailUrl ?thumb }}
+        UNION
+        {{ ?species owl:sameAs ?alt . ?alt bird:thumbnailUrl ?thumb }}
+    }}
     {name_filter}
 }}
 GROUP BY ?loc ?locality ?lat ?lon

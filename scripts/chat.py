@@ -532,7 +532,12 @@ Just report the tool results.
 7. **Show photos ONLY from tool results.** If a tool returns a `thumbnail` field, include it \
 as a markdown image: `![species name](url)`. Show max 3 photos per response. \
 **NEVER write a markdown image (`![...]()`) from memory or general knowledge** — only use \
-URLs that appear literally in a tool result.
+URLs that appear literally in a tool result. \
+**Photos come from `find_species`.** If the user asks for a photo and you do not have a \
+`thumbnail` in a tool result, call `find_species` for that species and use the `thumbnail` it \
+returns. Do NOT say "I have no photo" without calling `find_species` first — most species have \
+one. If `find_species` genuinely returns no `thumbnail`, say so plainly and **stop**: do not \
+substitute a different species, and never name a species that did not come from a tool result.
 8. **Links**: when referencing a species URI or eBird page, use markdown links: \
 `[text](url)`.
 9. **When comparing live vs historical data**, only list species as "expected but absent" if \
