@@ -16,6 +16,7 @@ from birdology.queries import (
     migration_calendar,
     migration_timing,
     nearby_watch,
+    observation_locations,
     phenology,
     recent_danish_observations,
     species_by_family,
@@ -603,3 +604,54 @@ def test_migration_calendar_merges_sameas_split_months():
     assert len(rows) == 1
     assert rows[0]["months"] == [True, True, True, False, False, False, False, False, False, True, True, True]
     assert rows[0]["arrivalMonth"] == 10 and rows[0]["departureMonth"] == 3
+
+
+# ── observation_locations ─────────────────────────────────────────────────────
+# Regression: the graph stored bird:observedAt for every observation, but no
+# query exposed it, so the chat assistant answered "où a-t-il été vu ?" with
+# "I have no locality information" while the data sat right there.
+
+def test_observation_locations_returns_locality_and_coords():
+    g = _make_graph()
+    rows = observation_locations(g, "Rødhals")
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["locality"] == "Nørrebro, Copenhagen"
+    assert float(row["lat"]) == 55.694
+    assert float(row["lon"]) == 12.554
+    assert int(row["observationCount"]) == 1
+
+
+def test_observation_locations_matches_any_language():
+    g = _make_graph()
+    for name in ["Erithacus rubecula", "European Robin", "Rouge-gorge", "rodhals"]:
+        rows = observation_locations(g, name)
+        assert rows, f"no locality rows for {name!r}"
+        assert rows[0]["locality"] == "Nørrebro, Copenhagen"
+
+
+def test_observation_locations_excludes_other_species():
+    g = _make_graph()
+    rows = observation_locations(g, "Rødhals")
+    assert all(r["locality"] != "Aarhus" for r in rows)
+
+
+def test_observation_locations_unknown_species_returns_empty():
+    g = _make_graph()
+    assert observation_locations(g, "Nonexistent bird") == []
+
+
+def test_observation_locations_aggregates_repeat_visits_to_one_row():
+    """Ten observations at one site is one place with count 10, not ten places."""
+    g = _make_graph()
+    robin = TAXON["species/robi"]
+    loc = LOC["loc_cph"]
+    for i in range(9):
+        obs = OBS[f"obs_robin_{i}"]
+        g.add((obs, RDF.type, BIRD.Observation))
+        g.add((obs, BIRD.observedOn, Literal(f"2024-05-{i + 1:02d}", datatype=XSD.date)))
+        g.add((obs, BIRD.observedAt, loc))
+        g.add((robin, BIRD.hasObservation, obs))
+    rows = observation_locations(g, "Rødhals")
+    assert len(rows) == 1
+    assert int(rows[0]["observationCount"]) == 10

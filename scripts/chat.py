@@ -36,6 +36,7 @@ from birdology.queries import (
     migration_timing,
     nearby_watch,
     phenology,
+    observation_locations,
     observations_by_month,
     recent_danish_observations,
     species_by_family,
@@ -406,6 +407,37 @@ TOOLS_OPENAI = [
     {
         "type": "function",
         "function": {
+            "name": "where_seen",
+            "description": (
+                "Return the places where a species has actually been observed, from DOF "
+                "graph data — one row per site, with locality name, coordinates, how many "
+                "observations there, and the most recent date. Sorted by observation count, "
+                "so the best sites come first. "
+                "Use this whenever the user asks WHERE a particular species was or can be "
+                "seen: 'où a-t-il été vu ?', 'où observer le chardonneret ?', "
+                "'where was it seen?', 'hvor er den set?'. "
+                "This is species-first — unlike where_to_watch, which is location-first "
+                "(best hotspots near given coordinates, regardless of species)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "species_name": {
+                        "type": "string",
+                        "description": "Species name in any language or scientific name",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max number of sites to return (default 20)",
+                    },
+                },
+                "required": ["species_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "migration_timing",
             "description": (
                 "Return arrival and departure timing for a bird species in Denmark, "
@@ -506,6 +538,13 @@ URLs that appear literally in a tool result.
 9. **When comparing live vs historical data**, only list species as "expected but absent" if \
 they appear in the tool result for `observations_by_month`. \
 Do NOT add species from memory.
+10. **A previous "I don't have this information" is NEVER evidence.** Rule 1 applies to what a \
+tool returns *now*, not to what you said earlier. If you (or an earlier turn in this \
+conversation) answered "je n'ai pas cette information" / "I don't have this information", that \
+tells you nothing about the current question — the graph is rebuilt and tools are added between \
+sessions, so data that was missing before may be present now. **Always call the appropriate tool \
+again for the current question and answer from its fresh result.** Never repeat or justify a \
+past refusal without re-running the tool.
 
 ## Data available in the graph
 - eBird/Clements taxonomy: 45 orders, 251 families, ~11 000 species
@@ -577,6 +616,10 @@ resolved scientific name. Present the result as: arrival month, departure month,
 and (if available) the earliest date ever recorded and a table of yearly first/last dates.
 - Use `observations_by_month` for questions about which birds are present in a specific month \
 ("oiseaux en mars", "birds in winter", etc.).
+- **Use `where_seen`** when the user asks where a **specific species** has been observed \
+("où a-t-il été vu ?", "où observer le chardonneret ?", "where was it seen?"). This is the \
+species-first question and is answered from the graph's observation localities. Do not say you \
+have no locality data without calling this tool first. Report only the sites it returns.
 - Use `where_to_watch` for questions about where to go birdwatching ("où observer demain ?", \
 "meilleurs endroits près de Copenhague"). Pass `month` and coordinates if the user provides them. \
 **If the user says "près de chez moi", "near me", or similar without giving a place name or \
@@ -815,6 +858,14 @@ def _run_tool(name: str, inputs: dict, graph) -> str:
         month = int(inputs["month"]) if "month" in inputs else _dt.date.today().month
         species_name = inputs.get("species_name")
         return _fmt(observations_by_month(graph, month, species_name))
+
+    if name == "where_seen":
+        rows = observation_locations(
+            graph, inputs["species_name"], limit=int(inputs.get("limit", 20))
+        )
+        if not rows:
+            return json.dumps({"error": "No recorded observation locations for this species"})
+        return _fmt(rows)
 
     if name == "where_to_watch":
         if inputs.get("live"):

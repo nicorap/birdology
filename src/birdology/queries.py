@@ -582,6 +582,63 @@ ORDER BY ?scientificName DESC(?date)
     return rows
 
 
+def observation_locations(
+    g: Graph | ConjunctiveGraph,
+    species_name: str,
+    limit: int = 20,
+) -> list[dict]:
+    """Where a species has actually been observed, grouped by site.
+
+    Answers "where was species X seen?". Each row is one location, not one
+    sighting: locality, lat, lon, observationCount, latestDate, totalIndividuals.
+    Sorted by observation count descending (the most reliable sites first).
+
+    Matching is case- and accent-insensitive across scientific, English, Danish
+    and French names.
+    """
+    limit = _sparql_int(limit)
+    name_filter = _sparql_name_filter(
+        "?scientificName", "?commonNameEn", "?commonNameDa", "?commonNameFr",
+        query=species_name,
+    )
+
+    # COUNT(DISTINCT ?obs): the reasoner's owl:sameAs closure leaves several
+    # species nodes pointing at the same observation, which would otherwise
+    # multiply every count.
+    q = (
+        _PREFIXES
+        + f"""
+SELECT ?locality ?lat ?lon
+       (COUNT(DISTINCT ?obs) AS ?obsCount)
+       (MAX(?date) AS ?latestDate)
+       (SUM(?count) AS ?totalIndividuals)
+WHERE {{
+    ?species a bird:Species ;
+             dwc:scientificName ?scientificName ;
+             bird:hasObservation ?obs .
+    {_CANONICAL_SPECIES}
+    ?obs bird:observedAt ?loc .
+    ?loc bird:latitude  ?lat ;
+         bird:longitude ?lon .
+    OPTIONAL {{ ?loc bird:locality        ?locality }}
+    OPTIONAL {{ ?obs bird:observedOn      ?date }}
+    OPTIONAL {{ ?obs bird:individualCount ?count }}
+    OPTIONAL {{ ?species bird:commonNameEn ?commonNameEn }}
+    OPTIONAL {{ ?species bird:commonNameDa ?commonNameDa }}
+    OPTIONAL {{ ?species bird:commonNameFr ?commonNameFr }}
+    {name_filter}
+}}
+GROUP BY ?loc ?locality ?lat ?lon
+ORDER BY DESC(?obsCount)
+LIMIT {limit}
+"""
+    )
+    rows = _rows(g.query(q))
+    for r in rows:
+        r["observationCount"] = r.pop("obsCount", 0)
+    return rows
+
+
 def observations_by_month(
     g: Graph | ConjunctiveGraph,
     month: int,
