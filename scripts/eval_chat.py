@@ -565,23 +565,56 @@ CONVERSATIONS: list[Conversation] = [
 # Core runner
 # ---------------------------------------------------------------------------
 
+# A coordinate this far from the pinned value is the same place, reported with more
+# decimals (Aarhus 56.16 vs a model's 56.1629). Anything further is a different place.
+# It has to be small: at 0.5 the check was useless for latitude, where Aarhus (56.16)
+# and Copenhagen (55.69) are only 0.47 apart — a wrong-city answer sailed through and
+# only the longitude could ever fail the assertion.
+_COORD_TOLERANCE = 0.05  # ~5.5 km of latitude
+
+
 def _arg_matches(expected, actual) -> bool:
     """One expected-arg value matches one actual-arg value.
 
-    Both numeric → tolerant comparison (abs diff <= 0.5): makes `month: 6` exact-ish
-    while tolerating a model's higher-precision lat/lon (56.16 vs 56.1629), and still
-    rejects a genuinely different location (Copenhagen's 12.57 vs Aarhus's 10.20).
+    Expected int (a month, a radius — categorical, not measured) → exact match, so
+    `month: 6` rejects 3 and 6.4 alike.
+    Expected float (a coordinate) → within _COORD_TOLERANCE, which accepts a model's
+    higher-precision 56.1629 for a pinned 56.16 but rejects another city.
     Otherwise → case-insensitive substring match.
     """
-    try:
-        return abs(float(actual) - float(expected)) <= 0.5
-    except (TypeError, ValueError):
-        return str(expected).lower() in str(actual).lower()
+    if isinstance(expected, bool):
+        return expected is actual
+    if isinstance(expected, int):
+        try:
+            return float(actual) == float(expected)
+        except (TypeError, ValueError):
+            return False
+    if isinstance(expected, float):
+        try:
+            return abs(float(actual) - float(expected)) <= _COORD_TOLERANCE
+        except (TypeError, ValueError):
+            return False
+    return str(expected).lower() in str(actual).lower()
 
 
-def _tool_call_matches_expected_args(expected_tool_args: dict, tool_call_details: list[dict]) -> bool:
-    """At least one recorded tool call must match ALL expected args."""
-    for call in tool_call_details:
+def _tool_call_matches_expected_args(
+    expected_tool_args: dict,
+    tool_call_details: list[dict],
+    expected_tools: list[str] | None = None,
+) -> bool:
+    """At least one recorded call TO AN EXPECTED TOOL must match ALL expected args.
+
+    Restricting to expected_tools is the whole point. Several tools share a parameter
+    name — `month` belongs to both observations_by_month and where_to_watch, `name` to
+    both find_species and search_wikipedia. Scanning every call regardless of its name
+    let a turn pass on the wrong one: on conv_month_carryover the model could call
+    observations_by_month(month=3) — precisely the regression under test — and still go
+    green because it also called where_to_watch(month=6).
+    """
+    candidates = tool_call_details
+    if expected_tools:
+        candidates = [c for c in tool_call_details if c.get("name") in expected_tools]
+    for call in candidates:
         args = call.get("args", {})
         if all(key in args and _arg_matches(value, args[key]) for key, value in expected_tool_args.items()):
             return True
@@ -608,10 +641,12 @@ def check_answer(spec, tool_calls: list[str], answer: str, tool_call_details: li
 
     expected_tool_args = getattr(spec, "expected_tool_args", {})
     if expected_tool_args:
-        if not _tool_call_matches_expected_args(expected_tool_args, tool_call_details or []):
+        if not _tool_call_matches_expected_args(
+            expected_tool_args, tool_call_details or [], spec.expected_tools
+        ):
             failures.append(
-                f"Expected a tool call matching args {expected_tool_args}, "
-                f"got {tool_call_details or []}"
+                f"Expected {spec.expected_tools or 'a tool'} to be called with args "
+                f"{expected_tool_args}, got {tool_call_details or []}"
             )
 
     for t in spec.forbidden_tools:

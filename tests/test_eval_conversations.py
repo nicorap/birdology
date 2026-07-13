@@ -237,16 +237,77 @@ def test_check_answer_flags_wrong_tool_args_wrong_month():
 
 
 def test_check_answer_numeric_tolerance_within_bound_passes():
+    """A model's higher-precision coordinate for the SAME place must still match."""
     spec = Turn("q", expected_tool_args={"lat": 56.16})
-    details = [{"name": "t", "args": {"lat": 56.16 + 0.5}}]  # exactly at the tolerance boundary
+    details = [{"name": "t", "args": {"lat": 56.1629}}]  # Aarhus, more decimal places
     assert check_answer(spec, ["t"], "answer", tool_call_details=details) == []
 
 
 def test_check_answer_numeric_tolerance_just_outside_bound_fails():
     spec = Turn("q", expected_tool_args={"lat": 56.16})
-    details = [{"name": "t", "args": {"lat": 56.16 + 0.51}}]
+    details = [{"name": "t", "args": {"lat": 56.16 + 0.06}}]
     failures = check_answer(spec, ["t"], "answer", tool_call_details=details)
-    assert failures, "0.51 is outside the 0.5 tolerance"
+    assert failures, "0.06 is outside the float tolerance"
+
+
+# ── the tolerance must actually discriminate between Danish cities ────────────
+# 0.5 degrees is ~55 km of latitude. Aarhus (56.16) and Copenhagen (55.69) are only
+# 0.47 apart — INSIDE the old tolerance. So the latitude half of conv_location_carryover's
+# assertion was vacuous: only the longitude could ever fail it.
+
+def test_check_answer_rejects_copenhagen_latitude_when_aarhus_expected():
+    spec = Turn("q", expected_tools=["where_to_watch"], expected_tool_args={"lat": 56.16})
+    details = [{"name": "where_to_watch", "args": {"lat": 55.6761}}]  # Copenhagen
+    failures = check_answer(spec, ["where_to_watch"], "answer", tool_call_details=details)
+    assert failures, (
+        "must fail: Copenhagen's latitude is 0.47 from Aarhus's — ~52 km — and has to be "
+        "rejected on latitude alone"
+    )
+
+
+def test_check_answer_int_args_are_matched_exactly():
+    """Integers are categorical (a month, a radius), not measurements: no float slop."""
+    spec = Turn("q", expected_tool_args={"month": 6})
+    ok = [{"name": "observations_by_month", "args": {"month": 6}}]
+    assert check_answer(spec, ["observations_by_month"], "a", tool_call_details=ok) == []
+
+    off_by_a_fraction = [{"name": "observations_by_month", "args": {"month": 6.4}}]
+    assert check_answer(spec, ["observations_by_month"], "a",
+                        tool_call_details=off_by_a_fraction), "month 6.4 is not month 6"
+
+
+# ── an arg match on the WRONG tool must not satisfy the assertion ─────────────
+# `month` is a parameter of BOTH observations_by_month and where_to_watch; `name` of
+# both find_species and search_wikipedia. Scanning every recorded call regardless of
+# its name meant a right-args call on an unrelated tool could green-light a turn whose
+# tool-under-test was called with exactly the wrong args.
+
+def test_check_answer_ignores_expected_args_matched_on_a_different_tool():
+    """THE false pass on conv_month_carryover turn 2: the model regresses and calls
+    observations_by_month(month=3) — the exact bug under test — but also happens to call
+    where_to_watch(month=6). The turn used to go green on the wrong call."""
+    spec = Turn("q", expected_tools=["observations_by_month"], expected_tool_args={"month": 6})
+    details = [
+        {"name": "observations_by_month", "args": {"month": 3}},  # tool under test, WRONG month
+        {"name": "where_to_watch", "args": {"month": 6}},         # other tool, right month
+    ]
+    failures = check_answer(spec, ["observations_by_month", "where_to_watch"], "answer",
+                            tool_call_details=details)
+    assert failures, (
+        "must fail: observations_by_month — the tool under test — was called with month=3; "
+        "where_to_watch(month=6) is a different tool and cannot satisfy the assertion"
+    )
+
+
+def test_check_answer_expected_args_still_match_on_the_expected_tool():
+    """Same shape, but the tool under test got the right args — must pass."""
+    spec = Turn("q", expected_tools=["observations_by_month"], expected_tool_args={"month": 6})
+    details = [
+        {"name": "where_to_watch", "args": {"month": 3}},
+        {"name": "observations_by_month", "args": {"month": 6}},
+    ]
+    assert check_answer(spec, ["observations_by_month", "where_to_watch"], "answer",
+                        tool_call_details=details) == []
 
 
 def test_check_answer_string_arg_is_case_insensitive_substring():
