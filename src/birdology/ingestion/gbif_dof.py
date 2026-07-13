@@ -10,6 +10,7 @@ GBIF API: https://api.gbif.org/v1/  (no auth required for reads)
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 from datetime import date
 
@@ -46,8 +47,9 @@ IUCN_LABELS = {
 
 _GBIF_OFFSET_CAP = 9_700   # GBIF hard-caps offset at ~10 000; stay safely under
 
-def _fetch_year(year: int, remaining: int) -> list[dict]:
-    """Fetch up to *remaining* occurrences for a single calendar year."""
+def _fetch_year(year: int, remaining: int, month: int | None = None) -> list[dict]:
+    """Fetch up to *remaining* occurrences for a calendar year, optionally
+    narrowed to a single *month*."""
     results: list[dict] = []
     offset = 0
     while len(results) < remaining:
@@ -60,6 +62,8 @@ def _fetch_year(year: int, remaining: int) -> list[dict]:
             "taxonKey": _AVES_TAXON_KEY,
             "year": year,
         }
+        if month is not None:
+            params["month"] = month
         resp = requests.get(
             f"{_GBIF_BASE}/occurrence/search", params=params, timeout=_TIMEOUT
         )
@@ -121,11 +125,15 @@ def fetch_dof_occurrences(max_records: int = 5000) -> list[dict]:
     Fetch occurrence records from the DOF GBIF dataset.
 
     The GBIF occurrence search API caps the offset at ~10 000 per query, so
-    fetching more than that requires batching by year.  We iterate recent years
-    newest-first until *max_records* is reached.
+    fetching more than that requires batching.  Batching by year alone is not
+    enough: GBIF returns a year's records in index order, so the first ~9 700
+    of any year all fall in the first days of January and the offset cap is hit
+    long before February.  We therefore batch by (year, month) and give each
+    month an equal share of the budget, which is what makes the phenology and
+    migration-status data meaningful.
 
     max_records caps total records fetched (default 5 000; use a higher value
-    like 50 000 to get a broader sample — each year contributes up to ~9 700).
+    like 50 000 to get a broader sample).
     """
     from datetime import date as _date
     current_year = _date.today().year
@@ -138,13 +146,21 @@ def fetch_dof_occurrences(max_records: int = 5000) -> list[dict]:
         for year in years:
             if len(results) >= max_records:
                 break
-            batch = _fetch_year(year, max_records - len(results))
-            for rec in batch:
-                key = rec.get("key") or rec.get("gbifID")
-                if key and key not in seen_keys:
-                    seen_keys.add(key)
-                    results.append(rec)
-            pbar.update(len(batch))
+            # Split this year's remaining budget evenly over the 12 months so a
+            # single month can never exhaust it. Months with fewer records than
+            # their quota simply return less, and the slack rolls to the next year.
+            per_month = max(1, math.ceil((max_records - len(results)) / 12))
+            for month in range(1, 13):
+                if len(results) >= max_records:
+                    break
+                quota = min(per_month, max_records - len(results))
+                batch = _fetch_year(year, quota, month=month)
+                for rec in batch:
+                    key = rec.get("key") or rec.get("gbifID")
+                    if key and key not in seen_keys:
+                        seen_keys.add(key)
+                        results.append(rec)
+                pbar.update(len(batch))
 
     return results[:max_records]
 
