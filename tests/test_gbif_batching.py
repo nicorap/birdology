@@ -1,5 +1,7 @@
 """Tests for DOF year-based batching logic — no live network calls."""
 import sys
+from collections import Counter
+from datetime import date
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -135,3 +137,39 @@ def test_fetch_dof_occurrences_spreads_budget_across_months():
 
     # 1200 records over 12 months → ~100 per month, never the full 1200
     assert max(quotas) <= 1200 // 12 + 1, f"a single month asked for {max(quotas)} records"
+
+
+# ── seasonal balance (regression: a 3.4:1 Jan-Jul over-sample) ────────────────
+# The month quota was derived once per year from the budget left at the start of
+# that year. But the current year has no data after the current month, so those
+# months' quotas were forfeited and the shortfall was refilled from earlier years
+# — every month up to today got a second helping. That bias feeds straight into
+# the phenology / observations_by_month output.
+
+def test_fetch_dof_occurrences_balances_months_when_current_year_is_partial():
+    """Today is mid-year, so the current year holds no Aug-Dec records.
+
+    Those months must be filled from earlier years, not left short. The previous
+    test cannot see this: its mock returns records for every (year, month),
+    including months that have not happened yet.
+    """
+    current_year = date.today().year
+    last_month_with_data = 7  # pretend it is July: Aug-Dec of this year do not exist
+
+    def mock_fetch(year, remaining, month=None):
+        if year == current_year and month > last_month_with_data:
+            return []
+        return [{"key": f"{year}-{month:02d}-{i}", "month": month} for i in range(remaining)]
+
+    with patch("birdology.ingestion.gbif_dof._fetch_year", side_effect=mock_fetch):
+        results = fetch_dof_occurrences(max_records=12000)
+
+    per_month = Counter(r["month"] for r in results)
+    assert set(per_month) == set(range(1, 13)), f"missing months: {per_month}"
+
+    fewest, most = min(per_month.values()), max(per_month.values())
+    assert most <= fewest * 1.1, (
+        f"seasonal over-sample of {most / fewest:.1f}:1 — records per month: "
+        f"{dict(sorted(per_month.items()))}"
+    )
+    assert len(results) >= 12000 * 0.99, f"budget under-spent: only {len(results)} records"

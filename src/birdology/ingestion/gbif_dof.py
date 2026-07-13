@@ -10,7 +10,6 @@ GBIF API: https://api.gbif.org/v1/  (no auth required for reads)
 from __future__ import annotations
 
 import hashlib
-import math
 import re
 from datetime import date
 
@@ -128,9 +127,18 @@ def fetch_dof_occurrences(max_records: int = 5000) -> list[dict]:
     fetching more than that requires batching.  Batching by year alone is not
     enough: GBIF returns a year's records in index order, so the first ~9 700
     of any year all fall in the first days of January and the offset cap is hit
-    long before February.  We therefore batch by (year, month) and give each
+    long before February.  We therefore batch by (month, year) and give each
     month an equal share of the budget, which is what makes the phenology and
     migration-status data meaningful.
+
+    The loop is month-outer / year-inner, not the reverse.  Deriving each month's
+    quota from the budget left at the start of a year looks equivalent, but the
+    current year has no data after the current month: those months forfeit their
+    quota, and the shortfall gets refilled from earlier years — handing every
+    month up to today a second helping.  That produced a 3.4:1 January-July
+    over-sample, a seasonal bias in exactly the phenology data this feeds.  Giving
+    each month a fixed budget and drawing it from as many years back as needed
+    keeps the sample flat across the calendar.
 
     max_records caps total records fetched (default 5 000; use a higher value
     like 50 000 to get a broader sample).
@@ -139,27 +147,29 @@ def fetch_dof_occurrences(max_records: int = 5000) -> list[dict]:
     current_year = _date.today().year
     years = list(range(current_year, current_year - 30, -1))  # up to 30 years back
 
+    # Fixed, year-independent share per month. Never rederived from what is left,
+    # so a month that comes up empty in recent years cannot inflate another month.
+    per_month = max(1, max_records // 12)
+
     results: list[dict] = []
     seen_keys: set = set()
 
     with tqdm(total=max_records, unit="rec", desc="Fetching DOFbasen") as pbar:
-        for year in years:
-            if len(results) >= max_records:
-                break
-            # Split this year's remaining budget evenly over the 12 months so a
-            # single month can never exhaust it. Months with fewer records than
-            # their quota simply return less, and the slack rolls to the next year.
-            per_month = max(1, math.ceil((max_records - len(results)) / 12))
-            for month in range(1, 13):
-                if len(results) >= max_records:
+        for month in range(1, 13):
+            fetched_this_month = 0
+            for year in years:  # newest year first, within the month
+                if fetched_this_month >= per_month or len(results) >= max_records:
                     break
-                quota = min(per_month, max_records - len(results))
+                # _fetch_year stops itself at _GBIF_OFFSET_CAP; asking for more than
+                # that is harmless and lets a big monthly quota span several years.
+                quota = min(per_month - fetched_this_month, max_records - len(results))
                 batch = _fetch_year(year, quota, month=month)
                 for rec in batch:
                     key = rec.get("key") or rec.get("gbifID")
                     if key and key not in seen_keys:
                         seen_keys.add(key)
                         results.append(rec)
+                        fetched_this_month += 1
                 pbar.update(len(batch))
 
     return results[:max_records]
