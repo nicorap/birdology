@@ -91,6 +91,29 @@ python scripts/eval_chat.py --url http://localhost:8080 --suite conversations # 
 python scripts/eval_chat.py --url http://localhost:8080 --suite all --judge   # everything + LLM judge
 ```
 
+## Makefile — prefer these for everyday work
+
+```bash
+make            # list all targets
+make serve      # web chat on PORT (default 8080; 5000 is taken by AirPlay on macOS)
+make update     # incremental: new observations only, then enrich + reason
+make rebuild    # full: graph + enrich + reason + wiki reindex
+make reindex    # Wikipedia index alone (needs Ollama + nomic-embed-text)
+make test       # offline suite
+make eval-conversations   # multi-turn eval (needs a running server)
+make months     # observations per calendar month — should be roughly flat
+```
+
+**Three artifacts must stay in step:** `output/birdology.ttl` (the graph),
+`output/birdology_reasoned.ttl` (what the server loads), and `data/wiki_index/`
+(built from the graph's **observed** species). `make rebuild` always reindexes,
+because the index is derived from the graph — when the graph held only January
+observations, the index silently excluded every summer migrant for months.
+
+`make update` does not reindex; run `make rebuild` weekly so the index keeps up.
+**Nothing is scheduled by default** — `scripts/daily_update.sh` exists but no cron
+or launchd entry invokes it.
+
 ## Architecture
 
 The project builds an OWL/RDF knowledge graph of birds and saves it as a Turtle file (`output/birdology.ttl`).
