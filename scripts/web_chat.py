@@ -55,26 +55,46 @@ _SESSION_TTL = 7200  # 2 hours
 _MAX_HISTORY = 40    # keep last N messages (+ system prompt) to avoid bloating LLM context
 _SESSION_DB: Path | None = None  # set by _init_session_db()
 _GRAPH_PATH: Path | None = None  # set at startup; part of the capability fingerprint
+# The Chroma store behind search_wikipedia. Also a capability: when it is rebuilt,
+# "this species is not indexed" answers recorded before become wrong.
+_WIKI_INDEX_DB: Path = (
+    Path(__file__).parent.parent / "data" / "wiki_index" / "chroma.sqlite3"
+)
+
+
+def _file_id(path: Path | None) -> str:
+    """Identity of a data file: path + mtime + size. Changes when it is rebuilt."""
+    if path is None:
+        return ""
+    try:
+        st = Path(path).stat()
+        return f"{path}:{st.st_mtime_ns}:{st.st_size}"
+    except OSError:
+        return str(path)
 
 
 def _capability_fingerprint() -> str:
     """Identify what this server can currently answer with.
 
-    Covers the tool set and the graph file. When either changes, conclusions the
-    assistant reached earlier may be stale — in particular its "I don't have this
+    Covers every source of an answer: the full tool DEFINITIONS, the graph, and
+    the Wikipedia index. When any of them changes, conclusions the assistant
+    reached earlier may be stale — in particular its "I don't have this
     information" answers, which it will otherwise keep repeating from history
-    instead of calling the tool that now exists (see _get_session).
+    instead of calling the tool that can now answer (see _get_session).
+
+    Hashing tool *names* alone was not enough, twice over: a tool can gain a
+    required argument without changing its name, and the Wikipedia index is a
+    data source exactly like the graph — rebuilding it (179 -> 276 species) made
+    every earlier "not indexed" refusal wrong while the fingerprint sat still.
     """
-    tools = sorted(t["function"]["name"] for t in TOOLS_OPENAI)
-    graph_id = ""
-    ttl = _GRAPH_PATH
-    if ttl is not None:
-        try:
-            st = Path(ttl).stat()
-            graph_id = f"{ttl}:{st.st_mtime_ns}:{st.st_size}"
-        except OSError:
-            graph_id = str(ttl)
-    payload = json.dumps({"tools": tools, "graph": graph_id}, sort_keys=True)
+    payload = json.dumps(
+        {
+            "tools": TOOLS_OPENAI,          # full definitions, not just names
+            "graph": _file_id(_GRAPH_PATH),
+            "wiki": _file_id(_WIKI_INDEX_DB),
+        },
+        sort_keys=True,
+    )
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 

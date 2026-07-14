@@ -117,3 +117,44 @@ def test_legacy_db_without_capabilities_column_is_migrated(tmp_path):
     web_chat._init_session_db(path)  # must not raise
     msgs = web_chat._get_session("old")
     assert len(msgs) == 1 and msgs[0]["role"] == "system"  # legacy history dropped
+
+
+# ── the fingerprint must cover every capability, not just tool NAMES ──────────
+# Regression: after the Wikipedia index was rebuilt (179 -> 276 species) and
+# search_wikipedia gained a required scientific_name argument, the fingerprint
+# did not change — tool NAMES were identical and the graph file was untouched.
+# Sessions kept their history and the assistant went on replaying "l'index
+# Wikipedia ne contient pas cette espèce" without ever calling the tool again.
+
+def test_fingerprint_changes_when_a_tool_schema_changes(monkeypatch):
+    """A tool can gain a required argument without changing its name. That is a
+    capability change and must invalidate sessions."""
+    before = web_chat._capability_fingerprint()
+
+    tools = [
+        {"function": {"name": t["function"]["name"],
+                      "parameters": dict(t["function"].get("parameters", {}))}}
+        for t in web_chat.TOOLS_OPENAI
+    ]
+    tools[0]["function"]["parameters"] = {"required": ["a_brand_new_required_arg"]}
+    monkeypatch.setattr(web_chat, "TOOLS_OPENAI", tools)
+
+    assert web_chat._capability_fingerprint() != before, (
+        "a changed tool schema must invalidate sessions — otherwise the model "
+        "keeps replaying refusals from before the tool could answer"
+    )
+
+
+def test_fingerprint_changes_when_the_wiki_index_changes(monkeypatch, tmp_path):
+    """The Wikipedia index is a data source like the graph. Rebuilding it makes
+    every prior 'not indexed' answer stale."""
+    idx = tmp_path / "chroma.sqlite3"
+    idx.write_bytes(b"old index")
+    monkeypatch.setattr(web_chat, "_WIKI_INDEX_DB", idx)
+    before = web_chat._capability_fingerprint()
+
+    idx.write_bytes(b"a much larger rebuilt index with more species")
+
+    assert web_chat._capability_fingerprint() != before, (
+        "rebuilding the wiki index must invalidate sessions"
+    )
