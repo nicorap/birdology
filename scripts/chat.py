@@ -480,8 +480,16 @@ TOOLS_OPENAI = [
                             "'Barn Swallow migration route', 'Great Tit song description'"
                         ),
                     },
+                    "scientific_name": {
+                        "type": "string",
+                        "description": (
+                            "Scientific (binomial) name of the species, e.g. 'Limosa limosa'. "
+                            "Take it from find_species — call that first. Results are restricted "
+                            "to this species, so the article can never be about another bird."
+                        ),
+                    },
                 },
-                "required": ["query"],
+                "required": ["query", "scientific_name"],
             },
         },
     },
@@ -601,13 +609,15 @@ on a specific species in a live context (e.g. "pas d'aigle royal ?" after a live
 **When the user mentions a city or place** (e.g. "près de Copenhague", "autour d'Aarhus"), \
 pass `lat`/`lon` coordinates for that place — do NOT omit them.
 - **ALWAYS call `search_wikipedia`** when the user asks about behavior (comportement), habitat, \
-song (chant), courtship, diet (régime alimentaire), or ecology of a specific species — \
-**call it even if you did NOT call `find_species` first** (e.g. "décris le comportement du \
-rouge-gorge" → call `search_wikipedia("European Robin")` directly). \
-Call it at most once per question — if it returns no results, say the Wikipedia index does not \
-yet cover this species, and answer from your own knowledge if you can, clearly labeling it as such. \
-**Always write `search_wikipedia` queries in English** (use the English common name or scientific \
-name). The Wikipedia index is in English — French queries reduce recall.
+song (chant), courtship, diet (régime alimentaire), or ecology of a specific species. \
+**Call `find_species` first** and pass its `scientificName` as the `scientific_name` argument: \
+results are restricted to that species, so the article can never be about a different bird. \
+Call it at most once per question. **If it returns an `error` saying the species is not indexed, \
+say plainly that you have no Wikipedia information for that species — and STOP. Do NOT answer \
+from your own knowledge, do NOT describe the species from memory, and do NOT substitute \
+information about a related or similar bird** (Rule 1 applies here without exception). \
+**Always write the `query` in English** (English common name or scientific name). \
+The Wikipedia index is in English — French queries reduce recall.
 - **Use `phenology`** (always together with `migration_timing`) for arrival/departure questions \
 and whenever the user asks about seasonal or monthly presence patterns: \
 "phénologie", "présence mensuelle", "seasonal chart", "which months". \
@@ -932,9 +942,17 @@ def _run_tool(name: str, inputs: dict, graph) -> str:
                 "Wikipedia index not built yet. "
                 "Run: python scripts/build_wiki_index.py"
             )
-        results = rag.search(inputs["query"], n_results=4)
+        sci = inputs.get("scientific_name") or ""
+        results = rag.search(inputs["query"], n_results=4, scientific_name=sci or None)
         if not results:
-            return "No Wikipedia results found for this query."
+            # Say the species is missing. Falling back to an unfiltered search here
+            # would hand back another bird's article, which is how the Godwit's
+            # biology came back as somebody else's.
+            return json.dumps({
+                "error": f"'{sci}' is not indexed in the Wikipedia index — "
+                         f"no article available for this species.",
+                "scientific_name": sci,
+            }, ensure_ascii=False)
         return json.dumps(results, ensure_ascii=False, indent=2)
 
     return f"Unknown tool: {name}"
