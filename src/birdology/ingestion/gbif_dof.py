@@ -24,6 +24,10 @@ _GBIF_BASE = "https://api.gbif.org/v1"
 _DOF_DATASET_KEY = "95db4db8-f762-11e1-a439-00145eb45e9a"
 _TIMEOUT = 30
 _PAGE_SIZE = 300  # GBIF max per request
+# DOFbasen is bird-focused but contains a small fraction of non-avian records
+# (mammals, etc.). Restrict fetches to the GBIF backbone class Aves so only
+# birds enter the graph.
+_AVES_TAXON_KEY = 212
 
 # IUCN Red List categories ordered from most to least threatened
 IUCN_RANK = {"CR": 0, "EN": 1, "VU": 2, "NT": 3, "LC": 4, "DD": 5, "NE": 6}
@@ -42,8 +46,9 @@ IUCN_LABELS = {
 
 _GBIF_OFFSET_CAP = 9_700   # GBIF hard-caps offset at ~10 000; stay safely under
 
-def _fetch_year(year: int, remaining: int) -> list[dict]:
-    """Fetch up to *remaining* occurrences for a single calendar year."""
+def _fetch_year(year: int, remaining: int, month: int | None = None) -> list[dict]:
+    """Fetch up to *remaining* occurrences for a calendar year, optionally
+    narrowed to a single *month*."""
     results: list[dict] = []
     offset = 0
     while len(results) < remaining:
@@ -53,8 +58,11 @@ def _fetch_year(year: int, remaining: int) -> list[dict]:
             "limit": limit,
             "offset": offset,
             "basisOfRecord": "HUMAN_OBSERVATION",
+            "taxonKey": _AVES_TAXON_KEY,
             "year": year,
         }
+        if month is not None:
+            params["month"] = month
         resp = requests.get(
             f"{_GBIF_BASE}/occurrence/search", params=params, timeout=_TIMEOUT
         )
@@ -89,6 +97,7 @@ def fetch_dof_occurrences_since(
                 "limit": limit,
                 "offset": offset,
                 "basisOfRecord": "HUMAN_OBSERVATION",
+                "taxonKey": _AVES_TAXON_KEY,
                 "eventDate": f"{since_str},*",
             }
             resp = requests.get(
@@ -115,30 +124,53 @@ def fetch_dof_occurrences(max_records: int = 5000) -> list[dict]:
     Fetch occurrence records from the DOF GBIF dataset.
 
     The GBIF occurrence search API caps the offset at ~10 000 per query, so
-    fetching more than that requires batching by year.  We iterate recent years
-    newest-first until *max_records* is reached.
+    fetching more than that requires batching.  Batching by year alone is not
+    enough: GBIF returns a year's records in index order, so the first ~9 700
+    of any year all fall in the first days of January and the offset cap is hit
+    long before February.  We therefore batch by (month, year) and give each
+    month an equal share of the budget, which is what makes the phenology and
+    migration-status data meaningful.
+
+    The loop is month-outer / year-inner, not the reverse.  Deriving each month's
+    quota from the budget left at the start of a year looks equivalent, but the
+    current year has no data after the current month: those months forfeit their
+    quota, and the shortfall gets refilled from earlier years — handing every
+    month up to today a second helping.  That produced a 3.4:1 January-July
+    over-sample, a seasonal bias in exactly the phenology data this feeds.  Giving
+    each month a fixed budget and drawing it from as many years back as needed
+    keeps the sample flat across the calendar.
 
     max_records caps total records fetched (default 5 000; use a higher value
-    like 50 000 to get a broader sample — each year contributes up to ~9 700).
+    like 50 000 to get a broader sample).
     """
     from datetime import date as _date
     current_year = _date.today().year
     years = list(range(current_year, current_year - 30, -1))  # up to 30 years back
 
+    # Fixed, year-independent share per month. Never rederived from what is left,
+    # so a month that comes up empty in recent years cannot inflate another month.
+    per_month = max(1, max_records // 12)
+
     results: list[dict] = []
     seen_keys: set = set()
 
     with tqdm(total=max_records, unit="rec", desc="Fetching DOFbasen") as pbar:
-        for year in years:
-            if len(results) >= max_records:
-                break
-            batch = _fetch_year(year, max_records - len(results))
-            for rec in batch:
-                key = rec.get("key") or rec.get("gbifID")
-                if key and key not in seen_keys:
-                    seen_keys.add(key)
-                    results.append(rec)
-            pbar.update(len(batch))
+        for month in range(1, 13):
+            fetched_this_month = 0
+            for year in years:  # newest year first, within the month
+                if fetched_this_month >= per_month or len(results) >= max_records:
+                    break
+                # _fetch_year stops itself at _GBIF_OFFSET_CAP; asking for more than
+                # that is harmless and lets a big monthly quota span several years.
+                quota = min(per_month - fetched_this_month, max_records - len(results))
+                batch = _fetch_year(year, quota, month=month)
+                for rec in batch:
+                    key = rec.get("key") or rec.get("gbifID")
+                    if key and key not in seen_keys:
+                        seen_keys.add(key)
+                        results.append(rec)
+                        fetched_this_month += 1
+                pbar.update(len(batch))
 
     return results[:max_records]
 

@@ -17,10 +17,11 @@
     background: #0f1117;
     color: #e0e0e0;
     display: grid;
-    grid-template-rows: auto 1fr;
-    grid-template-columns: minmax(380px, 1fr) 1.3fr;
+    grid-template-rows: auto auto 1fr;
+    grid-template-columns: minmax(380px, 1fr) 1.4fr;
     grid-template-areas:
       "header header"
+      "alerts alerts"
       "chat   panels";
     overflow: hidden;
   }
@@ -179,6 +180,44 @@
   .iucn-EN { background: #e65100; }
   .iucn-VU { background: #f9a825; color: #333; }
   .iucn-NT { background: #1565c0; }
+
+  #calendar-btn {
+    background: #2d5a3d; color: #7dcea0; border: none; border-radius: 10px;
+    padding: 8px 14px; font-size: 13px; cursor: pointer; margin-right: 8px;
+  }
+  #calendar-btn:hover { background: #3a7a50; }
+
+  #calendar-panel {
+    position: fixed; inset: 0; z-index: 2000; background: #0f1117;
+    display: none; flex-direction: column; padding: 18px 22px; overflow: hidden;
+  }
+  #calendar-panel.visible { display: flex; }
+  #calendar-panel .cal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+  #calendar-panel h2 { font-size: 18px; color: #7dcea0; }
+  .cal-close {
+    background: transparent; border: 1px solid #3a3d4a; color: #a0a8c0;
+    padding: 4px 12px; border-radius: 6px; cursor: pointer; font-size: 13px;
+  }
+  .cal-close:hover { border-color: #7dcea0; color: #7dcea0; }
+
+  #cal-forecast { display: flex; gap: 18px; flex-wrap: wrap; margin-bottom: 14px; font-size: 12px; }
+  .cal-forecast-group { background: #1a1d27; border: 1px solid #2a2d3a; border-radius: 8px; padding: 8px 12px; }
+  .cal-forecast-group .cal-fc-title { color: #7dcea0; font-weight: 600; margin-bottom: 4px; }
+  .cal-forecast-group .cal-fc-names { color: #c0c8d8; }
+
+  #cal-grid-wrap { flex: 1; overflow-y: auto; }
+  .cal-grid { width: 100%; border-collapse: collapse; }
+  .cal-grid th { position: sticky; top: 0; background: #0f1117; color: #8a94a8; font-size: 11px; font-weight: 500; padding: 4px 2px; text-align: center; }
+  .cal-grid th.cal-name-col { text-align: left; padding-left: 8px; }
+  .cal-row { cursor: pointer; }
+  .cal-row:hover td { background: #171a22; }
+  .cal-name { display: flex; align-items: center; gap: 8px; padding: 3px 8px; white-space: nowrap; }
+  .cal-name img { width: 26px; height: 26px; border-radius: 4px; object-fit: cover; background: #252830; }
+  .cal-name .cal-nm { font-size: 13px; color: #e0e0e0; }
+  .cal-name .cal-sci { font-size: 11px; color: #7a8496; font-style: italic; }
+  .cal-cell { width: 26px; height: 20px; border-radius: 3px; }
+  .cal-cell.on { }
+  th.cal-current, td.cal-current { box-shadow: inset 1px 0 0 #7dcea0, inset -1px 0 0 #7dcea0; }
 
   /* ── Weekend panel ───────────────────────────────────────────────── */
   #weekend-panel {
@@ -344,6 +383,66 @@
 
   #spots-panel, #cards-panel { border-top: 1px solid #2a2d3a; }
   #map { flex: 1; background: #0f1117; }
+
+  /* Alerts strip — horizontal across the top */
+  #alerts-panel {
+    grid-area: alerts;
+    background: #14161e;
+    border-bottom: 1px solid #2a2d3a;
+    display: flex;
+    flex-direction: column;
+    max-height: 110px;
+  }
+  #alerts-panel .panel-header { padding: 6px 14px; font-size: 11px; }
+  #alerts-list {
+    flex: 1;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 6px 12px 8px 12px;
+    display: flex;
+    flex-direction: row;
+    gap: 8px;
+    align-items: stretch;
+  }
+  .alert-row {
+    flex: 0 0 290px;
+    display: grid;
+    grid-template-columns: 38px 1fr auto;
+    gap: 10px;
+    align-items: center;
+    background: #1a1d27;
+    border: 1px solid #2a2d3a;
+    border-left: 3px solid #c0a050;
+    border-radius: 8px;
+    padding: 6px 10px;
+    cursor: pointer;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .alert-row:hover { background: #1e2130; border-left-color: #e8c870; }
+  .alert-row.cr { border-left-color: #d04a4a; }
+  .alert-row.en { border-left-color: #d07a3a; }
+  .alert-row.vu { border-left-color: #c0a050; }
+  .alert-row.nt { border-left-color: #6a8ec0; }
+  .alert-status {
+    font-size: 11px;
+    font-weight: 700;
+    text-align: center;
+    padding: 4px 0;
+    border-radius: 4px;
+    background: #252830;
+    color: #f0f0f0;
+  }
+  .alert-row.cr .alert-status { background: #4a1f1f; color: #ffb0b0; }
+  .alert-row.en .alert-status { background: #4a2f1a; color: #ffc890; }
+  .alert-row.vu .alert-status { background: #3a3520; color: #ffe8a0; }
+  .alert-row.nt .alert-status { background: #1f2f4a; color: #b0d0ff; }
+  .alert-info { min-width: 0; }
+  .alert-info .name { font-size: 13px; color: #f0f0f0; font-weight: 600; line-height: 1.3; }
+  .alert-info .sci { font-size: 11px; color: #7dcea0; font-style: italic; }
+  .alert-info .where { font-size: 11px; color: #8a8a8a; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .alert-date { font-size: 11px; color: #8a8a8a; white-space: nowrap; }
+  .alert-empty { padding: 16px; color: #7dcea0; font-size: 13px; text-align: center; }
+  /* Map dark theme tweaks */
   .leaflet-container { background: #1a1d27; }
   .leaflet-popup-content-wrapper, .leaflet-popup-tip {
     background: #1a1d27; color: #e0e0e0; border: 1px solid #2a2d3a;
@@ -366,7 +465,7 @@
   .species-card {
     background: #1a1d27;
     border: 1px solid #2a2d3a;
-    border-radius: 10px;
+    border-radius: 12px;
     overflow: hidden;
     cursor: pointer;
     transition: border-color 0.15s, transform 0.15s;
@@ -379,15 +478,15 @@
     background: #252830;
     display: block;
   }
-  .species-card .meta { padding: 8px 10px; }
-  .species-card .name { font-size: 12px; color: #f0f0f0; font-weight: 600; line-height: 1.3; }
-  .species-card .sci { font-size: 11px; color: #7dcea0; font-style: italic; margin-top: 2px; }
-  .species-card .obs-count { font-size: 10px; color: #6a7a8a; margin-top: 4px; }
+  .species-card .meta { padding: 10px 12px; }
+  .species-card .name { font-size: 14px; color: #f0f0f0; font-weight: 600; line-height: 1.3; }
+  .species-card .sci { font-size: 12px; color: #7dcea0; font-style: italic; margin-top: 3px; }
+  .species-card .obs-count { font-size: 11px; color: #6a7a8a; margin-top: 5px; }
 
   .panel-loading { padding: 20px; color: #666; font-size: 12px; text-align: center; }
 
   @media (max-width: 900px) {
-    body { grid-template-columns: 1fr; grid-template-areas: "header" "chat" "panels"; grid-template-rows: auto 1fr 60vh; }
+    body { grid-template-columns: 1fr; grid-template-areas: "header" "alerts" "chat" "panels"; grid-template-rows: auto auto 1fr 60vh; }
     #chat-column { border-right: none; border-bottom: 1px solid #2a2d3a; }
   }
 </style>
@@ -397,6 +496,7 @@
 <header>
   <h1>Birdology</h1>
   <span class="badge">Graph-RAG</span>
+  <button id="calendar-btn">📅 Migration calendar</button>
   <button id="weekend-btn">What to watch this weekend?</button>
   <button id="new-chat-btn">New chat</button>
 </header>
@@ -422,6 +522,13 @@
     </div>
   </div>
 </div>
+
+<section id="alerts-panel" class="panel">
+  <div class="panel-header">⚠ Recently observed threatened species <span class="count" id="alerts-count"></span></div>
+  <div id="alerts-list">
+    <div class="panel-loading">Loading...</div>
+  </div>
+</section>
 
 <div id="panels">
   <section id="map-panel" class="panel">
@@ -463,6 +570,15 @@
     </div>
     <div id="spots-panel-body"><div class="panel-loading">Loading...</div></div>
   </section>
+</div>
+
+<div id="calendar-panel">
+  <div class="cal-head">
+    <h2>📅 Migration calendar <span id="cal-count" style="color:#6a7a8a;font-size:13px;font-weight:400"></span></h2>
+    <button class="cal-close" id="cal-close-btn">✕ Close</button>
+  </div>
+  <div id="cal-forecast"></div>
+  <div id="cal-grid-wrap"><div class="panel-loading">Loading…</div></div>
 </div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -839,7 +955,36 @@ fetch('/api/observations').then(function(r) { return r.json(); }).then(function(
   console.error(e);
 });
 
-// ── Species cards (right panel) ──────────────────────────────────────────
+// ── Rare-nearby alerts ───────────────────────────────────────────────────
+var alertsList = document.getElementById('alerts-list');
+fetch('/api/rare-nearby').then(function(r) { return r.json(); }).then(function(rows) {
+  document.getElementById('alerts-count').textContent = rows.length + ' (25 km Norrebro)';
+  if (!rows.length) {
+    alertsList.innerHTML = '<div class="alert-empty">No threatened species observed recently within 25 km.</div>';
+    return;
+  }
+  alertsList.innerHTML = '';
+  rows.forEach(function(r) {
+    var name = r.commonName || r.scientificName;
+    var statusClass = (r.status || '').toLowerCase();
+    var row = document.createElement('div');
+    row.className = 'alert-row ' + statusClass;
+    row.innerHTML = '<div class="alert-status">' + escapeHtml(r.status) + '</div>'
+      + '<div class="alert-info">'
+      +   '<div class="name">' + escapeHtml(name) + '</div>'
+      + (r.scientificName && r.scientificName !== name ? '<div class="sci">' + escapeHtml(r.scientificName) + '</div>' : '')
+      + (r.locality ? '<div class="where">' + escapeHtml(r.locality) + '</div>' : '')
+      + '</div>'
+      + '<div class="alert-date">' + escapeHtml(r.date || '') + '</div>';
+    row.addEventListener('click', function() { askAbout(name); });
+    alertsList.appendChild(row);
+  });
+}).catch(function(e) {
+  alertsList.innerHTML = '<div class="panel-loading">Loading error</div>';
+  console.error(e);
+});
+
+// ── Species cards ────────────────────────────────────────────────────────
 var cardsGrid = document.getElementById('cards-grid');
 
 function renderRelevantCards(spots) {
@@ -1059,6 +1204,91 @@ document.getElementById('weekend-btn').addEventListener('click', function() {
   doSend();
 });
 
+
+// ── Migration calendar overlay ───────────────────────────────────────────
+var migColors = {
+  'Resident': '#7dcea0', 'SummerVisitor': '#e8c46a', 'WinterVisitor': '#6a9ec0',
+  'PassageMigrant': '#5fb0a0', 'PartialMigrant': '#b58ad0'
+};
+var calLoaded = false;
+
+function cyclic(m, delta) { return ((m - 1 + delta) % 12 + 12) % 12 + 1; }
+
+function renderCalendar(rows) {
+  var now = new Date().getMonth() + 1;
+  // Forecast: arriving / peaking / leaving this or next month.
+  var arriving = [], leaving = [], peaking = [];
+  rows.forEach(function(r) {
+    var soon = [now, cyclic(now, 1)];
+    if (r.arrivalMonth && soon.indexOf(r.arrivalMonth) !== -1) arriving.push(r.commonName);
+    else if (r.departureMonth && soon.indexOf(r.departureMonth) !== -1) leaving.push(r.commonName);
+    else if (r.migrationStatus !== 'Resident' && r.months[now - 1]) peaking.push(r.commonName);
+  });
+  function group(title, names) {
+    if (!names.length) return '';
+    return '<div class="cal-forecast-group"><div class="cal-fc-title">' + title + ' (' + names.length + ')</div>'
+      + '<div class="cal-fc-names">' + names.slice(0, 6).map(escapeHtml).join(', ') + (names.length > 6 ? '…' : '') + '</div></div>';
+  }
+  document.getElementById('cal-forecast').innerHTML =
+    group('↑ Arriving', arriving) + group('● Peaking', peaking) + group('↓ Leaving soon', leaving);
+
+  // Sort: non-residents by arrival month, residents block at the bottom.
+  var sorted = rows.slice().sort(function(a, b) {
+    var aa = a.arrivalMonth || 99, bb = b.arrivalMonth || 99;
+    if (aa !== bb) return aa - bb;
+    return a.commonName.localeCompare(b.commonName);
+  });
+
+  var letters = ['J','F','M','A','M','J','J','A','S','O','N','D'];
+  var html = '<table class="cal-grid"><thead><tr><th class="cal-name-col">Species</th>';
+  for (var i = 0; i < 12; i++) html += '<th' + (i + 1 === now ? ' class="cal-current"' : '') + '>' + letters[i] + '</th>';
+  html += '</tr></thead><tbody>';
+  sorted.forEach(function(r) {
+    var color = migColors[r.migrationStatus] || '#4a5568';
+    var thumb = r.thumbnail
+      ? '<img src="' + escapeAttr(r.thumbnail) + '" alt="" loading="lazy" onerror="this.style.visibility=\'hidden\'">'
+      : '<img alt="" style="visibility:hidden">';
+    html += '<tr class="cal-row" data-name="' + escapeAttr(r.commonName) + '">';
+    html += '<td class="cal-name">' + thumb + '<span class="cal-nm">' + escapeHtml(r.commonName)
+      + '</span> <span class="cal-sci">' + escapeHtml(r.scientificName) + '</span></td>';
+    for (var m = 0; m < 12; m++) {
+      var cur = (m + 1 === now) ? ' cal-current' : '';
+      var cell = r.months[m]
+        ? '<div class="cal-cell on" style="background:' + color + '"></div>'
+        : '<div class="cal-cell"></div>';
+      html += '<td class="' + cur.trim() + '">' + cell + '</td>';
+    }
+    html += '</tr>';
+  });
+  html += '</tbody></table>';
+  document.getElementById('cal-grid-wrap').innerHTML = html;
+  document.getElementById('cal-grid-wrap').querySelectorAll('.cal-row').forEach(function(tr) {
+    tr.addEventListener('click', function() { openCalSpecies(tr.dataset.name); });
+  });
+  document.getElementById('cal-count').textContent = rows.length + ' species';
+}
+
+function openCalSpecies(name) {
+  document.getElementById('calendar-panel').classList.remove('visible');
+  askAbout(name);
+}
+
+function openCalendar() {
+  document.getElementById('calendar-panel').classList.add('visible');
+  if (calLoaded) return;
+  fetch('/api/migration-calendar').then(function(r) { return r.json(); }).then(function(rows) {
+    calLoaded = true;
+    renderCalendar(rows);
+  }).catch(function(e) {
+    document.getElementById('cal-grid-wrap').innerHTML = '<div class="panel-loading">Error loading calendar</div>';
+    console.error(e);
+  });
+}
+
+document.getElementById('calendar-btn').addEventListener('click', openCalendar);
+document.getElementById('cal-close-btn').addEventListener('click', function() {
+  document.getElementById('calendar-panel').classList.remove('visible');
+});
 
 userInput.focus();
 </script>

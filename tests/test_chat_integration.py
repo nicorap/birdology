@@ -19,10 +19,22 @@ _TIMEOUT = 120  # seconds — LLM calls can be slow
 
 
 def _server_available() -> bool:
+    """True only if the birdology web_chat server actually answers.
+
+    A bare "did we get a response?" check is not enough: on macOS the
+    AirPlay Receiver (ControlCenter) squats on port 5000 and returns HTTP
+    403, which would fool the skip guard into running every test against
+    AirPlay. Require a 200 with the JSON dict /api/dashboard returns.
+    """
     try:
-        requests.get(f"{_BASE}/api/dashboard", timeout=3)
-        return True
+        r = requests.get(f"{_BASE}/api/dashboard", timeout=3)
     except Exception:
+        return False
+    if r.status_code != 200:
+        return False
+    try:
+        return isinstance(r.json(), dict)
+    except ValueError:
         return False
 
 

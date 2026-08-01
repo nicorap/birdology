@@ -235,20 +235,40 @@ class WikiRAG:
             time.sleep(_REQUEST_DELAY)
         return total
 
-    def search(self, query: str, n_results: int = 5) -> list[dict]:
+    def search(
+        self,
+        query: str,
+        n_results: int = 5,
+        scientific_name: str | None = None,
+    ) -> list[dict]:
         """
         Semantic search over indexed chunks.
         Returns list of dicts with keys: text, species, scientific_name, wiki_url, score.
+
+        When *scientific_name* is given, results are restricted to that species.
+        Without it a nearest-neighbour search happily returns chunks about OTHER
+        birds when the species asked about is not indexed — which is how a
+        Black-tailed Godwit's biology came back as a Redshank's. The caller gets
+        nothing rather than the wrong bird.
         """
         col = self._get_collection()
         count = col.count()
         if count == 0:
             return []
 
+        where = None
+        binomial = None
+        if scientific_name:
+            # The index stores the binomial with the author stripped; normalise
+            # identically or the filter silently matches nothing.
+            binomial = " ".join(scientific_name.split()[:2])
+            where = {"scientific_name": binomial}
+
         query_emb = self._embed(query)
         results = col.query(
             query_embeddings=[query_emb],
             n_results=min(n_results, count),
+            where=where,
             include=["documents", "metadatas", "distances"],
         )
 
@@ -258,6 +278,9 @@ class WikiRAG:
             results["metadatas"][0],
             results["distances"][0],
         ):
+            # Belt and braces: never hand back a chunk about a different species.
+            if binomial and meta.get("scientific_name") != binomial:
+                continue
             out.append({
                 "text": doc,
                 "species": meta.get("common_name") or meta.get("scientific_name", ""),

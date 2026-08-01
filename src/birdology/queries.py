@@ -7,6 +7,7 @@ result row dicts for easy consumption.
 from __future__ import annotations
 
 import math
+import re
 import unicodedata
 
 from rdflib import ConjunctiveGraph, Graph
@@ -460,7 +461,7 @@ WHERE {{
     q_names = (
         _PREFIXES
         + f"""
-SELECT ?species ?scientificName ?commonNameFr ?commonNameDa ?commonNameEn ?status
+SELECT ?species ?scientificName ?commonNameFr ?commonNameDa ?commonNameEn ?status ?thumbnail
 WHERE {{
     {values}
     ?species dwc:scientificName ?scientificName .
@@ -468,6 +469,11 @@ WHERE {{
     OPTIONAL {{ ?species bird:commonNameDa      ?commonNameDa }}
     OPTIONAL {{ ?species bird:commonNameEn      ?commonNameEn }}
     OPTIONAL {{ ?species bird:conservationStatus ?status }}
+    OPTIONAL {{
+        {{ ?species bird:thumbnailUrl ?thumbnail }}
+        UNION
+        {{ ?species owl:sameAs ?alt . ?alt bird:thumbnailUrl ?thumbnail }}
+    }}
 }}
 """
     )
@@ -580,6 +586,115 @@ ORDER BY ?scientificName DESC(?date)
             or _name_matches(r.get("commonNameDa", ""), species_filter)
         ]
     return rows
+
+
+def observation_locations(
+    g: Graph | ConjunctiveGraph,
+    species_name: str,
+    limit: int = 20,
+) -> list[dict]:
+    """Where a species has actually been observed, grouped by site.
+
+    Answers "where was species X seen?". Each row is one location, not one
+    sighting: locality, lat, lon, observationCount, latestDate, totalIndividuals.
+    Sorted by observation count descending (the most reliable sites first).
+
+    Matching is case- and accent-insensitive across scientific, English, Danish
+    and French names.
+    """
+    limit = _sparql_int(limit)
+    name_filter = _sparql_name_filter(
+        "?scientificName", "?commonNameEn", "?commonNameDa", "?commonNameFr",
+        query=species_name,
+    )
+
+    # Two things this query has to survive on the reasoned graph:
+    #
+    # 1. The name filter is a substring match, so "Carduelis" matches several
+    #    species. ?species and ?scientificName are therefore in both SELECT and
+    #    GROUP BY: without them, congeners seen at one site collapse into a single
+    #    row and the caller cannot tell whose count — or whose photo — it holds.
+    #
+    # 2. The reasoner's owl:sameAs closure copies every species property onto the
+    #    ebird:/gbif: alias IRIs, so a thumbnail lookup reaching through owl:sameAs
+    #    matches once per alias and multiplies the observation rows: 1+N rows per
+    #    (species, obs). COUNT(DISTINCT ?obs) is immune, SUM(?count) was not — it
+    #    reported 3x the true individual count. The thumbnail is therefore NOT
+    #    joined here at all; it is resolved afterwards, keyed on the species we
+    #    actually return (_thumbnails_for). That keeps this aggregate strictly
+    #    one-row-per-observation, so SUM cannot be inflated by any alias.
+    q = (
+        _PREFIXES
+        + f"""
+SELECT ?species ?scientificName ?locality ?lat ?lon
+       (COUNT(DISTINCT ?obs) AS ?obsCount)
+       (MAX(?date) AS ?latestDate)
+       (SUM(?count) AS ?totalIndividuals)
+WHERE {{
+    ?species a bird:Species ;
+             dwc:scientificName ?scientificName ;
+             bird:hasObservation ?obs .
+    {_CANONICAL_SPECIES}
+    ?obs bird:observedAt ?loc .
+    ?loc bird:latitude  ?lat ;
+         bird:longitude ?lon .
+    OPTIONAL {{ ?loc bird:locality        ?locality }}
+    OPTIONAL {{ ?obs bird:observedOn      ?date }}
+    OPTIONAL {{ ?obs bird:individualCount ?count }}
+    OPTIONAL {{ ?species bird:commonNameEn ?commonNameEn }}
+    OPTIONAL {{ ?species bird:commonNameDa ?commonNameDa }}
+    OPTIONAL {{ ?species bird:commonNameFr ?commonNameFr }}
+    {name_filter}
+}}
+GROUP BY ?species ?scientificName ?loc ?locality ?lat ?lon
+ORDER BY DESC(?obsCount)
+LIMIT {limit}
+"""
+    )
+    rows = _rows(g.query(q))
+    thumbs = _thumbnails_for(g, {r["species"] for r in rows if r.get("species")})
+    for r in rows:
+        r["observationCount"] = r.pop("obsCount", 0)
+        thumb = thumbs.get(r.get("species"))
+        if thumb:
+            r["thumbnail"] = thumb
+    return rows
+
+
+def _thumbnails_for(g: Graph | ConjunctiveGraph, species_uris: set[str]) -> dict[str, str]:
+    """Map species IRI → thumbnail URL, following owl:sameAs to the alias IRIs.
+
+    Split out of the aggregate query on purpose: reaching through owl:sameAs inside
+    an aggregate multiplies the rows being summed (see observation_locations).
+
+    One small query per species, with the IRI inlined. That looks like the naive
+    shape, but it is the fast one: batching the species into a `VALUES ?species`
+    block joined against the owl:sameAs UNION makes Oxigraph evaluate the UNION
+    with an unbound subject — a full scan of the 1.2M-triple store, ~17s — while
+    each inlined lookup resolves off the index in ~0ms. The species set is bounded
+    by the caller's LIMIT (20 by default), so this stays a handful of point reads.
+    """
+    thumbs: dict[str, str] = {}
+    for uri in species_uris:
+        # These IRIs come back out of the graph, but they are being spliced into a
+        # query string — refuse anything that could not be a plain IRI.
+        if not uri or re.search(r'[\s<>"{}|\\^`]', uri):
+            continue
+        q = (
+            _PREFIXES
+            + f"""
+SELECT ?t WHERE {{
+    {{ <{uri}> bird:thumbnailUrl ?t }}
+    UNION
+    {{ <{uri}> owl:sameAs ?alt . ?alt bird:thumbnailUrl ?t }}
+}}
+LIMIT 1
+"""
+        )
+        rows = _rows(g.query(q))
+        if rows and rows[0].get("t"):
+            thumbs[uri] = rows[0]["t"]
+    return thumbs
 
 
 def observations_by_month(
@@ -1007,3 +1122,87 @@ def taxonomy_summary(g: Graph | ConjunctiveGraph) -> dict:
         rows = list(g.query(q))
         counts[label] = int(rows[0]["n"]) if rows else 0
     return counts
+
+
+def _month_bools(months: set[int]) -> list[bool]:
+    """12-element presence list, index 0 = January."""
+    return [m in months for m in range(1, 13)]
+
+
+def _arrival_departure(months: set[int]) -> tuple[int | None, int | None]:
+    """Cyclic month-granularity arrival/departure edges.
+
+    arrival = smallest present month whose previous month (cyclic) is absent;
+    departure = smallest present month whose next month (cyclic) is absent.
+    Residents (all 12) and empties have neither.
+    """
+    if not months or len(months) == 12:
+        return (None, None)
+    prev_absent = [m for m in range(1, 13) if m in months and ((m - 2) % 12 + 1) not in months]
+    next_absent = [m for m in range(1, 13) if m in months and (m % 12 + 1) not in months]
+    arrival = min(prev_absent) if prev_absent else None
+    departure = min(next_absent) if next_absent else None
+    return (arrival, departure)
+
+
+def migration_calendar(g: Graph | ConjunctiveGraph) -> list[dict]:
+    """One row per observed, classified species: month-presence + arrival/departure.
+
+    Grouped by scientificName so owl:sameAs-split nodes merge into a single row.
+    """
+    q = (
+        _PREFIXES
+        + f"""
+SELECT ?scientificName ?commonNameEn ?commonNameFr ?commonNameDa
+       ?migrationStatus ?thumbnail ?month
+WHERE {{
+    ?species a bird:Species ;
+             dwc:scientificName    ?scientificName ;
+             bird:migrationStatus  ?migrationStatus .
+    FILTER EXISTS {{ ?species bird:hasObservation [] }}
+    {_CANONICAL_SPECIES}
+    OPTIONAL {{ ?species bird:typicallyPresentInMonth ?month }}
+    OPTIONAL {{
+        {{ ?species bird:thumbnailUrl ?thumbnail }}
+        UNION
+        {{ ?species owl:sameAs ?alt . ?alt bird:thumbnailUrl ?thumbnail }}
+    }}
+    OPTIONAL {{ ?species bird:commonNameEn ?commonNameEn }}
+    OPTIONAL {{ ?species bird:commonNameFr ?commonNameFr }}
+    OPTIONAL {{ ?species bird:commonNameDa ?commonNameDa }}
+}}
+"""
+    )
+    grouped: dict[str, dict] = {}
+    for row in g.query(q):
+        sci = str(row.scientificName)
+        entry = grouped.setdefault(sci, {
+            "scientificName": sci,
+            "commonName": "",
+            "thumbnail": "",
+            "migrationStatus": str(row.migrationStatus),
+            "months": set(),
+        })
+        if row.month is not None:
+            entry["months"].add(int(str(row.month)))
+        if not entry["thumbnail"] and row.thumbnail is not None:
+            entry["thumbnail"] = str(row.thumbnail)
+        if not entry["commonName"]:
+            name = row.commonNameFr or row.commonNameEn or row.commonNameDa
+            if name is not None:
+                entry["commonName"] = str(name)
+
+    out = []
+    for entry in grouped.values():
+        months = entry["months"]
+        arrival, departure = _arrival_departure(months)
+        out.append({
+            "commonName": entry["commonName"] or entry["scientificName"],
+            "scientificName": entry["scientificName"],
+            "thumbnail": entry["thumbnail"],
+            "migrationStatus": entry["migrationStatus"],
+            "months": _month_bools(months),
+            "arrivalMonth": arrival,
+            "departureMonth": departure,
+        })
+    return out

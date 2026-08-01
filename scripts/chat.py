@@ -36,6 +36,7 @@ from birdology.queries import (
     migration_timing,
     nearby_watch,
     phenology,
+    observation_locations,
     observations_by_month,
     recent_danish_observations,
     species_by_family,
@@ -406,6 +407,37 @@ TOOLS_OPENAI = [
     {
         "type": "function",
         "function": {
+            "name": "where_seen",
+            "description": (
+                "Return the places where a species has actually been observed, from DOF "
+                "graph data — one row per site, with locality name, coordinates, how many "
+                "observations there, and the most recent date. Sorted by observation count, "
+                "so the best sites come first. "
+                "Use this whenever the user asks WHERE a particular species was or can be "
+                "seen: 'où a-t-il été vu ?', 'où observer le chardonneret ?', "
+                "'where was it seen?', 'hvor er den set?'. "
+                "This is species-first — unlike where_to_watch, which is location-first "
+                "(best hotspots near given coordinates, regardless of species)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "species_name": {
+                        "type": "string",
+                        "description": "Species name in any language or scientific name",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max number of sites to return (default 20)",
+                    },
+                },
+                "required": ["species_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "migration_timing",
             "description": (
                 "Return arrival and departure timing for a bird species in Denmark, "
@@ -448,8 +480,16 @@ TOOLS_OPENAI = [
                             "'Barn Swallow migration route', 'Great Tit song description'"
                         ),
                     },
+                    "scientific_name": {
+                        "type": "string",
+                        "description": (
+                            "Scientific (binomial) name of the species, e.g. 'Limosa limosa'. "
+                            "Take it from find_species — call that first. Results are restricted "
+                            "to this species, so the article can never be about another bird."
+                        ),
+                    },
                 },
-                "required": ["query"],
+                "required": ["query", "scientific_name"],
             },
         },
     },
@@ -500,12 +540,24 @@ Just report the tool results.
 7. **Show photos ONLY from tool results.** If a tool returns a `thumbnail` field, include it \
 as a markdown image: `![species name](url)`. Show max 3 photos per response. \
 **NEVER write a markdown image (`![...]()`) from memory or general knowledge** — only use \
-URLs that appear literally in a tool result.
+URLs that appear literally in a tool result. \
+**Photos come from `find_species`.** If the user asks for a photo and you do not have a \
+`thumbnail` in a tool result, call `find_species` for that species and use the `thumbnail` it \
+returns. Do NOT say "I have no photo" without calling `find_species` first — most species have \
+one. If `find_species` genuinely returns no `thumbnail`, say so plainly and **stop**: do not \
+substitute a different species, and never name a species that did not come from a tool result.
 8. **Links**: when referencing a species URI or eBird page, use markdown links: \
 `[text](url)`.
 9. **When comparing live vs historical data**, only list species as "expected but absent" if \
 they appear in the tool result for `observations_by_month`. \
 Do NOT add species from memory.
+10. **A previous "I don't have this information" is NEVER evidence.** Rule 1 applies to what a \
+tool returns *now*, not to what you said earlier. If you (or an earlier turn in this \
+conversation) answered "je n'ai pas cette information" / "I don't have this information", that \
+tells you nothing about the current question — the graph is rebuilt and tools are added between \
+sessions, so data that was missing before may be present now. **Always call the appropriate tool \
+again for the current question and answer from its fresh result.** Never repeat or justify a \
+past refusal without re-running the tool.
 
 ## Data available in the graph
 - eBird/Clements taxonomy: 45 orders, 251 families, ~11 000 species
@@ -557,13 +609,15 @@ on a specific species in a live context (e.g. "pas d'aigle royal ?" after a live
 **When the user mentions a city or place** (e.g. "près de Copenhague", "autour d'Aarhus"), \
 pass `lat`/`lon` coordinates for that place — do NOT omit them.
 - **ALWAYS call `search_wikipedia`** when the user asks about behavior (comportement), habitat, \
-song (chant), courtship, diet (régime alimentaire), or ecology of a specific species — \
-**call it even if you did NOT call `find_species` first** (e.g. "décris le comportement du \
-rouge-gorge" → call `search_wikipedia("European Robin")` directly). \
-Call it at most once per question — if it returns no results, say the Wikipedia index does not \
-yet cover this species, and answer from your own knowledge if you can, clearly labeling it as such. \
-**Always write `search_wikipedia` queries in English** (use the English common name or scientific \
-name). The Wikipedia index is in English — French queries reduce recall.
+song (chant), courtship, diet (régime alimentaire), or ecology of a specific species. \
+**Call `find_species` first** and pass its `scientificName` as the `scientific_name` argument: \
+results are restricted to that species, so the article can never be about a different bird. \
+Call it at most once per question. **If it returns an `error` saying the species is not indexed, \
+say plainly that you have no Wikipedia information for that species — and STOP. Do NOT answer \
+from your own knowledge, do NOT describe the species from memory, and do NOT substitute \
+information about a related or similar bird** (Rule 1 applies here without exception). \
+**Always write the `query` in English** (English common name or scientific name). \
+The Wikipedia index is in English — French queries reduce recall.
 - **Use `phenology`** (always together with `migration_timing`) for arrival/departure questions \
 and whenever the user asks about seasonal or monthly presence patterns: \
 "phénologie", "présence mensuelle", "seasonal chart", "which months". \
@@ -577,6 +631,10 @@ resolved scientific name. Present the result as: arrival month, departure month,
 and (if available) the earliest date ever recorded and a table of yearly first/last dates.
 - Use `observations_by_month` for questions about which birds are present in a specific month \
 ("oiseaux en mars", "birds in winter", etc.).
+- **Use `where_seen`** when the user asks where a **specific species** has been observed \
+("où a-t-il été vu ?", "où observer le chardonneret ?", "where was it seen?"). This is the \
+species-first question and is answered from the graph's observation localities. Do not say you \
+have no locality data without calling this tool first. Report only the sites it returns.
 - Use `where_to_watch` for questions about where to go birdwatching ("où observer demain ?", \
 "meilleurs endroits près de Copenhague"). Pass `month` and coordinates if the user provides them. \
 **If the user says "près de chez moi", "near me", or similar without giving a place name or \
@@ -816,6 +874,14 @@ def _run_tool(name: str, inputs: dict, graph) -> str:
         species_name = inputs.get("species_name")
         return _fmt(observations_by_month(graph, month, species_name))
 
+    if name == "where_seen":
+        rows = observation_locations(
+            graph, inputs["species_name"], limit=int(inputs.get("limit", 20))
+        )
+        if not rows:
+            return json.dumps({"error": "No recorded observation locations for this species"})
+        return _fmt(rows)
+
     if name == "where_to_watch":
         if inputs.get("live"):
             api_key = os.getenv("EBIRD_API_KEY", "")
@@ -876,9 +942,17 @@ def _run_tool(name: str, inputs: dict, graph) -> str:
                 "Wikipedia index not built yet. "
                 "Run: python scripts/build_wiki_index.py"
             )
-        results = rag.search(inputs["query"], n_results=4)
+        sci = inputs.get("scientific_name") or ""
+        results = rag.search(inputs["query"], n_results=4, scientific_name=sci or None)
         if not results:
-            return "No Wikipedia results found for this query."
+            # Say the species is missing. Falling back to an unfiltered search here
+            # would hand back another bird's article, which is how the Godwit's
+            # biology came back as somebody else's.
+            return json.dumps({
+                "error": f"'{sci}' is not indexed in the Wikipedia index — "
+                         f"no article available for this species.",
+                "scientific_name": sci,
+            }, ensure_ascii=False)
         return json.dumps(results, ensure_ascii=False, indent=2)
 
     return f"Unknown tool: {name}"

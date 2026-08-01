@@ -26,9 +26,12 @@ pip install -r requirements.txt
 cp .env.example .env
 # edit .env and set EBIRD_API_KEY=...
 
-# 3. Build the graph (DOF observations batched by year, up to ~9 700/year)
+# 3. Build the graph
+#    DOF observations are batched by (month, year) so every calendar month gets an
+#    equal share. Batching by year alone silently returns only early January —
+#    GBIF caps the offset at ~10 000 and a year's records come back in index order.
 python scripts/build_graph.py --dof-max 5000    # quick demo
-python scripts/build_graph.py --dof-max 50000   # ~5 years of Danish sightings
+python scripts/build_graph.py --dof-max 50000   # ~4 000 observations per month
 
 # 4. Query
 python scripts/query_graph.py --summary
@@ -53,6 +56,41 @@ python scripts/chat.py --ask "Quels oiseaux près de Copenhague ?"
 python scripts/web_chat.py                      # → http://localhost:5000
 python scripts/web_chat.py --port 8080
 ```
+
+## Keeping the data fresh
+
+Everyday work goes through the Makefile — `make` on its own lists every target.
+
+```bash
+make serve      # run the web chat (PORT=8080 by default)
+make update     # incremental: fetch new observations only, then enrich + reason
+make rebuild    # full: refetch the graph, enrich, reason, AND rebuild the wiki index
+make reindex    # rebuild the Wikipedia index alone
+make test       # offline test suite
+make months     # observations per calendar month — should be roughly flat
+```
+
+There are three artifacts and they must stay in step:
+
+| Artifact | Built from | Rebuilt by |
+|---|---|---|
+| `output/birdology.ttl` | eBird API + GBIF/DOF | `make update` / `make rebuild` |
+| `output/birdology_reasoned.ttl` | the graph, via the reasoner — **this is what the server loads** | both |
+| `data/wiki_index/` | the graph's **observed** species | `make rebuild` / `make reindex` |
+
+**The wiki index is derived from the graph**, so `make rebuild` always reindexes.
+This coupling is not theoretical: the index was once built from a graph that
+contained only January observations, so every summer migrant was missing from it —
+and stayed missing for months, because nothing tied the two together.
+
+`make update` is incremental and does *not* reindex, so a new species that shows up
+in daily observations won't have a Wikipedia article until the next `make rebuild`.
+The assistant will say it has no article for that species rather than inventing one
+or returning a different bird's — but run `make rebuild` periodically (weekly is
+plenty) so the index keeps up.
+
+**Nothing runs on a schedule by default.** `scripts/daily_update.sh` exists but no
+cron or launchd entry invokes it; wire one up yourself if you want nightly refreshes.
 
 ## Scripts
 

@@ -84,7 +84,35 @@ python scripts/web_chat.py --input output/birdology_reasoned.ttl
 
 # Desktop dashboard (PySide6 GUI — wraps all CLI features)
 python scripts/dashboard.py
+
+# Evaluate the chat system (server must be running)
+python scripts/eval_chat.py --url http://localhost:8080                      # 21 single-turn cases
+python scripts/eval_chat.py --url http://localhost:8080 --suite conversations # multi-turn cases
+python scripts/eval_chat.py --url http://localhost:8080 --suite all --judge   # everything + LLM judge
 ```
+
+## Makefile — prefer these for everyday work
+
+```bash
+make            # list all targets
+make serve      # web chat on PORT (default 8080; 5000 is taken by AirPlay on macOS)
+make update     # incremental: new observations only, then enrich + reason
+make rebuild    # full: graph + enrich + reason + wiki reindex
+make reindex    # Wikipedia index alone (needs Ollama + nomic-embed-text)
+make test       # offline suite
+make eval-conversations   # multi-turn eval (needs a running server)
+make months     # observations per calendar month — should be roughly flat
+```
+
+**Three artifacts must stay in step:** `output/birdology.ttl` (the graph),
+`output/birdology_reasoned.ttl` (what the server loads), and `data/wiki_index/`
+(built from the graph's **observed** species). `make rebuild` always reindexes,
+because the index is derived from the graph — when the graph held only January
+observations, the index silently excluded every summer migrant for months.
+
+`make update` does not reindex; run `make rebuild` weekly so the index keeps up.
+**Nothing is scheduled by default** — `scripts/daily_update.sh` exists but no cron
+or launchd entry invokes it.
 
 ## Architecture
 
@@ -135,6 +163,7 @@ tests/test_queries.py       — all SPARQL query functions with an in-memory fix
 tests/test_reasoner.py      — each inference rule in isolation (idempotency, correctness)
 tests/test_gbif_batching.py — year-batching, offset-cap, deduplication (mocked HTTP)
 tests/test_chat.py          — Graph-RAG tool definitions, formatting, all 8 tools
+tests/test_eval_conversations.py — eval harness: check_answer + run_conversation (offline, mocked HTTP)
 tests/test_wikidata.py      — Wikidata enrichment
 tests/test_dbpedia.py       — DBpedia enrichment
 tests/test_iucn.py          — IUCN enrichment
