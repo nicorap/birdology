@@ -39,7 +39,7 @@ _PANEL_CACHE: dict[str, object] = {}
 
 load_dotenv()
 
-DEFAULT_TTL = Path(__file__).parent.parent / "output" / "birdology.ttl"
+DEFAULT_TTL = Path(__file__).parent.parent / "output" / "birdology_reasoned.ttl"
 STATIC_DIR = Path(__file__).parent / "static"
 
 app = Flask(__name__)
