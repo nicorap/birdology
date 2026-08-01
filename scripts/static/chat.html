@@ -524,9 +524,9 @@
 </div>
 
 <section id="alerts-panel" class="panel">
-  <div class="panel-header">⚠ Especes menacees vues recemment <span class="count" id="alerts-count"></span></div>
+  <div class="panel-header">⚠ Recently observed threatened species <span class="count" id="alerts-count"></span></div>
   <div id="alerts-list">
-    <div class="panel-loading">Chargement…</div>
+    <div class="panel-loading">Loading...</div>
   </div>
 </section>
 
@@ -960,7 +960,7 @@ var alertsList = document.getElementById('alerts-list');
 fetch('/api/rare-nearby').then(function(r) { return r.json(); }).then(function(rows) {
   document.getElementById('alerts-count').textContent = rows.length + ' (25 km Norrebro)';
   if (!rows.length) {
-    alertsList.innerHTML = '<div class="alert-empty">Aucune espece menacee observee recemment dans un rayon de 25 km.</div>';
+    alertsList.innerHTML = '<div class="alert-empty">No threatened species observed recently within 25 km.</div>';
     return;
   }
   alertsList.innerHTML = '';
@@ -980,7 +980,7 @@ fetch('/api/rare-nearby').then(function(r) { return r.json(); }).then(function(r
     alertsList.appendChild(row);
   });
 }).catch(function(e) {
-  alertsList.innerHTML = '<div class="panel-loading">Erreur de chargement</div>';
+  alertsList.innerHTML = '<div class="panel-loading">Loading error</div>';
   console.error(e);
 });
 
