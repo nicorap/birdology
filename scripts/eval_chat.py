@@ -395,9 +395,282 @@ class TestResult:
     judge_score: Optional[int] = None   # 1-5
 
 
+@dataclass
+class Turn:
+    """One question in a conversation. Every assertion field is optional: a turn
+    that only exists to set up context asserts nothing."""
+    question: str
+    expected_tools: list[str] = field(default_factory=list)
+    forbidden_tools: list[str] = field(default_factory=list)
+    must_contain: list[str] = field(default_factory=list)
+    must_contain_any: list[str] = field(default_factory=list)
+    must_not_contain: list[str] = field(default_factory=list)
+    expected_tool_args: dict = field(default_factory=dict)
+    notes: str = ""
+
+
+@dataclass
+class Conversation:
+    id: str
+    category: str
+    turns: list[Turn]
+
+
+@dataclass
+class TurnResult:
+    index: int              # 1-based, so failures read as "turn 3"
+    turn: Turn
+    passed: bool
+    tool_calls: list[str]
+    answer: str
+    failures: list[str]
+    tool_call_details: list[dict] = field(default_factory=list)
+
+
+@dataclass
+class ConversationResult:
+    conversation: Conversation
+    turns: list[TurnResult]
+
+    @property
+    def passed(self) -> bool:
+        return all(t.passed for t in self.turns)
+
+
+# ---------------------------------------------------------------------------
+# Multi-turn conversations
+#
+# Every bug found on 2026-07-13 was multi-turn, and the single-turn suite scored
+# 21/21 throughout. These cases run all turns against one session so the model
+# sees its own history — which is where it actually breaks.
+# ---------------------------------------------------------------------------
+
+CONVERSATIONS: list[Conversation] = [
+    # --- Regressions: these bugs really happened ---
+    Conversation(
+        id="conv_photo_after_nearby",
+        category="conversation_regression",
+        turns=[
+            Turn("Y a-t-il des rapaces près de Nørrebro ?",
+                 expected_tools=["nearby_birds", "where_to_watch"]),
+            Turn("montre moi une photo !",
+                 expected_tools=["find_species"],
+                 must_contain_any=["!["],
+                 notes="nearby_birds used to return no thumbnail, so the model claimed the "
+                       "species had no photo (false) instead of calling find_species."),
+        ],
+    ),
+    Conversation(
+        id="conv_pronoun_where_seen",
+        category="conversation_regression",
+        turns=[
+            Turn("Parle-moi du Chardonneret élégant",
+                 expected_tools=["find_species"]),
+            Turn("ou a t il ete vu la dernière fois ?",
+                 expected_tools=["where_seen"],
+                 must_not_contain=["pas d'information", "pas cette information"],
+                 notes="Pronoun follow-up, deliberately typo'd as the user typed it. "
+                       "The species has 425 observations — a refusal here is always a bug."),
+        ],
+    ),
+    Conversation(
+        id="conv_refusal_inertia",
+        category="conversation_regression",
+        turns=[
+            Turn("Parle-moi du Condor de Californie",
+                 expected_tools=["find_species"]),
+            Turn("où a-t-il été vu ?",
+                 notes="No Danish observations — a refusal here is CORRECT and expected."),
+            Turn("Et le Chardonneret élégant ?",
+                 expected_tools=["find_species"]),
+            Turn("où a-t-il été vu ?",
+                 expected_tools=["where_seen"],
+                 must_not_contain=["pas d'information", "pas cette information"],
+                 notes="The legitimate refusal two turns ago must NOT be inherited here."),
+        ],
+    ),
+    Conversation(
+        id="conv_no_invented_species",
+        category="conversation_regression",
+        turns=[
+            Turn("Parle-moi de l'Épervier d'Europe",
+                 expected_tools=["find_species"]),
+            Turn("montre moi une photo !",
+                 expected_tools=["find_species"],
+                 must_contain_any=["!["]),
+            Turn("il n'y a pas de photo !",
+                 must_not_contain=["albicillatus"],
+                 notes="Under pressure the model invented 'Haliaeetus albicillatus' "
+                       "(the real taxon is Haliaeetus albicilla) to have something to offer."),
+            Turn("montre moi une photo d'un autre rapace alors !",
+                 must_not_contain=["albicillatus"]),
+        ],
+    ),
+
+    # --- Robustness: general multi-turn behaviour ---
+    Conversation(
+        id="conv_location_carryover",
+        category="conversation_robustness",
+        turns=[
+            Turn("Où observer des oiseaux près de Copenhague ?",
+                 expected_tools=["where_to_watch", "nearby_birds"]),
+            Turn("et à Aarhus ?",
+                 expected_tools=["where_to_watch", "nearby_birds"],
+                 expected_tool_args={"lat": 56.16, "lon": 10.20},
+                 notes="Must re-run the tool for the NEW location, not reuse Copenhagen."),
+        ],
+    ),
+    Conversation(
+        id="conv_month_carryover",
+        category="conversation_robustness",
+        turns=[
+            Turn("Quels oiseaux voit-on en mars au Danemark ?",
+                 expected_tools=["observations_by_month"]),
+            Turn("et en juin ?",
+                 expected_tools=["observations_by_month"],
+                 expected_tool_args={"month": 6},
+                 notes="Must re-run for June, not answer from the March result."),
+        ],
+    ),
+    Conversation(
+        id="conv_topic_switch_and_back",
+        category="conversation_robustness",
+        turns=[
+            Turn("Parle-moi du Rouge-gorge familier",
+                 expected_tools=["find_species"]),
+            Turn("Quels oiseaux voit-on en mars au Danemark ?",
+                 expected_tools=["observations_by_month"]),
+            Turn("Revenons au premier oiseau : est-il menacé ?",
+                 expected_tools=["find_species"],
+                 expected_tool_args={"name": "Rouge-gorge"},
+                 notes="Must resolve 'le premier oiseau' back to the Robin."),
+        ],
+    ),
+    Conversation(
+        id="conv_user_correction",
+        category="conversation_robustness",
+        turns=[
+            Turn("Parle-moi du Rouge-gorge familier",
+                 expected_tools=["find_species"]),
+            Turn("non, je voulais dire le Rouge-queue noir",
+                 expected_tools=["find_species"],
+                 expected_tool_args={"name": "Rouge-queue"},
+                 notes="Must look up the corrected species, not keep answering about the Robin."),
+        ],
+    ),
+]
+
+
 # ---------------------------------------------------------------------------
 # Core runner
 # ---------------------------------------------------------------------------
+
+# A coordinate this far from the pinned value is the same place, reported with more
+# decimals (Aarhus 56.16 vs a model's 56.1629). Anything further is a different place.
+# It has to be small: at 0.5 the check was useless for latitude, where Aarhus (56.16)
+# and Copenhagen (55.69) are only 0.47 apart — a wrong-city answer sailed through and
+# only the longitude could ever fail the assertion.
+_COORD_TOLERANCE = 0.05  # ~5.5 km of latitude
+
+
+def _arg_matches(expected, actual) -> bool:
+    """One expected-arg value matches one actual-arg value.
+
+    Expected int (a month, a radius — categorical, not measured) → exact match, so
+    `month: 6` rejects 3 and 6.4 alike.
+    Expected float (a coordinate) → within _COORD_TOLERANCE, which accepts a model's
+    higher-precision 56.1629 for a pinned 56.16 but rejects another city.
+    Otherwise → case-insensitive substring match.
+    """
+    if isinstance(expected, bool):
+        return expected is actual
+    if isinstance(expected, int):
+        try:
+            return float(actual) == float(expected)
+        except (TypeError, ValueError):
+            return False
+    if isinstance(expected, float):
+        try:
+            return abs(float(actual) - float(expected)) <= _COORD_TOLERANCE
+        except (TypeError, ValueError):
+            return False
+    return str(expected).lower() in str(actual).lower()
+
+
+def _tool_call_matches_expected_args(
+    expected_tool_args: dict,
+    tool_call_details: list[dict],
+    expected_tools: list[str] | None = None,
+) -> bool:
+    """At least one recorded call TO AN EXPECTED TOOL must match ALL expected args.
+
+    Restricting to expected_tools is the whole point. Several tools share a parameter
+    name — `month` belongs to both observations_by_month and where_to_watch, `name` to
+    both find_species and search_wikipedia. Scanning every call regardless of its name
+    let a turn pass on the wrong one: on conv_month_carryover the model could call
+    observations_by_month(month=3) — precisely the regression under test — and still go
+    green because it also called where_to_watch(month=6).
+    """
+    candidates = tool_call_details
+    if expected_tools:
+        candidates = [c for c in tool_call_details if c.get("name") in expected_tools]
+    for call in candidates:
+        args = call.get("args", {})
+        if all(key in args and _arg_matches(value, args[key]) for key, value in expected_tool_args.items()):
+            return True
+    return False
+
+
+def check_answer(spec, tool_calls: list[str], answer: str, tool_call_details: list[dict] = None) -> list[str]:
+    """Evaluate one answer against a spec's assertions.
+
+    `spec` is anything exposing expected_tools / forbidden_tools / must_contain /
+    must_contain_any / must_not_contain — both TestCase and Turn satisfy this.
+    `expected_tool_args` is optional (only Turn defines it; TestCase does not), read
+    via getattr so single-turn TestCase callers are unaffected.
+    Returns the list of failures; empty means the answer passed.
+    """
+    # Infrastructure failures are not assertion failures — report them alone.
+    if answer.startswith("Erreur serveur:") and "api/embeddings" in answer:
+        return ["INFRA: Ollama embeddings crashed (nomic-embed-text unavailable)"]
+
+    failures: list[str] = []
+
+    if spec.expected_tools and not any(t in tool_calls for t in spec.expected_tools):
+        failures.append(f"Expected one of {spec.expected_tools}, got {tool_calls}")
+
+    expected_tool_args = getattr(spec, "expected_tool_args", {})
+    if expected_tool_args:
+        if not _tool_call_matches_expected_args(
+            expected_tool_args, tool_call_details or [], spec.expected_tools
+        ):
+            failures.append(
+                f"Expected {spec.expected_tools or 'a tool'} to be called with args "
+                f"{expected_tool_args}, got {tool_call_details or []}"
+            )
+
+    for t in spec.forbidden_tools:
+        if t in tool_calls:
+            failures.append(f"Forbidden tool called: {t}")
+
+    answer_lower = answer.lower()
+    for phrase in spec.must_contain:
+        if phrase.lower() not in answer_lower:
+            failures.append(f"Expected phrase not found: '{phrase}'")
+
+    if spec.must_contain_any and not any(p.lower() in answer_lower for p in spec.must_contain_any):
+        failures.append(f"Expected at least one of {spec.must_contain_any}")
+
+    for phrase in spec.must_not_contain:
+        if phrase.lower() in answer_lower:
+            failures.append(f"Forbidden phrase found: '{phrase}'")
+
+    for pattern, label in FORBIDDEN_PATTERNS:
+        if re.search(pattern, answer, re.IGNORECASE):
+            failures.append(f"Forbidden pattern ({label})")
+
+    return failures
+
 
 def run_test(test: TestCase, base_url: str) -> TestResult:
     failures: list[str] = []
@@ -420,46 +693,7 @@ def run_test(test: TestCase, base_url: str) -> TestResult:
         failures.append(f"HTTP error: {e}")
         return TestResult(test=test, passed=False, tool_calls=[], answer="", failures=failures)
 
-    # Detect infrastructure errors (Ollama / embedding crashes)
-    if answer.startswith("Erreur serveur:") and "api/embeddings" in answer:
-        return TestResult(
-            test=test, passed=False, tool_calls=tool_calls, answer=answer,
-            failures=["INFRA: Ollama embeddings crashed (nomic-embed-text unavailable)"],
-        )
-
-    # 1. Check expected tools
-    if test.expected_tools:
-        if not any(t in tool_calls for t in test.expected_tools):
-            failures.append(
-                f"Expected one of {test.expected_tools}, got {tool_calls}"
-            )
-
-    # 2. Check forbidden tools
-    for t in test.forbidden_tools:
-        if t in tool_calls:
-            failures.append(f"Forbidden tool called: {t}")
-
-    # 3. Check must_contain (ALL must be present)
-    answer_lower = answer.lower()
-    for phrase in test.must_contain:
-        if phrase.lower() not in answer_lower:
-            failures.append(f"Expected phrase not found: '{phrase}'")
-
-    # 3b. Check must_contain_any (AT LEAST ONE must be present)
-    if test.must_contain_any:
-        if not any(p.lower() in answer_lower for p in test.must_contain_any):
-            failures.append(f"Expected at least one of {test.must_contain_any}")
-
-    # 4. Check must_not_contain
-    for phrase in test.must_not_contain:
-        if phrase.lower() in answer_lower:
-            failures.append(f"Forbidden phrase found: '{phrase}'")
-
-    # 5. Global forbidden patterns
-    for pattern, label in FORBIDDEN_PATTERNS:
-        if re.search(pattern, answer, re.IGNORECASE):
-            failures.append(f"Forbidden pattern ({label})")
-
+    failures = check_answer(test, tool_calls, answer)
     return TestResult(
         test=test,
         passed=len(failures) == 0,
@@ -467,6 +701,62 @@ def run_test(test: TestCase, base_url: str) -> TestResult:
         answer=answer,
         failures=failures,
     )
+
+
+def _post_message(base_url: str, session_id: str, question: str) -> tuple[str, list[dict]]:
+    """POST one message to an existing session.
+
+    Returns (answer, tool_calls), where tool_calls is the list of dicts the server
+    returns as-is — each {"name": str, "args": dict} (see scripts/web_chat.py's
+    tool_calls_log). Argument capture matters: checking tool NAMES alone lets a
+    conversation pass even when the model calls the right tool with stale/wrong args.
+    """
+    resp = requests.post(
+        f"{base_url}/api/chat",
+        json={"message": question, "session_id": session_id},
+        timeout=300,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("answer", ""), data.get("tool_calls", [])
+
+
+def run_conversation(
+    conv: Conversation,
+    base_url: str,
+    delay: float = 0.0,
+    post=_post_message,
+    sleep=time.sleep,
+) -> ConversationResult:
+    """Run every turn against ONE session, so the model sees its own history.
+
+    A failing turn does not abort the conversation: whether the assistant recovers
+    on a later turn is exactly what we want to measure.
+    """
+    session_id = f"eval_{conv.id}_{int(time.time())}"
+    results: list[TurnResult] = []
+
+    for i, turn in enumerate(conv.turns, 1):
+        try:
+            answer, tool_call_details = post(base_url, session_id, turn.question)
+        except Exception as e:
+            results.append(TurnResult(
+                index=i, turn=turn, passed=False,
+                tool_calls=[], answer="", failures=[f"HTTP error: {e}"],
+                tool_call_details=[],
+            ))
+        else:
+            tool_calls = [tc["name"] for tc in tool_call_details]
+            failures = check_answer(turn, tool_calls, answer, tool_call_details=tool_call_details)
+            results.append(TurnResult(
+                index=i, turn=turn, passed=len(failures) == 0,
+                tool_calls=tool_calls, answer=answer, failures=failures,
+                tool_call_details=tool_call_details,
+            ))
+        if i < len(conv.turns):
+            sleep(delay)
+
+    return ConversationResult(conversation=conv, turns=results)
 
 
 # ---------------------------------------------------------------------------
@@ -548,6 +838,33 @@ def print_report(results: list[TestResult], use_judge: bool) -> None:
         print()
 
 
+def print_conversation_report(results: list[ConversationResult]) -> None:
+    passed = sum(1 for r in results if r.passed)
+    total = len(results)
+    print(f"\n{'='*60}")
+    print(f"BIRDOLOGY CONVERSATION EVAL — {passed}/{total} conversations passed")
+    print(f"{'='*60}\n")
+
+    by_category: dict[str, list[ConversationResult]] = {}
+    for r in results:
+        by_category.setdefault(r.conversation.category, []).append(r)
+
+    for cat, cat_results in by_category.items():
+        cat_pass = sum(1 for r in cat_results if r.passed)
+        print(f"  [{cat}] {cat_pass}/{len(cat_results)}")
+        for r in cat_results:
+            icon = "✓" if r.passed else "✗"
+            print(f"    {icon} {r.conversation.id}")
+            for t in r.turns:
+                t_icon = "✓" if t.passed else "✗"
+                tools_str = ", ".join(t.tool_calls) if t.tool_calls else "none"
+                print(f"        {t_icon} turn {t.index}: {t.turn.question[:55]}")
+                print(f"             tools: {tools_str}")
+                for f in t.failures:
+                    print(f"             FAIL: {f}")
+        print()
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -562,9 +879,10 @@ def main() -> None:
     ap.add_argument("--delay", type=float, default=1.5, help="Seconds between requests")
     ap.add_argument(
         "--suite",
-        choices=["core", "robustness", "all"],
+        choices=["core", "robustness", "conversations", "all"],
         default="core",
-        help="Test suite to run: core (default), robustness (phrasings), all",
+        help="Test suite: core (default), robustness (phrasings), "
+             "conversations (multi-turn), all",
     )
     args = ap.parse_args()
 
@@ -583,6 +901,16 @@ def main() -> None:
         tests = [t for t in tests if t.category == args.category]
     if args.id:
         tests = [t for t in tests if t.id == args.id]
+
+    conversations: list[Conversation] = []
+    if args.suite in ("conversations", "all"):
+        conversations = CONVERSATIONS
+    if args.suite == "conversations":
+        tests = []
+    if args.category:
+        conversations = [c for c in conversations if c.category == args.category]
+    if args.id:
+        conversations = [c for c in conversations if c.id == args.id]
 
     # Check server is up
     try:
@@ -611,6 +939,18 @@ def main() -> None:
             time.sleep(args.delay)
 
     print_report(results, args.judge)
+
+    conv_results: list[ConversationResult] = []
+    for i, conv in enumerate(conversations, 1):
+        print(f"  [conv {i}/{len(conversations)}] {conv.id} ({len(conv.turns)} turns)...",
+              end=" ", flush=True)
+        cr = run_conversation(conv, args.url, delay=args.delay)
+        conv_results.append(cr)
+        failed_turns = [t.index for t in cr.turns if not t.passed]
+        print("PASS" if cr.passed else f"FAIL (turns {failed_turns})")
+
+    if conv_results:
+        print_conversation_report(conv_results)
 
     if args.output:
         with open(args.output, "w") as f:

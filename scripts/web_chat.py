@@ -12,6 +12,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -27,7 +28,7 @@ from flask import Flask, request, jsonify, Response
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from birdology.graph import load_graph
-from birdology.queries import observations_for_map, nearby_watch
+from birdology.queries import observations_for_map, nearby_watch, migration_calendar
 from chat import (
     SYSTEM_PROMPT,
     TOOLS_OPENAI,
@@ -38,7 +39,7 @@ _PANEL_CACHE: dict[str, object] = {}
 
 load_dotenv()
 
-DEFAULT_TTL = Path(__file__).parent.parent / "output" / "birdology.ttl"
+DEFAULT_TTL = Path(__file__).parent.parent / "output" / "birdology_reasoned.ttl"
 STATIC_DIR = Path(__file__).parent / "static"
 
 app = Flask(__name__)
@@ -53,6 +54,48 @@ _sessions_lock = threading.Lock()
 _SESSION_TTL = 7200  # 2 hours
 _MAX_HISTORY = 40    # keep last N messages (+ system prompt) to avoid bloating LLM context
 _SESSION_DB: Path | None = None  # set by _init_session_db()
+_GRAPH_PATH: Path | None = None  # set at startup; part of the capability fingerprint
+# The Chroma store behind search_wikipedia. Also a capability: when it is rebuilt,
+# "this species is not indexed" answers recorded before become wrong.
+_WIKI_INDEX_DB: Path = (
+    Path(__file__).parent.parent / "data" / "wiki_index" / "chroma.sqlite3"
+)
+
+
+def _file_id(path: Path | None) -> str:
+    """Identity of a data file: path + mtime + size. Changes when it is rebuilt."""
+    if path is None:
+        return ""
+    try:
+        st = Path(path).stat()
+        return f"{path}:{st.st_mtime_ns}:{st.st_size}"
+    except OSError:
+        return str(path)
+
+
+def _capability_fingerprint() -> str:
+    """Identify what this server can currently answer with.
+
+    Covers every source of an answer: the full tool DEFINITIONS, the graph, and
+    the Wikipedia index. When any of them changes, conclusions the assistant
+    reached earlier may be stale — in particular its "I don't have this
+    information" answers, which it will otherwise keep repeating from history
+    instead of calling the tool that can now answer (see _get_session).
+
+    Hashing tool *names* alone was not enough, twice over: a tool can gain a
+    required argument without changing its name, and the Wikipedia index is a
+    data source exactly like the graph — rebuilding it (179 -> 276 species) made
+    every earlier "not indexed" refusal wrong while the fingerprint sat still.
+    """
+    payload = json.dumps(
+        {
+            "tools": TOOLS_OPENAI,          # full definitions, not just names
+            "graph": _file_id(_GRAPH_PATH),
+            "wiki": _file_id(_WIKI_INDEX_DB),
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
 def _init_session_db(db_path: Path) -> None:
@@ -66,6 +109,10 @@ def _init_session_db(db_path: Path) -> None:
                 last_seen  REAL NOT NULL
             )
         """)
+        # Older sessions.db files predate the capabilities column.
+        cols = {r[1] for r in con.execute("PRAGMA table_info(sessions)")}
+        if "capabilities" not in cols:
+            con.execute("ALTER TABLE sessions ADD COLUMN capabilities TEXT")
 
 
 def _db() -> sqlite3.Connection:
@@ -86,37 +133,40 @@ def _get_session(session_id: str) -> list[dict]:
             con.execute("DELETE FROM sessions WHERE last_seen < ?", (now - _SESSION_TTL,))
 
             row = con.execute(
-                "SELECT messages FROM sessions WHERE session_id = ?", (session_id,)
+                "SELECT messages, capabilities FROM sessions WHERE session_id = ?",
+                (session_id,),
             ).fetchone()
 
+            today = datetime.date.today()
+            system = SYSTEM_PROMPT + (
+                f"\n\n## Current date\nToday is {today.strftime('%A %d %B %Y')} "
+                f"(month {today.month}). Use this when the user says 'today', 'tomorrow', "
+                f"'this month', etc. — never assume a different month."
+            )
+            fingerprint = _capability_fingerprint()
+
             if row is None:
-                today = datetime.date.today()
-                system = SYSTEM_PROMPT + (
-                    f"\n\n## Current date\nToday is {today.strftime('%A %d %B %Y')} "
-                    f"(month {today.month}). Use this when the user says 'today', 'tomorrow', "
-                    f"'this month', etc. — never assume a different month."
-                )
                 msgs: list[dict] = [{"role": "system", "content": system}]
+            elif row[1] != fingerprint:
+                # Tools or graph changed since this session was last touched. Its
+                # history may assert that data is missing which now exists, and the
+                # model trusts its own past refusals over any instruction to re-check.
+                # Drop the stale turns rather than let them poison the new answers.
+                print(f"Session {session_id}: capabilities changed — clearing stale history")
+                msgs = [{"role": "system", "content": system}]
             else:
                 msgs = json.loads(row[0])
-                # Refresh system prompt date on each new day
-                import datetime as _dt
-                today = _dt.date.today()
-                new_system = SYSTEM_PROMPT + (
-                    f"\n\n## Current date\nToday is {today.strftime('%A %d %B %Y')} "
-                    f"(month {today.month}). Use this when the user says 'today', 'tomorrow', "
-                    f"'this month', etc. — never assume a different month."
-                )
                 if msgs and msgs[0]["role"] == "system":
-                    msgs[0]["content"] = new_system
+                    msgs[0]["content"] = system  # refresh the date line
 
             # Trim to MAX_HISTORY (keep system prompt + last N)
             if len(msgs) > _MAX_HISTORY + 1:
                 msgs = msgs[:1] + msgs[-_MAX_HISTORY:]
 
             con.execute(
-                "INSERT OR REPLACE INTO sessions (session_id, messages, last_seen) VALUES (?,?,?)",
-                (session_id, json.dumps(msgs, ensure_ascii=False), now),
+                "INSERT OR REPLACE INTO sessions"
+                " (session_id, messages, last_seen, capabilities) VALUES (?,?,?,?)",
+                (session_id, json.dumps(msgs, ensure_ascii=False), now, fingerprint),
             )
 
         return msgs
@@ -557,6 +607,13 @@ LIMIT 30
     return jsonify(_PANEL_CACHE["species"])
 
 
+@app.route("/api/migration-calendar")
+def api_migration_calendar():
+    if "migration_calendar" not in _PANEL_CACHE:
+        _PANEL_CACHE["migration_calendar"] = migration_calendar(GRAPH)
+    return jsonify(_PANEL_CACHE["migration_calendar"])
+
+
 @app.route("/api/dashboard")
 def api_dashboard():
     """Return dashboard data: rare species (eBird live) and hotspots."""
@@ -886,7 +943,7 @@ def api_reset():
 
 
 def main():
-    global GRAPH
+    global GRAPH, _GRAPH_PATH
 
     parser = argparse.ArgumentParser(description="Birdology Graph-RAG web chat")
     parser.add_argument(
@@ -913,6 +970,7 @@ def main():
         print(f"Error: graph file not found: {ttl_path}", file=sys.stderr)
         sys.exit(1)
 
+    _GRAPH_PATH = ttl_path
     db_path = ttl_path.parent / "sessions.db"
     _init_session_db(db_path)
     print(f"Session DB: {db_path}")
