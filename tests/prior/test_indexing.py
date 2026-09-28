@@ -158,6 +158,38 @@ def test_cell_is_at_the_requested_resolution():
         assert h3.get_resolution(cell) == resolution
 
 
+def test_cell_uses_lat_lon_order_not_lon_lat():
+    """h3 v4 takes (lat, lon); it does NOT validate the latitude range, so a
+    swapped call returns a plausible-looking cell in the wrong hemisphere
+    instead of raising. Copenhagen (55.69N, 12.63E) swapped lands in the
+    Arabian Sea (12.40N, 55.70E), which would silently poison every prior.
+    Asymmetric points only — 0/0 and any lat==lon point survive the swap.
+    """
+    t = _table(
+        [
+            (1, "A", 55.6867, 12.5700, date(2025, 3, 3), "p", "o"),  # Copenhagen
+            (2, "B", -33.8688, 151.2093, date(2025, 3, 3), "p", "o"),  # Sydney
+        ]
+    )
+    out = assign_cells(t, resolution=4)
+    cph, syd = out.column("cell")[0].as_py(), out.column("cell")[1].as_py()
+
+    # Round-trip form: the cell centre must be back where we put the record.
+    lat, lon = h3.cell_to_latlng(cph)
+    assert lat == pytest.approx(55.69, abs=0.1)
+    assert lon == pytest.approx(12.63, abs=0.1)
+    lat, lon = h3.cell_to_latlng(syd)
+    assert lat == pytest.approx(-33.87, abs=0.2)
+    assert lon == pytest.approx(151.21, abs=0.2)
+
+    # Exact form: identical to a direct lat-first call, and different from the
+    # swapped call (which h3 accepts without error).
+    assert cph == h3.latlng_to_cell(55.6867, 12.5700, 4)
+    assert cph != h3.latlng_to_cell(12.5700, 55.6867, 4)
+    assert syd == h3.latlng_to_cell(-33.8688, 151.2093, 4)
+    assert syd != h3.latlng_to_cell(151.2093, -33.8688, 4)
+
+
 def test_assign_cells_preserves_occurrence_columns_and_nulls():
     """Task 4's leakage guard reads publisher_key / recorded_by and relies on
     them being NULL (not "") when absent — indexing must not disturb that."""

@@ -41,13 +41,17 @@ def assign_cells(table: pa.Table, resolution: int) -> pa.Table:
 
 
 def aggregate_counts(table: pa.Table) -> pa.Table:
-    """Reduce to (species_key, cell, week) -> n."""
+    """Reduce to (species_key, cell, week) -> n.
+
+    Provenance (publisher_key, recorded_by) is dropped — run leakage guards on
+    the assign_cells output first.
+    """
     grouped = (
         table.select(["species_key", "cell", "week"])
         .append_column("n", pa.array([1] * table.num_rows, pa.int64()))
         .group_by(["species_key", "cell", "week"])
         .aggregate([("n", "sum")])
     )
-    return grouped.rename_columns(["species_key", "cell", "week", "n"]).select(
+    return grouped.rename_columns({"n_sum": "n"}).select(
         ["species_key", "cell", "week", "n"]
     )
