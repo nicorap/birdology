@@ -92,6 +92,15 @@ def target_group_ratios(counts: pa.Table) -> pa.Table:
         .rename_columns(["cell", "week", "total"])
     )
     joined = counts.join(totals, keys=["cell", "week"], join_type="inner")
+    if joined.num_rows != counts.num_rows:
+        # Unreachable while `_validate` holds: every (cell, week) in `counts`
+        # is by construction a key in `totals`. Kept as defence in depth,
+        # because the failure it catches -- a row silently absent from the
+        # prior -- is invisible downstream. It reads as a mild prior, not a bug.
+        raise ValueError(
+            f"join changed the row count ({counts.num_rows} -> {joined.num_rows}); "
+            "a (cell, week) key failed to match its own total"
+        )
     ratio = pc.divide(
         pc.cast(joined.column("n"), pa.float64()),
         pc.cast(joined.column("total"), pa.float64()),

@@ -300,3 +300,27 @@ def test_integration_with_aggregate_counts():
     assert rows[1]["total"] == 3
     assert rows[1]["ratio"] == pytest.approx(2 / 3)
     assert rows[2]["ratio"] == pytest.approx(1 / 3)
+
+
+def test_join_drop_is_caught_even_if_validation_is_bypassed(monkeypatch):
+    """Defence in depth for the silent-drop mode.
+
+    `_validate` already rejects null keys, so the inner join can never lose a
+    row in practice. That makes the join type unobservable -- a reviewer's
+    `left outer` mutant survived the suite. This test disables validation and
+    proves the post-join row-count invariant is what actually stops a dropped
+    row, independently of the null check.
+    """
+    import birdology.prior.effort as effort
+
+    monkeypatch.setattr(effort, "_validate", lambda counts: None)
+    t = pa.table(
+        {
+            "species_key": pa.array([1, 2], pa.int64()),
+            "cell": pa.array(["c", None], pa.string()),
+            "week": pa.array([5, 5], pa.int8()),
+            "n": pa.array([3, 1], pa.int64()),
+        }
+    )
+    with pytest.raises(ValueError, match="join"):
+        effort.target_group_ratios(t)
