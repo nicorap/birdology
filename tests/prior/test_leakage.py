@@ -940,6 +940,24 @@ def test_normalise_week_accepts_integral_and_rejects_the_rest():
             normalise_week(bad)
 
 
+def test_keep_mask_routes_the_week_column_through_normalise_week():
+    """Pin the REQUIREMENT half of keep_mask's documented week CONTRACT.
+
+    test_normalise_week_accepts_integral_and_rejects_the_rest pins the helper in
+    isolation but never proves keep_mask actually routes its column through it.
+    Without this, a keep_mask that used int(week) directly would pass the whole
+    suite while silently truncating a units bug.
+
+    Mutant E/M38 (normalise_week -> int) makes this killable rather than
+    decorative: int(None) raises TypeError, not ValueError, so the assertion
+    cannot quietly rot.
+    """
+    banned = {(CELL_A, 46, "ole")}
+    for bad_week in (None, 46.9):
+        with pytest.raises(ValueError, match="week"):
+            keep_mask([CELL_A], [bad_week], ["Ole"], banned)  # type: ignore[list-item]
+
+
 def test_banned_keys_rejects_a_non_integral_week_for_duck_typed_callers():
     rec = SimpleNamespace(cell=CELL_A, week=46.9, recorded_by="Ole")
     with pytest.raises(ValueError, match="week"):

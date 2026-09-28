@@ -147,6 +147,10 @@ def test_week_column_is_int8():
     out = assign_cells(t, resolution=4)
     assert out.schema.field("week").type == pa.int8()
     assert out.schema.field("cell").type == pa.string()
+    # leakage.keep_mask documents a CONTRACT that week is non-null and integral,
+    # and raises rather than coercing. Pin the guarantee side here, so the
+    # promise assign_cells makes is an assertion and not just prose.
+    assert out.column("week").null_count == 0
 
 
 def test_cell_is_at_the_requested_resolution():
