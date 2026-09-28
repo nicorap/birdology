@@ -754,6 +754,62 @@ def test_invalid_test_cell_raises_rather_than_matching_nothing():
         )
 
 
+def _with_table_cell(table, text):
+    """Rewrite the TABLE's `cell` value, keeping the schema untouched.
+
+    The odd formatting has to sit on the OCCURRENCE side here: the test-side
+    spellings are already pinned above, and `_assert_one_resolution` derives the
+    table's resolution from this column alone.
+    """
+    index = table.schema.get_field_index("cell")
+    field = table.schema.field(index)
+    return table.set_column(
+        index, field, pa.array([text] * table.num_rows, field.type)
+    )
+
+
+@pytest.mark.parametrize(
+    "variant,label",
+    [
+        (lambda c: "\u200b" + c, "zero-width-prefixed"),
+        (lambda c: c[:4] + "\u00ad" + c[4:], "soft-hyphen inside"),
+        (lambda c: "  " + c.upper() + " ", "uppercase and padded"),
+    ],
+)
+def test_resolution_derivation_normalises_the_table_cell(variant, label):
+    """`_assert_one_resolution` must derive the resolution from the NORMALISED
+    table cell, not the raw one.
+
+    A table whose `cell` was not written by `assign_cells` — a hand-built or
+    round-tripped table, caller-supplied metadata — can carry invisible
+    formatting. `h3.get_resolution` tolerates case and ordinary whitespace but
+    rejects Cf codepoints outright, so comparing the raw cell turns a row the
+    guard should remove into a spurious "not a valid H3 index" ValueError. The
+    guard must still remove the row, since `keep_mask` normalises the same cell.
+    """
+    t = _one_ole_at_cell_a_week_46()
+    t = _with_table_cell(t, variant(CELL_A))
+    out = drop_test_contributor_cells(
+        t, [TestRecording(cell=CELL_A, week=46, recorded_by="Ole")]
+    )
+    assert out.num_rows == 0, f"{label} table cell broke the guard"
+
+
+def test_resolution_mismatch_is_detected_through_an_odd_table_cell():
+    """The mismatch raise must survive odd table-cell formatting too: comparing
+    the raw cell would report an H3-validity error instead of the resolution
+    mismatch, which points the reader at the wrong side of the join."""
+    t = _one_ole_at_cell_a_week_46()
+    t = _with_table_cell(t, "\u200b" + CELL_A_RES5)
+    with pytest.raises(ValueError) as excinfo:
+        drop_test_contributor_cells(
+            t, [TestRecording(cell=CELL_A, week=46, recorded_by="Ole")]
+        )
+    message = str(excinfo.value)
+    assert "resolution" in message
+    assert "4" in message and "5" in message
+
+
 # --------------------------------------------------------------------------
 # F3: a zero-effect guard must not be silent.
 # --------------------------------------------------------------------------

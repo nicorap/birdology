@@ -246,6 +246,16 @@ def keep_mask(
     A row with a null/blank ``recorded_by`` is ALWAYS kept, independently of
     what is in *banned*. This holds even if a blank key reached *banned* by
     some other route, so an anonymous population can never be wiped wholesale.
+
+    CONTRACT — *weeks* must contain non-null, integral values. Each one goes
+    through :func:`normalise_week`, which RAISES ``ValueError`` on ``None`` or a
+    non-integral value rather than coercing it, because ``int(46.9)`` would
+    silently ban the wrong week. ``assign_cells`` guarantees this: it writes
+    ``week`` as ``pa.int8()`` derived from a non-null ``event_date``, and
+    ``read_occurrences`` already drops rows without a day-precision date. A
+    table not produced by ``assign_cells`` can therefore turn a null week into a
+    hard failure whose message talks about units bugs; normalise or drop such
+    rows before calling this, and do NOT loosen :func:`normalise_week`.
     """
     return [
         normalise_contributor(name) is None
@@ -315,6 +325,12 @@ def drop_test_contributor_cells(
 
     Raises ``ValueError`` if the test split's H3 resolution differs from the
     table's, which would make the whole guard a silent no-op.
+
+    CONTRACT — *table* must carry a non-null, integral ``week`` column, as
+    written by ``assign_cells`` (``pa.int8()`` from a non-null ``event_date``).
+    :func:`keep_mask` routes every week through :func:`normalise_week`, which
+    raises rather than coercing, so a null or fractional week from a table built
+    some other way is a hard build failure, not a silently mis-banned week.
     """
     banned = banned_keys(test_recordings)
     if not banned:

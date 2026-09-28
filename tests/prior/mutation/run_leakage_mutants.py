@@ -381,12 +381,25 @@ MUTANTS: list[tuple[str, str, list[tuple[str, str]]]] = [
     ),
     (
         "M33",
-        "F2: resolution check compares the RAW table cell, so an uppercase "
-        "table cell makes it blow up / skip",
+        "F2: mismatch raise disabled while the per-banned-cell H3 validity "
+        "check survives (distinct from M31, which removes the whole call, and "
+        "from M32, which keeps the comparison and only downgrades the raise)",
         [
             (
                 "        if banned_resolution != table_resolution:",
                 "        if False:",
+            )
+        ],
+    ),
+    (
+        "M40",
+        "F8: resolution derivation compares the RAW table cell, so an "
+        "occurrence-side cell carrying Cf/zero-width formatting blows up as "
+        "'not a valid H3 index' instead of being normalised first",
+        [
+            (
+                "            normalised = normalise_cell(cell)",
+                "            normalised = cell",
             )
         ],
     ),
