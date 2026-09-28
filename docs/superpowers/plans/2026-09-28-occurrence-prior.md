@@ -2024,6 +2024,32 @@ The marginal-frequency control is the one a reviewer will demand."
   - `build_from_archive(zip_path, *, resolution, source, test_recordings, out_dir, gbif_doi) -> list[Path]` — writes the full prior plus all four controls, returns their paths.
   - CLI: `python scripts/build_prior.py --archive PATH --source dof --resolutions 3 4 5 --out output/priors`
 
+> **CORRECTED 2026-09-29 — the multi-resolution sweep and the test split are incompatible
+> as originally written.** `build_from_archive` takes one `resolution`, but the CLI loops
+> over `--resolutions 3 4 5` while `test_recordings` is supplied ONCE. A `TestRecording`'s
+> `cell` is fixed at whatever resolution it was built at, so from Task 4 onward the guard
+> RAISES `ValueError` on every resolution except the matching one (it used to silently
+> no-op, which is why this was invisible in the original draft).
+> Task 10 obligations, all four binding:
+>   1. **Re-derive the split's cells per resolution.** Carry each test recording's lat/lon
+>      and compute its cell with the SAME `resolution` value handed to `assign_cells` —
+>      never reuse one pre-computed cell across resolutions. (Alternatively restrict the
+>      sweep to the split's own resolution, but re-deriving is what the sweep needs.)
+>   2. **Let a guard ValueError crash the build.** Never try/except it to keep the loop
+>      going: a caught mismatch writes a leak-contaminated artifact under a normal-looking
+>      filename, which is worse than the pre-fix silence because it looks deliberate. Fail
+>      that resolution's artifact entirely and exit non-zero.
+>   3. **Assert the split is non-empty.** `drop_test_contributor_cells` returns early and
+>      silently on an empty `test_recordings` — correct for that module, and `[]` is a
+>      legitimate mode. Task 10 is the ONLY place that knows a split was meant to be wired
+>      in, so require `--test-split PATH` or an explicit `--no-test-split` opt-out. Without
+>      this, the highest-consequence failure in the plan (a paper's numbers computed against
+>      an unguarded prior) has no automated detector anywhere.
+>   4. **Configure logging so WARNING reaches the console and the build log.** The
+>      zero-match warning is the shared symptom of four silent failure modes; an
+>      unconfigured logger discards it and re-silences all of them. Treat that specific
+>      warning as a build failure when a non-empty split was supplied.
+
 - [ ] **Step 1: Write the failing test**
 
 Create `tests/prior/test_build_prior.py`:
