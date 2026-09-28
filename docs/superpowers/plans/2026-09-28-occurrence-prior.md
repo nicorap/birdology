@@ -2024,6 +2024,21 @@ The marginal-frequency control is the one a reviewer will demand."
   - `build_from_archive(zip_path, *, resolution, source, test_recordings, out_dir, gbif_doi) -> list[Path]` — writes the full prior plus all four controls, returns their paths.
   - CLI: `python scripts/build_prior.py --archive PATH --source dof --resolutions 3 4 5 --out output/priors`
 
+> **ACCEPTANCE CRITERION added 2026-09-29 — prove the GUARDED table is what reaches
+> `target_group_ratios`.** A guarded and an unguarded `CountTable` are structurally
+> identical (same four columns, same dtypes), so NO check inside `effort.py` can tell them
+> apart — this is unenforceable anywhere except here. The failure it guards against is the
+> worst kind: an unguarded denominator under-weights every guarded cell-week uniformly,
+> producing a smooth, plausible, mildly-flat prior with no error, no nan and no missing
+> row. Invisible in the output and invisible in the paper.
+> Close it STRUCTURALLY, not by convention. Cheapest workable form: stamp the guard chain's
+> output with Arrow schema metadata (e.g. `b'leakage_guards_applied'`), have
+> `aggregate_counts` propagate it, and have `target_group_ratios` require it and raise
+> otherwise (~5 lines, machine-checked, compatible with the no-try/except rule). Stronger
+> form: a distinct type (`NewType`/wrapper `GuardedCounts`) so an unguarded table cannot be
+> passed at all. Either way this task must carry an explicit test that the ONLY table
+> reaching `target_group_ratios` is the post-guard one.
+>
 > **CORRECTED 2026-09-29 — the multi-resolution sweep and the test split are incompatible
 > as originally written.** `build_from_archive` takes one `resolution`, but the CLI loops
 > over `--resolutions 3 4 5` while `test_recordings` is supplied ONCE. A `TestRecording`'s
