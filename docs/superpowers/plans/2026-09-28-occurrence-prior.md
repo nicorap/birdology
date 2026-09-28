@@ -871,9 +871,14 @@ from dataclasses import dataclass
 import pyarrow as pa
 import pyarrow.compute as pc
 
-# Xeno-Canto Foundation for Nature Sounds, publishing organisation on GBIF.
+# Xeno-canto Foundation for Nature Sounds, publishing organisation on GBIF.
+# CORRECTED 2026-09-29: this plan originally named e2e717bf-551a-4917-bdc9-4fa0f342c530,
+# which api.gbif.org/v1/organization resolves to the CORNELL LAB OF ORNITHOLOGY (the eBird
+# publisher). Using it would have leaked every Xeno-Canto occurrence into the prior AND
+# deleted the entire eBird population — both failure modes at once. Verified against the
+# live API: the key below is "Xeno-canto Foundation for Nature Sounds".
 XENO_CANTO_PUBLISHER_KEYS = frozenset(
-    {"e2e717bf-551a-4917-bdc9-4fa0f342c530"}
+    {"1f00d75c-f6fc-4224-a595-975e82d7689c"}
 )
 
 
@@ -934,8 +939,12 @@ curl -s "https://api.gbif.org/v1/dataset/search?q=xeno-canto&limit=5" \
   | python3 -c "import json,sys; d=json.load(sys.stdin); [print(r['publishingOrganizationKey'], r['title']) for r in d['results']]"
 ```
 
-If the key differs from `e2e717bf-551a-4917-bdc9-4fa0f342c530`, update
-`XENO_CANTO_PUBLISHER_KEYS` and re-run the tests.
+Expected: `1f00d75c-f6fc-4224-a595-975e82d7689c` for all five Xeno-canto datasets.
+If the key differs, update `XENO_CANTO_PUBLISHER_KEYS` and re-run the tests.
+
+DO NOT use `e2e717bf-551a-4917-bdc9-4fa0f342c530` — an earlier draft of this plan named it
+as Xeno-Canto, but it is the Cornell Lab of Ornithology (eBird). `tests/prior/test_leakage.py`
+asserts that key is ABSENT from `XENO_CANTO_PUBLISHER_KEYS`; do not weaken that test.
 
 - [ ] **Step 6: Commit**
 
