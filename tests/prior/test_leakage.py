@@ -5,11 +5,13 @@ from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 
+import h3
 import pyarrow as pa
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 
+import birdology.prior.leakage as leakage_module
 from birdology.prior.indexing import aggregate_counts, assign_cells
 from birdology.prior.leakage import (
     REPLACEMENT_CHARACTER,
@@ -20,10 +22,19 @@ from birdology.prior.leakage import (
     drop_test_contributor_cells,
     drop_xeno_canto,
     keep_mask,
+    normalise_cell,
     normalise_contributor,
+    normalise_week,
 )
 
 XC = next(iter(XENO_CANTO_PUBLISHER_KEYS))
+
+#: Real H3 indexes. `normalise_cell` casefolds and `_assert_one_resolution`
+#: calls `h3.get_resolution`, so a placeholder like "C" is neither a valid H3
+#: index nor stable under normalisation; unit tests must use real ones.
+CELL_A = h3.latlng_to_cell(55.6867, 12.5700, 4)
+CELL_B = h3.latlng_to_cell(40.0000, -3.7000, 4)
+CELL_A_RES5 = h3.latlng_to_cell(55.6867, 12.5700, 5)
 
 
 def _table(rows):
@@ -498,16 +509,16 @@ def test_keep_mask_keeps_blank_contributor_rows_even_if_banned_holds_a_blank_key
     The None key matters: `normalise_contributor` maps every blank spelling to
     None, so a None-keyed ban is precisely what would collide with — and wipe —
     the whole anonymous population of a cell-week."""
-    poisoned = {("C", 46, ""), ("C", 46, "   "), ("C", 46, None)}
-    mask = keep_mask(["C"], [46], [blank], poisoned)
+    poisoned = {(CELL_A, 46, ""), (CELL_A, 46, "   "), (CELL_A, 46, None)}
+    mask = keep_mask([CELL_A], [46], [blank], poisoned)
     assert mask == [True]
 
 
 def test_keep_mask_still_drops_a_genuine_match():
     """Guards the previous test against a vacuously all-True mask."""
-    banned = {("C", 46, "ole hansen")}
+    banned = {(CELL_A, 46, "ole hansen")}
     mask = keep_mask(
-        ["C", "C", "C"],
+        [CELL_A, CELL_A, CELL_A],
         [46, 46, 47],
         ["Ole Hansen", "Jens", "Ole Hansen"],
         banned,
@@ -516,4 +527,343 @@ def test_keep_mask_still_drops_a_genuine_match():
 
 
 def test_keep_mask_is_empty_for_an_empty_table():
-    assert keep_mask([], [], [], {("C", 46, "ole")}) == []
+    assert keep_mask([], [], [], {(CELL_A, 46, "ole")}) == []
+
+
+# --------------------------------------------------------------------------
+# F4: layer 2's contribution to the COMPOSED path, made observable.
+#
+# Layer 1 (banned_keys) makes a None-contributor key unreachable through the
+# public API, so no integration test can reach layer 2's blank-row branch —
+# the reviewer reimplemented keep_mask's body inline inside
+# drop_test_contributor_cells WITHOUT the blank clause and the whole suite
+# stayed green. Monkeypatching banned_keys injects the key layer 1 refuses to
+# produce, which is the only way to exercise layer 2 through the composition.
+# --------------------------------------------------------------------------
+
+
+def test_composed_guard_keeps_null_contributor_rows_against_a_none_key(monkeypatch):
+    """Layer 2, THROUGH drop_test_contributor_cells.
+
+    With `banned` poisoned by a None-contributor key, a table whose
+    `recorded_by` is null must lose ZERO rows. Without layer 2's
+    `normalise_contributor(name) is None or ...` clause, `normalise_contributor`
+    of a null name IS None, so the key matches and the anonymous population is
+    wiped — which is exactly the mutation that previously survived.
+    """
+    t = _one_anonymous_and_one_named()
+    cell = t.column("cell")[0].as_py()
+    monkeypatch.setattr(
+        leakage_module, "banned_keys", lambda _recordings: {(cell, 46, None)}
+    )
+    out = drop_test_contributor_cells(
+        t, [TestRecording(cell=cell, week=46, recorded_by="Ole")]
+    )
+    assert out.num_rows == t.num_rows
+    assert out.column("recorded_by").to_pylist() == [None, "Ole"]
+
+
+def test_composed_guard_with_a_blank_string_key_keeps_anonymous_rows(monkeypatch):
+    """Same, for the blank-string spelling of the poisoned key."""
+    t = _one_anonymous_and_one_named()
+    cell = t.column("cell")[0].as_py()
+    monkeypatch.setattr(
+        leakage_module,
+        "banned_keys",
+        lambda _recordings: {(cell, 46, ""), (cell, 46, "   ")},
+    )
+    out = drop_test_contributor_cells(
+        t, [TestRecording(cell=cell, week=46, recorded_by="Ole")]
+    )
+    assert out.num_rows == t.num_rows
+
+
+def test_composed_guard_still_drops_a_real_match_when_banned_is_patched(monkeypatch):
+    """Guards the two above against a vacuous pass: the monkeypatched path must
+    still be able to remove a row, so an all-keep implementation fails here."""
+    t = _one_anonymous_and_one_named()
+    cell = t.column("cell")[0].as_py()
+    monkeypatch.setattr(
+        leakage_module, "banned_keys", lambda _recordings: {(cell, 46, "ole")}
+    )
+    out = drop_test_contributor_cells(t, [])
+    assert out.column("recorded_by").to_pylist() == [None]
+
+
+# --------------------------------------------------------------------------
+# F1: the CELL is normalised on both sides.
+#
+# Controller-reproduced silent no-ops on a real res-4 table: an UPPERCASE cell,
+# a whitespace-padded cell and a res-5 cell each kept the row that the guard
+# should have removed — no exception, no log line, leak survives. Test-split
+# metadata is caller-side CSV/JSON, which is exactly where uppercase and
+# padded hex comes from, and h3.get_resolution accepts an uppercased cell so
+# no validity check catches it.
+# --------------------------------------------------------------------------
+
+
+def _one_ole_at_cell_a_week_46():
+    return assign_cells(
+        _table([(1, 55.6867, 12.5700, date(2025, 11, 14), "pub", "Ole")]),
+        resolution=4,
+    )
+
+
+def test_exact_cell_removes_the_row_control():
+    """Control for the three variants below: the guard does work in the base case."""
+    t = _one_ole_at_cell_a_week_46()
+    cell = t.column("cell")[0].as_py()
+    assert cell == CELL_A
+    out = drop_test_contributor_cells(
+        t, [TestRecording(cell=cell, week=46, recorded_by="Ole")]
+    )
+    assert out.num_rows == 0
+
+
+@pytest.mark.parametrize(
+    "variant,label",
+    [
+        (lambda c: c.upper(), "UPPERCASE"),
+        (lambda c: "  " + c + " ", "whitespace-padded"),
+        (lambda c: c.title(), "mixed case"),
+        (lambda c: "\u200b" + c, "zero-width-prefixed"),
+    ],
+)
+def test_cell_spelling_variants_still_remove_the_row(variant, label):
+    """Each of these was a TOTAL silent no-op before the cell was normalised."""
+    t = _one_ole_at_cell_a_week_46()
+    cell = t.column("cell")[0].as_py()
+    out = drop_test_contributor_cells(
+        t, [TestRecording(cell=variant(cell), week=46, recorded_by="Ole")]
+    )
+    assert out.num_rows == 0, f"{label} cell was a silent no-op"
+
+
+def test_cell_normalisation_applies_to_the_occurrence_side_too():
+    """Normalising only the test side is still a no-op if the table's cell is
+    spelled differently. Simulated by handing keep_mask an uppercase table
+    cell against a canonical banned key."""
+    banned = {(CELL_A, 46, "ole")}
+    assert keep_mask([CELL_A.upper()], [46], ["Ole"], banned) == [False]
+    assert keep_mask(["  " + CELL_A + " "], [46], ["Ole"], banned) == [False]
+
+
+def test_test_recording_stores_the_normalised_cell():
+    """The value held must be the value compared — a frozen dataclass storing a
+    raw cell while banned_keys normalises a different one is how the two sides
+    drift apart."""
+    rec = TestRecording(cell="  " + CELL_A.upper() + " ", week=46, recorded_by="Ole")
+    assert rec.cell == CELL_A
+
+
+def test_banned_keys_normalises_the_cell_for_duck_typed_callers():
+    rec = SimpleNamespace(cell="  " + CELL_A.upper() + " ", week=46, recorded_by="Ole")
+    assert banned_keys([rec]) == {(CELL_A, 46, "ole")}
+
+
+def test_normalise_cell_is_case_and_whitespace_insensitive():
+    assert normalise_cell(CELL_A.upper()) == CELL_A
+    assert normalise_cell("  " + CELL_A + "\n") == CELL_A
+    assert normalise_cell(None) is None
+
+
+def test_cell_in_key_at_a_shared_week_keep_mask_layer():
+    """F7: the cell component of the key was pinned by only ONE test at the
+    keep_mask layer. Two different cells, SAME week, SAME contributor: only the
+    banned cell's row may be dropped, so dropping `cell` from the key is caught
+    here and not only end-to-end."""
+    banned = {(CELL_A, 46, "ole")}
+    assert keep_mask(
+        [CELL_A, CELL_B], [46, 46], ["Ole", "Ole"], banned
+    ) == [False, True]
+
+
+def test_week_in_key_at_a_shared_cell_keep_mask_layer():
+    """F7, the week component: same cell, same contributor, different weeks."""
+    banned = {(CELL_A, 46, "ole")}
+    assert keep_mask(
+        [CELL_A, CELL_A], [46, 47], ["Ole", "Ole"], banned
+    ) == [False, True]
+
+
+# --------------------------------------------------------------------------
+# F2: a cross-resolution cell must RAISE, not silently match nothing.
+# --------------------------------------------------------------------------
+
+
+def test_cross_resolution_test_cell_raises():
+    """drop_test_contributor_cells is the only place where the test split's
+    resolution and the assign_cells resolution are both in scope, so the
+    invariant lives here. A res-5 cell against a res-4 table matches nothing at
+    all — total silent leakage — and is never intentional."""
+    t = _one_ole_at_cell_a_week_46()
+    with pytest.raises(ValueError) as excinfo:
+        drop_test_contributor_cells(
+            t, [TestRecording(cell=CELL_A_RES5, week=46, recorded_by="Ole")]
+        )
+    message = str(excinfo.value)
+    assert "resolution" in message
+    assert "5" in message and "4" in message
+    # names which side is which
+    assert "test recording" in message and "occurrence table" in message
+
+
+def test_cross_resolution_raises_through_apply_leakage_guards():
+    t = _one_ole_at_cell_a_week_46()
+    with pytest.raises(ValueError, match="resolution"):
+        apply_leakage_guards(
+            t, [TestRecording(cell=CELL_A_RES5, week=46, recorded_by="Ole")]
+        )
+
+
+def test_cross_resolution_raises_even_when_uppercased():
+    """The resolution check must run on the normalised cell, so F1's casefold
+    cannot let a mismatched cell slip past it."""
+    t = _one_ole_at_cell_a_week_46()
+    with pytest.raises(ValueError, match="resolution"):
+        drop_test_contributor_cells(
+            t, [TestRecording(cell=CELL_A_RES5.upper(), week=46, recorded_by="Ole")]
+        )
+
+
+def test_matching_resolution_does_not_raise():
+    """Guards the three above against a check that always raises."""
+    t = _one_ole_at_cell_a_week_46()
+    out = drop_test_contributor_cells(
+        t, [TestRecording(cell=CELL_B, week=46, recorded_by="Ole")]
+    )
+    assert out.num_rows == 1
+
+
+def test_resolution_check_is_skipped_on_an_empty_table():
+    """An empty table has no resolution to compare against; it must not raise."""
+    t = assign_cells(_table([]), resolution=4)
+    out = drop_test_contributor_cells(
+        t, [TestRecording(cell=CELL_A_RES5, week=46, recorded_by="Ole")]
+    )
+    assert out.num_rows == 0
+
+
+def test_invalid_test_cell_raises_rather_than_matching_nothing():
+    """A cell that is not an H3 index at all is a caller-side bug, and would
+    otherwise be another silent no-op."""
+    t = _one_ole_at_cell_a_week_46()
+    with pytest.raises(ValueError, match="valid H3"):
+        drop_test_contributor_cells(
+            t, [TestRecording(cell="not-a-cell", week=46, recorded_by="Ole")]
+        )
+
+
+# --------------------------------------------------------------------------
+# F3: a zero-effect guard must not be silent.
+# --------------------------------------------------------------------------
+
+
+def test_warns_when_a_non_empty_banned_set_matches_nothing(caplog):
+    """The shared observable symptom of every remaining silent-failure mode:
+    contributor-spelling miss, mojibake, an un-wired eval split. Without it, a
+    guard that removes nothing produces no output at all."""
+    t = _one_ole_at_cell_a_week_46()
+    cell = t.column("cell")[0].as_py()
+    with caplog.at_level(logging.WARNING, logger="birdology.prior.leakage"):
+        out = drop_test_contributor_cells(
+            t, [TestRecording(cell=cell, week=46, recorded_by="Somebody Else")]
+        )
+    assert out.num_rows == 1
+    messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("matched zero" in m for m in messages), messages
+    assert any("1 banned" in m for m in messages), messages
+
+
+def test_no_zero_match_warning_when_the_guard_removed_rows(caplog):
+    """Guards the previous test against an always-on warning."""
+    t = _one_ole_at_cell_a_week_46()
+    cell = t.column("cell")[0].as_py()
+    with caplog.at_level(logging.WARNING, logger="birdology.prior.leakage"):
+        drop_test_contributor_cells(
+            t, [TestRecording(cell=cell, week=46, recorded_by="Ole")]
+        )
+    assert not [r for r in caplog.records if "matched zero" in r.getMessage()]
+
+
+def test_no_zero_match_warning_when_the_banned_set_is_empty(caplog):
+    """An empty banned set legitimately matches nothing; warning there would
+    fire on every un-guarded build and train the operator to ignore it."""
+    t = _one_ole_at_cell_a_week_46()
+    with caplog.at_level(logging.WARNING, logger="birdology.prior.leakage"):
+        drop_test_contributor_cells(t, [])
+    assert not [r for r in caplog.records if "matched zero" in r.getMessage()]
+
+
+# --------------------------------------------------------------------------
+# F5: zero-width and soft-hyphen codepoints must not survive normalisation.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("invisible", ["\u200b", "\u200c", "\u200d", "\u00ad", "\ufeff"])
+def test_invisible_codepoints_do_not_block_a_contributor_match(invisible):
+    """NFKC does not strip Cf codepoints and str.split() does not treat them as
+    whitespace, so 'Ole\\u200bHansen' could never match 'ole hansen'. GBIF
+    recordedBy is free text and does carry these."""
+    assert normalise_contributor("Ole" + invisible + " Hansen") == "ole hansen"
+    assert normalise_contributor("Ole" + invisible + "Hansen") == "olehansen"
+
+
+def test_zero_width_contributor_is_still_guarded_end_to_end():
+    t = assign_cells(
+        _table(
+            [
+                (1, 55.6867, 12.5700, date(2025, 11, 14), "pub", "Ole\u200b Hansen"),
+                (1, 55.6867, 12.5700, date(2025, 11, 14), "pub", "Jens"),
+            ]
+        ),
+        resolution=4,
+    )
+    cell = t.column("cell")[0].as_py()
+    out = drop_test_contributor_cells(
+        t, [TestRecording(cell=cell, week=46, recorded_by="Ole Hansen")]
+    )
+    assert out.column("recorded_by").to_pylist() == ["Jens"]
+
+
+def test_invisible_only_contributor_is_blank():
+    """A name made only of invisible codepoints must normalise to None, not to
+    a usable join key that would wipe an anonymous population."""
+    assert normalise_contributor("\u200b\u00ad") is None
+    with pytest.raises(ValueError, match="recorded_by"):
+        TestRecording(cell=CELL_A, week=46, recorded_by="\u200b")
+
+
+# --------------------------------------------------------------------------
+# F6: week must not be silently coerced.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("week", [46.9, 46.0, "46", None, True])
+def test_test_recording_rejects_non_integral_week(week):
+    """int(46.9) silently bans week 46, so a caller-side units bug (a
+    day-of-year, a string) would quietly guard the WRONG week."""
+    with pytest.raises(ValueError, match="week"):
+        TestRecording(cell=CELL_A, week=week, recorded_by="Ole")
+
+
+def test_test_recording_stores_the_coerced_week():
+    """__post_init__ used to validate int(self.week) and then throw it away, so
+    banned_keys independently re-coerced the raw value: two derivations of one
+    number is how the two sides drift."""
+    rec = TestRecording(cell=CELL_A, week=46, recorded_by="Ole")
+    assert rec.week == 46
+    assert type(rec.week) is int
+
+
+def test_normalise_week_accepts_integral_and_rejects_the_rest():
+    assert normalise_week(46) == 46
+    for bad in (46.9, 46.0, "46", None, True):
+        with pytest.raises(ValueError, match="week"):
+            normalise_week(bad)
+
+
+def test_banned_keys_rejects_a_non_integral_week_for_duck_typed_callers():
+    rec = SimpleNamespace(cell=CELL_A, week=46.9, recorded_by="Ole")
+    with pytest.raises(ValueError, match="week"):
+        banned_keys([rec])
