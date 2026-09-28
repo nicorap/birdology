@@ -190,9 +190,10 @@ convergence.
 ### Phase A — embedding extraction
 
 Both frozen encoders over the whole BirdSet corpus, once; cache the embeddings. Embarrassingly
-parallel: shard recordings across 192 GPUs, zero communication.
+parallel: shard recordings across the working fleet (160 GPUs today, 192 once dgx184–187 are
+remediated), zero communication.
 
-This is the real hardware stress test — 192 GPUs decoding audio, running inference and writing
+This is the real hardware stress test — the whole fleet decoding audio, running inference and writing
 storage for hours. Expected pain point: 24 nodes pulling a multi-hundred-GB corpus off one Synology
 NFS box. Mitigation: stage each shard to node-local `/raid/scratch` first (5.3 GB/s measured vs
 317 MB/s NFS write / 239 MB/s read), compute, write only compact embeddings back to shared storage.
@@ -216,7 +217,8 @@ At ~3 GPU-hours each: roughly 1.5 days of the full machine.
 
 ### Scheduling
 
-Slurm job array, `--gres=gpu:1`, 192 concurrent tasks, one results row per task — the same pattern
+Slurm job array, `--gres=gpu:1`, up to 160 concurrent tasks (192 after remediation), one results
+row per task — the same pattern
 as the existing `gpu-scale-sweep.csv` harness. Deliberately 1 GPU per task so a flaky node kills
 one cell, not the sweep.
 
@@ -282,7 +284,8 @@ correctness check: results disagreeing with published ones indicate a stack prob
 ## Section 5 — Cluster execution
 
 **Cluster:** `ssh ubuntu@100.69.23.11` (slurm-login-01.infra.faic.dk), partition `gpu`,
-24 × DGX (dgx160–171, 176–187), 8×H100 80GB each = 192 GPUs, 224 CPU + 2 TB RAM per node,
+24 × DGX (dgx160–171, 176–187), 8×H100 80GB each = 192 GPUs (160 usable today, see container
+runtime below), 224 CPU + 2 TB RAM per node,
 MaxTime 2-00:00:00, driver 595.91.07. Queue empty.
 
 ### Storage (resolved)
@@ -304,7 +307,58 @@ writable from a job on dgx160. No sysadmin ticket needed.
 | `/raid/scratch` (node-local, 28 TB) | staging: audio shards, temp | 5.3 GB/s |
 | `/tmp` | job scratch | node-local, wiped |
 
-### PyTorch (open)
+### Container runtime (resolved: Apptainer, 20 of 24 nodes)
+
+**Decision: Apptainer SIF, not pyxis/enroot.** Built and verified.
+
+`/shared/apps/ML/containers/pytorch.sif` — 9.8 GB, from `nvcr.io/nvidia/pytorch:25.08-py3`,
+built by `code/build_sif.sh` (job 2359, 4m07s). Verified inside the image on an H100:
+
+```
+torch 2.8.0a0+34c6371d24.nv25.08   cuda 13.0   avail True
+bf16 8192^3 matmul: 786.3 TFLOP/s
+on-GPU stft ok (64, 513, 501)      numpy 1.26.4   scipy 1.15.3
+```
+
+The on-GPU STFT check settles the audio decode question: `torch.stft` in the container works, so
+no torchaudio/librosa module is needed for mel spectrograms.
+
+**Why not pyxis/enroot.** Pyxis derives its enroot paths from the passwd `HOME` (`/home/ubuntu`),
+which is unreadable inside a job, and it ignores `--export`, so every `--container-image` start
+dies on `mkdir: Permission denied`. Fixing it requires editing `/etc/enroot/enroot.conf`
+fleet-wide — a privileged change, deliberately not made. Apptainer honours `APPTAINER_CACHEDIR` /
+`APPTAINER_TMPDIR` / `HOME` from the environment, so it needs no such change. Every job script
+must set those three to node-local paths.
+
+**Fleet status** (job 2362, all 24 nodes, `code/fleet_check.sh`):
+
+| Nodes | apptainer | Result |
+|---|---|---|
+| dgx160, 162–171, 176–183 (19) | system binary | OK, 716–745 TFLOP/s bf16 4096³ — tight spread, no slow node |
+| dgx161 | system binary | task launch timed out (23 of 24 started); transient, re-test |
+| dgx184–187 (4) | module only | **FAILED** |
+
+dgx184–187 have no system apptainer, enroot or pyxis. The module binary is not setuid
+(`-rwxrwxr-x`), so it cannot mount a SIF directly and falls back to sandbox extraction, which
+needs unprivileged user namespaces:
+
+```
+FATAL: while extracting pytorch.sif: root filesystem extraction failed:
+       Failed to create container process: Operation not permitted
+```
+
+They also lack `squashfuse`. Remediation is a sysadmin task (install the apptainer package +
+`squashfuse`, or set `kernel.apparmor_restrict_unprivileged_userns=0`) — **not a blocker**:
+20 nodes × 8 = **160 GPUs** is the working fleet, and the sweep is embarrassingly parallel, so it
+simply uses fewer array slots. Treat 184–187 as a remediation ticket to file, not a dependency.
+
+**Observed I/O ceiling, for free.** The fleet check took 10m33s, almost entirely spent with 24
+nodes pulling the same 9.8 GB SIF over one NFS link (~235 GB through a 239 MB/s pipe). This is
+exactly the Phase A bottleneck the spec predicts, arriving early and for free. It confirms the
+mitigation: stage the SIF and audio shards to node-local `/raid/scratch` (5.3 GB/s) once per node,
+never per task.
+
+### PyTorch module (deferred, not needed)
 
 No PyTorch module is installed: `/shared/apps/modules/all/ai/PyTorch/` holds no modulefile and
 `/shared/apps/software/PyTorch` does not exist. Build 2241
@@ -312,19 +366,14 @@ No PyTorch module is installed: `/shared/apps/modules/all/ai/PyTorch/` holds no 
 minutes — then EasyBuild ran the test suite for 9h23m and aborted on 144 failures against a max of
 10, so nothing installed. Staging prefix was `/raid/scratch/nvidia-eb-2241/...`, node-local.
 
-Two routes, both to be taken:
-
-1. **Container (immediate):** NGC PyTorch via enroot or Apptainer. Both binaries verified present
-   on dgx160 — the earlier inventory suggesting enroot exists only on dgx160–168 must be
-   re-checked across all 24 nodes before relying on it.
-2. **Module (clean stack):** re-run the build with the test step relaxed or known-failing tests
-   excluded. The compile is proven; the tests are the blocker.
+The container covers all project needs, so the module is deferred. If a clean module stack is
+wanted later, re-run the build with the test step relaxed or known-failing tests excluded — the
+compile is proven; the tests are the blocker.
 
 Also confirmed on compute nodes: `libcuda.so.1` present, PyPI reachable (so a venv on
-`/shared/apps/ML` is viable). No torchaudio / torchvision / librosa / soundfile easyconfigs exist
-anywhere — FFmpeg and LLVM do. Survivable: mel spectrograms are `torch.stft` plus a filterbank
-matmul, and doing them on-GPU beats torchaudio-on-CPU. But the audio decode path is a decision, not
-an assumption.
+`/shared/apps/ML` is viable if the container ever needs supplementing). No torchaudio /
+torchvision / librosa / soundfile easyconfigs exist anywhere — moot now that on-GPU STFT is
+verified.
 
 ### Xeno-Canto API
 
@@ -334,15 +383,15 @@ hosts the audio.
 
 ### Phase order
 
-1. Storage (done) + PyTorch route settled + XC key + EOD/DOF proportional pull started
+1. Storage (done) + container (done: Apptainer SIF, 20/24 nodes) + XC key + EOD/DOF proportional
+   pull started
 2. Reproduce BirdSet baselines on one node — **hard correctness gate**
 3. Build priors (global + Denmark × 3 resolutions), leakage tests green
-4. Phase A: embedding extraction, 192-way, NFS behaviour measured
+4. Phase A: embedding extraction, fleet-wide, NFS behaviour measured
 5. Phase B: sweep as job array
 6. Analysis, artifact packaging, paper
 
 ## Open questions
 
-- Audio decode path: on-GPU STFT vs FFmpeg-based CPU decode — decide during Phase A design.
 - Whether the EBD arrives in time to add a detectability-modelling arm.
 - Denmark case study depth: how far back the proportional DOF pull should reach.
