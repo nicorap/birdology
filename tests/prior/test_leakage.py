@@ -16,8 +16,10 @@ from birdology.prior.leakage import (
     XENO_CANTO_PUBLISHER_KEYS,
     TestRecording,
     apply_leakage_guards,
+    banned_keys,
     drop_test_contributor_cells,
     drop_xeno_canto,
+    keep_mask,
     normalise_contributor,
 )
 
@@ -457,3 +459,61 @@ def test_guards_run_before_aggregation_loses_provenance():
     )
     assert aggregate_counts(guarded).num_rows == 0
     assert aggregated.num_rows == 1
+
+
+# --------------------------------------------------------------------------
+# The two blank-contributor layers, pinned INDEPENDENTLY.
+#
+# banned_keys and keep_mask are each individually sufficient to stop a blank
+# contributor wiping an anonymous population, so an end-to-end test cannot
+# tell which one is doing the work: mutating either alone leaves the suite
+# green. Unit tests on each layer make the redundancy observable.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\t\n", None])
+def test_banned_keys_never_admits_a_blank_contributor(blank):
+    """Layer 1, alone: a blank contributor must not become a join key."""
+    rec = SimpleNamespace(cell="841f059ffffffff", week=46, recorded_by=blank)
+    assert banned_keys([rec]) == set()
+
+
+def test_banned_keys_warns_when_it_skips_a_blank_contributor(caplog):
+    rec = SimpleNamespace(cell="841f059ffffffff", week=46, recorded_by="")
+    with caplog.at_level(logging.WARNING, logger="birdology.prior.leakage"):
+        banned_keys([rec])
+    assert any("blank contributor" in r.getMessage() for r in caplog.records)
+
+
+def test_banned_keys_normalises_and_keeps_real_contributors():
+    rec = SimpleNamespace(cell="841f059ffffffff", week=46, recorded_by="  Ole  Hansen ")
+    assert banned_keys([rec]) == {("841f059ffffffff", 46, "ole hansen")}
+
+
+@pytest.mark.parametrize("blank", ["", "   ", None])
+def test_keep_mask_keeps_blank_contributor_rows_even_if_banned_holds_a_blank_key(blank):
+    """Layer 2, alone: even if a blank OR None key reached `banned` by some
+    other route, a row with a blank contributor must still be KEPT.
+
+    The None key matters: `normalise_contributor` maps every blank spelling to
+    None, so a None-keyed ban is precisely what would collide with — and wipe —
+    the whole anonymous population of a cell-week."""
+    poisoned = {("C", 46, ""), ("C", 46, "   "), ("C", 46, None)}
+    mask = keep_mask(["C"], [46], [blank], poisoned)
+    assert mask == [True]
+
+
+def test_keep_mask_still_drops_a_genuine_match():
+    """Guards the previous test against a vacuously all-True mask."""
+    banned = {("C", 46, "ole hansen")}
+    mask = keep_mask(
+        ["C", "C", "C"],
+        [46, 46, 47],
+        ["Ole Hansen", "Jens", "Ole Hansen"],
+        banned,
+    )
+    assert mask == [False, True, True]
+
+
+def test_keep_mask_is_empty_for_an_empty_table():
+    assert keep_mask([], [], [], {("C", 46, "ole")}) == []

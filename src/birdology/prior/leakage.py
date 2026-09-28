@@ -118,14 +118,16 @@ def drop_xeno_canto(table: pa.Table) -> pa.Table:
     return kept
 
 
-def drop_test_contributor_cells(
-    table: pa.Table, test_recordings: Iterable[TestRecording]
-) -> pa.Table:
-    """Remove rows matching a test recording's (cell, week, contributor).
+def banned_keys(
+    test_recordings: Iterable[TestRecording],
+) -> set[tuple[str, int, str]]:
+    """Normalised (cell, week, contributor) keys to exclude.
 
-    Contributor names are normalised on BOTH sides before the join (see
-    :func:`normalise_contributor`). A row whose ``recorded_by`` is null can
-    never match, since a blank key is rejected at ``TestRecording`` construction.
+    Layer 1 of the blank-contributor defence: a recording whose contributor
+    normalises to ``None`` NEVER becomes a key. Exposed separately from
+    :func:`keep_mask` so each layer can be tested — and mutated — on its own;
+    together they are redundant, and redundancy that cannot be observed is
+    indistinguishable from a bug.
     """
     banned: set[tuple[str, int, str]] = set()
     for recording in test_recordings:
@@ -140,7 +142,38 @@ def drop_test_contributor_cells(
             )
             continue
         banned.add((recording.cell, int(recording.week), who))
+    return banned
 
+
+def keep_mask(
+    cells: list[str],
+    weeks: list[int],
+    names: list[str | None],
+    banned: set[tuple[str, int, str]],
+) -> list[bool]:
+    """Row mask: True to keep. Layer 2 of the blank-contributor defence.
+
+    A row with a null/blank ``recorded_by`` is ALWAYS kept, independently of
+    what is in *banned*. This holds even if a blank key reached *banned* by
+    some other route, so an anonymous population can never be wiped wholesale.
+    """
+    return [
+        normalise_contributor(name) is None
+        or (cell, int(week), normalise_contributor(name)) not in banned
+        for cell, week, name in zip(cells, weeks, names)
+    ]
+
+
+def drop_test_contributor_cells(
+    table: pa.Table, test_recordings: Iterable[TestRecording]
+) -> pa.Table:
+    """Remove rows matching a test recording's (cell, week, contributor).
+
+    Contributor names are normalised on BOTH sides before the join (see
+    :func:`normalise_contributor`). A row whose ``recorded_by`` is null can
+    never match, since a blank key is rejected at ``TestRecording`` construction.
+    """
+    banned = banned_keys(test_recordings)
     if not banned:
         return table
 
@@ -148,17 +181,9 @@ def drop_test_contributor_cells(
     weeks = table.column("week").to_pylist()
     who_raw = table.column("recorded_by").to_pylist()
 
-    keep: list[bool] = []
-    flagged = 0
-    for cell, week, name in zip(cells, weeks, who_raw):
-        if name is not None and REPLACEMENT_CHARACTER in name:
-            flagged += 1
-        contributor = normalise_contributor(name)
-        keep.append(
-            contributor is None
-            or (cell, int(week), contributor) not in banned
-        )
-
+    flagged = sum(
+        1 for name in who_raw if name is not None and REPLACEMENT_CHARACTER in name
+    )
     if flagged:
         logger.warning(
             "drop_test_contributor_cells: %d occurrence(s) carry U+FFFD in "
@@ -167,6 +192,7 @@ def drop_test_contributor_cells(
             flagged,
         )
 
+    keep = keep_mask(cells, weeks, who_raw, banned)
     kept = table.filter(pa.array(keep, pa.bool_()))
     if kept.num_rows != table.num_rows:
         logger.info(
