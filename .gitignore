@@ -26,3 +26,4 @@ output/.birdology*_oxi/
 
 # SDD process artifacts
 .superpowers/
+.worktrees/
