@@ -85,6 +85,123 @@ def test_negative_count_is_rejected():
         target_group_ratios(_counts([(1, "c", 5, 3), (2, "c", 5, -3)]))
 
 
+def test_a_cell_week_summing_to_zero_is_rejected_even_when_the_table_is_positive():
+    """The guard is per-ROW (`min`), not per-TABLE (`sum`).
+
+    A table-wide `sum(n) > 0` check would pass this fixture: 5 + -5 + 10 == 10.
+    But cell 'c' totals ZERO, so its two rows divide by zero and emit
+    `ratio = +inf` and `-inf` with `total = 0` -- exactly the poisoned output
+    rule (D) exists to prevent. Only a `min` over every row sees the -5.
+    """
+    t = _counts([(1, "c", 5, 5), (2, "c", 5, -5), (3, "d", 5, 10)])
+    assert sum(t.column("n").to_pylist()) > 0
+    with pytest.raises(ValueError, match="n must be >= 1"):
+        target_group_ratios(t)
+
+
+# --------------------------------------------------------------------------
+# Output post-condition: rows that are KEPT but poisoned.
+#
+# The post-join row-count invariant only sees rows that VANISH. A row with a
+# null `total` or an inf/nan `ratio` keeps the count intact and reads
+# downstream as a perfectly ordinary share.
+# --------------------------------------------------------------------------
+
+
+def test_a_zero_total_is_caught_on_output_even_if_validation_is_bypassed(monkeypatch):
+    """Defence in depth for the poisoned-row mode.
+
+    With `_validate` disabled, `n = [5, -5]` reaches the divide: the row count
+    is preserved, so the join invariant is silent, and the module would emit
+    `total = 0` with `ratio = +/-inf`. The output post-condition is the only
+    thing standing between that and the prior.
+    """
+    import birdology.prior.effort as effort
+
+    monkeypatch.setattr(effort, "_validate", lambda counts: None)
+    t = _counts([(1, "c", 5, 5), (2, "c", 5, -5)])
+    with pytest.raises(ValueError, match="total is null or < 1"):
+        effort.target_group_ratios(t)
+
+
+def test_a_non_finite_ratio_is_caught_on_output():
+    """inf/nan must never be emitted as if it were a share.
+
+    Checked on `_check_output` directly with a hand-built row, because the
+    total guard fires first on every input that would actually divide by zero.
+    Both guards are needed: a numerator/denominator misalignment can leave
+    `total >= 1` and still produce a nan.
+    """
+    import birdology.prior.effort as effort
+
+    bad = pa.table(
+        {
+            "species_key": pa.array([1], pa.int64()),
+            "cell": pa.array(["c"], pa.string()),
+            "week": pa.array([5], pa.int8()),
+            "n": pa.array([7], pa.int64()),
+            "total": pa.array([1], pa.int64()),
+            "ratio": pa.array([float("inf")], pa.float64()),
+        }
+    )
+    with pytest.raises(ValueError, match="non-finite"):
+        effort._check_output(bad)
+
+    bad_nan = bad.set_column(
+        bad.column_names.index("ratio"), "ratio", pa.array([float("nan")], pa.float64())
+    )
+    with pytest.raises(ValueError, match="non-finite"):
+        effort._check_output(bad_nan)
+
+
+def test_a_ratio_above_one_is_caught_on_output():
+    """A share cannot exceed its own denominator.
+
+    Built by hand-poisoning the post-condition's input, because no reachable
+    code path produces it -- which is the point: it is the shape a numerator /
+    denominator misalignment takes.
+    """
+    import birdology.prior.effort as effort
+
+    bad = pa.table(
+        {
+            "species_key": pa.array([1], pa.int64()),
+            "cell": pa.array(["c"], pa.string()),
+            "week": pa.array([5], pa.int8()),
+            "n": pa.array([7], pa.int64()),
+            "total": pa.array([3], pa.int64()),
+            "ratio": pa.array([7 / 3], pa.float64()),
+        }
+    )
+    with pytest.raises(ValueError, match=r"outside \[0, 1\]"):
+        effort._check_output(bad)
+
+
+def test_a_null_total_is_caught_on_output():
+    """The shape a left-outer join leaves behind when the count still matches."""
+    import birdology.prior.effort as effort
+
+    bad = pa.table(
+        {
+            "species_key": pa.array([1], pa.int64()),
+            "cell": pa.array(["c"], pa.string()),
+            "week": pa.array([5], pa.int8()),
+            "n": pa.array([7], pa.int64()),
+            "total": pa.array([None], pa.int64()),
+            "ratio": pa.array([None], pa.float64()),
+        }
+    )
+    with pytest.raises(ValueError, match="total"):
+        effort._check_output(bad)
+
+
+def test_a_re_run_on_its_own_output_is_rejected():
+    """A RatioTable fed back in would otherwise die on a raw pyarrow KeyError."""
+    out = target_group_ratios(_counts([(1, "c", 5, 3)]))
+    with pytest.raises(ValueError, match="already carries"):
+        target_group_ratios(out)
+
+
 def test_null_cell_is_rejected_rather_than_silently_dropped():
     """A null join key matches nothing in an inner join: the row disappears."""
     t = pa.table(
@@ -179,6 +296,59 @@ def test_cell_string_is_passed_through_verbatim():
     assert out.to_pylist()[0]["cell"] == "8a1fb46622dffff"
 
 
+def test_a_mixed_case_cell_is_passed_through_UNCHANGED():
+    """Rule (C) with teeth: a REDUNDANT local normalisation must be visible.
+
+    The contract says `cell` arrives already lowercased, so on a lowercase
+    fixture any local `utf8_lower` is a no-op and no test can see it -- which
+    is precisely how a second derivation sneaks in and then diverges from the
+    upstream one. This fixture is deliberately contract-VIOLATING in case only:
+    if the module ever re-normalises, the output cell differs from the input
+    and this fails. The module must pass `cell` through byte-for-byte, not
+    tidy it up.
+    """
+    cell = "8A1Fb46622dFFFF"
+    out = target_group_ratios(_counts([(1, cell, 5, 3), (2, cell, 5, 1)]))
+    rows = out.to_pylist()
+    assert {r["cell"] for r in rows} == {cell}
+    assert {r["total"] for r in rows} == {4}
+
+
+def test_mixed_and_lower_case_cells_are_DIFFERENT_cells():
+    """A local casefold would merge these two cell-weeks into one denominator."""
+    out = target_group_ratios(
+        _counts([(1, "8A1F", 5, 3), (1, "8a1f", 5, 1)])
+    )
+    totals = {r["cell"]: r["total"] for r in out.to_pylist()}
+    assert totals == {"8A1F": 3, "8a1f": 1}
+
+
+def test_ratio_is_aligned_with_its_own_row_in_a_multi_chunk_table():
+    """The join REORDERS a multi-chunk table; numerator and denominator must
+    still come from the same output row.
+
+    Every fixture above is single-chunk, where the join happens to preserve
+    input order -- so taking the numerator from `counts` instead of `joined`
+    is invisible. Here it is not: the pairing is asserted row-by-row on the
+    OUTPUT, which is the only place it is meaningful.
+    """
+    chunk_a = _counts([(1, "a", 5, 1), (2, "a", 5, 9)])
+    chunk_b = _counts([(3, "b", 6, 40), (4, "b", 6, 60), (5, "c", 7, 2)])
+    t = pa.concat_tables([chunk_a, chunk_b])
+    assert t.column("n").num_chunks > 1
+
+    out = target_group_ratios(t)
+    assert out.num_rows == t.num_rows
+    for row in out.to_pylist():
+        assert row["ratio"] == pytest.approx(row["n"] / row["total"]), row
+    by_species = {r["species_key"]: r for r in out.to_pylist()}
+    assert by_species[1]["ratio"] == pytest.approx(0.1)
+    assert by_species[2]["ratio"] == pytest.approx(0.9)
+    assert by_species[3]["ratio"] == pytest.approx(0.4)
+    assert by_species[4]["ratio"] == pytest.approx(0.6)
+    assert by_species[5]["ratio"] == pytest.approx(1.0)
+
+
 def test_a_wrong_week_type_is_rejected_not_cast():
     """int64 week means someone bypassed aggregate_counts; do not paper over it."""
     t = pa.table(
@@ -190,6 +360,48 @@ def test_a_wrong_week_type_is_rejected_not_cast():
         }
     )
     with pytest.raises(ValueError, match="week"):
+        target_group_ratios(t)
+
+
+def test_a_wrong_cell_type_is_rejected_not_cast():
+    """A dictionary-encoded or binary cell means a different upstream path."""
+    t = pa.table(
+        {
+            "species_key": pa.array([1], pa.int64()),
+            "cell": pa.array([b"c"], pa.binary()),
+            "week": pa.array([5], pa.int8()),
+            "n": pa.array([1], pa.int64()),
+        }
+    )
+    with pytest.raises(ValueError, match="cell"):
+        target_group_ratios(t)
+
+
+def test_a_wrong_n_type_is_rejected_not_cast():
+    """A float `n` means `n` stopped being a count somewhere upstream."""
+    t = pa.table(
+        {
+            "species_key": pa.array([1], pa.int64()),
+            "cell": pa.array(["c"], pa.string()),
+            "week": pa.array([5], pa.int8()),
+            "n": pa.array([1.0], pa.float64()),
+        }
+    )
+    with pytest.raises(ValueError, match="'n'"):
+        target_group_ratios(t)
+
+
+def test_a_wrong_species_key_type_is_rejected_not_cast():
+    """int32 species_key silently truncates GBIF keys above 2**31."""
+    t = pa.table(
+        {
+            "species_key": pa.array([1], pa.int32()),
+            "cell": pa.array(["c"], pa.string()),
+            "week": pa.array([5], pa.int8()),
+            "n": pa.array([1], pa.int64()),
+        }
+    )
+    with pytest.raises(ValueError, match="species_key"):
         target_group_ratios(t)
 
 

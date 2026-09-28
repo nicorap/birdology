@@ -15,7 +15,8 @@ Each mutant is an exact-string edit on the source. The harness:
    file, so a mutant can never be committed by accident;
 2. requires every pattern to occur EXACTLY ONCE, and reports NOT-APPLIED
    separately from SURVIVED — a stale pattern that silently matched nothing
-   would otherwise masquerade as a kill;
+   would otherwise masquerade as a kill. NOT-APPLIED also makes the harness
+   EXIT NON-ZERO, so it cannot hide under a "Survivors: none" banner;
 3. clears every `__pycache__` BEFORE and AFTER each run. CPython invalidates a
    `.pyc` on (mtime, size), so a SAME-LENGTH mutation — `(lon, lat)` for
    `(lat, lon)`, say — can leave a mutant `.pyc` that outlives its own source
@@ -510,6 +511,7 @@ def main() -> int:
     selected = [m for m in MUTANTS if args.only is None or m[0] in args.only]
     rows: list[tuple[str, str, str]] = []
     survivors: list[str] = []
+    not_applied: list[str] = []
 
     for mid, description, edits in selected:
         mutated = source
@@ -523,6 +525,7 @@ def main() -> int:
             mutated = mutated.replace(old, new)
         if not applied:
             rows.append((mid, description, "NOT APPLIED"))
+            not_applied.append(mid)
             continue
 
         (REPO / TARGET).write_text(mutated)
@@ -551,7 +554,11 @@ def main() -> int:
     for mid, description, verdict in rows:
         print(f"| {mid} | {description} | {verdict} |")
     print(f"\nSurvivors: {survivors or 'none'}")
-    return 1 if survivors or final else 0
+    # NOT-APPLIED is a FAILURE, not a neutral row (round-1 finding F7). A
+    # pattern that has gone stale after a refactor tests nothing, and under a
+    # "Survivors: none" banner it reads as coverage it never provided.
+    print(f"NOT APPLIED: {not_applied or 'none'}")
+    return 1 if survivors or not_applied or final else 0
 
 
 if __name__ == "__main__":

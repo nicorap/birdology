@@ -30,6 +30,38 @@ surface as `inf`/`nan` or as a vanished row:
 This validation is deliberately never caught-and-continued. A contract
 violation here means the upstream pipeline changed shape, and a warn-and-carry
 path would reproduce the silent-failure class the leakage guards exist to kill.
+
+Input validation is not enough on its own. It catches rows that arrive broken;
+it cannot catch rows that leave broken. The output is therefore re-checked
+before it is returned: `total >= 1` on every row, `ratio` finite and inside
+[0, 1]. The post-join row-count invariant only sees rows that VANISH -- a row
+that is kept but poisoned (null `total`, `inf`/`nan` `ratio`) passes it
+untouched, because the count still matches.
+
+WHAT `ratio` MEANS -- read this before consuming it
+---------------------------------------------------
+`ratio` is P(species | a bird was recorded in this cell-week). It is a SHARE
+of the target-group background, NOT P(species is present). The two are easy to
+confuse because `ratio` looks like a probability: it lies in [0, 1] and sums to
+1.0 across the species of a cell-week.
+
+Two consequences, both of which silently corrupt a prior rather than raise:
+
+* A cell-week absent from this table means NOBODY LOOKED, not that no bird was
+  there. Absence is ROW ABSENCE. Zero-filling missing cell-weeks with
+  `ratio = 0` turns "unsurveyed" into "certainly absent" -- the classic
+  target-group-background pitfall.
+* `ratio == 0` never occurs on contract-conforming input (`n >= 1` forces
+  `ratio > 0`), so a zero in this column is a bug, not an observation.
+
+Error contract
+--------------
+Every contract violation raises `ValueError`, with one documented escape: a
+cell-week total above 2**53 is not exactly representable in float64, so
+`pc.cast` raises `pyarrow.lib.ArrowInvalid` instead. That is unreachable at
+GBIF scale (order 1e9 bird records globally, spread over millions of
+cell-weeks), and it is recorded here only so the uniform-`ValueError` claim is
+honest.
 """
 from __future__ import annotations
 
@@ -46,6 +78,14 @@ _REQUIRED_TYPES = {
 
 def _validate(counts: pa.Table) -> None:
     """Reject anything that violates the CountTable contract. Never repairs."""
+    for name in ("total", "ratio"):
+        if name in counts.column_names:
+            raise ValueError(
+                f"CountTable already carries a {name!r} column; this looks "
+                "like a RatioTable fed back in. Appending would produce a "
+                "duplicate field name, and the join would pick one at random"
+            )
+
     for name, expected in _REQUIRED_TYPES.items():
         if name not in counts.column_names:
             raise ValueError(
@@ -73,6 +113,37 @@ def _validate(counts: pa.Table) -> None:
             "CountTable column n must be >= 1 (it is a count of records); "
             "a non-positive count can drive a cell-week total to zero, and "
             "0/0 is nan rather than an error"
+        )
+
+
+def _check_output(out: pa.Table) -> None:
+    """Re-check the emitted RatioTable.
+
+    The input guard sees rows that arrive broken; this sees rows that leave
+    broken. The post-join row-count invariant cannot substitute for it: a row
+    that is KEPT but poisoned (null `total`, `inf`/`nan` `ratio`) leaves the
+    count intact and sails straight into the prior looking like a real share.
+    """
+    total = out.column("total")
+    if total.null_count or pc.min(total).as_py() < 1:
+        raise ValueError(
+            "RatioTable has a row whose cell-week total is null or < 1; the "
+            "denominator is a sum of counts that are each >= 1, so this means "
+            "the totals no longer line up with the rows they divide"
+        )
+
+    ratio = out.column("ratio")
+    if ratio.null_count or not pc.all(pc.is_finite(ratio)).as_py():
+        raise ValueError(
+            "RatioTable has a null or non-finite ratio (inf/nan); a zero or "
+            "missing denominator reached the division instead of being "
+            "rejected, and nothing downstream distinguishes inf from a share"
+        )
+    if pc.min(ratio).as_py() < 0.0 or pc.max(ratio).as_py() > 1.0:
+        raise ValueError(
+            "RatioTable has a ratio outside [0, 1]; a share of a cell-week "
+            "total cannot exceed the total or go negative, so the numerator "
+            "and the denominator are no longer paired row-for-row"
         )
 
 
@@ -105,6 +176,8 @@ def target_group_ratios(counts: pa.Table) -> pa.Table:
         pc.cast(joined.column("n"), pa.float64()),
         pc.cast(joined.column("total"), pa.float64()),
     )
-    return joined.append_column("ratio", ratio).select(
+    out = joined.append_column("ratio", ratio).select(
         ["species_key", "cell", "week", "n", "total", "ratio"]
     )
+    _check_output(out)
+    return out
