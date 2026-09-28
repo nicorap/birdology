@@ -728,6 +728,22 @@ Week 53 folds into 52 so the circular kernel never sees a short week."
 
 **Interfaces:**
 - Consumes: the celled `pa.Table` from `assign_cells`.
+
+> **CORRECTED 2026-09-29 — normalise EVERY key component on BOTH sides.**
+> An earlier draft of this plan required both-sides normalisation only for the
+> contributor name. That was too narrow. A leakage-guard key is a tuple, and any
+> un-normalised component silently disables the whole guard. Verified on a real res-4
+> table where the guard should have removed the row: an UPPERCASED cell kept it, a
+> whitespace-padded cell kept it, and a res-5 cell kept it — no exception, no log line,
+> leak survives. `h3.get_resolution` accepts an uppercased cell, so validity checks do
+> not catch it.
+> Rules for any guard in this plan:
+>   1. Normalise every string key component on both sides (contributor AND cell).
+>   2. Raise on a cross-resolution cell mismatch — never warn. It is never intentional
+>      and the consequence is total silent leakage. The guard function holds both the
+>      table and the recordings, so it is the only place the invariant can be checked.
+>   3. WARN when a non-empty banned set removes ZERO rows. That one line is the shared
+>      observable symptom of every silent under-match mode.
 - Produces:
   - `XENO_CANTO_PUBLISHER_KEYS: frozenset[str]`
   - `TestRecording` dataclass: `cell: str`, `week: int`, `recorded_by: str`.
