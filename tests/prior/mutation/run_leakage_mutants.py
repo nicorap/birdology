@@ -397,13 +397,14 @@ MUTANTS: list[tuple[str, str, list[tuple[str, str]]]] = [
     ),
     (
         "M35",
-        "F3: zero-match warning fires unconditionally, including for an empty "
-        "banned set (vacuous-warning check)",
+        "F3: zero-match warning fires vacuously — early return removed AND the "
+        "warning made unconditional, so an EMPTY banned set warns too",
         [
             (
                 "    banned = banned_keys(test_recordings)\n    if not banned:\n        return table",
-                "    banned = banned_keys(test_recordings)\n    if not banned:\n        pass",
-            )
+                "    banned = banned_keys(test_recordings)\n    if False:\n        return table",
+            ),
+            ("    elif banned:", "    else:"),
         ],
     ),
     (

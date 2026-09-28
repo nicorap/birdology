@@ -856,6 +856,27 @@ def test_test_recording_stores_the_coerced_week():
     assert type(rec.week) is int
 
 
+def test_test_recording_coerces_an_index_like_week_to_a_plain_int():
+    """A week arriving as numpy.int8 (pyarrow/pandas test-split metadata) or any
+    other __index__-able wrapper must be STORED as a plain int. If
+    __post_init__ validates a coercion it does not keep, the dataclass holds a
+    value that is not `== 46` and does not hash like 46, so equality,
+    deduplication and the banned key all diverge from what was validated."""
+
+    class Int8Like:
+        def __init__(self, value: int) -> None:
+            self._value = value
+
+        def __index__(self) -> int:
+            return self._value
+
+    rec = TestRecording(cell=CELL_A, week=Int8Like(46), recorded_by="Ole")  # type: ignore[arg-type]
+    assert rec.week == 46
+    assert type(rec.week) is int
+    assert hash(rec) == hash(TestRecording(cell=CELL_A, week=46, recorded_by="Ole"))
+    assert rec == TestRecording(cell=CELL_A, week=46, recorded_by="Ole")
+
+
 def test_normalise_week_accepts_integral_and_rejects_the_rest():
     assert normalise_week(46) == 46
     for bad in (46.9, 46.0, "46", None, True):
