@@ -103,7 +103,7 @@ context too, including the ones nobody surveyed.
 WHY THE DENSE-GRID REFUSAL IS GONE
 -----------------------------------
 An earlier revision of this module REFUSED any tensor with ``nnz < size``, on
-the then-current premise that an absent context was a STRUCTURAL ZERO and that
+the then-current premise that an absent context was a structural zero and that
 averaging over it silently diluted every control by ``nnz/size``. That premise
 has been reversed in ``tensor.py``: an absent context reads ``FLOOR``, there is
 nothing structural left to divide by, and the refusal made all four controls
