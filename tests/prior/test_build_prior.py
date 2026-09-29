@@ -1029,7 +1029,7 @@ def test_a_measurement_row_inconsistent_with_its_own_numbers_is_REFUSED(tmp_path
         json.dumps([{**row, "bytes_per_context_net": 161.0}]), encoding="utf-8"
     )
     with pytest.raises(ValueError, match="does not follow from"):
-        build_prior.worst_measured_bytes_per_context(lied)
+        build_prior.validate_measurement_file(lied)
 
     # ...and inflating `contexts` to make a low ratio arithmetically true is
     # caught by the grid, which is the other redundancy.
@@ -1048,7 +1048,7 @@ def test_a_measurement_row_inconsistent_with_its_own_numbers_is_REFUSED(tmp_path
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="disagrees with its own grid|contains"):
-        build_prior.worst_measured_bytes_per_context(stretched)
+        build_prior.validate_measurement_file(stretched)
 
 
 def test_the_committed_measurement_is_itself_self_consistent():
@@ -1057,10 +1057,73 @@ def test_the_committed_measurement_is_itself_self_consistent():
     Without this, the consistency check above could be asserted entirely
     against synthetic fixtures while the committed file quietly violated it --
     a test that cannot fail on the artifact it exists to protect.
+
+    It therefore runs `validate_measurement_file` over the COMMITTED file and
+    checks each row's arithmetic here as well. The previous form asserted
+    `worst_measured_bytes_per_context() == WORST_MEASURED_BYTES_PER_CONTEXT`,
+    which is the function compared against a constant that IS that function's
+    return value -- both reading the same file in the same process. It could
+    only fail if the file changed mid-session, so it could not fail on the
+    thing its own docstring claimed it protected.
     """
-    assert build_prior.worst_measured_bytes_per_context() == pytest.approx(
-        build_prior.WORST_MEASURED_BYTES_PER_CONTEXT
+    build_prior.validate_measurement_file()
+
+    rows = json.loads(
+        build_prior.MEASURE_PEAK_RESULTS.read_text(encoding="utf-8")
     )
+    assert rows, "the committed measurement file is empty, so it pins nothing"
+
+    # Independently of the module's own checker: every row's stated ratio must
+    # follow from its own raw observations, and its context count from its own
+    # grid. Asserted here so a weakening of `_check_measurement_row` cannot
+    # take this test with it.
+    for i, row in enumerate(rows):
+        contexts = row["contexts"]
+        assert contexts == (
+            row["n_species"] * row["n_cells"] * build_prior.WEEKS_PER_YEAR
+        ), f"row {i}: contexts disagrees with its own grid"
+        assert row["bytes_per_context_net"] == pytest.approx(
+            row["net_peak_bytes"] / contexts
+        ), f"row {i}: stated ratio does not follow from peak RSS over contexts"
+
+    # ...and the constant really is the max over those rows.
+    assert build_prior.WORST_MEASURED_BYTES_PER_CONTEXT == pytest.approx(
+        max(float(r["bytes_per_context_net"]) for r in rows)
+    )
+
+
+def test_a_tampered_measurement_file_fails_a_NAMED_test_not_collection(tmp_path):
+    """The row check must be reachable by a test, not raised at import.
+
+    `worst_measured_bytes_per_context` runs at module import. If it also
+    validated rows, a mutant that retypes a ratio in the committed JSON would
+    raise during import, pytest would report a COLLECTION ERROR naming no
+    test, and the mutation harness -- which attributes a kill to the test that
+    caught it -- would score the row MISLABELLED. The guard would be working
+    and the evidence that it works would be gone.
+
+    So validation lives in `validate_measurement_file`, called from `main`.
+    This asserts both halves: importing with a tampered file still SUCCEEDS
+    (so collection survives), and the validator REFUSES it.
+    """
+    tampered = tmp_path / "tampered.json"
+    rows = json.loads(
+        build_prior.MEASURE_PEAK_RESULTS.read_text(encoding="utf-8")
+    )
+    rows[0]["bytes_per_context_net"] = 158.0
+    tampered.write_text(json.dumps(rows), encoding="utf-8")
+
+    # The import-time derivation tolerates it: it reads the number, it does
+    # not audit it. This is what keeps collection alive -- no reload is needed
+    # to show it, and reloading the module here would rebind state other tests
+    # in this file hold references to.
+    assert build_prior.worst_measured_bytes_per_context(tampered) == pytest.approx(
+        max(float(r["bytes_per_context_net"]) for r in rows)
+    )
+
+    # The validator is where it dies, with a message naming the disagreement.
+    with pytest.raises(ValueError, match="does not follow from"):
+        build_prior.validate_measurement_file(tampered)
 
 
 def test_save_prior_refuses_a_WHITESPACE_ONLY_doi_from_any_caller(tmp_path):

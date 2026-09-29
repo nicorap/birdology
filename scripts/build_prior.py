@@ -539,6 +539,16 @@ def worst_measured_bytes_per_context(path: Path = MEASURE_PEAK_RESULTS) -> float
     unreadable or empty. A default would re-create exactly the defect this
     replaces: the constant would go back to being pinned by a number typed
     beside it, while the test still appeared to read a measurement.
+
+    Does NOT check each row against its own raw observations -- that is
+    `validate_measurement_file`, called from `main` before a build and
+    asserted directly by the tests. The split is deliberate and the reason is
+    mutation attribution: this function runs at import, and a check that
+    raises at import takes the whole test MODULE out at collection time. A
+    collection error names no test, so the harness cannot attribute the kill
+    and scores the row MISLABELLED -- the evidence that the guard works is
+    lost precisely when the guard works. Validation that a named test can fail
+    on is worth more here than validation one frame earlier.
     """
     import json
 
@@ -552,27 +562,41 @@ def worst_measured_bytes_per_context(path: Path = MEASURE_PEAK_RESULTS) -> float
             "and commit its output here"
         )
     rows = json.loads(path.read_text(encoding="utf-8"))
-    values = []
-    for i, row in enumerate(rows):
-        if "bytes_per_context_net" in row:
-            values.append(float(row["bytes_per_context_net"]))
-        # EACH ROW IS CHECKED AGAINST ITS OWN RAW OBSERVATIONS. Committing the
-        # file stops a coordinated edit from retyping two numbers in the
-        # source, but on its own it just moves the retyping into the JSON --
-        # `bytes_per_context_net: 161.0` would pin the constant at 161 with no
-        # test able to object. The derived figure is redundant with
-        # `net_peak_bytes` and `contexts`, and `contexts` is redundant with the
-        # grid shape, so falsifying the ratio requires fabricating a coherent
-        # measurement (a peak RSS, a grid, and a context count that multiply
-        # out) rather than editing one number. That is the "visible, arguable
-        # act" the pin is supposed to demand.
-        _check_measurement_row(path, i, row)
+    values = [
+        float(row["bytes_per_context_net"])
+        for row in rows
+        if "bytes_per_context_net" in row
+    ]
     if not values:
         raise ValueError(
             f"the recorded peak-RSS measurement {path} carries no "
             "`bytes_per_context_net` row, so it pins nothing"
         )
     return max(values)
+
+
+def validate_measurement_file(path: Path = MEASURE_PEAK_RESULTS) -> None:
+    """Refuse a measurement file whose rows disagree with their own numbers.
+
+    EACH ROW IS CHECKED AGAINST ITS OWN RAW OBSERVATIONS. Committing the file
+    stops a coordinated edit from retyping two numbers in the source, but on
+    its own it just moves the retyping into the JSON -- `bytes_per_context_net:
+    161.0` would pin the constant at 161 with no test able to object. The
+    derived figure is redundant with `net_peak_bytes` and `contexts`, and
+    `contexts` is redundant with the grid shape, so falsifying the ratio
+    requires fabricating a coherent measurement (a peak RSS, a grid, and a
+    context count that multiply out) rather than editing one number. That is
+    the "visible, arguable act" the pin is supposed to demand.
+
+    Called from `main` before any build work, so an operator whose measurement
+    file has been tampered with is refused at the start of a job rather than
+    after the expensive stage.
+    """
+    import json
+
+    rows = json.loads(path.read_text(encoding="utf-8"))
+    for i, row in enumerate(rows):
+        _check_measurement_row(path, i, row)
 
 
 def _check_measurement_row(path: Path, i: int, row: dict) -> None:
@@ -1133,6 +1157,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+
+    # BEFORE any pipeline call, and before the expensive stage: a measurement
+    # file whose rows disagree with their own raw observations pins nothing,
+    # and `MEASURED_BYTES_PER_CONTEXT` is derived from it. Checked here rather
+    # than at import so a mutant that tampers with the file fails a NAMED test
+    # instead of taking out collection, where the harness cannot attribute it.
+    validate_measurement_file()
 
     split = [] if args.no_test_split else load_test_split(args.test_split)
     if args.no_test_split:
