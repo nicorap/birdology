@@ -231,7 +231,14 @@ def test_a_cell_two_rings_away_is_not_a_neighbour():
 
 
 def test_the_spatial_neighbour_must_be_the_SAME_week():
-    t = _est([(1, CPH, 20, 1.0), (1, NEIGHBOUR, 40, 0.0)])
+    """A neighbour's week-1 value must not be read for week 40.
+
+    The grid holds the neighbour at week 1 precisely so that a lookup hard-
+    coded to week 1 would find something: without that row the defect is
+    unreachable and the test proves nothing.
+    """
+    t = _est([(1, CPH, 1, 1.0), (1, NEIGHBOUR, 40, 0.0)])
+    assert (1, CPH, 1) in _lookup(t), "fixture must offer a week-1 neighbour"
     out = _lookup(smooth(t, SmoothingParams(space_weight=0.3, time_weight=0.3)))
     assert out[(1, NEIGHBOUR, 40)] == pytest.approx(0.0, abs=1e-12)
 
@@ -248,6 +255,52 @@ def test_all_six_neighbours_contribute_not_just_the_first():
     t = _est([(1, CPH, 20, 0.0)] + [(1, c, 20, 1.0) for c in ring])
     out = _lookup(smooth(t, SmoothingParams(space_weight=0.3, time_weight=0.0)))
     assert out[(1, CPH, 20)] == pytest.approx((6 * 0.3) / (1 + 6 * 0.3), rel=1e-12)
+
+
+def test_cells_with_different_neighbour_counts_are_smoothed_independently():
+    """Three cells where A touches both B and C but B does not touch C.
+
+    The ring matrix is ragged, so the shorter rows are padded with an
+    "absent" marker. If that marker collided with a real cell code, B and C
+    would each pick up a phantom neighbour; if the padding were dropped, B
+    and C would be blended with each other. Both are silent.
+    """
+    ring = [c for c in h3.grid_disk(CPH, 1) if c != CPH]
+    pairs = [
+        (a, b)
+        for i, a in enumerate(ring)
+        for b in ring[i + 1 :]
+        if b not in h3.grid_disk(a, 1)
+    ]
+    assert pairs, "res-4 ring must contain two mutually non-adjacent cells"
+    b_cell, c_cell = pairs[0]
+    assert b_cell in h3.grid_disk(CPH, 1) and c_cell in h3.grid_disk(CPH, 1)
+    assert c_cell not in h3.grid_disk(b_cell, 1), "fixture precondition"
+    t = _est([(1, CPH, 20, 1.0), (1, b_cell, 20, 0.0), (1, c_cell, 20, 0.0)])
+    out = _lookup(smooth(t, SmoothingParams(space_weight=0.3, time_weight=0.0)))
+    # A has two neighbours in the grid; B and C have exactly one (A).
+    assert out[(1, CPH, 20)] == pytest.approx(1.0 / 1.6, rel=1e-12)
+    assert out[(1, b_cell, 20)] == pytest.approx(0.3 / 1.3, rel=1e-12)
+    assert out[(1, c_cell, 20)] == pytest.approx(0.3 / 1.3, rel=1e-12)
+
+
+def test_a_neighbour_is_read_from_the_row_that_ACTUALLY_HOLDS_it():
+    """The neighbour's value, not whichever row sits at that sort position.
+
+    Neighbours are found by binary search over sorted keys, so the search
+    result must be mapped back through the sort order. Using the raw insertion
+    point as a row index reads a plausible number from the wrong row. The
+    fixture is built so that mapping and not-mapping disagree: the rows are in
+    descending week order, so the internal permutation is NOT the identity,
+    and the two candidate rows carry different values.
+    """
+    near = [c for c in h3.grid_disk(CPH, 1) if c != CPH][0]
+    t = _est([(1, CPH, 21, 0.0), (1, CPH, 20, 0.8), (1, near, 20, 0.0)])
+    assert t.column("week").to_pylist() == [21, 20, 20], "fixture must be unsorted"
+    out = _lookup(smooth(t, SmoothingParams(space_weight=0.5, time_weight=0.0)))
+    # `near` at week 20 must read CPH's WEEK-20 value (0.8), not its week-21
+    # value (0.0), which is the row that sits at the raw insertion point.
+    assert out[(1, near, 20)] == pytest.approx((0.5 * 0.8) / 1.5, rel=1e-12)
 
 
 def test_a_pentagon_cell_has_five_neighbours_and_smooths():
@@ -432,20 +485,27 @@ def test_output_schema_types_are_exact():
 
 
 def test_row_ORDER_is_preserved_exactly():
-    """Output row i is input row i. The keys are passed through, so a `p`
-    computed in sorted order and attached to unsorted keys would mislabel
-    every value with no error."""
-    rows = [(2, NEIGHBOUR, 30, 0.9), (1, CPH, 20, 0.1), (1, CPH, 21, 0.2)]
+    """Output row i is input row i.
+
+    The key columns are passed through unchanged, so a `p` computed in sorted
+    key order and attached to the original keys would mislabel every value
+    with nothing raised. The fixture is in DESCENDING week order so that the
+    internal sort really does permute it: an ascending fixture would leave the
+    permutation an identity and the defect unreachable.
+    """
+    rows = [(1, CPH, 21, 0.2), (1, CPH, 20, 0.1)]
     t = _est(rows)
-    keys = list(zip(t.column("species_key").to_pylist(), t.column("cell").to_pylist()))
-    assert keys != sorted(keys), "fixture must not already be in sorted order"
+    assert t.column("week").to_pylist() == [21, 20], "fixture must be descending"
     out = smooth(t)
     assert out.column("species_key").to_pylist() == [r[0] for r in rows]
     assert out.column("cell").to_pylist() == [r[1] for r in rows]
     assert out.column("week").to_pylist() == [r[2] for r in rows]
-    # Row 0 is isolated in space and time: its value must be unchanged, and
-    # must not be row 1's smoothed value.
-    assert out.column("p")[0].as_py() == pytest.approx(0.9, rel=1e-12)
+    # Week 21 sits above week 20 on the way in and must still be above it on
+    # the way out; a sorted-order `p` swaps the two.
+    smoothed = out.column("p").to_pylist()
+    assert smoothed[0] == pytest.approx((0.2 + 0.3 * 0.1) / 1.3, rel=1e-12)
+    assert smoothed[1] == pytest.approx((0.1 + 0.3 * 0.2) / 1.3, rel=1e-12)
+    assert smoothed[0] > smoothed[1]
 
 
 def test_a_CHUNKED_input_smooths_identically_to_a_contiguous_one():

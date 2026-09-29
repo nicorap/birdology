@@ -297,14 +297,19 @@ def smooth(
     # neighbour in the grid divides by this and nothing else.
     weight = np.ones(p.shape, dtype=np.float64)
 
-    if params.space_weight and p.size:
+    # These two short-circuits are a COST guard, not a semantic one: a weight
+    # of 0.0 would add 0.0-weighted neighbours and change nothing, so removing
+    # them is numerically equivalent (see the mutation harness's note on S13).
+    # They matter because the bandwidth sweep does pass 0.0, and the ring
+    # lookup over a national cell set is not free.
+    if params.space_weight:
         ring = _neighbour_codes(cells)
         for slot in range(ring.shape[1]):
             index, found = neighbour_values(pack(ring[cell_code, slot], weeks))
             total[found] += params.space_weight * p[index[found]]
             weight[found] += params.space_weight
 
-    if params.time_weight and p.size:
+    if params.time_weight:
         for side in range(_ADJACENT.shape[1]):
             index, found = neighbour_values(pack(cell_code, _ADJACENT[weeks, side]))
             total[found] += params.time_weight * p[index[found]]
