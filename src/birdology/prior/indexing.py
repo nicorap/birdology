@@ -12,6 +12,8 @@ from datetime import date
 import h3
 import pyarrow as pa
 
+from .leakage import guards_applied, mark_guards_applied
+
 WEEKS_PER_YEAR = 52
 
 
@@ -45,6 +47,25 @@ def aggregate_counts(table: pa.Table) -> pa.Table:
 
     Provenance (publisher_key, recorded_by) is dropped — run leakage guards on
     the assign_cells output first.
+
+    THE GUARD MARKER IS RE-STAMPED, CONDITIONALLY (T10-R2)
+    ------------------------------------------------------
+    `leakage.apply_leakage_guards` stamps its output with Arrow schema
+    metadata, and `effort.target_group_ratios` refuses a table without it.
+    That marker does NOT survive this function on its own: measured,
+    `group_by(...).aggregate(...)` returns a schema whose metadata is `None`,
+    and neither `rename_columns` nor `select` restores it. (`filter` DOES
+    preserve it, which is why the guards themselves need no re-stamp.) So the
+    chain guards -> aggregate -> ratios would lose the marker in the middle
+    and every guarded build would be refused.
+
+    The re-stamp is CONDITIONAL on the input carrying the marker, and that is
+    the whole of its value. An unconditional stamp would make this function
+    authenticate ANY table that passed through it, including one that never
+    saw a guard — the check would still be present, still raise on a table
+    handed straight to `target_group_ratios`, and yet be decorative for every
+    realistic pipeline, which routes through here. Propagating a marker is
+    not the same as minting one.
     """
     grouped = (
         table.select(["species_key", "cell", "week"])
@@ -52,6 +73,9 @@ def aggregate_counts(table: pa.Table) -> pa.Table:
         .group_by(["species_key", "cell", "week"])
         .aggregate([("n", "sum")])
     )
-    return grouped.rename_columns({"n_sum": "n"}).select(
+    counts = grouped.rename_columns({"n_sum": "n"}).select(
         ["species_key", "cell", "week", "n"]
     )
+    if guards_applied(table):
+        counts = mark_guards_applied(counts)
+    return counts

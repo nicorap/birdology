@@ -11,7 +11,22 @@ observer preference. Rarities are reported disproportionately.
 
 Input contract (from `indexing.aggregate_counts`, AFTER the leakage guards):
 `species_key` int64, `cell` non-null normalised lowercase H3 string, `week`
-int8 in 1..52, `n` int64 >= 1.
+int8 in 1..52, `n` int64 >= 1, AND the Arrow schema-metadata marker
+`leakage.GUARD_MARKER_KEY`.
+
+THE GUARD MARKER IS PART OF THE CONTRACT, NOT A CONVENTION
+-----------------------------------------------------------
+"AFTER the leakage guards" used to be prose. It is now checked: a CountTable
+without the marker is REFUSED. A guarded and an unguarded CountTable are
+structurally identical, so nothing else in this module -- or anywhere
+downstream -- can tell them apart, and the consequence of getting it wrong is
+invisible rather than loud: the leaked rows stay in the cell-week denominator
+and under-weight every guarded cell-week by the same factor, producing a
+plausible, mildly-flat prior. See `_require_guard_marker`.
+
+What the marker does NOT assert: that a non-empty evaluation split was wired
+in. `apply_leakage_guards(table, [])` stamps too, because `[]` is legitimate.
+Requiring a split belongs to the build script.
 
 What this module actually checks, stated precisely because a later task will
 otherwise lean on a guarantee that is not here: it validates the four column
@@ -79,12 +94,51 @@ from __future__ import annotations
 import pyarrow as pa
 import pyarrow.compute as pc
 
+from .leakage import GUARD_MARKER_KEY, guards_applied
+
 _REQUIRED_TYPES = {
     "species_key": pa.int64(),
     "cell": pa.string(),
     "week": pa.int8(),
     "n": pa.int64(),
 }
+
+
+def _require_guard_marker(counts: pa.Table) -> None:
+    """The CountTable must come from a table the leakage guards stamped.
+
+    A guarded and an unguarded CountTable are structurally identical -- the
+    same four columns, the same dtypes, the same nullability -- so no check
+    over the DATA can tell them apart. This one check is therefore the only
+    place in the codebase where the distinction is mechanically enforceable,
+    and the failure it closes is the quietest in the plan: an unguarded table
+    leaves the leaked rows in the per-cell-week DENOMINATOR, which
+    under-weights every guarded cell-week UNIFORMLY. The result is a smooth,
+    plausible, mildly-flat prior -- no error, no nan, no missing row, nothing
+    a reviewer or a downstream stage could see.
+
+    It raises rather than warns, and it is checked BEFORE the column contract:
+    a table that never saw a guard is not a CountTable with a fixable problem,
+    it is the wrong table.
+
+    What this does NOT establish: that the guards were given the RIGHT test
+    split. The marker says both guards ran, not that a non-empty split was
+    supplied -- `[]` is a legitimate mode and stamps too. Requiring a split to
+    have been wired in is the build script's job, because it is the only layer
+    that knows one was meant to be.
+    """
+    if not guards_applied(counts):
+        raise ValueError(
+            "CountTable does not carry the leakage-guard marker "
+            f"({GUARD_MARKER_KEY!r}); the effort denominator must be computed "
+            "over the table `leakage.apply_leakage_guards` returned. A "
+            "guarded and an unguarded CountTable are structurally identical, "
+            "so this marker is the only thing that can tell them apart: an "
+            "unguarded denominator keeps every leaked record in the "
+            "cell-week total and under-weights every guarded cell-week "
+            "uniformly, producing a plausible, mildly-flat prior with no "
+            "error and no missing row"
+        )
 
 
 def _validate(counts: pa.Table) -> None:
@@ -96,6 +150,13 @@ def _validate(counts: pa.Table) -> None:
                 "like a RatioTable fed back in. Appending would produce a "
                 "duplicate field name, and the join would pick one at random"
             )
+
+    # AFTER the re-run check, BEFORE the column contract. A RatioTable fed
+    # back in has ALSO lost the marker (the inner join drops schema metadata),
+    # so marker-first would answer every re-run with the guard message and
+    # send the caller to look for a missing guard that ran perfectly well.
+    # The more specific diagnosis wins.
+    _require_guard_marker(counts)
 
     for name, expected in _REQUIRED_TYPES.items():
         if name not in counts.column_names:

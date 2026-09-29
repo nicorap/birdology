@@ -14,17 +14,25 @@ from birdology.prior.backoff import (
     hierarchical_estimate,
 )
 from birdology.prior.effort import target_group_ratios
+from birdology.prior.leakage import mark_guards_applied
 
 
 def _counts(rows):
+    # STAMPED: `target_group_ratios` refuses a CountTable that does not carry
+    # the leakage-guard marker (T10's acceptance criterion). These fixtures
+    # stand in for the post-guard table the real pipeline hands it, so they
+    # carry the marker the real one would. The refusal itself is tested in
+    # `test_effort.py`, on a deliberately UNSTAMPED table.
     return target_group_ratios(
-        pa.table(
-            {
-                "species_key": pa.array([r[0] for r in rows], pa.int64()),
-                "cell": pa.array([r[1] for r in rows], pa.string()),
-                "week": pa.array([r[2] for r in rows], pa.int8()),
-                "n": pa.array([r[3] for r in rows], pa.int64()),
-            }
+        mark_guards_applied(
+            pa.table(
+                {
+                    "species_key": pa.array([r[0] for r in rows], pa.int64()),
+                    "cell": pa.array([r[1] for r in rows], pa.string()),
+                    "week": pa.array([r[2] for r in rows], pa.int8()),
+                    "n": pa.array([r[3] for r in rows], pa.int64()),
+                }
+            )
         )
     )
 

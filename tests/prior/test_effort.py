@@ -9,16 +9,27 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 
 from birdology.prior.effort import target_group_ratios
+from birdology.prior.leakage import (
+    GUARD_MARKER_KEY,
+    apply_leakage_guards,
+    mark_guards_applied,
+)
 
 
 def _counts(rows):
-    return pa.table(
-        {
-            "species_key": pa.array([r[0] for r in rows], pa.int64()),
-            "cell": pa.array([r[1] for r in rows], pa.string()),
-            "week": pa.array([r[2] for r in rows], pa.int8()),
-            "n": pa.array([r[3] for r in rows], pa.int64()),
-        }
+    # STAMPED. `target_group_ratios` refuses an unmarked CountTable, so every
+    # fixture that is NOT about the marker carries it — it stands in for the
+    # post-guard table the pipeline really hands over. The refusal has its own
+    # tests further down, on deliberately unstamped tables.
+    return mark_guards_applied(
+        pa.table(
+            {
+                "species_key": pa.array([r[0] for r in rows], pa.int64()),
+                "cell": pa.array([r[1] for r in rows], pa.string()),
+                "week": pa.array([r[2] for r in rows], pa.int8()),
+                "n": pa.array([r[3] for r in rows], pa.int64()),
+            }
+        )
     )
 
 
@@ -341,26 +352,30 @@ def test_null_cell_is_rejected_rather_than_silently_dropped():
     ratio" too, so it cannot tell the input guard from a downstream
     backstop -- which is how a deleted input check goes unnoticed.
     """
-    t = pa.table(
-        {
-            "species_key": pa.array([1, 2], pa.int64()),
-            "cell": pa.array(["c", None], pa.string()),
-            "week": pa.array([5, 5], pa.int8()),
-            "n": pa.array([3, 1], pa.int64()),
-        }
+    t = mark_guards_applied(
+        pa.table(
+            {
+                "species_key": pa.array([1, 2], pa.int64()),
+                "cell": pa.array(["c", None], pa.string()),
+                "week": pa.array([5, 5], pa.int8()),
+                "n": pa.array([3, 1], pa.int64()),
+            }
+        )
     )
     with pytest.raises(ValueError, match="CountTable column 'cell' contains null"):
         target_group_ratios(t)
 
 
 def test_null_week_is_rejected_rather_than_silently_dropped():
-    t = pa.table(
-        {
-            "species_key": pa.array([1, 2], pa.int64()),
-            "cell": pa.array(["c", "c"], pa.string()),
-            "week": pa.array([5, None], pa.int8()),
-            "n": pa.array([3, 1], pa.int64()),
-        }
+    t = mark_guards_applied(
+        pa.table(
+            {
+                "species_key": pa.array([1, 2], pa.int64()),
+                "cell": pa.array(["c", "c"], pa.string()),
+                "week": pa.array([5, None], pa.int8()),
+                "n": pa.array([3, 1], pa.int64()),
+            }
+        )
     )
     with pytest.raises(ValueError, match="CountTable column 'week' contains null"):
         target_group_ratios(t)
@@ -376,13 +391,15 @@ def test_null_n_is_rejected():
     the `n` case from the input null check left the suite green (harness
     mutant E14c). The input guard is what must fire here.
     """
-    t = pa.table(
-        {
-            "species_key": pa.array([1, 2], pa.int64()),
-            "cell": pa.array(["c", "c"], pa.string()),
-            "week": pa.array([5, 5], pa.int8()),
-            "n": pa.array([3, None], pa.int64()),
-        }
+    t = mark_guards_applied(
+        pa.table(
+            {
+                "species_key": pa.array([1, 2], pa.int64()),
+                "cell": pa.array(["c", "c"], pa.string()),
+                "week": pa.array([5, 5], pa.int8()),
+                "n": pa.array([3, None], pa.int64()),
+            }
+        )
     )
     with pytest.raises(ValueError, match="CountTable column 'n' contains null"):
         target_group_ratios(t)
@@ -576,26 +593,30 @@ def test_an_out_of_range_week_is_NOT_validated_here(week):
     here deliberately, this test SHOULD fail and be deleted along with the
     docstring paragraph -- that is the point of pinning it.
     """
-    t = pa.table(
-        {
-            "species_key": pa.array([1], pa.int64()),
-            "cell": pa.array(["c"], pa.string()),
-            "week": pa.array([week], pa.int8()),
-            "n": pa.array([1], pa.int64()),
-        }
+    t = mark_guards_applied(
+        pa.table(
+            {
+                "species_key": pa.array([1], pa.int64()),
+                "cell": pa.array(["c"], pa.string()),
+                "week": pa.array([week], pa.int8()),
+                "n": pa.array([1], pa.int64()),
+            }
+        )
     )
     assert target_group_ratios(t).to_pylist()[0]["week"] == week
 
 
 def test_a_wrong_week_type_is_rejected_not_cast():
     """int64 week means someone bypassed aggregate_counts; do not paper over it."""
-    t = pa.table(
-        {
-            "species_key": pa.array([1], pa.int64()),
-            "cell": pa.array(["c"], pa.string()),
-            "week": pa.array([5], pa.int64()),
-            "n": pa.array([1], pa.int64()),
-        }
+    t = mark_guards_applied(
+        pa.table(
+            {
+                "species_key": pa.array([1], pa.int64()),
+                "cell": pa.array(["c"], pa.string()),
+                "week": pa.array([5], pa.int64()),
+                "n": pa.array([1], pa.int64()),
+            }
+        )
     )
     with pytest.raises(ValueError, match="week"):
         target_group_ratios(t)
@@ -603,13 +624,15 @@ def test_a_wrong_week_type_is_rejected_not_cast():
 
 def test_a_wrong_cell_type_is_rejected_not_cast():
     """A dictionary-encoded or binary cell means a different upstream path."""
-    t = pa.table(
-        {
-            "species_key": pa.array([1], pa.int64()),
-            "cell": pa.array([b"c"], pa.binary()),
-            "week": pa.array([5], pa.int8()),
-            "n": pa.array([1], pa.int64()),
-        }
+    t = mark_guards_applied(
+        pa.table(
+            {
+                "species_key": pa.array([1], pa.int64()),
+                "cell": pa.array([b"c"], pa.binary()),
+                "week": pa.array([5], pa.int8()),
+                "n": pa.array([1], pa.int64()),
+            }
+        )
     )
     with pytest.raises(ValueError, match="cell"):
         target_group_ratios(t)
@@ -617,13 +640,15 @@ def test_a_wrong_cell_type_is_rejected_not_cast():
 
 def test_a_wrong_n_type_is_rejected_not_cast():
     """A float `n` means `n` stopped being a count somewhere upstream."""
-    t = pa.table(
-        {
-            "species_key": pa.array([1], pa.int64()),
-            "cell": pa.array(["c"], pa.string()),
-            "week": pa.array([5], pa.int8()),
-            "n": pa.array([1.0], pa.float64()),
-        }
+    t = mark_guards_applied(
+        pa.table(
+            {
+                "species_key": pa.array([1], pa.int64()),
+                "cell": pa.array(["c"], pa.string()),
+                "week": pa.array([5], pa.int8()),
+                "n": pa.array([1.0], pa.float64()),
+            }
+        )
     )
     with pytest.raises(ValueError, match="'n'"):
         target_group_ratios(t)
@@ -631,25 +656,29 @@ def test_a_wrong_n_type_is_rejected_not_cast():
 
 def test_a_wrong_species_key_type_is_rejected_not_cast():
     """int32 species_key silently truncates GBIF keys above 2**31."""
-    t = pa.table(
-        {
-            "species_key": pa.array([1], pa.int32()),
-            "cell": pa.array(["c"], pa.string()),
-            "week": pa.array([5], pa.int8()),
-            "n": pa.array([1], pa.int64()),
-        }
+    t = mark_guards_applied(
+        pa.table(
+            {
+                "species_key": pa.array([1], pa.int32()),
+                "cell": pa.array(["c"], pa.string()),
+                "week": pa.array([5], pa.int8()),
+                "n": pa.array([1], pa.int64()),
+            }
+        )
     )
     with pytest.raises(ValueError, match="species_key"):
         target_group_ratios(t)
 
 
 def test_a_missing_column_is_rejected():
-    t = pa.table(
-        {
-            "species_key": pa.array([1], pa.int64()),
-            "cell": pa.array(["c"], pa.string()),
-            "week": pa.array([5], pa.int8()),
-        }
+    t = mark_guards_applied(
+        pa.table(
+            {
+                "species_key": pa.array([1], pa.int64()),
+                "cell": pa.array(["c"], pa.string()),
+                "week": pa.array([5], pa.int8()),
+            }
+        )
     )
     with pytest.raises(ValueError, match="missing"):
         target_group_ratios(t)
@@ -734,15 +763,24 @@ def test_leakage_guard_errors_are_not_swallowed():
 
 
 def test_integration_with_aggregate_counts():
-    """The real upstream output feeds straight in, with no adaptation."""
+    """The real upstream output feeds straight in, with no adaptation.
+
+    The occurrence table is STAMPED, as `apply_leakage_guards` stamps the
+    real one, and `aggregate_counts` propagates the marker across the
+    `group_by().aggregate()` that would otherwise drop it. That propagation
+    is what makes the guard requirement compatible with the real pipeline;
+    it has its own dedicated tests below.
+    """
     from birdology.prior.indexing import aggregate_counts
 
-    occurrences = pa.table(
-        {
-            "species_key": pa.array([1, 1, 2], pa.int64()),
-            "cell": pa.array(["8a1fb46622dffff"] * 3, pa.string()),
-            "week": pa.array([5, 5, 5], pa.int8()),
-        }
+    occurrences = mark_guards_applied(
+        pa.table(
+            {
+                "species_key": pa.array([1, 1, 2], pa.int64()),
+                "cell": pa.array(["8a1fb46622dffff"] * 3, pa.string()),
+                "week": pa.array([5, 5, 5], pa.int8()),
+            }
+        )
     )
     out = target_group_ratios(aggregate_counts(occurrences)).to_pylist()
     rows = {r["species_key"]: r for r in out}
@@ -750,6 +788,170 @@ def test_integration_with_aggregate_counts():
     assert rows[1]["total"] == 3
     assert rows[1]["ratio"] == pytest.approx(2 / 3)
     assert rows[2]["ratio"] == pytest.approx(1 / 3)
+
+
+# --------------------------------------------------------------------------
+# T10's ACCEPTANCE CRITERION: the table reaching `target_group_ratios` is the
+# post-guard one, and that is enforced STRUCTURALLY rather than by convention.
+#
+# A guarded and an unguarded CountTable are structurally identical, so this
+# is the only layer at which the distinction is checkable at all. The failure
+# it closes leaves no trace in the output: the leaked rows stay in the
+# cell-week denominator and every guarded cell-week is under-weighted by the
+# same factor.
+# --------------------------------------------------------------------------
+
+
+def _unstamped(rows):
+    """The same fixture `_counts` builds, WITHOUT the guard marker."""
+    return pa.table(
+        {
+            "species_key": pa.array([r[0] for r in rows], pa.int64()),
+            "cell": pa.array([r[1] for r in rows], pa.string()),
+            "week": pa.array([r[2] for r in rows], pa.int8()),
+            "n": pa.array([r[3] for r in rows], pa.int64()),
+        }
+    )
+
+
+def test_an_unguarded_count_table_is_refused_by_name():
+    """The ONLY mechanical check that the effort denominator is post-guard.
+
+    The fixture is otherwise perfectly legal — every column, every dtype,
+    every value inside its contract — which is exactly the point: nothing in
+    the DATA distinguishes it from the guarded table, so only the marker can.
+    """
+    unguarded = _unstamped([(1, "c", 5, 3), (2, "c", 5, 1)])
+    assert unguarded.schema.metadata is None, "the fixture must be unstamped"
+    with pytest.raises(ValueError, match="does not carry the leakage-guard marker"):
+        target_group_ratios(unguarded)
+
+
+def test_the_same_table_is_accepted_once_the_guards_have_stamped_it():
+    """The precondition of the test above: only the marker differs.
+
+    Without this, a refusal could be blamed on anything about the fixture.
+    The two tables are byte-identical in every column; the marker is the
+    whole difference, and it flips refusal into a correct answer.
+    """
+    rows = [(1, "c", 5, 3), (2, "c", 5, 1)]
+    unguarded = _unstamped(rows)
+    stamped = mark_guards_applied(unguarded)
+    assert stamped.equals(unguarded), "only the schema metadata may differ"
+    out = {r["species_key"]: r["ratio"] for r in target_group_ratios(stamped).to_pylist()}
+    assert out[1] == pytest.approx(0.75)
+
+
+def test_apply_leakage_guards_is_what_stamps_the_marker():
+    """The marker means `apply_leakage_guards` ran, not that someone set a flag.
+
+    Checked through the real function on a real occurrence table rather than
+    through `mark_guards_applied`: if the stamp were dropped from
+    `apply_leakage_guards`, every other test here would still pass on its
+    hand-stamped fixtures while the pipeline refused its own output.
+    """
+    occurrences = pa.table(
+        {
+            "species_key": pa.array([1], pa.int64()),
+            "cell": pa.array(["8a1fb46622dffff"], pa.string()),
+            "week": pa.array([5], pa.int8()),
+            "publisher_key": pa.array(["pub"], pa.string()),
+            "recorded_by": pa.array(["obs"], pa.string()),
+        }
+    )
+    assert occurrences.schema.metadata is None
+    guarded = apply_leakage_guards(occurrences, [])
+    assert guarded.schema.metadata == {GUARD_MARKER_KEY: b"1"}
+
+
+def test_a_marker_key_with_a_foreign_value_does_not_authenticate():
+    """The marker's VALUE is checked, not merely its key.
+
+    A presence-only check would let any unrelated metadata convention that
+    happens to use this key authenticate an unguarded table. The value is
+    part of the stamp.
+    """
+    forged = _unstamped([(1, "c", 5, 3)]).replace_schema_metadata(
+        {GUARD_MARKER_KEY: b"maybe"}
+    )
+    assert GUARD_MARKER_KEY in (forged.schema.metadata or {})
+    with pytest.raises(ValueError, match="does not carry the leakage-guard marker"):
+        target_group_ratios(forged)
+
+
+# --------------------------------------------------------------------------
+# T10-R2: the marker does NOT survive `group_by().aggregate()`, so
+# `aggregate_counts` must RE-STAMP — conditionally.
+# --------------------------------------------------------------------------
+
+
+def test_the_marker_does_not_survive_a_group_by_aggregate():
+    """The measured Arrow behaviour the re-stamp exists for.
+
+    If a future pyarrow started preserving schema metadata across
+    `aggregate()`, the conditional re-stamp would become redundant and this
+    test SHOULD fail — that is what pins the reason for it, rather than
+    leaving it as an unexplained line that nobody dares delete.
+    """
+    stamped = mark_guards_applied(
+        pa.table(
+            {
+                "cell": pa.array(["c"], pa.string()),
+                "n": pa.array([1], pa.int64()),
+            }
+        )
+    )
+    assert stamped.schema.metadata is not None
+    grouped = stamped.group_by(["cell"]).aggregate([("n", "sum")])
+    assert grouped.schema.metadata is None
+    # ...and neither of the two reshaping calls that follow it restores the
+    # metadata either, so nothing downstream of the aggregate can recover it.
+    assert grouped.rename_columns(["cell", "n"]).schema.metadata is None
+    assert grouped.select(["cell"]).schema.metadata is None
+
+
+def test_aggregate_counts_propagates_the_marker_to_its_output():
+    """The chain guards -> aggregate -> ratios must survive end to end."""
+    from birdology.prior.indexing import aggregate_counts
+
+    guarded = mark_guards_applied(
+        pa.table(
+            {
+                "species_key": pa.array([1], pa.int64()),
+                "cell": pa.array(["8a1fb46622dffff"], pa.string()),
+                "week": pa.array([5], pa.int8()),
+            }
+        )
+    )
+    counts = aggregate_counts(guarded)
+    assert counts.schema.metadata == {GUARD_MARKER_KEY: b"1"}
+
+
+def test_aggregate_counts_does_NOT_mint_a_marker_for_an_unstamped_input():
+    """The re-stamp is CONDITIONAL, and that is the whole of its value.
+
+    An UNCONDITIONAL stamp would leave the guard technically present — it
+    would still raise on a table handed straight to `target_group_ratios` —
+    while authenticating every table that came through `aggregate_counts`,
+    which is every table in the real pipeline. The check would then be
+    decorative exactly where it matters. Propagating a marker is not minting
+    one.
+    """
+    from birdology.prior.indexing import aggregate_counts
+
+    unguarded = pa.table(
+        {
+            "species_key": pa.array([1], pa.int64()),
+            "cell": pa.array(["8a1fb46622dffff"], pa.string()),
+            "week": pa.array([5], pa.int8()),
+        }
+    )
+    assert unguarded.schema.metadata is None
+    counts = aggregate_counts(unguarded)
+    assert counts.schema.metadata is None
+    with pytest.raises(ValueError, match="does not carry the leakage-guard marker"):
+        target_group_ratios(counts)
+
 
 
 def test_join_drop_is_caught_even_if_validation_is_bypassed(monkeypatch):

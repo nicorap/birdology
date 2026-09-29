@@ -11,6 +11,15 @@ recording's own occurrence record reaches the prior, the prior trivially
 Both guards MUST run on the ``assign_cells`` output, before
 ``aggregate_counts``, which discards ``publisher_key`` and ``recorded_by``.
 
+THE GUARD MARKER
+----------------
+:func:`apply_leakage_guards` stamps its output with the Arrow schema-metadata
+key :data:`GUARD_MARKER_KEY`, and ``effort.target_group_ratios`` REFUSES a
+table that does not carry it. A guarded and an unguarded table are
+structurally identical, so that refusal is the only mechanical way to know
+which one reached the effort denominator; see :data:`GUARD_MARKER_KEY` for
+what the unguarded denominator does to the prior.
+
 Every component of guard 2's join key — cell, week, contributor — is normalised
 on BOTH sides before comparison. A component normalised on only one side is not
 a partial failure but a TOTAL one: no key matches, no row is removed, no
@@ -55,6 +64,59 @@ XENO_CANTO_PUBLISHER_KEYS = frozenset({"1f00d75c-f6fc-4224-a595-975e82d7689c"})
 #: ``errors="replace"``, so any non-UTF-8 byte in a contributor name becomes
 #: U+FFFD and one contributor can appear under two spellings.
 REPLACEMENT_CHARACTER = "\ufffd"
+
+#: Arrow schema-metadata key stamped on a table that has been through BOTH
+#: guards, in order.
+#:
+#: A guarded and an unguarded occurrence table are STRUCTURALLY IDENTICAL --
+#: same columns, same dtypes, same nullability -- so no check anywhere
+#: downstream can tell them apart by inspection. The failure that makes this
+#: worth a marker is the quietest in the plan: an unguarded table reaching
+#: ``effort.target_group_ratios`` leaves the leaked rows in the DENOMINATOR,
+#: which under-weights every guarded cell-week uniformly and yields a smooth,
+#: plausible, mildly-flat prior with no error, no nan and no missing row.
+#: Invisible in the output and invisible in the paper.
+#:
+#: The marker lives here because this module is what "guarded" MEANS. It is a
+#: convention rather than a type, so it is not proof against a caller who
+#: stamps by hand -- the type-level form (a ``GuardedCounts`` wrapper) would
+#: be -- but it does close the accidental path, which is the one that has
+#: actually occurred.
+GUARD_MARKER_KEY = b"leakage_guards_applied"
+GUARD_MARKER_VALUE = b"1"
+
+
+def mark_guards_applied(table: pa.Table) -> pa.Table:
+    """Stamp *table* as having been through both guards.
+
+    Schema metadata is REPLACED wholesale by ``replace_schema_metadata``, so
+    any existing keys are merged in rather than dropped: a caller that carries
+    its own metadata must not lose it to a provenance stamp.
+    """
+    metadata = dict(table.schema.metadata or {})
+    metadata[GUARD_MARKER_KEY] = GUARD_MARKER_VALUE
+    return table.replace_schema_metadata(metadata)
+
+
+def guards_applied(table: pa.Table) -> bool:
+    """Whether *table* carries the guard marker.
+
+    The VALUE is checked, not merely the key's presence: a key mapped to
+    something else is not this module's stamp, and treating it as one would
+    let an unrelated metadata convention authenticate an unguarded table.
+    """
+    metadata = table.schema.metadata or {}
+    return metadata.get(GUARD_MARKER_KEY) == GUARD_MARKER_VALUE
+
+
+#: The WARNING `drop_test_contributor_cells` emits when a NON-EMPTY banned
+#: set matches nothing at all. It is the shared observable symptom of every
+#: remaining silent-failure mode in this module, so the build script matches
+#: on this marker to turn it into a build failure. Single-sourced here rather
+#: than re-spelled there: a caller string-matching a message defined in
+#: another module goes silently dead the day the message is reworded, which
+#: is precisely the failure this warning exists to make visible.
+ZERO_MATCH_WARNING_MARKER = "matched zero of"
 
 
 def _strip_format_characters(text: str) -> str:
@@ -372,9 +434,10 @@ def drop_test_contributor_cells(
         # legitimately matches nothing and returned earlier, so it never warns.
         logger.warning(
             "drop_test_contributor_cells: %d banned (cell, week, contributor) "
-            "key(s) matched zero of %d occurrences; check the H3 resolution and "
+            "key(s) %s %d occurrences; check the H3 resolution and "
             "cell formatting of the test split",
             len(banned),
+            ZERO_MATCH_WARNING_MARKER,
             table.num_rows,
         )
     return kept
@@ -383,5 +446,23 @@ def drop_test_contributor_cells(
 def apply_leakage_guards(
     table: pa.Table, test_recordings: Iterable[TestRecording]
 ) -> pa.Table:
-    """Both guards, in order."""
-    return drop_test_contributor_cells(drop_xeno_canto(table), test_recordings)
+    """Both guards, in order, and STAMP the result as guarded.
+
+    The stamp is applied here and nowhere else: this function is the only
+    definition of "both guards have run", so a table that carries the marker
+    without having been through it would have to have been stamped by hand.
+    ``effort.target_group_ratios`` requires the marker, so the structural
+    consequence is that the effort denominator can only be computed over a
+    table this function produced.
+
+    An EMPTY ``test_recordings`` still stamps. That is deliberate: ``[]`` is a
+    legitimate mode (no evaluation split is wired in), the Xeno-Canto guard
+    ran regardless, and refusing to stamp it would push every caller toward
+    stamping by hand -- which is exactly the bypass the marker exists to
+    close. Whether a split SHOULD have been supplied is knowledge only the
+    build script has, and it is enforced there, by requiring an explicit
+    ``--no-test-split`` opt-out.
+    """
+    return mark_guards_applied(
+        drop_test_contributor_cells(drop_xeno_canto(table), test_recordings)
+    )
