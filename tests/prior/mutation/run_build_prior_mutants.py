@@ -453,8 +453,8 @@ MUTANTS: list[Mutant] = [
         "test_filenames_encode_source_resolution_and_variant",
         [
             (
-                '    stem = f"prior_{source}_r{resolution}"',
-                '    stem = f"prior_{source}"',
+                '    return f"prior_{source}_r{resolution}"',
+                '    return f"prior_{source}"',
             )
         ],
     ),
@@ -530,20 +530,19 @@ MUTANTS: list[Mutant] = [
     ),
     (
         "B17c",
-        "the recorded measurement lowered ALONGSIDE the constant, so the two "
-        "agree again and B17b's killer test passes. This is the way to defeat "
-        "a self-referential pin, and it is why the killer test ALSO asserts "
-        "that the recorded worst case exceeds the discredited 160: a "
-        "re-measurement is legitimate and must be arguable, but silently "
-        "restoring the number the review rejected is not",
-        "test_the_memory_constant_is_not_below_the_worst_measurement",
-        [
-            ("MEASURED_BYTES_PER_CONTEXT = 270", "MEASURED_BYTES_PER_CONTEXT = 158"),
-            (
-                "WORST_MEASURED_BYTES_PER_CONTEXT = 263.0",
-                "WORST_MEASURED_BYTES_PER_CONTEXT = 158.0",
-            ),
-        ],
+        "M2: the coordinated edit MOVED INTO THE MEASUREMENT FILE. Its "
+        "original form -- lower the constant and the recorded worst case "
+        "together in the source -- no longer exists to be made, because the "
+        "recorded worst case is not typed in the source any more (B17e "
+        "catches re-introducing it). The edit that remains is to retype the "
+        "ratio in the committed JSON, which is why the file is checked "
+        "against its OWN raw observations: 158.0 does not follow from this "
+        "row's peak RSS over its context count, so the build refuses the "
+        "measurement instead of quietly re-deriving a discredited constant "
+        "from it",
+        "test_the_committed_measurement_is_itself_self_consistent",
+        [('"bytes_per_context_net": 263.0367179487179', '"bytes_per_context_net": 158.0')],
+        "scripts/measurements/measure_peak_results.json",
     ),
     (
         "B17d",
@@ -685,8 +684,8 @@ MUTANTS: list[Mutant] = [
                 "        try:\n            paths = build_from_archive(\n",
             ),
             (
-                "            species_chunk=args.species_chunk,\n        )\n",
-                "                species_chunk=args.species_chunk,\n"
+                "            min_split_match_rate=args.min_split_match_rate,\n        )\n",
+                "                min_split_match_rate=args.min_split_match_rate,\n"
                 "            )\n"
                 "        except ValueError as exc:\n"
                 "            log.warning"
@@ -1259,9 +1258,9 @@ MUTANTS: list[Mutant] = [
         "test_a_build_that_dies_part_way_leaves_NO_manifest",
         [
             (
-                "    written: list[Path] = []\n    stem = artifact_stem(source, resolution)",
-                "    written: list[Path] = []\n"
-                "    stem = artifact_stem(source, resolution)\n"
+                "    manifest_path(out_dir, source, resolution).unlink(missing_ok=True)\n"
+                "    written.append(save_prior(full, out_dir / f\"{stem}_full.npz\"))",
+                "    manifest_path(out_dir, source, resolution).unlink(missing_ok=True)\n"
                 "    write_manifest(\n"
                 "        out_dir,\n"
                 "        source,\n"
@@ -1269,7 +1268,8 @@ MUTANTS: list[Mutant] = [
                 "        [out_dir / f\"{stem}_full.npz\"]\n"
                 "        + [out_dir / f\"{stem}_{n}.npz\" for n in CONTROLS],\n"
                 "        gbif_doi,\n"
-                "    )",
+                "    )\n"
+                "    written.append(save_prior(full, out_dir / f\"{stem}_full.npz\"))",
             )
         ],
     ),
@@ -1327,7 +1327,7 @@ MUTANTS: list[Mutant] = [
         "including N copies of the full prior or N files from another "
         "resolution's build. The manifest names its artifacts for exactly "
         "this reason",
-        "test_check_manifest_DETECTS_a_truncated_set",
+        "test_check_manifest_verifies_NAMES_not_a_COUNT",
         [
             (
                 "    missing = []\n"
@@ -1452,7 +1452,7 @@ MUTANTS: list[Mutant] = [
         "`test_save_accepts_a_doi_with_INCIDENTAL_surrounding_whitespace` "
         "pins the byte-for-byte round trip precisely so a message improvement "
         "cannot become a provenance change",
-        "test_the_cli_accepts_every_documented_doi_spelling",
+        "test_the_cli_REFUSES_a_doi_with_surrounding_whitespace",
         [("    if not DOI_PATTERN.match(value):", "    value = value.strip()\n    if not DOI_PATTERN.match(value):")],
     ),
 ]

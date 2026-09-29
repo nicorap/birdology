@@ -19,6 +19,7 @@ from a hardcoded cluster path.
 import builtins
 import json
 import logging
+import shutil
 import sys
 import zipfile
 from pathlib import Path
@@ -79,6 +80,17 @@ def _measurement_row(n_species: int, n_cells: int, net_peak_bytes: int) -> dict:
         "bytes_per_context_net": net_peak_bytes / contexts,
     }
 
+
+#: The M3 spellings: a DOI that is CORRECT but carries incidental whitespace
+#: or a citation label. Shared by the refusal test and the message test so the
+#: two provably speak about the same inputs -- a drift between two literal
+#: tuples would let one of them quietly stop covering the trailing-space case.
+_WHITESPACE_DOIS = (
+    "10.15468/dl.bq3fxc ",
+    " 10.15468/dl.bq3fxc",
+    "DOI: 10.15468/dl.bq3fxc",
+    "10.15468/dl.bq3\tfxc",
+)
 
 DOI = "10.15468/dl.test"
 
@@ -934,6 +946,30 @@ def test_the_cli_accepts_every_documented_doi_spelling():
         assert args.gbif_doi == good
 
 
+def test_the_cli_REFUSES_a_doi_with_surrounding_whitespace(capsys):
+    """M3's no-repair half: the value is NEVER stripped to make it fit.
+
+    SEPARATE from the message test below, and the separation is the point. A
+    message improvement is one edit away from being bought by
+    `value = value.strip()`, which would satisfy any test that only asked
+    "does a whitespace DOI end up working". It must not work: the sidecar has
+    to carry the exact string the operator attested to, because silently
+    repairing an attribution field means the artifact cites something the
+    build was never told. So this pins the REFUSAL and
+    `test_the_doi_shape_message_names_whitespace_as_a_probable_cause` pins
+    the WORDING, and no single edit can satisfy both wrongly.
+    """
+    for bad in _WHITESPACE_DOIS:
+        with pytest.raises(SystemExit):
+            build_prior._parse_args(
+                [
+                    "--archive", "a.zip", "--source", "dof", "--no-test-split",
+                    "--gbif-doi", bad,
+                ]
+            )
+        assert "is not shaped like a DOI" in capsys.readouterr().err
+
+
 def test_the_doi_shape_message_names_whitespace_as_a_probable_cause(capsys):
     """M3: the three whitespace spellings are refused for a NAMED reason.
 
@@ -951,12 +987,7 @@ def test_the_doi_shape_message_names_whitespace_as_a_probable_cause(capsys):
     byte-for-byte round trip from the other side, so this improvement cannot
     become a provenance change. Only the MESSAGE changes.
     """
-    for bad in (
-        "10.15468/dl.bq3fxc ",
-        " 10.15468/dl.bq3fxc",
-        "DOI: 10.15468/dl.bq3fxc",
-        "10.15468/dl.bq3\tfxc",
-    ):
+    for bad in _WHITESPACE_DOIS:
         with pytest.raises(SystemExit):
             build_prior._parse_args(
                 [
@@ -2054,6 +2085,38 @@ def test_check_manifest_accepts_a_complete_set(tmp_path):
     paths = _build(tmp_path, out_dir=out)
     verified = build_prior.check_manifest(out, "dof", 4)
     assert sorted(verified) == sorted(paths)
+
+
+def test_check_manifest_verifies_NAMES_not_a_COUNT(tmp_path):
+    """A count is satisfied by the wrong files. The manifest names them.
+
+    ISOLATES the name check from the count. `test_check_manifest_DETECTS_a_
+    truncated_set` deletes an artifact, which lowers the count too, so it
+    cannot tell a check that verifies names from one that counts files. Here
+    the count is RESTORED by a decoy -- the deleted control's name is taken by
+    a copy of the full prior -- so the directory holds exactly as many files
+    as the manifest names, and every one of them is a valid, correctly
+    provenanced artifact. Only the names disagree.
+
+    Realistic rather than contrived: a sweep writes every resolution into one
+    `--out`, so a directory routinely holds files from several builds, and a
+    count is satisfied by a neighbour's.
+    """
+    out = tmp_path / "priors"
+    paths = _build(tmp_path, out_dir=out)
+    full = next(p for p in paths if "_full" in p.name)
+    victim = next(p for p in paths if "_full" not in p.name)
+
+    decoy = victim.with_name(victim.name.replace(".npz", "_decoy.npz"))
+    shutil.copy(full, decoy)
+    shutil.copy(full.with_suffix(".json"), decoy.with_suffix(".json"))
+    victim.unlink()
+    victim.with_suffix(".json").unlink()
+
+    # The count now matches exactly, and nothing on disk is malformed.
+    assert len(list(out.glob("*.npz"))) == len(paths)
+    with pytest.raises(ValueError, match="truncated artifact set"):
+        build_prior.check_manifest(out, "dof", 4)
 
 
 def test_check_manifest_DETECTS_a_truncated_set(tmp_path):
