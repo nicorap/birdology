@@ -7,7 +7,7 @@ Run from the repository root:
     uv run python tests/prior/mutation/run_tensor_mutants.py --only T1 T7
     uv run python tests/prior/mutation/run_tensor_mutants.py --verify-labels
 
-Structure is copied from `run_smoothing_mutants.py`, including the five things
+Structure is copied from `run_smoothing_mutants.py`, including the things
 that make the result trustworthy:
 
 1. it refuses to start unless `git status --porcelain` is clean for the target
@@ -24,11 +24,24 @@ that make the result trustworthy:
    runtime: a mutant that fails only OTHER tests is scored MISLABELLED, not a
    kill, and also exits non-zero;
 5. `--verify-labels` prints the unified diff each mutant actually applies, so
-   each LABEL can be read against its EDIT rather than trusted.
+   each LABEL can be read against its EDIT rather than trusted;
+6. a mutant whose output shows an `AttributeError`, `NameError`, `ImportError`
+   or `SyntaxError` raised FROM THE TARGET MODULE is scored CRASHED, never a
+   kill, and CRASHED exits non-zero. This exists because of a real defect in
+   this very table: T28 was written as `pa.compute.utf8_lower(...)` while
+   `tensor.py` imports only `pyarrow as pa`, and `pa.compute` is not an
+   attribute without an explicit import. The edit therefore lowercased
+   nothing; it raised `AttributeError` inside `to_tensor` and took out 48 of
+   63 tests. The name-based check in (4) only asks whether the named killer is
+   among the failures, and an edit that breaks EVERYTHING trivially contains
+   any named killer -- so the row scored KILLED while proving nothing at all
+   about the contract it claimed (byte-for-byte cell pass-through, this
+   module's most load-bearing property). A crash mutant is not a behavioural
+   mutation: it is a broken edit wearing a kill's clothes.
 
-A mutant is KILLED if at least one test fails AND the named killer is among
-the failures. Zero failures is a SURVIVOR: the suite does not pin that
-behaviour.
+A mutant is KILLED if at least one test fails, the named killer is among the
+failures, and the failure is NOT a crash in the target module. Zero failures is
+a SURVIVOR: the suite does not pin that behaviour.
 
 COMPOUND CONDITIONS ARE MUTATED PER DISJUNCT
 --------------------------------------------
@@ -40,6 +53,7 @@ clause, and each statement gets its own mutant:
 * `isfinite` / `<= 0.0` / `> 1.0` on `p`        -> T8, T9, T10 (per clause)
 * the schema loop's missing / dtype / null arms -> T14, T15, T16
 * the two axis-vs-matrix shape checks           -> T21, T22
+* the unknown-cell and unknown-species guards   -> T49, T50 (per axis)
 
 WHAT THIS SET DOES NOT COVER -- stated so the table is not read as more than
 it is
@@ -50,14 +64,18 @@ it is
   exact dtypes is pinned by `test_smoothing.py`, not here; a contract drift in
   its OUTPUT would be caught there and would show up in this table only as a
   schema rejection, which reads identically to a caller error.
-* THE DENSE-GRID OBLIGATION (T8-R5). `test_a_context_absent_from_the_table_is
-  _a_structural_zero_not_the_floor` pins that an absent context reads 0.0, and
-  the module docstring states the caller must therefore supply a dense grid.
-  NOTHING HERE ENFORCES THAT the caller did: `to_tensor` accepts a table with
-  holes without complaint, by design (it cannot know which grid was intended).
-  A pipeline that hands it a sparse grid produces a tensor full of structural
-  zeros and every test in this file still passes. That obligation lives in
-  Task 10 (T10-R1) and is only as strong as Task 10's own tests.
+* WHETHER THE FLOOR IS THE RIGHT VALUE FOR AN UNOBSERVED CONTEXT. T47/T51/T52
+  pin that an unstored context on both axes reads `backoff.FLOOR` rather than
+  0.0, and that `lookup`, `vector` and `dense` agree on it. That `FLOOR = 1e-6`
+  is a good choice of prior for "nobody looked" is a modelling decision made in
+  `backoff.py` and defended there; no mutation of a serialiser can speak to it.
+  What this set DOES cover is that the choice is single-sourced: a mutant that
+  hard-codes a different constant here dies.
+* THE SIZE OF THE UNOBSERVED REGION. Nothing here checks that the fill is
+  reasonable. `nnz` and `dense_capacity` are PUBLISHED (T53) so a reader can
+  see a prior that observed 0.01% of its own grid, but no test rejects one:
+  that judgement belongs to whoever reads the sidecar, and a legitimate
+  national-scale prior really is that sparse.
 * WHETHER `p` IS THE RIGHT NUMBER. Every mutant here concerns LAYOUT and
   VALIDATION. The calibration of the prior -- whether the backoff weights and
   the smoothing bandwidth produce a useful probability -- is empirical and no
@@ -66,24 +84,34 @@ it is
   here would catch a defect that appears only at national scale: an int64
   overflow in the packed duplicate key (bounded by n_species * n_cells * 52,
   which overflows only far beyond any plausible grid), memory blow-up from
-  `todense()` on a very wide `vector()` call, or `to_pylist()` creeping back
-  into the hot path. The smoothing harness has a peak-allocation test (S31);
-  this one does not, because this stage's cost is dominated by scipy's own
-  COO->CSR conversion rather than by Python objects.
-* THE `.npz` CONTAINER ITSELF. `save_prior`/`load_prior` are tested as a pair,
-  so a mutant that changed BOTH the write and the read consistently (a
-  different scipy format, a different key name) would round-trip and survive.
-  Nothing here reads the `.npz` with an independent reader, so the on-disk
-  format is pinned only up to "whatever this build of scipy writes and reads".
-  An artifact released today and loaded by a future scipy is not covered.
-* THE SIDECAR AS A CITATION. T24/T25 prove the licence and DOI reach the JSON
-  and come back. That the DOI is the RIGHT one -- that it names the GBIF
+  `todense()` on a very wide `vector()` call or from `dense()` on a full grid
+  (which at national scale really is ~750 MB and is the inherent cost of
+  asking for every context), or `to_pylist()` creeping back into the hot path.
+  The smoothing harness has a peak-allocation test (S31); this one does not,
+  because this stage's cost is dominated by scipy's own COO->CSR conversion
+  rather than by Python objects.
+* THE `.npz` CONTAINER BEYOND WHAT ONE INDEPENDENT READ PROVES.
+  `test_the_npz_is_decodable_by_a_third_party_with_numpy_alone` decodes the
+  artifact with `np.load` and no scipy, pinning the member names, the `coo`
+  format tag, the float64 dtype, the ORIENTATION and the sidecar's packing --
+  so a consistent-both-sides mutant (a different format, a renamed member, a
+  transpose) now dies. What remains uncovered is FORWARD COMPATIBILITY: that a
+  future scipy still writes these five members under these names is not
+  something a test run today can establish.
+* THE SIDECAR AS A CITATION. T24/T25/T54 prove the licence, the DOI and the
+  attribution string reach the JSON and come back, and `save_prior` now
+  REFUSES an empty DOI. That the DOI is the RIGHT one -- that it names the GBIF
   download this tensor was actually built from -- is a pipeline-level property
-  no test in this file can check: `gbif_doi` is a free string the caller sets.
+  no test in this file can check: `gbif_doi` is a free string the caller sets,
+  and the guard tests emptiness, not well-formedness.
 * JSON ENCODING EDGE CASES. The sidecar is written with the default encoder.
   A cell string containing an unusual codepoint round-trips through JSON, but
   nothing here exercises non-ASCII cells, because H3 cells are hexadecimal.
   A future non-H3 `cell` spelling would be untested.
+* CONCURRENT WRITES. Two processes saving to the same path interleave a
+  matrix from one with a sidecar from the other. The nnz-agreement check on
+  load would catch the common case, but nothing here exercises it and no lock
+  is taken.
 """
 from __future__ import annotations
 
@@ -138,19 +166,15 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
     (
         "T4",
         "the week guard moved BELOW the cell lookup in `_column`, so an "
-        "out-of-range week on an unknown cell returns 0.0 through the `None` "
-        "path instead of raising -- the caller cannot tell an aliasing bug "
-        "from a legitimate miss",
-        "test_an_out_of_range_week_raises_even_for_an_unknown_cell",
+        "out-of-range week on an unknown cell raises the CELL error instead of "
+        "the WEEK one -- the caller is pointed at a cell name that is not the "
+        "defect while the aliasing bug in its week arithmetic survives",
+        "test_an_out_of_range_week_raises_the_WEEK_error_even_for_an_unknown_cell",
         [
             (
                 '        _validate_week(int(week), "a tensor lookup")\n'
+                "        ci = self._cell_index.get(cell)",
                 "        ci = self._cell_index.get(cell)\n"
-                "        if ci is None:\n"
-                "            return None",
-                "        ci = self._cell_index.get(cell)\n"
-                "        if ci is None:\n"
-                "            return None\n"
                 '        _validate_week(int(week), "a tensor lookup")',
             )
         ],
@@ -477,12 +501,18 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         "T28",
         "`cell` LOWERCASED before it is encoded: a redundant second "
         "normalisation of a value normalised exactly once upstream, which "
-        "merges two distinct cells and changes the bytes the release carries",
+        "merges two distinct cells and changes the bytes the release carries. "
+        "Written with `pc.utf8_lower` and its own `import pyarrow.compute as "
+        "pc`, because the original spelling `pa.compute.utf8_lower` raised "
+        "AttributeError (tensor.py imports only `pyarrow as pa`) and so "
+        "lowercased NOTHING while crashing 48 of 63 tests -- scored KILLED "
+        "while proving nothing about this module's most load-bearing contract",
         "test_a_cell_string_is_passed_through_byte_for_byte",
         [
             (
                 '    encoded = _single_array(table.column("cell")).dictionary_encode()',
-                "    encoded = pa.compute.utf8_lower(\n"
+                "    import pyarrow.compute as pc\n"
+                "    encoded = pc.utf8_lower(\n"
                 '        _single_array(table.column("cell"))\n'
                 "    ).dictionary_encode()",
             )
@@ -510,10 +540,8 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         "test_vector_does_NOT_renormalise_over_species",
         [
             (
-                "        return np.asarray(self.values[:, [col]].todense(), dtype=np.float64).ravel()",
-                "        _v = np.asarray(\n"
-                "            self.values[:, [col]].todense(), dtype=np.float64\n"
-                "        ).ravel()\n"
+                "        return _floor_missing(stored)",
+                "        _v = _floor_missing(stored)\n"
                 "        _t = _v.sum()\n"
                 "        return _v / _t if _t else _v",
             )
@@ -521,14 +549,23 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
     ),
     (
         "T31",
-        "`vector` for an UNKNOWN cell returns a zero-length array instead of "
-        "one zero per species, so a downstream fusion that multiplies by the "
-        "prior silently broadcasts to the wrong shape",
-        "test_vector_for_an_unknown_cell_is_all_zeros_of_the_right_length",
+        "the unknown-CELL guard in `_column` replaced by a silent FLOOR "
+        "vector: `vector` answers a misspelled or wrong-resolution cell with a "
+        "well-shaped, plausible prior instead of raising. This is the most "
+        "dangerous form of the reversal taken too far -- the axes are derived "
+        "from the data, so an unknown cell is a CALLER error, and flooring it "
+        "substitutes a fabricated prior for the real one with nothing raised",
+        "test_vector_for_an_unknown_cell_raises_rather_than_returning_floors",
         [
             (
-                "            return np.zeros(len(self.species_keys), dtype=np.float64)",
-                "            return np.zeros(0, dtype=np.float64)",
+                "        ci = self._cell_index.get(cell)\n"
+                "        if ci is None:\n"
+                "            raise ValueError(",
+                "        ci = self._cell_index.get(cell)\n"
+                "        if ci is None:\n"
+                "            return 0\n"
+                "        if False:\n"
+                "            raise ValueError(",
             )
         ],
     ),
@@ -540,8 +577,8 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         "test_vector_reads_only_its_own_context",
         [
             (
-                "        return np.asarray(self.values[:, [col]].todense(), dtype=np.float64).ravel()",
-                "        return np.asarray(\n"
+                "        stored = np.asarray(self.values[:, [col]].todense(), dtype=np.float64).ravel()",
+                "        stored = np.asarray(\n"
                 "            self.values[:, [min(col + 1, self.values.get_shape()[1] - 1)]].todense(),\n"
                 "            dtype=np.float64,\n"
                 "        ).ravel()",
@@ -555,10 +592,8 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         "test_vector_is_float64",
         [
             (
-                "        return np.asarray(self.values[:, [col]].todense(), dtype=np.float64).ravel()",
-                "        return np.asarray(\n"
-                "            self.values[:, [col]].todense(), dtype=np.float32\n"
-                "        ).ravel()",
+                "        return _floor_missing(stored)",
+                "        return _floor_missing(stored).astype(np.float32)",
             )
         ],
     ),
@@ -566,10 +601,10 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
     (
         "T34",
         "the brief's original suffix handling restored: `save_npz` is called "
-        "with the RAW path, so `p.dat` is written as `p.dat.npz` while the "
-        "returned path and the sidecar name `p.npz`. The return value then "
-        "points at a file that does not exist and `load_prior` fails",
-        "test_save_returns_a_path_that_exists_for_a_non_npz_name",
+        "with the RAW path while the sidecar and the returned path are "
+        "computed elsewhere, so the artifact and its sidecar can name "
+        "different files and the return value point at nothing",
+        "test_the_sidecar_sits_beside_the_npz_that_was_written",
         [
             (
                 "    npz = _npz_path(path)\n"
@@ -577,7 +612,7 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
                 "    sparse.save_npz(npz, tensor.values.tocoo())",
                 "    path.parent.mkdir(parents=True, exist_ok=True)\n"
                 "    sparse.save_npz(path, tensor.values.tocoo())\n"
-                "    npz = _npz_path(path)",
+                "    npz = path.with_suffix(\".npz\")",
             )
         ],
     ),
@@ -589,8 +624,24 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         "test_the_sidecar_sits_beside_the_npz_that_was_written",
         [
             (
-                '    return path if path.suffix == ".npz" else path.with_suffix(".npz")',
+                '    return path if path.suffix == ".npz" else path.with_name(path.name + ".npz")',
                 "    return path",
+            )
+        ],
+    ),
+    (
+        "T49",
+        "`_npz_path` reverted to the SUBSTITUTING `with_suffix` form, which "
+        "TRUNCATES at the last dot: `prior_v1.2` and `prior_v1.3` both become "
+        "`prior_v1.npz`, so saving the second OVERWRITES the first with no "
+        "error and a caller asking for v1.2 is handed v1.3's values. Measured "
+        "silent DATA LOSS at the release boundary -- a wrong artifact under a "
+        "right name",
+        "test_two_names_differing_only_after_a_dot_produce_two_distinct_artifacts",
+        [
+            (
+                '    return path if path.suffix == ".npz" else path.with_name(path.name + ".npz")',
+                '    return path if path.suffix == ".npz" else path.with_suffix(".npz")',
             )
         ],
     ),
@@ -604,9 +655,9 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         [
             (
                 "    npz = _npz_path(path)\n"
-                '    meta = json.loads(npz.with_suffix(".json").read_text(encoding="utf-8"))',
+                '    meta = json.loads(_sidecar_path(npz).read_text(encoding="utf-8"))',
                 "    npz = path\n"
-                '    meta = json.loads(path.with_suffix(".json").read_text(encoding="utf-8"))',
+                '    meta = json.loads(_sidecar_path(path).read_text(encoding="utf-8"))',
             )
         ],
     ),
@@ -740,23 +791,24 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
     ),
     (
         "T47",
-        "`load_prior` IMPUTES the upstream floor for every structural zero. "
-        "This is the T8-R5 violation in its most tempting form -- it looks "
-        "like it is restoring the floor the backoff guarantees -- but this "
-        "stage was never handed those contexts, so it would be inventing a "
-        "probability for a grid point that does not exist, and `nnz` would "
-        "stop distinguishing a real estimate from an absent one",
-        "test_round_trip_preserves_structural_zeros",
+        "the HARD ZERO reintroduced on the read path: `load_prior` drops the "
+        "flooring, so a context that is on both axes but was never stored "
+        "reads 0.0 instead of `backoff.FLOOR`. This is the ruling this plan "
+        "REVERSED, in the form it would come back: it looks like refusing to "
+        "invent data, but the backoff's own docstring defines FLOOR as the "
+        "value for \"nobody looked\", and a zero there lets the prior VETO a "
+        "correct detection across most of the grid -- which is exactly what "
+        "the floor exists to prevent. Nothing raises; every fusion score just "
+        "gets quietly worse",
+        "test_round_trip_preserves_the_sparsity_pattern_and_the_floor",
         [
             (
-                "        values=sparse.load_npz(npz).tocsr(),",
-                "        values=sparse.csr_matrix(\n"
-                "            np.where(\n"
-                "                np.asarray(sparse.load_npz(npz).todense()) > 0.0,\n"
-                "                np.asarray(sparse.load_npz(npz).todense()),\n"
-                "                1e-6,\n"
-                "            )\n"
-                "        ),",
+                "def _floor_missing(values):",
+                "def _floor_missing(values):\n"
+                "    return values\n"
+                "\n"
+                "\n"
+                "def _floor_missing_unused(values):",
             )
         ],
     ),
@@ -770,6 +822,216 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
             (
                 '        spec=PriorSpec(**meta["spec"]),',
                 '        spec=PriorSpec(resolution=4, source="dof", variant="uniform"),',
+            )
+        ],
+    ),
+    # ---- the reversal: FLOOR for an unstored context, LOUD for an unknown axis
+    (
+        "T50",
+        "the unknown-SPECIES guard removed and replaced by a silent floor, so "
+        "`lookup` answers a typo'd or out-of-label-set species key with a "
+        "plausible probability. Separate mutant from T31: one deletion cannot "
+        "detect the other's loss, and a fixture with an unknown CELL never "
+        "reaches the species lookup at all",
+        "test_lookup_of_an_unknown_species_key_raises_naming_the_species_axis",
+        [
+            (
+                "        row = self._species_index.get(int(species_key))\n"
+                "        if row is None:\n"
+                "            raise ValueError(",
+                "        row = self._species_index.get(int(species_key))\n"
+                "        if row is None:\n"
+                "            return 0\n"
+                "        if False:\n"
+                "            raise ValueError(",
+            )
+        ],
+    ),
+    (
+        "T51",
+        "the floor HARD-CODED here instead of imported from `backoff`, at a "
+        "value one order of magnitude away. The semantics survive -- an "
+        "unstored context still reads a small positive number -- but the "
+        "boundary and the backoff now disagree about what \"no evidence\" is "
+        "worth, so a context the smoother emitted at the floor and one it "
+        "never emitted read DIFFERENTLY, which is the distinction the reversal "
+        "exists to erase",
+        "test_a_context_absent_from_the_table_reads_the_FLOOR_not_a_hard_zero",
+        [
+            (
+                "    return np.where(values == 0.0, FLOOR, values)",
+                "    return np.where(values == 0.0, 1e-5, values)",
+            )
+        ],
+    ),
+    (
+        "T52",
+        "the flooring applied in `lookup` but NOT in `vector`, so the two "
+        "public readers disagree about an unobserved context: a scalar query "
+        "gets the floor and the vector query the fusion sweep actually uses "
+        "gets a hard zero. Precisely the writer/reader drift the single "
+        "`_floor_missing` definition exists to prevent, and invisible to any "
+        "test that exercises only one reader",
+        "test_vector_and_lookup_agree_on_every_species_of_a_context",
+        [
+            (
+                "        stored = np.asarray(self.values[:, [col]].todense(), dtype=np.float64).ravel()\n"
+                "        return _floor_missing(stored)",
+                "        return np.asarray(\n"
+                "            self.values[:, [col]].todense(), dtype=np.float64\n"
+                "        ).ravel()",
+            )
+        ],
+    ),
+    (
+        "T53",
+        "`nnz` and the dense capacity dropped from the sidecar, so a released "
+        "artifact carries no visible evidence of its own fill. A third party "
+        "then cannot tell a prior built from a dense national grid from one "
+        "built from a handful of observed cells, and the two warrant very "
+        "different confidence",
+        "test_the_sidecar_publishes_the_fill_of_the_artifact",
+        [
+            (
+                '        "nnz": int(tensor.values.nnz),\n'
+                '        "dense_capacity": int(tensor.dense_capacity),\n',
+                "",
+            )
+        ],
+    ),
+    (
+        "T54",
+        "the empty-DOI refusal removed, so a release ships with empty "
+        "provenance SILENTLY: the `.npz` writes fine, the sidecar is valid "
+        "JSON, and nothing in the artifact states which GBIF download it came "
+        "from. CC BY requires attribution, so this is a licence breach that no "
+        "reader of the artifact can detect",
+        "test_save_refuses_a_tensor_with_no_gbif_doi",
+        [
+            (
+                "    if not tensor.gbif_doi:\n        raise ValueError(",
+                "    if False:\n        raise ValueError(",
+            )
+        ],
+    ),
+    (
+        "T55",
+        "the attribution string reduced to the licence alone, dropping the "
+        "DOI. Both fields are still present separately, so T40 and T38 pass; "
+        "what breaks is the one string a third party can actually cite from "
+        "without consulting this repository",
+        "test_the_sidecar_carries_an_attribution_naming_both_the_doi_and_the_licence",
+        [
+            (
+                '            f"Derived from GBIF occurrence download {tensor.gbif_doi}. "\n'
+                '            f"Released under {LICENCE} ({LICENCE_URL}); cite that DOI and this "\n'
+                '            "licence when redistributing or building on this artifact."',
+                '            f"Released under {LICENCE}."',
+            )
+        ],
+    ),
+    (
+        "T56",
+        "the matrix TRANSPOSED on write and transposed back on read: "
+        "consistent on BOTH sides, so every round-trip test in the suite "
+        "passes while the released `.npz` has rows indexing cell-weeks and "
+        "columns indexing species. Every third-party reader decoding it "
+        "against the sidecar's published packing gets every value wrong. Only "
+        "the independent numpy reader can see this",
+        "test_the_npz_is_decodable_by_a_third_party_with_numpy_alone",
+        [
+            (
+                "    sparse.save_npz(npz, tensor.values.tocoo())",
+                "    sparse.save_npz(npz, tensor.values.T.tocoo())",
+            ),
+            (
+                "    matrix = sparse.load_npz(npz).tocsr()",
+                "    matrix = sparse.load_npz(npz).T.tocsr()",
+            ),
+        ],
+    ),
+    (
+        "T57",
+        "the artifact written in scipy's CSR format rather than COO -- "
+        "consistent on both sides, so it round-trips perfectly, but the "
+        "on-disk members change from (data, row, col, shape) to (data, "
+        "indices, indptr, shape). A third-party reader written against the "
+        "published COO layout finds no `row` member at all",
+        "test_the_npz_is_decodable_by_a_third_party_with_numpy_alone",
+        [
+            (
+                "    sparse.save_npz(npz, tensor.values.tocoo())",
+                "    sparse.save_npz(npz, tensor.values.tocsr())",
+            )
+        ],
+    ),
+    (
+        "T58",
+        "the sidecar's `missing_value` dropped, so a third party decoding the "
+        "matrix has no way to know an unstored entry means the floor. They "
+        "fill with 0.0, and every unobserved context silently vetoes its "
+        "species -- the reversal's whole point, lost at the boundary where it "
+        "matters most",
+        "test_the_sidecar_publishes_the_value_an_absent_context_takes",
+        [
+            (
+                '        "missing_value": FLOOR,\n',
+                "",
+            )
+        ],
+    ),
+    (
+        "T59",
+        "the missing-value agreement check on load removed, so an artifact "
+        "published under a DIFFERENT absent-context convention is read against "
+        "this build's floor and every unobserved context silently changes "
+        "value",
+        "test_a_sidecar_declaring_a_different_missing_value_is_rejected",
+        [
+            (
+                '    if float(meta["missing_value"]) != FLOOR:',
+                "    if False:",
+            )
+        ],
+    ),
+    (
+        "T60",
+        "the nnz-agreement check on load removed, so a sidecar paired with a "
+        "DIFFERENT matrix loads without complaint: the axes then describe a "
+        "matrix they do not belong to and every lookup reads the wrong row or "
+        "column",
+        "test_a_sidecar_whose_nnz_disagrees_with_the_matrix_is_rejected",
+        [
+            (
+                '    if int(meta["nnz"]) != matrix.nnz:',
+                "    if False:",
+            )
+        ],
+    ),
+    (
+        "T61",
+        "`dense_capacity` computed WITHOUT the week axis, so the published "
+        "fill overstates coverage by a factor of 52 and a release looks 52x "
+        "denser than it is",
+        "test_dense_capacity_is_the_product_of_the_three_axes",
+        [
+            (
+                "        return len(self.species_keys) * len(self.cells) * WEEKS_PER_YEAR",
+                "        return len(self.species_keys) * len(self.cells)",
+            )
+        ],
+    ),
+    (
+        "T62",
+        "`dense()` skips the flooring, so the one matrix-shaped reader "
+        "disagrees with `lookup` and `vector` about every unobserved context. "
+        "Separate from T52, which breaks `vector` instead: each reader needs "
+        "its own mutant because one's loss cannot detect another's",
+        "test_dense_floors_every_unstored_context_and_preserves_the_stored_ones",
+        [
+            (
+                "        return _floor_missing(np.asarray(self.values.toarray(), dtype=np.float64))",
+                "        return np.asarray(self.values.toarray(), dtype=np.float64)",
             )
         ],
     ),
@@ -814,6 +1076,48 @@ def _run_tests() -> tuple[int, str, set[str]]:
     # still a kill; treat any non-zero exit as at least one failure so that a
     # broken run can never be scored as a survivor.
     return (0 if proc.returncode == 0 else 1), out, failed
+
+
+# A mutant that BREAKS the target module rather than changing its behaviour is
+# not a mutant at all. `AttributeError`, `NameError` and `ImportError` mean the
+# edit referenced something that does not exist (T28's original
+# `pa.compute.utf8_lower` against a module importing only `pyarrow as pa`), and
+# `SyntaxError`/`IndentationError` mean it does not parse. Such an edit takes
+# out most of the suite, which TRIVIALLY includes whatever test the row names
+# as its killer -- so the name check in `main` passes and the row is credited
+# with proving a contract it never exercised.
+_CRASH_TYPES = (
+    "AttributeError",
+    "NameError",
+    "ImportError",
+    "ModuleNotFoundError",
+    "SyntaxError",
+    "IndentationError",
+)
+
+
+def _crash_in_target(out: str) -> str | None:
+    """The crash type, if the output shows one raised FROM THE TARGET MODULE.
+
+    Scoped to the target file on purpose. A mutant is entitled to make a TEST
+    raise `AttributeError` -- for instance one that removes a method a test
+    calls, where that IS the behaviour under test. What is never legitimate is
+    the mutated module failing to load or to resolve its own names, and that is
+    what the traceback line `src/birdology/prior/tensor.py:NNN: SomeError`
+    reports.
+    """
+    for crash in _CRASH_TYPES:
+        # pytest's one-line traceback summary: "<path>:<line>: <ErrorType>".
+        if re.search(rf"^{re.escape(str(TARGET))}:\d+: {crash}$", out, re.MULTILINE):
+            return crash
+        # A module that does not even import reports the error without a
+        # "path:line:" prefix of its own, but names the file in the frame.
+        if re.search(
+            rf'File "[^"]*{re.escape(TARGET.name)}".*\n(?:.*\n)??\s*{crash}:',
+            out,
+        ):
+            return crash
+    return None
 
 
 def _apply(source: str, edits: list[tuple[str, str]]) -> str | None:
@@ -879,6 +1183,7 @@ def main() -> int:
     survivors: list[str] = []
     not_applied: list[str] = []
     mislabelled: list[str] = []
+    crashed: list[str] = []
 
     for mid, description, killer, edits in selected:
         if f"def {killer}(" not in test_source:
@@ -904,7 +1209,16 @@ def main() -> int:
             _clear_pycache()
             assert (REPO / TARGET).read_text() == source, "restore failed"
 
-        if not failures:
+        crash = _crash_in_target(out)
+        if crash is not None:
+            # NOT a kill, whatever the failure count says. The edit broke the
+            # module instead of changing its behaviour, so it exercises no
+            # contract -- and because it breaks nearly every test, the named
+            # killer is among the failures by accident. See the module
+            # docstring, item 6.
+            verdict = f"CRASHED ({crash}, {failures} failed)"
+            crashed.append(mid)
+        elif not failures:
             verdict = "SURVIVED"
             survivors.append(mid)
         elif killer not in failed_names:
@@ -930,12 +1244,15 @@ def main() -> int:
     for mid, description, verdict in rows:
         print(f"| {mid} | {description} | `{by_id[mid]}` | {verdict} |")
     print(f"\nSurvivors: {survivors or 'none'}")
-    # NOT-APPLIED and MISLABELLED are FAILURES, not neutral rows. A pattern
-    # that has gone stale after a refactor tests nothing, and a mutant killed
-    # only by an unrelated test credits coverage that does not exist.
+    # NOT-APPLIED, MISLABELLED and CRASHED are FAILURES, not neutral rows. A
+    # pattern that has gone stale after a refactor tests nothing; a mutant
+    # killed only by an unrelated test credits coverage that does not exist;
+    # and a mutant that crashes the module exercises no contract at all while
+    # trivially containing every named killer.
     print(f"NOT APPLIED: {not_applied or 'none'}")
     print(f"MISLABELLED: {mislabelled or 'none'}")
-    return 1 if survivors or not_applied or mislabelled or final else 0
+    print(f"CRASHED: {crashed or 'none'}")
+    return 1 if survivors or not_applied or mislabelled or crashed or final else 0
 
 
 if __name__ == "__main__":

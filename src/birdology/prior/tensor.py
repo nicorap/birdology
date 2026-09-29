@@ -20,26 +20,43 @@ is used by BOTH the writer (`to_tensor`) and the readers (`lookup`,
 defect this plan has found most often.
 
 Beside the `.npz` sits a JSON sidecar carrying the spec, the species and cell
-axes, the GBIF download DOI and the licence. The sidecar is what makes the
-release citable: the matrix alone cannot say which species a row is, which
-grid it was cut on, or under what terms it may be redistributed.
+axes, the value a missing context takes, the fill (`nnz` against the dense
+capacity), the GBIF download DOI and the licence. The sidecar is what makes
+the release citable: the matrix alone cannot say which species a row is, which
+grid it was cut on, what an absent entry means, or under what terms it may be
+redistributed.
 
-STRUCTURAL ZEROS -- read this with Task 10's T10-R1
----------------------------------------------------
-A `(species, cell, week)` context that is ABSENT from the input table is a
-STRUCTURAL zero here, and `lookup` returns a hard `0.0` for it -- NOT the
-upstream floor (`backoff.FLOOR = 1e-6`).
+A MISSING CONTEXT READS THE FLOOR, AND THAT IS NOT IMPUTATION
+-------------------------------------------------------------
+A `(species, cell, week)` context whose species IS on the species axis and
+whose cell IS on the cell axis, but which has no stored value, reads
+`backoff.FLOOR` -- not a hard `0.0`.
 
-That is correct for this stage: it cannot invent a probability for a grid
-point it was never handed, and inventing one would make a missing row
-indistinguishable from a real estimate. It does, however, put an obligation on
-the CALLER: the table passed to `to_tensor` must be a DENSE grid over all
-`WEEKS_PER_YEAR` weeks (and over every cell and species the downstream sweep
-will query), because a gap in that grid becomes a hard zero that can veto a
-correct detection. `hierarchical_estimate` emits exactly such a dense grid and
-clamps every value into `[floor, 1.0]`; anything that bypasses it must do the
-same. Task 10 carries the matching obligation (T10-R1); the two must be read
-together.
+This is not the serialiser inventing a probability. `FLOOR` is precisely the
+value the backoff DEFINES for "no evidence", in its own words: most
+(cell, week, species) combinations are empty, empty almost always means
+"nobody looked" rather than "absent", and a species with no occurrences
+anywhere still gets `floor`, never zero. Neither the backoff nor the smoother
+expands to a full grid; both pass observed rows through. So an unstored
+context is not a grid point that does not exist -- it is a grid point whose
+value is known a priori, and it is exactly the value it would have carried had
+it been materialised. Storing 93 600 000 explicit copies of one constant
+(~1.12 GB of CSR at national scale) into a container whose entire purpose is
+sparsity would change no answer this module can give.
+
+A hard `0.0` would be the defect: the floor exists so the prior can never veto
+a correct detection, and a zero for "nobody looked there" does exactly that.
+
+What stays LOUD, because it is a CALLER error rather than an absence of
+evidence:
+
+* an UNKNOWN `species_key` raises `ValueError`;
+* an UNKNOWN `cell` raises `ValueError`;
+* a `week` outside 1..WEEKS_PER_YEAR raises `ValueError`.
+
+The axes are derived from the data, so a key that is not on them is a typo, a
+wrong-resolution H3 string, or a mismatched label set -- never a context with
+no evidence. Flooring those would turn a caller bug into a plausible number.
 
 NEVER RENORMALISED
 ------------------
@@ -67,9 +84,11 @@ import numpy as np
 import pyarrow as pa
 from scipy import sparse
 
+from .backoff import FLOOR
 from .indexing import WEEKS_PER_YEAR
 
 LICENCE = "CC BY 4.0"
+LICENCE_URL = "https://creativecommons.org/licenses/by/4.0/"
 
 _REQUIRED_TYPES = {
     "species_key": pa.int64(),
@@ -79,8 +98,8 @@ _REQUIRED_TYPES = {
 }
 
 
-def _validate_week(week: int, where: str) -> None:
-    """Weeks are 1..WEEKS_PER_YEAR. Outside that range the packing ALIASES.
+def _validate_week(week, where: str) -> None:
+    """Weeks are integers in 1..WEEKS_PER_YEAR. Outside that the packing ALIASES.
 
     `cell_index * WEEKS_PER_YEAR + (week - 1)` is not injective once `week`
     leaves 1..52: week 53 of cell *i* is exactly the column of week 1 of cell
@@ -90,8 +109,8 @@ def _validate_week(week: int, where: str) -> None:
     are the public interface every downstream plan calls with its own
     arguments, so the bound is enforced here too.
 
-    The two bounds are checked in two separate statements on purpose: a
-    fixture that trips one never exercises the other.
+    The clauses are checked in separate statements on purpose: a fixture that
+    trips one never exercises the others.
     """
     if week < 1:
         raise ValueError(
@@ -116,6 +135,25 @@ def _column_index(cell_index, week):
     them. `week` must already have been validated by `_validate_week`.
     """
     return cell_index * WEEKS_PER_YEAR + (week - 1)
+
+
+def _floor_missing(values):
+    """The one definition of "unstored means the floor"; scalar or elementwise.
+
+    `lookup`, `vector` and `dense` ALL read through this, so the semantics
+    cannot be true on one path and false on another -- the drift this module
+    guards hardest against.
+
+    The test is numeric (`values == 0.0`) rather than an inspection of the
+    sparsity pattern, and that is exact rather than an approximation:
+    `_validate_p` refuses a stored `p` at or below 0.0, so "reads as 0.0" and
+    "was never stored" are the SAME SET for any tensor this module built. A
+    hand-assembled tensor carrying an explicit 0.0 is an upstream contract
+    breach either way, and the floor is the right answer for it too -- the
+    backoff clamps into [FLOOR, 1.0], so 0.0 is not a probability this
+    pipeline can produce.
+    """
+    return np.where(values == 0.0, FLOOR, values)
 
 
 def _single_array(column: pa.ChunkedArray | pa.Array) -> pa.Array:
@@ -158,10 +196,11 @@ def _validate_p(values: np.ndarray) -> None:
     can never veto a correct detection with a hard zero, and the backoff
     clamps every emitted value into `[floor, 1.0]`. A `p` of exactly `0.0`
     arriving here is therefore an upstream CONTRACT BREACH, not a value to
-    optimise away: skipping it would convert a real zero into a structural
-    zero that `lookup` reports identically to "this context is not in the
-    tensor at all". A nan would be stored as an explicit nan entry and a
-    negative or above-one value is not a probability at all.
+    optimise away: storing it would put an explicit zero in the matrix, and
+    `_floor_missing` reads an explicit zero exactly as it reads an unstored
+    context, so no reader could tell it from one. A nan would be stored as a
+    silent nan entry and a negative or above-one value is not a probability at
+    all.
 
     Three separate statements, one per clause: a finiteness check passes on a
     column of zeros, and a positivity check passes on a column of nans.
@@ -181,8 +220,9 @@ def _validate_p(values: np.ndarray) -> None:
         raise ValueError(
             "prior table column 'p' contains values at or below 0.0; the "
             "backoff clamps every value into [1e-06, 1.0], so a non-positive "
-            "`p` means a stage was bypassed. Storing it would make a real "
-            "zero indistinguishable from a context missing from the tensor"
+            "`p` means a stage was bypassed. Storing it would put an explicit "
+            "zero in the matrix, which no reader can tell from a context that "
+            "was never stored at all"
         )
     if np.any(values > 1.0):
         raise ValueError(
@@ -243,42 +283,85 @@ class PriorTensor:
                 "disagree, so every lookup would read a shifted column"
             )
 
-    def _column(self, cell: str, week: int) -> int | None:
-        """The packed column, or None when the CELL is not in the tensor.
+    @property
+    def dense_capacity(self) -> int:
+        """How many contexts the axes span, stored or not.
+
+        `nnz / dense_capacity` is the artifact's fill, and the sidecar
+        publishes both so a released tensor carries visible evidence of how
+        much of its own grid was ever observed.
+        """
+        return len(self.species_keys) * len(self.cells) * WEEKS_PER_YEAR
+
+    def _column(self, cell: str, week: int) -> int:
+        """The packed column for a context; raises for an unknown CELL.
 
         The week is validated BEFORE the cell is looked up: an out-of-range
-        week on an unknown cell must still raise rather than be swallowed by
-        the `None` path, which the caller cannot tell from a legitimate miss.
+        week on an unknown cell must raise the WEEK error, because a caller
+        shown the cell error first would fix the wrong thing.
         """
         _validate_week(int(week), "a tensor lookup")
         ci = self._cell_index.get(cell)
         if ci is None:
-            return None
+            raise ValueError(
+                f"cell {cell!r} is not on this tensor's cell axis "
+                f"({len(self.cells)} cells); the axis is derived from the "
+                "occurrence data, so an unknown cell is a caller error -- a "
+                "typo or a wrong-resolution H3 string -- not a context with "
+                "no evidence, and returning the floor for it would turn that "
+                "bug into a plausible probability"
+            )
         return int(_column_index(ci, int(week)))
+
+    def _row(self, species_key: int) -> int:
+        """The matrix row for a species; raises for an unknown KEY."""
+        row = self._species_index.get(int(species_key))
+        if row is None:
+            raise ValueError(
+                f"species_key {int(species_key)!r} is not on this tensor's "
+                f"species axis ({len(self.species_keys)} species); the axis is "
+                "derived from the occurrence data, so an unknown key is a "
+                "caller error -- a typo or a mismatched label set -- not a "
+                "context with no evidence, and returning the floor for it "
+                "would turn that bug into a plausible probability"
+            )
+        return row
 
     def lookup(self, species_key: int, cell: str, week: int) -> float:
         """P(species | cell, week).
 
-        Returns a hard `0.0` for an unknown species or cell, and for any
-        context absent from the table this tensor was built from. That is a
-        STRUCTURAL zero, not the floor -- see the module docstring.
+        Raises for an out-of-range week, an unknown cell or an unknown species
+        key. For a context that is ON both axes but has no stored value,
+        returns `backoff.FLOOR` -- the value the backoff defines for "no
+        evidence" -- never a hard 0.0. See the module docstring.
         """
-        row = self._species_index.get(int(species_key))
         col = self._column(cell, week)
-        if row is None or col is None:
-            return 0.0
-        return float(self.values[row, col])
+        row = self._row(species_key)
+        return float(_floor_missing(np.float64(self.values[row, col])))
 
     def vector(self, cell: str, week: int) -> np.ndarray:
         """The prior over every species for one context, in `species_keys` order.
+
+        Exactly one entry per species on the axis, floored wherever nothing was
+        stored -- the same rule `lookup` applies, through the same
+        `_floor_missing`, so the two can never disagree.
 
         NOT normalised: the values are whatever the pipeline produced, and
         their sum carries no meaning. See the module docstring.
         """
         col = self._column(cell, week)
-        if col is None:
-            return np.zeros(len(self.species_keys), dtype=np.float64)
-        return np.asarray(self.values[:, [col]].todense(), dtype=np.float64).ravel()
+        stored = np.asarray(self.values[:, [col]].todense(), dtype=np.float64).ravel()
+        return _floor_missing(stored)
+
+    def dense(self) -> np.ndarray:
+        """The full (species x cell-week) grid, floored where nothing was stored.
+
+        The matrix-shaped spelling of the same semantics `lookup` and `vector`
+        expose, through the same `_floor_missing`, for callers that genuinely
+        need every context at once (the dense controls). It materialises
+        `dense_capacity` float64s, which is the inherent cost of being dense.
+        """
+        return _floor_missing(np.asarray(self.values.toarray(), dtype=np.float64))
 
 
 def to_tensor(table: pa.Table, spec: PriorSpec) -> PriorTensor:
@@ -361,19 +444,46 @@ def _reject_duplicates(
 
 
 def _npz_path(path: Path) -> Path:
-    """The `.npz` file this path names.
+    """The `.npz` file this path names -- scipy's own rule, reproduced.
 
     `scipy.sparse.save_npz` APPENDS `.npz` to any path that does not already
-    end in it, so the suffix must be normalised BEFORE the save, not after:
-    saving to `p.dat` writes `p.dat.npz` while the sidecar and the returned
-    path would name `p.npz`, and `load_prior` would then fail on a path
-    `save_prior` had just returned as successful.
+    end in it. This function reproduces that rule exactly, so the SIDECAR and
+    the RETURNED PATH name the file scipy actually wrote: unnormalised, saving
+    to `p.dat` wrote `p.dat.npz` while the sidecar and the returned path named
+    something else, and `load_prior` then failed on a path `save_prior` had
+    just returned as successful.
+
+    The suffix is APPENDED, never SUBSTITUTED. `Path.with_suffix` truncates at
+    the LAST dot, which silently collapses any name whose version carries one:
+    `prior_v1.2` and `prior_v1.3` both become `prior_v1.npz`, so saving the
+    second OVERWRITES the first with no error and the released directory holds
+    one file claiming to be both. That is data loss at the release boundary,
+    which is why the append form is the only correct one here.
     """
-    return path if path.suffix == ".npz" else path.with_suffix(".npz")
+    return path if path.suffix == ".npz" else path.with_name(path.name + ".npz")
+
+
+def _sidecar_path(npz: Path) -> Path:
+    """The JSON sidecar beside an `.npz`.
+
+    Derived by replacing only the `.npz` suffix, which is safe precisely
+    because `_npz_path` guarantees the name ENDS in `.npz`: two artifacts with
+    distinct `.npz` names therefore always have distinct sidecars.
+    """
+    return npz.with_suffix(".json")
 
 
 def save_prior(tensor: PriorTensor, path: Path) -> Path:
     """Write the matrix and its citable sidecar; return the `.npz` written."""
+    if not tensor.gbif_doi:
+        raise ValueError(
+            "refusing to write a prior artifact with an empty gbif_doi; this "
+            f"release is licensed {LICENCE}, which REQUIRES attribution, and "
+            "the GBIF download DOI is the only thing tying this tensor to the "
+            "occurrence records it was derived from. Shipped without it the "
+            "artifact cannot be cited, cannot be reproduced, and carries no "
+            "trace of the terms its own sources were published under"
+        )
     npz = _npz_path(path)
     npz.parent.mkdir(parents=True, exist_ok=True)
     sparse.save_npz(npz, tensor.values.tocoo())
@@ -382,27 +492,57 @@ def save_prior(tensor: PriorTensor, path: Path) -> Path:
         "species_keys": [int(k) for k in tensor.species_keys],
         "cells": list(tensor.cells),
         "weeks_per_year": WEEKS_PER_YEAR,
+        # The value a context on both axes but absent from the matrix takes.
+        # Published because a third party decoding the `.npz` with a plain
+        # sparse reader would otherwise read 0.0 there and silently veto every
+        # unobserved context.
+        "missing_value": FLOOR,
+        # The artifact's own fill, so a release carries visible evidence of
+        # how much of its grid was ever observed.
+        "nnz": int(tensor.values.nnz),
+        "dense_capacity": int(tensor.dense_capacity),
         "licence": LICENCE,
+        "licence_url": LICENCE_URL,
         "gbif_doi": tensor.gbif_doi,
+        "attribution": (
+            f"Derived from GBIF occurrence download {tensor.gbif_doi}. "
+            f"Released under {LICENCE} ({LICENCE_URL}); cite that DOI and this "
+            "licence when redistributing or building on this artifact."
+        ),
     }
-    npz.with_suffix(".json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    _sidecar_path(npz).write_text(json.dumps(meta, indent=2), encoding="utf-8")
     return npz
 
 
 def load_prior(path: Path) -> PriorTensor:
     """Read back a tensor written by `save_prior`."""
     npz = _npz_path(path)
-    meta = json.loads(npz.with_suffix(".json").read_text(encoding="utf-8"))
+    meta = json.loads(_sidecar_path(npz).read_text(encoding="utf-8"))
     if int(meta["weeks_per_year"]) != WEEKS_PER_YEAR:
         raise ValueError(
             f"sidecar was written with weeks_per_year={meta['weeks_per_year']!r} "
             f"but this build packs {WEEKS_PER_YEAR}; every column index in the "
             "matrix would be read against the wrong stride"
         )
+    if float(meta["missing_value"]) != FLOOR:
+        raise ValueError(
+            f"sidecar was written with missing_value={meta['missing_value']!r} "
+            f"but this build reads an absent context as {FLOOR}; every "
+            "unobserved context would be answered against a different "
+            "convention from the one the artifact was published under"
+        )
+    matrix = sparse.load_npz(npz).tocsr()
+    if int(meta["nnz"]) != matrix.nnz:
+        raise ValueError(
+            f"sidecar reports nnz={meta['nnz']!r} but the matrix stores "
+            f"{matrix.nnz}; the sidecar and the `.npz` are not halves of the "
+            "same artifact, so neither the published fill nor the axes can be "
+            "trusted to describe this matrix"
+        )
     return PriorTensor(
         spec=PriorSpec(**meta["spec"]),
         species_keys=np.asarray(meta["species_keys"], dtype=np.int64),
         cells=list(meta["cells"]),
-        values=sparse.load_npz(npz).tocsr(),
+        values=matrix,
         gbif_doi=meta.get("gbif_doi", ""),
     )
