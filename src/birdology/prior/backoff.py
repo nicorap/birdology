@@ -11,6 +11,72 @@ data stands behind it:
 
 A species with no occurrences anywhere still gets `floor`, never zero: the
 label set can legitimately contain species the occurrence data misses.
+
+WHAT THE OUTPUT `p` MEANS
+-------------------------
+`p` is a shrunk estimate of P(species | a bird was recorded here this week) --
+the same quantity the upstream `ratio` measures, pulled toward the coarser
+levels where the local data is thin. It is NOT P(species present), and it is
+NOT renormalised over `species_keys`: a species absent from the occurrence data
+contributes `floor` on top, so the values over a requested species list can sum
+to slightly more or (for a subset) much less than 1.0.
+
+THE DENOMINATOR IS `total`, NEVER A RE-SUM OF `n`
+-------------------------------------------------
+`total` is the effort proxy: the count of ALL bird records in the cell-week,
+computed once upstream over the complete table. This module READS it. It does
+not re-derive it by summing the `n` values it was handed, and the distinction
+is not academic:
+
+* the two agree only while the table still holds every species;
+* filtering to a label set is an ordinary pipeline step, and after it the rows
+  of a cell-week sum to far less than `total`;
+* a re-summed denominator then reports a share of 1.0 where the real share is
+  0.01 -- a hundredfold error, in the direction of confident presence, with
+  nothing raised anywhere.
+
+This is the same rule the upstream effort module states: a value derived once
+must not be derived a second time locally.
+
+PARENT LEVELS COME FROM PARENT COUNTS
+-------------------------------------
+Both coarser levels are ratios of sums, never means of child ratios:
+
+    p_cell   = sum(n over the cell) / sum(total over the cell's cell-weeks)
+    p_global = sum(n everywhere)    / sum(total over all cell-weeks)
+
+Averaging child ratios instead would weight a one-record cell-week exactly as
+heavily as a thousand-record one, which silently reintroduces the observer
+effort bias the target-group correction removes. The numbers are far apart: a
+cell with weeks of 1 and 101 records gives 0.02 from counts and 0.51 from
+averaged ratios.
+
+Each cell-week's `total` is counted ONCE per (cell, week) when summing a parent
+denominator, not once per row -- otherwise a cell-week with ten species present
+would contribute ten times its own effort.
+
+WEEKS
+-----
+`week` is 1..52 on input and on output, validated at both ends. Circular
+52 <-> 1 adjacency is deliberately NOT handled here: this module only shrinks
+toward coarser levels, and blending neighbouring weeks belongs to the smoothing
+stage. A week outside 1..52 is rejected rather than silently dropped from the
+emitted grid, which would delete its records from the cell profile with no
+error.
+
+CELLS
+-----
+`cell` is an opaque string, already normalised upstream, at ONE H3 resolution.
+It is passed through byte-for-byte: no local casefolding, no parent-cell
+derivation. Two differently-cased spellings are two different cells here, which
+is what makes a redundant second normalisation visible instead of a no-op.
+
+ERROR CONTRACT
+--------------
+Every contract violation raises `ValueError`. There is no try/except: an
+upstream shape change must stop the pipeline, not be warned about and carried,
+because a warn-and-continue path here produces a prior that is confidently
+wrong exactly where the data is thinnest.
 """
 from __future__ import annotations
 
@@ -19,7 +85,17 @@ from dataclasses import dataclass
 
 import pyarrow as pa
 
+from .indexing import WEEKS_PER_YEAR
+
 FLOOR = 1e-6
+
+_REQUIRED_TYPES = {
+    "species_key": pa.int64(),
+    "cell": pa.string(),
+    "week": pa.int8(),
+    "n": pa.int64(),
+    "total": pa.int64(),
+}
 
 
 @dataclass(frozen=True)
@@ -36,6 +112,56 @@ def _shrink(local_num: float, local_den: float, coarse_p: float, weight: float) 
     return (local_num + weight * coarse_p) / (local_den + weight)
 
 
+def _validate_table(ratios: pa.Table) -> None:
+    """Reject anything that is not a RatioTable. Never repairs, never casts."""
+    for name, expected in _REQUIRED_TYPES.items():
+        if name not in ratios.column_names:
+            raise ValueError(
+                f"RatioTable is missing the {name!r} column; got "
+                f"{ratios.column_names!r}. This module needs both {'n'!r} and "
+                f"{'total'!r}: reading {'ratio'!r} alone would discard the "
+                "effort weight that decides how far to shrink"
+            )
+        actual = ratios.schema.field(name).type
+        if actual != expected:
+            # Deliberately not cast: `week` and `cell` are derived exactly
+            # once, upstream. A cast here would be a second derivation.
+            raise ValueError(
+                f"RatioTable column {name!r} must be {expected}, got {actual}"
+            )
+        if ratios.column(name).null_count:
+            raise ValueError(
+                f"RatioTable column {name!r} contains null values; a null key "
+                "vanishes from the emitted grid and a null count poisons a "
+                "denominator, neither with an error"
+            )
+
+
+def _validate_grid_axis(values: Sequence[object], name: str) -> None:
+    """Reject duplicates on an output axis.
+
+    A repeated value emits duplicate grid rows, and a downstream tensor would
+    silently keep whichever one it indexed last.
+    """
+    seen: set[object] = set()
+    for value in values:
+        if value in seen:
+            raise ValueError(
+                f"duplicate {name} {value!r} in the requested grid; the output "
+                "would carry two rows for one (species, cell, week)"
+            )
+        seen.add(value)
+
+
+def _validate_week(week: int, where: str) -> None:
+    if not 1 <= week <= WEEKS_PER_YEAR:
+        raise ValueError(
+            f"week {week!r} in {where} is outside 1..{WEEKS_PER_YEAR}; weeks "
+            "are folded into that range upstream, so a value outside it means "
+            "a different derivation leaked in"
+        )
+
+
 def hierarchical_estimate(
     ratios: pa.Table,
     species_keys: Sequence[int],
@@ -45,26 +171,81 @@ def hierarchical_estimate(
     weeks: Sequence[int] | None = None,
 ) -> pa.Table:
     """Estimate P(species | cell, week) over the full requested grid."""
+    _validate_table(ratios)
+    _validate_grid_axis(list(species_keys), "species_key")
+    if cells is not None:
+        _validate_grid_axis(list(cells), "cell")
+    if weeks is not None:
+        _validate_grid_axis([int(w) for w in weeks], "week")
+        for week in weeks:
+            _validate_week(int(week), "the requested weeks")
+
     rows = ratios.to_pylist()
 
-    cell_week_n: dict[tuple[str, int], float] = {}
+    # Effort per cell-week, read from `total` and recorded ONCE per (cell,
+    # week). Counting it per row would multiply a cell-week's effort by the
+    # number of species present in it.
+    cell_week_total: dict[tuple[str, int], int] = {}
     cell_week_species: dict[tuple[int, str, int], float] = {}
-    cell_n: dict[str, float] = {}
     cell_species: dict[tuple[int, str], float] = {}
-    global_n = 0.0
     global_species: dict[int, float] = {}
 
     for row in rows:
-        sk, cell, week, n = row["species_key"], row["cell"], int(row["week"]), row["n"]
-        cell_week_species[(sk, cell, week)] = cell_week_species.get((sk, cell, week), 0.0) + n
-        cell_week_n[(cell, week)] = cell_week_n.get((cell, week), 0.0) + n
+        sk = row["species_key"]
+        cell = row["cell"]
+        week = int(row["week"])
+        n = row["n"]
+        total = row["total"]
+
+        _validate_week(week, "the RatioTable")
+        if total < 1:
+            raise ValueError(
+                f"RatioTable row ({sk}, {cell!r}, {week}) has total={total}; "
+                "the cell-week effort is a count of records and must be >= 1, "
+                "and dividing by it would give inf or nan rather than an error"
+            )
+        if n < 1:
+            raise ValueError(
+                f"RatioTable row ({sk}, {cell!r}, {week}) has n={n}; absence "
+                "is ROW ABSENCE in this table, so a non-positive count means a "
+                "zero-fill was mistaken for an observation"
+            )
+        if n > total:
+            raise ValueError(
+                f"RatioTable row ({sk}, {cell!r}, {week}) has n={n} which "
+                f"exceeds its own total={total}; the numerator and the "
+                "denominator are no longer paired row-for-row"
+            )
+
+        key = (cell, week)
+        if key in cell_week_total and cell_week_total[key] != total:
+            raise ValueError(
+                f"RatioTable cell-week {key!r} carries two different totals "
+                f"({cell_week_total[key]} and {total}); `total` is a property "
+                "of the (cell, week), so picking one would make every parent "
+                "denominator depend on row order"
+            )
+        cell_week_total[key] = total
+
+        cell_week_species[(sk, cell, week)] = (
+            cell_week_species.get((sk, cell, week), 0.0) + n
+        )
         cell_species[(sk, cell)] = cell_species.get((sk, cell), 0.0) + n
-        cell_n[cell] = cell_n.get(cell, 0.0) + n
         global_species[sk] = global_species.get(sk, 0.0) + n
-        global_n += n
+
+    # Parent denominators: sums of COUNTS, over distinct cell-weeks.
+    cell_n: dict[str, float] = {}
+    global_n = 0.0
+    for (cell, _week), total in cell_week_total.items():
+        cell_n[cell] = cell_n.get(cell, 0.0) + total
+        global_n += total
 
     all_cells = list(cells) if cells is not None else sorted(cell_n)
-    all_weeks = list(weeks) if weeks is not None else sorted({w for _, w in cell_week_n})
+    all_weeks = (
+        [int(w) for w in weeks]
+        if weeks is not None
+        else sorted({w for _, w in cell_week_total})
+    )
     if not all_weeks:
         all_weeks = [1]
 
@@ -85,14 +266,14 @@ def hierarchical_estimate(
             )
             for week in all_weeks:
                 p = _shrink(
-                    cell_week_species.get((sk, cell, int(week)), 0.0),
-                    cell_week_n.get((cell, int(week)), 0.0),
+                    cell_week_species.get((sk, cell, week), 0.0),
+                    cell_week_total.get((cell, week), 0.0),
                     p_cell,
                     params.cell_week_weight,
                 )
                 out_species.append(sk)
                 out_cells.append(cell)
-                out_weeks.append(int(week))
+                out_weeks.append(week)
                 out_p.append(min(max(p, params.floor), 1.0))
 
     return pa.table(
