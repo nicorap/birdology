@@ -52,7 +52,10 @@ evidence:
 
 * an UNKNOWN `species_key` raises `ValueError`;
 * an UNKNOWN `cell` raises `ValueError`;
-* a `week` outside 1..WEEKS_PER_YEAR raises `ValueError`.
+* a `week` outside 1..WEEKS_PER_YEAR raises `ValueError`;
+* a `week` that is not a whole number -- `46.9`, `True`, `'5'` -- raises
+  `ValueError` rather than being truncated into a week the caller never
+  asked for.
 
 The axes are derived from the data, so a key that is not on them is a typo, a
 wrong-resolution H3 string, or a mismatched label set -- never a context with
@@ -99,7 +102,7 @@ _REQUIRED_TYPES = {
 
 
 def _validate_week(week, where: str) -> None:
-    """Weeks are integers in 1..WEEKS_PER_YEAR. Outside that the packing ALIASES.
+    """Weeks are WHOLE NUMBERS in 1..WEEKS_PER_YEAR. Outside that the packing ALIASES.
 
     `cell_index * WEEKS_PER_YEAR + (week - 1)` is not injective once `week`
     leaves 1..52: week 53 of cell *i* is exactly the column of week 1 of cell
@@ -109,9 +112,52 @@ def _validate_week(week, where: str) -> None:
     are the public interface every downstream plan calls with its own
     arguments, so the bound is enforced here too.
 
+    INTEGRALITY IS PART OF THE BOUND, and it is checked on the value the
+    CALLER passed rather than on a truncation of it. `int(46.9)` is 46: a
+    caller asking for week 46.9 was previously answered with week 46's column,
+    a DIFFERENT week, with nothing raised -- the same consequence shape the
+    aliasing checks below exist to prevent, and a repair at a boundary whose
+    docstring forbids repair. `'5'` was coerced to week 5 the same way.
+
+    A `bool` is REJECTED rather than accepted as 0/1. `isinstance(True, int)`
+    is True in Python, so an int-only type check would let it through and
+    `True` would silently read week 1 while `False` aliased the previous
+    cell's last week. No caller means "the first week of the year" by `True`,
+    so the only reading that is not a repair is a refusal.
+
+    An INTEGRAL float (`5.0`) IS accepted: it names exactly the week a caller
+    asking for 5 would get, so admitting it converts nothing and hides
+    nothing. The rejection is of values whose acceptance would change WHICH
+    week is answered.
+
     The clauses are checked in separate statements on purpose: a fixture that
-    trips one never exercises the others.
+    trips one never exercises the others. They are ORDERED -- bool, then
+    numeric type, then integrality, then the two bounds -- because each later
+    clause presupposes what the earlier ones establish (`'5' % 1` raises
+    TypeError, and `True < 1` is a perfectly meaningful comparison that would
+    silently pass).
     """
+    if isinstance(week, bool):
+        raise ValueError(
+            f"week {week!r} in {where} is a bool, not a week number; Python "
+            "counts True as 1 and False as 0, so a bool week would be answered "
+            f"as week {int(week)} -- a week the caller never asked for -- and "
+            "this boundary does not repair the value it was handed"
+        )
+    if not isinstance(week, (int, float, np.integer, np.floating)):
+        raise ValueError(
+            f"week {week!r} in {where} is not a numeric week (got "
+            f"{type(week).__name__}); a string such as '5' would be coerced to "
+            "week 5 and answered as if it had been asked for as a number, "
+            "which is a repair at a boundary that must not repair"
+        )
+    if week % 1 != 0:
+        raise ValueError(
+            f"week {week!r} in {where} is not a whole number; the tensor packs "
+            f"cell * {WEEKS_PER_YEAR} + (week - 1), which has a column only "
+            "for whole weeks, so truncating would answer with a DIFFERENT "
+            "week's probability and nothing downstream could detect it"
+        )
     if week < 1:
         raise ValueError(
             f"week {week!r} in {where} is below 1; the tensor packs "
@@ -135,6 +181,26 @@ def _column_index(cell_index, week):
     them. `week` must already have been validated by `_validate_week`.
     """
     return cell_index * WEEKS_PER_YEAR + (week - 1)
+
+
+def _cell_of_column(col):
+    """The INVERSE of `_column_index`'s cell half; scalar or elementwise.
+
+    It sits directly beside the forward definition on purpose. The only reader
+    of it is the duplicate-row error message, which must name the cell the
+    duplicate is ACTUALLY in: a contract-breach message that names the wrong
+    cell sends whoever reads it to look for a real duplicate in the wrong
+    place, which is worse than no name at all.
+
+    Spelling the inverse inline at that call site -- `cells[col //
+    WEEKS_PER_YEAR]` -- put half of the packing in a module whose docstring
+    claims the layout has exactly one definition, so a change to
+    `_column_index` would leave the message silently naming a different cell
+    with nothing to catch it. Here the two are adjacent, and
+    `test_the_column_packing_and_its_inverse_round_trip_over_the_whole_grid`
+    pins them against each other over every (cell, week) of a real grid.
+    """
+    return col // WEEKS_PER_YEAR
 
 
 def _floor_missing(values):
@@ -293,14 +359,19 @@ class PriorTensor:
         """
         return len(self.species_keys) * len(self.cells) * WEEKS_PER_YEAR
 
-    def _column(self, cell: str, week: int) -> int:
+    def _column(self, cell: str, week: int | float) -> int:
         """The packed column for a context; raises for an unknown CELL.
 
         The week is validated BEFORE the cell is looked up: an out-of-range
         week on an unknown cell must raise the WEEK error, because a caller
         shown the cell error first would fix the wrong thing.
+
+        `week` is handed to the guard AS THE CALLER PASSED IT, not as
+        `int(week)`. Validating a truncation is validating a different value:
+        `int(46.9)` is 46, so the guard would approve week 46 and this method
+        would return week 46's column for a caller who asked for 46.9.
         """
-        _validate_week(int(week), "a tensor lookup")
+        _validate_week(week, "a tensor lookup")
         ci = self._cell_index.get(cell)
         if ci is None:
             raise ValueError(
@@ -327,7 +398,7 @@ class PriorTensor:
             )
         return row
 
-    def lookup(self, species_key: int, cell: str, week: int) -> float:
+    def lookup(self, species_key: int, cell: str, week: int | float) -> float:
         """P(species | cell, week).
 
         Raises for an out-of-range week, an unknown cell or an unknown species
@@ -339,7 +410,7 @@ class PriorTensor:
         row = self._row(species_key)
         return float(_floor_missing(np.float64(self.values[row, col])))
 
-    def vector(self, cell: str, week: int) -> np.ndarray:
+    def vector(self, cell: str, week: int | float) -> np.ndarray:
         """The prior over every species for one context, in `species_keys` order.
 
         Exactly one entry per species on the axis, floored wherever nothing was
@@ -436,7 +507,7 @@ def _reject_duplicates(
         raise ValueError(
             "duplicate (species_key, cell, week) "
             f"({int(species_keys[row_idx[first]])!r}, "
-            f"{cells[int(col_idx[first]) // WEEKS_PER_YEAR]!r}, "
+            f"{cells[int(_cell_of_column(col_idx[first]))]!r}, "
             f"{int(weeks[first])}) in the prior table; scipy SUMS duplicate "
             "sparse coordinates, so the two values would be silently added "
             "into one plausible-looking probability"

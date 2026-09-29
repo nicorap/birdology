@@ -7,6 +7,7 @@ matched on wording specific to THAT check rather than on a bare word another
 layer could also produce.
 """
 import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -24,6 +25,8 @@ from birdology.prior.tensor import (
     LICENCE_URL,
     PriorSpec,
     PriorTensor,
+    _cell_of_column,
+    _column_index,
     load_prior,
     save_prior,
     to_tensor,
@@ -226,6 +229,110 @@ def test_to_tensor_rejects_week_zero_in_the_table():
         to_tensor(_table([(1, "cell-a", 0, 0.25)]), SPEC)
 
 
+# --------------------------------------------------------------------------
+# M1: a non-whole week is REJECTED, not truncated into a different week
+# --------------------------------------------------------------------------
+def _two_week_tensor():
+    """Weeks 5 and 46 stored, 47 NOT stored, so a truncation is observable.
+
+    `int(46.9)` is 46, a week that HOLDS a value here: the pre-fix behaviour
+    answered `lookup(..., 46.9)` with week 46's real probability. Storing 46
+    rather than leaving it empty is what makes the repair visible as a WRONG
+    ANSWER rather than as the floor.
+    """
+    t = to_tensor(
+        _table([(1, "cell-a", 5, 0.5), (1, "cell-a", 46, 0.25)]), SPEC
+    )
+    # Precondition: week 46 really does carry a value distinct from week 5's,
+    # so truncating 46.9 to 46 would hand back a DIFFERENT week's number.
+    assert t.lookup(1, "cell-a", 46) == pytest.approx(0.25)
+    assert t.lookup(1, "cell-a", 5) == pytest.approx(0.5)
+    return t
+
+
+def test_lookup_rejects_a_fractional_week_rather_than_truncating_it():
+    """Measured before the fix: `lookup(1, 'cell-a', 46.9)` returned week 46's value.
+
+    `_validate_week(int(week), ...)` validated the TRUNCATION, so the guard
+    never saw what the caller passed: 46.9 was silently answered as 46. That is
+    a repair at a boundary whose own docstring forbids repair, and its
+    consequence is the shape the aliasing guards exist to prevent -- a real
+    probability belonging to a DIFFERENT week, returned with nothing raised.
+    """
+    t = _two_week_tensor()
+    with pytest.raises(ValueError, match="46.9.*is not a whole number"):
+        t.lookup(1, "cell-a", 46.9)
+
+
+def test_vector_rejects_a_fractional_week_too():
+    """`vector` is the reader the fusion sweep calls; same guard, same refusal."""
+    t = _two_week_tensor()
+    with pytest.raises(ValueError, match="is not a whole number"):
+        t.vector("cell-a", 46.9)
+
+
+def test_lookup_rejects_a_bool_week_even_though_a_bool_IS_an_int():
+    """`isinstance(True, int)` is True, so a type check alone would admit it.
+
+    Before the fix `lookup(..., True)` was answered as week 1 and
+    `lookup(..., False)` aliased the previous cell's last week. No caller means
+    "the first week of the year" by `True`, so the bool arm is its own clause
+    with its own fixture -- an int-only check cannot see it.
+    """
+    t = _two_week_tensor()
+    with pytest.raises(ValueError, match="is a bool, not a week number"):
+        t.lookup(1, "cell-a", True)
+
+
+def test_a_false_week_is_rejected_as_a_bool_not_as_a_below_one_week():
+    """`False` trips the BOOL clause, not the lower bound.
+
+    `False < 1` is True, so the lower-bound guard would also fire -- and the
+    caller would be told to fix an out-of-range week number when the defect is
+    that a bool was passed at all. The clause ORDER is what this pins.
+    """
+    t = _two_week_tensor()
+    with pytest.raises(ValueError, match="is a bool, not a week number"):
+        t.lookup(1, "cell-a", False)
+
+
+def test_lookup_rejects_a_non_numeric_week():
+    """A string week was coerced: `lookup(..., '5')` returned week 5's value.
+
+    The type clause is separate from the integrality one because `'5' % 1`
+    raises `TypeError`, not the `ValueError` this module's contract promises,
+    so the integrality check cannot stand in for it.
+    """
+    t = _two_week_tensor()
+    with pytest.raises(ValueError, match="is not a numeric week"):
+        t.lookup(1, "cell-a", "5")  # type: ignore[arg-type]  # deliberately wrong type
+
+
+def test_an_integral_float_week_is_ACCEPTED_because_it_names_one_exact_week():
+    """5.0 is week 5 under any reading, so admitting it converts nothing.
+
+    The rejection above is of values whose acceptance would change WHICH week
+    is answered. A guard that also refused 5.0 would be refusing a value it
+    can honour exactly, which is a different defect from the one M1 reports.
+    """
+    t = _two_week_tensor()
+    assert t.lookup(1, "cell-a", 5.0) == pytest.approx(0.5)
+    assert t.lookup(1, "cell-a", np.float64(46.0)) == pytest.approx(0.25)
+
+
+def test_a_numpy_integer_week_is_accepted():
+    """`week` arrives as an int8 from Arrow upstream; numpy ints are real weeks."""
+    t = _two_week_tensor()
+    assert t.lookup(1, "cell-a", np.int8(5)) == pytest.approx(0.5)
+
+
+def test_a_nan_week_is_rejected_rather_than_read_as_some_column():
+    """`nan % 1` is `nan`, so the integrality clause catches it; `int(nan)` raised."""
+    t = _two_week_tensor()
+    with pytest.raises(ValueError, match="is not a whole number"):
+        t.lookup(1, "cell-a", float("nan"))
+
+
 def test_week_52_is_accepted_and_is_the_last_column_of_its_cell():
     """The upper bound is inclusive: 52 is a real ISO week, not an overflow."""
     t = to_tensor(
@@ -283,6 +390,57 @@ def test_to_tensor_rejects_a_duplicate_species_cell_week_row():
 def test_the_duplicate_message_names_the_offending_key():
     with pytest.raises(ValueError, match=r"\(1, 'cell-a', 46\)"):
         to_tensor(_table([(1, "cell-a", 46, 0.4), (1, "cell-a", 46, 0.4)]), SPEC)
+
+
+def test_the_duplicate_message_names_the_cell_the_duplicate_is_actually_in():
+    """The message's cell comes from the INVERSE of the packing, so it can be wrong.
+
+    The duplicate is in `cell-b`, the MIDDLE cell of three, so an inverse that
+    is off by one in either direction names a cell that really exists -- the
+    message stays plausible and sends whoever reads it hunting for a duplicate
+    in a cell that has none. A single-cell fixture cannot see this: any wrong
+    index there is either out of range or the only cell there is.
+    """
+    rows = [
+        (1, "cell-a", 46, 0.4),
+        (1, "cell-b", 46, 0.4),
+        (1, "cell-b", 46, 0.4),
+        (1, "cell-c", 46, 0.4),
+    ]
+    with pytest.raises(ValueError) as excinfo:
+        to_tensor(_table(rows), SPEC)
+    message = str(excinfo.value)
+    assert "'cell-b'" in message, message
+    # Not merely "it raised": naming a NEIGHBOUR is the defect being pinned.
+    assert "'cell-a'" not in message, message
+    assert "'cell-c'" not in message, message
+
+
+def test_the_column_packing_and_its_inverse_round_trip_over_the_whole_grid():
+    """`_cell_of_column` is `_column_index`'s inverse for every real context.
+
+    The two sit side by side in `tensor.py` precisely so this can be asserted
+    directly rather than trusted: the inverse was previously spelled inline in
+    the duplicate message, so a change to the forward packing would have left
+    the message naming a different cell with nothing to catch it.
+    """
+    for cell_index in range(4):
+        for week in range(1, WEEKS_PER_YEAR + 1):
+            col = _column_index(cell_index, week)
+            assert _cell_of_column(col) == cell_index, (cell_index, week, col)
+
+
+def test_the_inverse_maps_a_cell_boundary_to_the_right_side_of_it():
+    """The two columns either side of a cell boundary belong to different cells.
+
+    The first and last week of a cell are where an off-by-one in the inverse
+    shows up, and they are the exact columns the duplicate message is most
+    likely to be reporting.
+    """
+    assert _cell_of_column(_column_index(1, 1)) == 1
+    assert _cell_of_column(_column_index(1, WEEKS_PER_YEAR)) == 1
+    assert _cell_of_column(_column_index(0, WEEKS_PER_YEAR)) == 0
+    assert _cell_of_column(_column_index(2, 1)) == 2
 
 
 def test_rows_differing_only_in_week_are_not_duplicates():
@@ -887,6 +1045,89 @@ def test_load_accepts_the_same_non_npz_name_that_save_was_given(tmp_path):
     assert not name.exists()  # precondition: the raw name is NOT a file
     back = load_prior(name)
     assert back.lookup(1, "cell-a", 46) == pytest.approx(0.25)
+
+
+# --------------------------------------------------------------------------
+# I4: the two reads `load_prior` performs are pinned SEPARATELY
+#
+# `load_prior` normalises the path once and then reads TWO files from it: the
+# `.npz` and the JSON sidecar. A single mutant that de-normalised both was
+# credited with covering the sidecar half while its kill came entirely from
+# the matrix half -- and under the OLD truncating `_npz_path` the sidecar half
+# was unkillable at all, because `_sidecar_path(_npz_path('p.dat'))` and
+# `_sidecar_path('p.dat')` were BOTH `p.json`.
+#
+# The `_npz_path` fix separated them: `p.dat` now normalises to `p.dat.npz`,
+# whose sidecar is `p.dat.json`, while the raw path's sidecar is still
+# `p.json`. The two reads therefore address four distinct filenames and each
+# can be pinned on its own.
+#
+# Each test below plants a DECOY at the location the OTHER half's mutant would
+# read, so that mutant still passes and the test fails for exactly one reason.
+# Merely asserting "loading a non-`.npz` name works" cannot do that: it fails
+# for both halves and so proves neither.
+# --------------------------------------------------------------------------
+def test_load_reads_the_MATRIX_from_the_normalised_path_not_the_raw_one(tmp_path):
+    """A decoy matrix at the RAW name must not be the one that answers.
+
+    The raw name `p.dat` is a legitimate file path, and a variant sweep that
+    writes both `p.dat` and `p.dat.npz` is not exotic. Reading the matrix from
+    the raw path then returns ANOTHER artifact's values against THIS
+    artifact's axes, with the same nnz so the agreement check passes.
+
+    A valid copy of the real sidecar is planted at `p.json` on purpose, so a
+    mutant that de-normalises only the SIDECAR read still passes here: the
+    failure this test reports is the matrix read and nothing else.
+    """
+    real = _saveable([(1, "cell-a", 46, 0.25)])
+    npz = save_prior(real, tmp_path / "p.dat")
+    assert npz.name == "p.dat.npz"  # precondition: the suffix was APPENDED
+
+    decoy = _saveable([(1, "cell-a", 46, 0.75)])
+    sparse.save_npz(str(tmp_path / "decoy.npz"), decoy.values.tocoo())
+    shutil.copyfile(tmp_path / "decoy.npz", tmp_path / "p.dat")
+    # Precondition: the decoy is a DIFFERENT artifact with the SAME nnz, so it
+    # passes the sidecar's agreement check and is caught only by its value.
+    assert (tmp_path / "p.dat").exists()
+    assert decoy.values.nnz == real.values.nnz
+
+    # The sidecar half is neutralised for this test: both filenames resolve to
+    # an identical sidecar, so only the matrix read can fail.
+    shutil.copyfile(tmp_path / "p.dat.json", tmp_path / "p.json")
+
+    assert load_prior(tmp_path / "p.dat").lookup(1, "cell-a", 46) == pytest.approx(0.25)
+
+
+def test_load_reads_the_SIDECAR_from_the_normalised_path_not_the_raw_one(tmp_path):
+    """A decoy sidecar at the RAW name's sidecar location must not be the one read.
+
+    `p.dat` normalises to `p.dat.npz`, whose sidecar is `p.dat.json`; the raw
+    path's own sidecar would be `p.json`. A sidecar names which species a row
+    is and which cell a column block belongs to, so reading the wrong one
+    decodes a correct matrix against foreign axes -- every lookup by a real H3
+    cell then raises or, worse, silently answers under another cell's name.
+
+    A valid copy of the matrix is planted at the raw path `p.dat` on purpose,
+    so a mutant that de-normalises only the MATRIX read still passes here.
+    """
+    real = _saveable([(1, "cell-a", 46, 0.25)])
+    npz = save_prior(real, tmp_path / "p.dat")
+    assert npz.name == "p.dat.npz"  # precondition: the suffix was APPENDED
+
+    decoy_meta = json.loads((tmp_path / "p.dat.json").read_text(encoding="utf-8"))
+    decoy_meta["cells"] = ["decoy-cell"]
+    (tmp_path / "p.json").write_text(json.dumps(decoy_meta), encoding="utf-8")
+    # Precondition: the decoy is a VALID sidecar for this matrix's shape -- same
+    # axis lengths, same nnz -- so no agreement check rejects it and the only
+    # thing wrong with it is WHICH cell it names.
+    assert decoy_meta["nnz"] == real.values.nnz
+    assert len(decoy_meta["cells"]) == len(real.cells)
+    assert decoy_meta["cells"] != real.cells
+
+    # The matrix half is neutralised: the raw path holds the same matrix.
+    shutil.copyfile(tmp_path / "p.dat.npz", tmp_path / "p.dat")
+
+    assert load_prior(tmp_path / "p.dat").cells == ["cell-a"]
 
 
 def test_two_names_differing_only_after_a_dot_produce_two_distinct_artifacts(tmp_path):

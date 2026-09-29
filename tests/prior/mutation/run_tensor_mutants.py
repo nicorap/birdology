@@ -50,10 +50,15 @@ conditions, precisely so that one fixture cannot mask the loss of another
 clause, and each statement gets its own mutant:
 
 * `week < 1` / `week > WEEKS_PER_YEAR`          -> T1, T2 (per bound)
+* the week guard's BOOL / NUMERIC-TYPE / INTEGRALITY clauses
+                                                -> T64, T66, T67 (per clause),
+  plus T65 for their ORDER and T68 for the truncate-then-validate form the
+  clauses replace
 * `isfinite` / `<= 0.0` / `> 1.0` on `p`        -> T8, T9, T10 (per clause)
 * the schema loop's missing / dtype / null arms -> T14, T15, T16
 * the two axis-vs-matrix shape checks           -> T21, T22
 * the unknown-cell and unknown-species guards   -> T49, T50 (per axis)
+* `load_prior`'s MATRIX read and its SIDECAR read -> T36a, T36b (per read)
 
 WHAT THIS SET DOES NOT COVER -- stated so the table is not read as more than
 it is
@@ -98,9 +103,14 @@ it is
   transpose) now dies. What remains uncovered is FORWARD COMPATIBILITY: that a
   future scipy still writes these five members under these names is not
   something a test run today can establish.
-* THE SIDECAR AS A CITATION. T24/T25/T54 prove the licence, the DOI and the
-  attribution string reach the JSON and come back, and `save_prior` now
-  REFUSES an empty DOI. That the DOI is the RIGHT one -- that it names the GBIF
+* THE SIDECAR AS A CITATION. T38-T41 and T55 prove the licence, the DOI and
+  the attribution string reach the JSON and come back, and T54 pins that
+  `save_prior` REFUSES an empty DOI. (An earlier version of this list credited
+  "T24/T25" with that coverage; those are the duplicate-species-axis and
+  species-axis-ORDER mutants and have nothing to do with the citation. A label
+  naming the wrong mutant is a claim of coverage that cannot be checked against
+  the thing it names, which is the same defect class as T28's.) That the DOI is
+  the RIGHT one -- that it names the GBIF
   download this tensor was actually built from -- is a pipeline-level property
   no test in this file can check: `gbif_doi` is a free string the caller sets,
   and the guard tests emptiness, not well-formedness.
@@ -172,13 +182,13 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         "test_an_out_of_range_week_raises_the_WEEK_error_even_for_an_unknown_cell",
         [
             (
-                '        _validate_week(int(week), "a tensor lookup")\n'
+                '        _validate_week(week, "a tensor lookup")\n'
                 "        ci = self._cell_index.get(cell)",
                 "        ci = self._cell_index.get(cell)",
             ),
             (
                 "        return int(_column_index(ci, int(week)))",
-                '        _validate_week(int(week), "a tensor lookup")\n'
+                '        _validate_week(week, "a tensor lookup")\n'
                 "        return int(_column_index(ci, int(week)))",
             ),
         ],
@@ -311,10 +321,13 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
     (
         "T13",
         "the brief's original `if r['p'] == 0.0: continue` restored in spirit: "
-        "non-positive rows are DROPPED instead of raising. Nothing errors, "
-        "the tensor is one entry smaller, and the dropped context now reads "
-        "the FLOOR -- so an upstream stage that emitted a real zero has it "
-        "silently converted into \"nobody looked\", the failure T8-R4 forbids",
+        "`_validate_p` replaced by a `_keep` MASK that silently DROPS every "
+        "row the guard would have rejected -- non-finite, non-positive AND "
+        "above-one alike, since the mask is the conjunction of all three "
+        "clauses. Nothing errors, the tensor is smaller than its input, and "
+        "each dropped context now reads the FLOOR -- so an upstream stage that "
+        "emitted a real zero has it silently converted into \"nobody looked\", "
+        "the failure T8-R4 forbids",
         "test_a_zero_p_is_rejected_not_silently_skipped",
         [
             (
@@ -341,9 +354,10 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
     ),
     (
         "T15",
-        "the DTYPE arm CASTS instead of raising -- a second derivation of a "
-        "value derived exactly once upstream, accepting an int64 `week` from "
-        "a bypassed pipeline",
+        "the DTYPE arm DISABLED, so a column of the wrong type is ACCEPTED "
+        "rather than rejected -- no cast is performed here, the check simply "
+        "stops firing, and an int64 `week` from a bypassed pipeline is then "
+        "packed as if it had been the int8 the contract requires",
         "test_a_wrong_input_dtype_is_rejected_not_cast",
         [
             (
@@ -669,17 +683,36 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         ],
     ),
     (
-        "T36",
-        "`load_prior` reads the sidecar beside the RAW path rather than the "
-        "normalised one, so a caller who hands back the same non-`.npz` name "
-        "it gave `save_prior` cannot reload its tensor. Invisible to the "
-        "returned-path test, whose path already ends in `.npz`",
-        "test_load_accepts_the_same_non_npz_name_that_save_was_given",
+        "T36a",
+        "`load_prior` reads the MATRIX from the RAW path rather than the "
+        "normalised one, so a file that happens to sit at the un-suffixed name "
+        "is decoded against THIS artifact's sidecar. Split from T36b because "
+        "the single T36 that de-normalised BOTH reads took its kill entirely "
+        "from this half while its label named the sidecar: under the old "
+        "truncating `_npz_path` the two sidecar names COINCIDED, so the "
+        "sidecar half was unkillable by any fixture and the row credited "
+        "coverage that did not exist",
+        "test_load_reads_the_MATRIX_from_the_normalised_path_not_the_raw_one",
         [
             (
-                "    npz = _npz_path(path)\n"
+                "    matrix = sparse.load_npz(npz).tocsr()",
+                "    matrix = sparse.load_npz(path).tocsr()",
+            )
+        ],
+    ),
+    (
+        "T36b",
+        "`load_prior` reads the SIDECAR from the RAW path rather than the "
+        "normalised one, so a correct matrix is decoded against FOREIGN axes: "
+        "`p.dat` normalises to `p.dat.npz` whose sidecar is `p.dat.json`, "
+        "while the raw path's sidecar is `p.json`. Killable only since the "
+        "`_npz_path` fix separated those two names, and only by a fixture that "
+        "plants a valid decoy sidecar at the raw location -- a test that merely "
+        "reloads a non-`.npz` name dies to T36a too and so proves neither half",
+        "test_load_reads_the_SIDECAR_from_the_normalised_path_not_the_raw_one",
+        [
+            (
                 '    meta = json.loads(_sidecar_path(npz).read_text(encoding="utf-8"))',
-                "    npz = path\n"
                 '    meta = json.loads(_sidecar_path(path).read_text(encoding="utf-8"))',
             )
         ],
@@ -1055,6 +1088,135 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
             (
                 "        return _floor_missing(np.asarray(self.values.toarray(), dtype=np.float64))",
                 "        return np.asarray(self.values.toarray(), dtype=np.float64)",
+            )
+        ],
+    ),
+    # ---- M1: a non-whole week is REJECTED, not truncated (one per clause) --
+    (
+        "T64",
+        "the BOOL clause of the week guard removed, so `lookup(..., True)` is "
+        "answered as week 1 and `lookup(..., False)` as week 0. Its own mutant "
+        "because `isinstance(True, int)` is True in Python: the numeric-type "
+        "clause below ADMITS a bool, and `True % 1 == 0` and `1 <= True <= 52` "
+        "both hold, so every other clause in the guard passes a bool through",
+        "test_lookup_rejects_a_bool_week_even_though_a_bool_IS_an_int",
+        [
+            (
+                "    if isinstance(week, bool):",
+                "    if False:",
+            )
+        ],
+    ),
+    (
+        "T65",
+        "the bool clause moved BELOW both bounds, so `False` trips the "
+        "below-1 guard first and the caller is told to fix an out-of-range "
+        "WEEK NUMBER when the defect is that a bool was passed at all. `True` "
+        "still dies to the relocated clause, so this is the ORDER and nothing "
+        "else -- a separate mutant from T64, which deletes the clause outright",
+        "test_a_false_week_is_rejected_as_a_bool_not_as_a_below_one_week",
+        [
+            (
+                "    if isinstance(week, bool):\n"
+                "        raise ValueError(\n"
+                '            f"week {week!r} in {where} is a bool, not a week number; Python "\n'
+                '            "counts True as 1 and False as 0, so a bool week would be answered "\n'
+                '            f"as week {int(week)} -- a week the caller never asked for -- and "\n'
+                '            "this boundary does not repair the value it was handed"\n'
+                "        )\n"
+                "    if not isinstance(week, (int, float, np.integer, np.floating)):",
+                "    if not isinstance(week, (int, float, np.integer, np.floating)):",
+            ),
+            (
+                '            f"week 53 is folded into {WEEKS_PER_YEAR} upstream"\n'
+                "        )",
+                '            f"week 53 is folded into {WEEKS_PER_YEAR} upstream"\n'
+                "        )\n"
+                "    if isinstance(week, bool):\n"
+                "        raise ValueError(\n"
+                '            f"week {week!r} in {where} is a bool, not a week number; Python "\n'
+                '            "counts True as 1 and False as 0, so a bool week would be answered "\n'
+                '            f"as week {int(week)} -- a week the caller never asked for -- and "\n'
+                '            "this boundary does not repair the value it was handed"\n'
+                "        )",
+            ),
+        ],
+    ),
+    (
+        "T66",
+        "the NUMERIC-TYPE clause removed, so a string week reaches `week % 1` "
+        "and dies on a raw TypeError instead of the ValueError this module's "
+        "contract promises for every violation. Separate from T67 because the "
+        "integrality clause cannot stand in for it: `'5' % 1` does not "
+        "evaluate at all",
+        "test_lookup_rejects_a_non_numeric_week",
+        [
+            (
+                "    if not isinstance(week, (int, float, np.integer, np.floating)):",
+                "    if False:",
+            )
+        ],
+    ),
+    (
+        "T67",
+        "the INTEGRALITY clause removed, so week 46.9 passes both bounds and "
+        "`int(_column_index(ci, 46.9))` truncates to week 46's column: the "
+        "caller is handed a real probability belonging to a DIFFERENT week with "
+        "nothing raised. Separate from T64 and T66, whose clauses see nothing "
+        "wrong with a plain in-range float",
+        "test_lookup_rejects_a_fractional_week_rather_than_truncating_it",
+        [
+            (
+                "    if week % 1 != 0:",
+                "    if False:",
+            )
+        ],
+    ),
+    (
+        "T68",
+        "the TRUNCATE-THEN-VALIDATE call site restored: `_column` validates "
+        "`int(week)` instead of the value the caller passed, so the guard never "
+        "sees 46.9 at all -- it approves week 46 and the lookup answers week "
+        "46. This is the defect M1 reports, in the exact form it had: the "
+        "clauses can all be present and still be bypassed by truncating before "
+        "they run, which is why the call site needs its own mutant",
+        "test_lookup_rejects_a_fractional_week_rather_than_truncating_it",
+        [
+            (
+                '        _validate_week(week, "a tensor lookup")',
+                '        _validate_week(int(week), "a tensor lookup")',
+            )
+        ],
+    ),
+    # ---- M2: the packing's inverse, single-sourced beside the forward form -
+    (
+        "T69",
+        "`_cell_of_column` off by one cell, so the duplicate-row message names "
+        "the cell BEFORE the one the duplicate is actually in. Nothing else in "
+        "the module reads the inverse, so the only visible damage is a "
+        "contract-breach message that sends whoever reads it to hunt for a real "
+        "duplicate in a cell that has none -- which is why the test must assert "
+        "WHICH cell the message names, not merely that it raises",
+        "test_the_duplicate_message_names_the_cell_the_duplicate_is_actually_in",
+        [
+            (
+                "    return col // WEEKS_PER_YEAR",
+                "    return col // WEEKS_PER_YEAR - 1",
+            )
+        ],
+    ),
+    (
+        "T70",
+        "the INVERSE's stride hard-coded to 53 while the forward packing keeps "
+        "WEEKS_PER_YEAR -- the drift the two being adjacent exists to prevent. "
+        "It happens to name the right cell for many columns (97 // 53 == 1), so "
+        "only a test that round-trips EVERY (cell, week) of a grid catches it; "
+        "a single-duplicate fixture would pass",
+        "test_the_column_packing_and_its_inverse_round_trip_over_the_whole_grid",
+        [
+            (
+                "    return col // WEEKS_PER_YEAR",
+                "    return col // 53",
             )
         ],
     ),
