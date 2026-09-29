@@ -1532,7 +1532,7 @@ def _crash_in_target(out: str, target: Path) -> str | None:
         # A module that does not even import reports the error without a
         # "path:line:" prefix of its own, but names the file in the frame.
         if re.search(
-            rf'File "[^"]*{re.escape(target.name)}".*\n(?:.*\n)??\s*{crash}:',
+            rf'File "[^"]*{re.escape(Path(target).name)}".*\n(?:.*\n)??\s*{crash}:',
             out,
         ):
             return crash
