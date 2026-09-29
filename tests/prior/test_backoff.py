@@ -796,19 +796,32 @@ def test_an_absent_species_is_at_the_floor_in_every_cell_INCLUDING_rich_ones():
 def test_the_upper_clamp_holds_when_a_weight_is_negative():
     """Kills B11: the upper clamp removed.
 
-    Every valid input keeps `p <= 1` on its own, so the clamp is unreachable
-    from contract-conforming data -- which is why the bounded-probability test
-    could not see it. A NEGATIVE shrinkage weight is the reachable path: it
-    makes the denominator smaller than the numerator and drives `p` above 1.
+    No contract-conforming input can push `p` above 1 on its own: with
+    `n <= total`, a coarse value in [0, 1] and a positive weight, the
+    shrinkage is a weighted average of two quantities that are both <= 1. That
+    is precisely why the bounded-probability test cannot see this clamp, and
+    why leaving it untested would have recorded coverage that does not exist.
 
-    This documents the clamp as the last line of defence, not as dead code.
+    A NEGATIVE weight is the reachable path -- a caller error rather than a
+    data error, but one whose damage the clamp is there to bound. The fixture
+    is built so the mutation is definitely visible: species 1 is the whole of
+    its cell-week (n == total == 10) while a second cell keeps the global
+    profile below 1, which makes the unclamped value 1.75.
     """
-    rows = [(1, "c", 5, 10), (2, "c", 5, 90)]
-    out = _p(
-        rows, [1], cells=["c"], weeks=[5],
-        params=BackoffParams(cell_week_weight=-5.0),
+    rows = [(1, "c", 5, 10), (2, "d", 9, 90)]
+    params = BackoffParams(cell_week_weight=-5.0)
+    out = _p(rows, [1], cells=["c"], weeks=[5], params=params)
+
+    # PRECONDITION: without the clamp this fixture really does exceed 1.0.
+    p_global = 10 / 100
+    p_cell = (10 + 50.0 * p_global) / (10 + 50.0)
+    unclamped = (10 + -5.0 * p_cell) / (10 + -5.0)
+    assert unclamped > 1.0, (
+        "the fixture no longer drives p above 1, so it cannot demonstrate the "
+        "clamp and the clamp's coverage would be imaginary"
     )
-    assert out[(1, "c", 5)] <= 1.0
+
+    assert out[(1, "c", 5)] == 1.0
 
 
 def test_a_duplicate_species_cell_week_ROW_is_rejected():
