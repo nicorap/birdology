@@ -284,6 +284,65 @@ def test_cells_with_different_neighbour_counts_are_smoothed_independently():
     assert out[(1, c_cell, 20)] == pytest.approx(0.3 / 1.3, rel=1e-12)
 
 
+def test_the_absent_neighbour_sentinel_cannot_alias_another_species_row():
+    """The `+ 1` headroom in `cell_stride` is load-bearing, not decoration.
+
+    A cell whose ring is not fully present in the grid gets its ring row
+    PADDED with the sentinel code `len(cells)`, one past the last real cell
+    code. The packed key is mixed-radix, so the cell digit needs a radix of
+    `len(cells) + 1` for that sentinel to occupy a digit of its own. With a
+    radix of `len(cells)` the sentinel carries into the SPECIES digit and the
+    "no such neighbour" key lands exactly on a real row of the next species:
+    a boundary cell is then blended with a stranger of another species, with
+    no error, no nan and no missing row.
+
+    Reaching it needs both conditions at once — two species, so there is a
+    real row for the sentinel to alias, AND a ragged ring, so the sentinel is
+    actually emitted beside a real neighbour code.
+    """
+    ring = [c for c in h3.grid_disk(CPH, 1) if c != CPH]
+    pairs = [
+        (a, b)
+        for i, a in enumerate(ring)
+        for b in ring[i + 1 :]
+        if b not in h3.grid_disk(a, 1)
+    ]
+    assert pairs, "res-4 ring must contain two mutually non-adjacent cells"
+    n1, n2 = pairs[0]
+    rows = [(1, CPH, 20, 1.0), (1, n1, 20, 0.5), (2, CPH, 20, 0.6), (2, n2, 20, 0.6)]
+
+    # Preconditions, asserted on the fixture itself rather than on a proxy.
+    assert len({r[0] for r in rows}) >= 2, "fixture must carry >= 2 species"
+    in_table = {r[1] for r in rows}
+    absent_neighbours = {
+        c: [n for n in h3.grid_disk(c, 1) if n != c and n not in in_table]
+        for c in in_table
+    }
+    assert all(absent_neighbours.values()), (
+        "every fixture cell must have at least one in-ring neighbour missing "
+        "from the table, so the ring matrix is padded with the sentinel"
+    )
+    present_counts = {
+        c: sum(1 for n in h3.grid_disk(c, 1) if n != c and n in in_table)
+        for c in in_table
+    }
+    assert len(set(present_counts.values())) > 1, (
+        "the ring matrix must be RAGGED (cells with different in-grid "
+        "neighbour counts) or the sentinel never occupies a padded slot"
+    )
+
+    out = smooth(_est(rows), SmoothingParams(space_weight=0.3, time_weight=0.0))
+    # Species 1: CPH and n1 are adjacent and blend with each other. Species 2:
+    # CPH and n2 are NOT adjacent (n2 was chosen non-adjacent to n1, and CPH
+    # is adjacent to both — so within species 2 the pair CPH/n2 IS adjacent).
+    assert out.column("p").to_pylist() == [
+        pytest.approx((1.0 + 0.3 * 0.5) / 1.3, rel=1e-12),
+        pytest.approx((0.5 + 0.3 * 1.0) / 1.3, rel=1e-12),
+        pytest.approx((0.6 + 0.3 * 0.6) / 1.3, rel=1e-12),
+        pytest.approx((0.6 + 0.3 * 0.6) / 1.3, rel=1e-12),
+    ]
+
+
 def test_a_neighbour_is_read_from_the_row_that_ACTUALLY_HOLDS_it():
     """The neighbour's value, not whichever row sits at that sort position.
 
@@ -458,6 +517,71 @@ def test_a_null_in_a_key_or_in_p_is_rejected():
         columns[column] = value
         with pytest.raises(ValueError, match="null"):
             smooth(pa.table(columns))
+
+
+def test_a_non_finite_p_is_rejected():
+    """The null guard's own message says a null `p` "poisons every neighbour
+    that reads it". A nan does exactly that and Arrow's `null_count` cannot
+    see it: one nan at the centre of a ring turns every cell that reads it
+    into nan, with no error and no missing row. `inf` the same.
+
+    Fixture violates ONLY the finiteness clause: every other value is a
+    well-formed probability, and nan/inf are not "outside [0, 1]" in the
+    comparison sense (`nan < 0.0` is False), so the range clause below cannot
+    mask this one.
+    """
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        rows = [(1, CPH, 20, bad), (1, NEIGHBOUR, 20, 0.5)]
+        t = _est(rows)
+        assert t.column("p").null_count == 0, "must not be the NULL defect"
+        values = t.column("p").to_pylist()
+        assert not all(math.isfinite(v) for v in values), "fixture precondition"
+        assert all(
+            0.0 <= v <= 1.0 for v in values if math.isfinite(v)
+        ), "the finite values must be in range, so only finiteness is violated"
+        with pytest.raises(ValueError, match="non-finite"):
+            smooth(t)
+
+
+def test_a_p_below_zero_is_rejected():
+    """`p` is a probability and this module does not clamp, so a negative
+    input is carried straight into the output (-5.0 emits -3.73 and -0.77).
+
+    Fixture violates ONLY the lower bound: every value is finite and none
+    exceeds 1.0.
+    """
+    rows = [(1, CPH, 20, -5.0), (1, NEIGHBOUR, 20, 0.5)]
+    t = _est(rows)
+    values = t.column("p").to_pylist()
+    assert all(math.isfinite(v) for v in values), "must not be the nan defect"
+    assert min(values) < 0.0, "fixture precondition: a value below zero"
+    assert max(values) <= 1.0, "fixture must not also violate the upper bound"
+    with pytest.raises(ValueError, match=r"outside \[0\.0, 1\.0\]"):
+        smooth(t)
+
+
+def test_a_p_above_one_is_rejected():
+    """The mirror bound, mutated separately: one comparison can be lost
+    without the other. `p = 7.0` emits 5.5 and 2.0 with no error.
+
+    Fixture violates ONLY the upper bound.
+    """
+    rows = [(1, CPH, 20, 7.0), (1, NEIGHBOUR, 20, 0.5)]
+    t = _est(rows)
+    values = t.column("p").to_pylist()
+    assert all(math.isfinite(v) for v in values), "must not be the nan defect"
+    assert max(values) > 1.0, "fixture precondition: a value above one"
+    assert min(values) >= 0.0, "fixture must not also violate the lower bound"
+    with pytest.raises(ValueError, match=r"outside \[0\.0, 1\.0\]"):
+        smooth(t)
+
+
+def test_the_bounds_of_p_are_INCLUSIVE():
+    """0.0 and 1.0 are legitimate probabilities and the backoff emits both
+    ends of the range; a `<=`/`<` slip would reject conforming input."""
+    t = _est([(1, CPH, 20, 0.0), (1, NEIGHBOUR, 20, 1.0)])
+    out = _lookup(smooth(t, SmoothingParams(space_weight=0.3, time_weight=0.0)))
+    assert out[(1, CPH, 20)] == pytest.approx(0.3 / 1.3, rel=1e-12)
 
 
 def test_a_duplicate_species_cell_week_row_is_rejected():

@@ -43,6 +43,15 @@ condition in the target is split here:
 * `not np.isfinite(value)` / `value < 0.0`            -> S17, S18 (separately)
 * `len(resolutions) > 1` / the canonical-spelling
   check sharing its loop                              -> S25, S26 (separately)
+* the `p` guard: `not np.all(np.isfinite(values))`
+  -> S44; `values.min() < 0.0` -> S45;
+  `values.max() > 1.0` -> S46; the whole range
+  guard -> S47; the bounds made exclusive -> S48.
+  The finiteness clause is mutated apart from the
+  range clause because they do NOT subsume each
+  other: `nan < 0.0` is False, so a range test
+  passes on a nan column, and a finiteness test
+  passes on a column of -5.0.
 
 The `if params.space_weight:` / `if params.time_weight:` short-circuits are
 NOT mutated per clause, because they carry no semantics: see the S13 note.
@@ -89,6 +98,19 @@ it is
   swapped both call sites consistently would be a pure relabelling and is not
   tested (S14 catches the swap only because the two axes are tested with
   different values).
+* THE SENTINEL HEADROOM AT SCALE. S43 proves the cell radix must be
+  `len(cells) + 1` on a 2-species, 4-row ragged fixture. It does NOT prove
+  the packed key is free of int64 overflow at national scale (see the SCALE
+  bullet), and no mutant here distinguishes `len(cells) + 1` from any LARGER
+  radix: over-wide headroom is wasteful but not wrong, so a mutant raising it
+  would be equivalent.
+* THE `p` GUARD'S REACH. S44-S48 pin that a non-finite or out-of-range `p`
+  is REJECTED. They do not pin anything about `p` values that are finite, in
+  range and still wrong — a mis-shrunk probability from the backoff is a
+  conforming input here and this module has no way to see it. Nor is the
+  guard's COST measured: it is one `np.isfinite` pass and two reductions over
+  the dense column, and no test bounds that against the 40 MB / dense-grid
+  budget beyond the existing `test_a_dense_grid_...` passing with it in place.
 """
 from __future__ import annotations
 
@@ -276,13 +298,25 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
     # It weakened the `params.space_weight` short-circuit to always-true. That
     # guard is a COST guard, not a semantic one: with a weight of 0.0 the loop
     # adds 0.0 * neighbour and 0.0 to the total weight, so the emitted numbers
-    # are bit-identical either way. No fixture can distinguish it, and a
-    # contrived one would be exactly the "coverage that does not exist" this
-    # harness exists to prevent. The same applied to the `and p.size` clause,
-    # which was DEAD: the empty-table path is correct without it, so the clause
-    # was deleted from the source rather than papered over with a mutant. The
-    # observable behaviour that the zero-weight path must still VALIDATE its
-    # cells is pinned by
+    # are bit-identical either way.
+    #
+    # That equivalence is now UNCONDITIONAL over every input this module
+    # accepts. It was previously conditional: the argument "0.0 * neighbour
+    # adds nothing" fails when the neighbour is nan or inf (0.0 * nan is nan,
+    # not 0.0), so before F2's guard the mutant was distinguishable on an
+    # input the module then accepted. The verification itself sampled only
+    # finite `p` — bit-identical over 270 comparisons — so it covered only the
+    # regime it sampled. F2's finiteness clause (S44) is what closes the gap:
+    # a non-finite `p` can no longer reach the loop at all, so the sampled
+    # regime is now the whole accepted domain and no fixture can distinguish
+    # the mutant.
+    #
+    # No fixture can distinguish it, and a contrived one would be exactly the
+    # "coverage that does not exist" this harness exists to prevent. The same
+    # applied to the `and p.size` clause, which was DEAD: the empty-table path
+    # is correct without it, so the clause was deleted from the source rather
+    # than papered over with a mutant. The observable behaviour that the
+    # zero-weight path must still VALIDATE its cells is pinned by
     # `test_a_synthetic_cell_is_rejected_even_when_the_space_weight_is_zero`
     # and mutated by S24.
     (
@@ -710,6 +744,101 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
             (
                 "        return order[position], sorted_keys[position] == wanted",
                 "        return order[position], np.ones(wanted.shape, dtype=bool)",
+            )
+        ],
+    ),
+    # ---- the sentinel headroom in the packed key --------------------------
+    (
+        "S43",
+        "the SENTINEL HEADROOM removed from the cell radix (`len(cells) + 1` "
+        "-> `len(cells)`), so the 'no such neighbour' code `len(cells)` no "
+        "longer has a digit of its own: it carries into the SPECIES digit and "
+        "the absent-neighbour key lands on a real row of another species. A "
+        "boundary cell is silently blended with a stranger -- no error, no "
+        "nan, no missing row. Reaching it needs >= 2 species AND a ragged "
+        "ring at once; every older multi-species fixture is 2 rows, so the "
+        "sentinel had no real row to alias and this SURVIVED the pre-fix "
+        "suite",
+        "test_the_absent_neighbour_sentinel_cannot_alias_another_species_row",
+        [
+            (
+                "    cell_stride = len(cells) + 1",
+                "    cell_stride = len(cells)",
+            )
+        ],
+    ),
+    # The mirror mutant `week_stride = WEEKS_PER_YEAR + 1` -> `WEEKS_PER_YEAR`
+    # is NOT registered: it is EQUIVALENT. Weeks are validated to 1..52 before
+    # the key is packed and there is no week sentinel, so week digit 0 is
+    # unreachable and `WEEKS_PER_YEAR` is an equally injective radix. Verified
+    # empirically: 0 divergences over 60 dense grids. The two `+ 1`s look
+    # symmetric and are not -- see the comment at that line in the target.
+    # ---- `p` is a probability: finite and in [0, 1] (per disjunct) --------
+    (
+        "S44",
+        "the FINITENESS clause of the `p` guard removed, so a nan or inf `p` "
+        "is accepted: one nan at the centre of a ring turns every cell that "
+        "reads it into nan, with no error. Arrow's `null_count` cannot see "
+        "this -- it is the same defect as a null `p` in a form the null guard "
+        "misses",
+        "test_a_non_finite_p_is_rejected",
+        [
+            (
+                "    if not np.all(np.isfinite(values)):",
+                "    if False:",
+            )
+        ],
+    ),
+    (
+        "S45",
+        "the LOWER bound of the `p` range guard weakened, so a negative `p` "
+        "reaches the kernel; this module deliberately does not clamp, so "
+        "`p = -5.0` is carried into the output as -3.73 and -0.77. Separate "
+        "from S44: nan does not compare below zero, so a finiteness test "
+        "cannot detect the loss of this clause",
+        "test_a_p_below_zero_is_rejected",
+        [
+            (
+                "    if values.size and (values.min() < 0.0 or values.max() > 1.0):",
+                "    if values.size and (False or values.max() > 1.0):",
+            )
+        ],
+    ),
+    (
+        "S46",
+        "the UPPER bound of the same guard weakened, so `p = 7.0` is accepted "
+        "and emitted as 5.5 and 2.0. Mutated separately from S45 because one "
+        "comparison can be lost without the other, and separately from S47 "
+        "(the whole guard), which could not distinguish the loss of one bound",
+        "test_a_p_above_one_is_rejected",
+        [
+            (
+                "    if values.size and (values.min() < 0.0 or values.max() > 1.0):",
+                "    if values.size and (values.min() < 0.0 or False):",
+            )
+        ],
+    ),
+    (
+        "S47",
+        "the whole `p` range guard removed",
+        "test_a_p_below_zero_is_rejected",
+        [
+            (
+                "    if values.size and (values.min() < 0.0 or values.max() > 1.0):",
+                "    if False:",
+            )
+        ],
+    ),
+    (
+        "S48",
+        "the range bounds made EXCLUSIVE, rejecting `p = 0.0` and `p = 1.0`. "
+        "Both are legitimate probabilities the backoff emits, so this turns a "
+        "guard against malformed input into a guard against conforming input",
+        "test_the_bounds_of_p_are_INCLUSIVE",
+        [
+            (
+                "    if values.size and (values.min() < 0.0 or values.max() > 1.0):",
+                "    if values.size and (values.min() <= 0.0 or values.max() >= 1.0):",
             )
         ],
     ),

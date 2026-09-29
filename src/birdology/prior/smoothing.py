@@ -33,7 +33,11 @@ were dropped.
 For the same reason there is no clamp on the output: with non-negative
 weights a convex combination of values already in [0, 1] cannot leave [0, 1],
 so a clamp could only mask an upstream violation instead of letting it
-surface.
+surface. The INPUT `p` is therefore validated to be finite and inside
+[0, 1] -- the premise of that argument is checked where it can be observed,
+rather than assumed and then hidden by a clamp. Consumers of this stage may
+rely on the output `p` being finite and in [0, 1]: it is enforced here, not
+merely inherited.
 
 ISOLATED CELLS AND ABSENT NEIGHBOURS
 ------------------------------------
@@ -143,6 +147,30 @@ def _validate_table(estimates: pa.Table) -> None:
                 "key matches no neighbour and a null `p` poisons every "
                 "neighbour that reads it, neither with an error"
             )
+
+    # `p` must be a probability, not merely a float64 without nulls. The null
+    # guard above rejects the NULL form of exactly this defect; nan and inf are
+    # the same defect in a form Arrow's null_count cannot see. A single nan at
+    # the centre of a ring turns every cell that reads it into nan, and an
+    # out-of-range value is carried straight through the convex combination
+    # into the output, because this module deliberately does not clamp (a
+    # clamp would mask the violation instead of surfacing it). The two clauses
+    # are checked SEPARATELY: a column of nan alongside finite values violates
+    # only the first, and a column of -5.0 only the second.
+    values = _numeric(estimates.column("p"), np.float64)
+    if not np.all(np.isfinite(values)):
+        raise ValueError(
+            "estimate table column 'p' contains non-finite values; a nan or "
+            "inf `p` is averaged into every neighbour that reads it and turns "
+            "a whole neighbourhood non-finite with no error"
+        )
+    if values.size and (values.min() < 0.0 or values.max() > 1.0):
+        raise ValueError(
+            "estimate table column 'p' has values outside [0.0, 1.0] "
+            f"({values.min()}..{values.max()}); `p` is a probability, and "
+            "this module emits a convex combination without clamping, so an "
+            "out-of-range input is carried straight into the output"
+        )
 
 
 def _validate_params(params: SmoothingParams) -> None:
@@ -269,6 +297,21 @@ def smooth(
     # len(cells) + 1 and the week digit by WEEKS_PER_YEAR + 1; `len(cells)` is
     # reserved for "no such neighbour", so an absent neighbour's key cannot
     # collide with any real row's key.
+    #
+    # The two `+ 1`s are NOT equally load-bearing, despite looking symmetric.
+    # `cell_stride`'s is REAL headroom: `_neighbour_codes` pads an absent
+    # neighbour with the code `len(cells)`, which is one past the last real
+    # cell code, so the stride must be `len(cells) + 1` for that sentinel to
+    # occupy a digit of its own. Drop it and the sentinel wraps into the next
+    # species' digit and aliases a real row -- a silently different number,
+    # not an error (mutant S43).
+    #
+    # `week_stride`'s `+ 1` is INERT BUT SYMMETRIC: week digits are validated
+    # to 1..52 before this point and there is no week sentinel, so digit 0 is
+    # unreachable and `WEEKS_PER_YEAR` would be an equally injective radix.
+    # It is kept so the two strides read the same way and so a future week
+    # sentinel would have somewhere to go. A mutant of it is EQUIVALENT and is
+    # deliberately not registered; see the harness's note on it.
     cell_stride = len(cells) + 1
     week_stride = WEEKS_PER_YEAR + 1
 
