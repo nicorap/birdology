@@ -327,26 +327,68 @@ def test_ratio_is_aligned_with_its_own_row_in_a_multi_chunk_table():
     """The join REORDERS a multi-chunk table; numerator and denominator must
     still come from the same output row.
 
-    Every fixture above is single-chunk, where the join happens to preserve
-    input order -- so taking the numerator from `counts` instead of `joined`
-    is invisible. Here it is not: the pairing is asserted row-by-row on the
-    OUTPUT, which is the only place it is meaningful.
+    Every fixture above is single-chunk, where the join preserves input order
+    -- so taking the numerator from `counts` instead of `joined` is invisible.
+    Making the table multi-chunk is NOT by itself enough: a 2-chunk, 2-groups
+    table comes back in input order about half the time, and with
+    `pa.cpu_count() == 1` Acero's hash join is sequential and NEVER reorders.
+    Under those conditions `counts.column("n")` and `joined.column("n")` are
+    element-wise identical and every assertion below still holds on the buggy
+    code -- the exact way this test's coverage was found to be imaginary.
+
+    So the reordering is asserted as an explicit PRECONDITION, not assumed:
+    eight chunks over eight (cell, week) groups reorder on every observed run,
+    and if a future pyarrow ever preserves that order the precondition fails
+    loudly instead of quietly hollowing the test out.
     """
-    chunk_a = _counts([(1, "a", 5, 1), (2, "a", 5, 9)])
-    chunk_b = _counts([(3, "b", 6, 40), (4, "b", 6, 60), (5, "c", 7, 2)])
-    t = pa.concat_tables([chunk_a, chunk_b])
+    # Eight chunks, each one (cell, week) group whose four species split it
+    # 1:2:3:4. The four `n` values are SCALED PER GROUP, so the concatenated
+    # `n` sequence is distinct group-to-group: a reorder is then visible in
+    # `n` itself, not just in `species_key`. (With the same 1,2,3,4 in every
+    # group the `n` sequence is reorder-invariant and the mutation stays
+    # hidden even though the rows demonstrably move.)
+    chunks = [
+        _counts(
+            [
+                (10 * g + k, f"c{g}", 1 + g, k * (g + 1))
+                for k in (1, 2, 3, 4)
+            ]
+        )
+        for g in range(8)
+    ]
+    t = pa.concat_tables(chunks)
     assert t.column("n").num_chunks > 1
+
+    if pa.cpu_count() < 2:
+        pytest.skip(
+            "single-threaded pyarrow: Acero's hash join is sequential and "
+            "order-preserving, so no fixture can reach the misalignment path"
+        )
 
     out = target_group_ratios(t)
     assert out.num_rows == t.num_rows
+
+    # PRECONDITION. The bug this test exists to catch -- a numerator read from
+    # the pre-join table -- is only observable when the join moves rows, i.e.
+    # when the output's `n` sequence differs from the input's. Assert it.
+    assert out.column("n").to_pylist() != t.column("n").to_pylist(), (
+        "the join preserved row order, so a numerator taken from the pre-join "
+        "table would be element-wise identical and this test cannot fail"
+    )
+    assert (
+        out.column("species_key").to_pylist()
+        != t.column("species_key").to_pylist()
+    )
+
     for row in out.to_pylist():
         assert row["ratio"] == pytest.approx(row["n"] / row["total"]), row
     by_species = {r["species_key"]: r for r in out.to_pylist()}
-    assert by_species[1]["ratio"] == pytest.approx(0.1)
-    assert by_species[2]["ratio"] == pytest.approx(0.9)
-    assert by_species[3]["ratio"] == pytest.approx(0.4)
-    assert by_species[4]["ratio"] == pytest.approx(0.6)
-    assert by_species[5]["ratio"] == pytest.approx(1.0)
+    assert len(by_species) == t.num_rows
+    for g in range(8):
+        assert by_species[10 * g + 1]["ratio"] == pytest.approx(0.1)
+        assert by_species[10 * g + 2]["ratio"] == pytest.approx(0.2)
+        assert by_species[10 * g + 3]["ratio"] == pytest.approx(0.3)
+        assert by_species[10 * g + 4]["ratio"] == pytest.approx(0.4)
 
 
 def test_a_wrong_week_type_is_rejected_not_cast():

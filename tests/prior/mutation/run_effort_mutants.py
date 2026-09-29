@@ -26,6 +26,26 @@ that make the result trustworthy:
 
 A mutant is KILLED if at least one test fails. Zero failures is a SURVIVOR and
 means the suite does not pin that behaviour.
+
+THE THREE-INSTANCE LESSON FROM THIS PLAN -- read before trusting a green table
+-----------------------------------------------------------------------------
+Three mutants in this plan produced a passing table that meant nothing, each in
+a different way:
+
+* M33 (leakage): the mutant's LABEL did not match the edit it actually made,
+  so the row credited a kill to behaviour nothing tested.
+* E20 (effort): same mismatch, and the mutation the label DESCRIBED was a
+  no-op on every fixture -- it could not have been killed as written.
+* E33 (effort): label and edit agreed, and the test was correctly written, but
+  its FIXTURE never reached the mutated path (the multi-chunk join happened to
+  preserve row order), so the coverage was imaginary and E33 survived.
+
+All three create the same false confidence. THE RULE: a green mutation table
+means nothing unless each mutant's label matches its edit AND some fixture
+actually reaches the mutated path. Where a test depends on a precondition
+(multi-chunk, reordering, mixed case, non-empty, multi-threaded), ASSERT THE
+PRECONDITION in the test -- otherwise the coverage can evaporate silently under
+a library change or a different machine.
 """
 from __future__ import annotations
 
