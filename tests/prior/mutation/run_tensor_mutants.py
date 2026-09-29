@@ -978,8 +978,27 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         "test_save_refuses_a_tensor_with_no_gbif_doi",
         [
             (
-                "    if not tensor.gbif_doi:\n        raise ValueError(",
+                "    if not tensor.gbif_doi or not tensor.gbif_doi.strip():\n"
+                "        raise ValueError(",
                 "    if False:\n        raise ValueError(",
+            )
+        ],
+    ),
+    (
+        "T54b",
+        "C2: only the WHITESPACE half of the refusal removed, so `\'\'` is still "
+        "rejected and `\'   \'` ships the whole release. This is the exact "
+        "released defect: `--gbif-doi \'   \'` wrote all five artifacts with "
+        "attribution `Derived from GBIF occurrence download    .` A separate "
+        "mutant from T54 because `\'   \'` is TRUTHY -- the emptiness check "
+        "passes it -- so a fixture using only `\'\'` cannot tell the two "
+        "disjuncts apart, and the whitespace one is the half an unset shell "
+        "variable produces",
+        "test_save_refuses_a_tensor_whose_gbif_doi_is_only_whitespace",
+        [
+            (
+                "    if not tensor.gbif_doi or not tensor.gbif_doi.strip():",
+                "    if not tensor.gbif_doi:",
             )
         ],
     ),

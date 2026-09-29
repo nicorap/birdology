@@ -821,6 +821,49 @@ def test_save_refuses_a_tensor_with_no_gbif_doi(tmp_path):
         save_prior(t, tmp_path / "p.npz")
 
 
+@pytest.mark.parametrize("blank", [" ", "   ", "\t", "\n", " \t \n "])
+def test_save_refuses_a_tensor_whose_gbif_doi_is_only_whitespace(tmp_path, blank):
+    """C2's library half: `'   '` is TRUTHY, and that is the whole defect.
+
+    The emptiness check above passes a whitespace-only DOI, so before this
+    guard `--gbif-doi '   '` -- what `--gbif-doi "$DOI"` produces from an unset
+    shell variable -- wrote all five artifacts with sidecar `gbif_doi: '   '`
+    and attribution `Derived from GBIF occurrence download    .` A CC BY 4.0
+    breach in a published artifact, indistinguishable from a correct one to
+    everyone except someone who looks at the whitespace.
+
+    The build script also rejects this at parse time, and neither guard is
+    redundant: that one protects the command line, this one protects every
+    other caller of the library.
+
+    REJECTED, NOT COERCED. `.strip()` appears only in the CONDITION; the value
+    is never rewritten. Silently storing `'10.15468/dl.x'` for an input of
+    `'  10.15468/dl.x  '` would make the artifact cite a string the caller
+    never supplied, which is the repair-at-a-boundary this plan forbids.
+    """
+    t = to_tensor(_table([(1, "cell-a", 46, 0.25)]), SPEC)
+    t.gbif_doi = blank
+    with pytest.raises(ValueError, match="empty gbif_doi"):
+        save_prior(t, tmp_path / "p.npz")
+    assert not list(tmp_path.glob("*")), "a half-artifact was left behind"
+
+
+def test_save_accepts_a_doi_with_INCIDENTAL_surrounding_whitespace(tmp_path):
+    """...and does not silently trim it. Guards the clause against over-reach.
+
+    A `.strip()` moved from the condition into an ASSIGNMENT would pass every
+    rejection test above while quietly changing the attribution string. This
+    asserts the value round-trips BYTE-FOR-BYTE: the sidecar must carry what
+    the caller attested to, whitespace included, because normalising an
+    attribution field is a decision about provenance and not a formatting
+    choice.
+    """
+    t = to_tensor(_table([(1, "cell-a", 46, 0.25)]), SPEC)
+    t.gbif_doi = "  10.15468/dl.abc123  "
+    path = save_prior(t, tmp_path / "p.npz")
+    assert load_prior(path).gbif_doi == "  10.15468/dl.abc123  "
+
+
 def test_nothing_is_written_when_the_doi_check_refuses(tmp_path):
     """The guard runs BEFORE the matrix is written, so no half-artifact is left."""
     t = to_tensor(_table([(1, "cell-a", 46, 0.25)]), SPEC)
