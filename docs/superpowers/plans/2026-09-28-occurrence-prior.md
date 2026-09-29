@@ -1586,6 +1586,51 @@ week 52 is adjacent to week 1."
 
 Create `tests/prior/test_tensor.py`:
 
+> **PRE-FLIGHT RULINGS added 2026-09-29 — four defects in this task's own code,
+> all verified against the installed scipy 1.18.1 / pyarrow 25.0.1.** Each is
+> silent: none raises, none produces a nan, each yields a plausible number.
+>
+> **T8-R1 — `_column` must reject a week outside 1..52.** With no bounds check,
+> `week = 53` in cell *i* computes column `i*52 + 52`, which is **exactly** the
+> column of week 1 in cell *i+1*; `week = 0` aliases week 52 of the previous
+> cell. Measured: `col("cell-a", 53) == col("cell-b", 1) == 52`. Upstream folds
+> ISO week 53 into 52, but `lookup`/`vector` are the public interface every
+> downstream plan calls with its own arguments, and an aliased read returns a
+> real probability belonging to a different cell. Raise `ValueError` naming this
+> check; register one mutant per bound (lower and upper separately — a fixture
+> tripping one clause never exercises the other).
+>
+> **T8-R2 — `to_tensor` must reject duplicate `(species_key, cell, week)` rows.**
+> `sparse.csr_matrix((data, (row, col)))` **sums duplicate coordinates silently**:
+> measured, two rows of `p = 0.4` for the same key become `0.8`. Every upstream
+> stage rejects duplicates explicitly and says why (`backoff.py` and
+> `smoothing.py` both raise); this stage would quietly double them instead. Raise
+> `ValueError` naming the offending key.
+>
+> **T8-R3 — normalise the path to `.npz` BEFORE calling `save_npz`.** As written,
+> `save_prior(t, dir/"p.dat")` makes `sparse.save_npz` write **`p.dat.npz`**
+> (scipy appends the suffix), while the next line computes
+> `npz = path.with_suffix(".npz")` = `p.npz` and writes the sidecar to `p.json`.
+> The returned path then names a file that does not exist and `load_prior` fails.
+> Verified. It never fires in the tests below only because every fixture path
+> already ends in `.npz`. Compute the `.npz` path first, save to it, and return it.
+>
+> **T8-R4 — delete the `if r["p"] == 0.0: continue` skip; reject a non-positive or
+> non-finite `p` instead.** The upstream floor (`backoff.FLOOR = 1e-6`) exists so
+> the prior can never veto a correct detection with a hard zero, and the backoff
+> clamps every emitted value into `[floor, 1.0]` — so a `p` of exactly `0.0`
+> arriving here is an upstream contract breach, not a value to optimise away.
+> Silently skipping it converts a real zero into a **structural** zero that
+> `lookup` reports as `0.0`, indistinguishable from "this context is not in the
+> tensor at all". Match the guard Task 7 now applies to the same column.
+>
+> **T8-R5 (documentation, load-bearing) — a context absent from the input table is
+> a structural zero and `lookup` returns a hard `0.0` for it, NOT the floor.**
+> This is correct behaviour for this stage — it cannot invent a probability for a
+> grid point it was never handed — but it means **the caller must supply a dense
+> grid over all 52 weeks**. State it in the module docstring. Task 10 carries the
+> matching obligation (T10-R1); the two must be read together.
+
 ```python
 """Sparse prior tensor, round-tripped through disk."""
 import json
@@ -1660,6 +1705,19 @@ def test_vector_returns_all_species_for_a_context():
     assert vec.shape == (2,)
     assert vec.sum() == pytest.approx(1.0)
 ```
+
+> **T8-R6 — the `vec.sum() == 1.0` above is a property of THIS FIXTURE, not of the
+> code, and must be labelled as such.** `0.25 + 0.75` was chosen to sum to one.
+> The prior is **never renormalised over species** — `backoff.py` and
+> `smoothing.py` both say so at length, and a species absent from the occurrence
+> data contributes the floor *on top*, so a real context routinely sums above or
+> far below 1.0. Left as written, this test reads as though `vector()` normalises,
+> and the next person to touch it will "fix" the code to match.
+> Keep the test, rename it `test_vector_returns_one_entry_per_species_in_order`,
+> assert the shape and the two values positionally, and drop the sum assertion.
+> Then add a second test with a fixture that does **not** sum to 1.0 (e.g. 0.3 and
+> 0.9) asserting the values pass through un-normalised — that is the property the
+> pipeline actually relies on, and nothing currently pins it.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -1826,6 +1884,58 @@ git commit -m "feat(prior): sparse tensor format with a citable sidecar"
 - [ ] **Step 1: Write the failing test**
 
 Create `tests/prior/test_controls.py`:
+
+> **PRE-FLIGHT RULINGS for Task 9 — read all four before writing a line.**
+>
+> **T9-R1 (was ledger finding F2) — the `_tensor()` fixture below makes
+> `test_marginal_still_varies_across_species` UNPASSABLE.** It gives species 1 the
+> values {0.8, 0.4, 0.2, 0.1} and species 2 the values {0.2, 0.1, 0.8, 0.4} — the
+> same multiset, so both species have mean 0.375 and `marginal_prior` (which
+> averages over contexts) emits an identical value for each. `not np.allclose(vec,
+> vec[0])` then fails. Verified. **The test is right and the fixture is wrong:**
+> preserving label-frequency differences is the entire point of the marginal
+> control. Make the fixture asymmetric in total mass — give species 1 strictly more
+> occurrence mass than species 2 (scaling species 2's values by 0.25 is enough) —
+> and keep every assertion exactly as written.
+>
+> **T9-R2 — `uniform_prior` and `marginal_prior` as written silently rescale the
+> prior, and the two controls end up on a different scale from the full prior they
+> are compared against.** This is the defect that would quietly decide the paper's
+> headline comparison. The full prior is **not** normalised per context (see
+> `backoff.py`, `smoothing.py`); measured on a 2-species × 3-context example whose
+> per-context sums are [0.32, 0.12, 0.65], the plan's `uniform_prior` emits
+> per-context sums of [1.0, 1.0, 1.0] and its `marginal_prior` the same — **2.75×
+> the full prior's total mass**. Every fusion method in Section 2 of the spec
+> combines prior with posterior multiplicatively or via `log prior`, so a control
+> sitting at a different scale is not the null hypothesis it claims to be: the
+> comparison measures a scale difference and reports it as a context effect. No
+> test in this plan could catch it — every value is finite, in range and plausible.
+> **Ruling: both controls must preserve the full prior's total mass.**
+>   - `uniform_prior`: fill with `t.values.mean()` (the mean over the whole matrix,
+>     *including* stored zeros), not `1.0 / n_species`.
+>   - `marginal_prior`: use each species' mean over contexts **as-is** — delete the
+>     `per_species / total` renormalisation entirely.
+>   Both still satisfy every assertion in the tests below (verified: uniform stays
+>   flat across species, marginal stays constant across contexts and still varies
+>   across species). Add one test per control asserting total mass is preserved
+>   against the input tensor, and register a mutant that re-introduces the
+>   renormalisation.
+>
+> **T9-R3 — `shuffle_time` permutes all 52 week slots with ONE permutation shared
+> across every cell, and `shuffle_space` permutes cells with one permutation shared
+> across every species.** That is the intended construction — it destroys the
+> space/time association while preserving each block's internal profile — but it is
+> not what the function names suggest, and the tests below only check the value
+> multiset, which a no-op permutation also satisfies. Add, for each shuffle, a test
+> that the permutation is **not** the identity on a fixture where it is observable,
+> and assert that precondition in the test rather than trusting the seed.
+>
+> **T9-R4 — `shuffle_*` reshape to `(species, n_cells, 52)` requires the tensor's
+> column count to be exactly `n_cells * 52`.** That holds by construction from
+> `to_tensor`, but a reshape on a mismatch either raises an opaque numpy error or,
+> worse, succeeds with a wrong block structure. Assert
+> `values.shape[1] == len(cells) * WEEKS_PER_YEAR` at the top of each shuffle with
+> a message naming the check.
 
 ```python
 """The four control priors. A gain surviving all four is a real effect."""
@@ -2073,6 +2183,48 @@ The marginal-frequency control is the one a reviewer will demand."
 >      zero-match warning is the shared symptom of four silent failure modes; an
 >      unconfigured logger discards it and re-silences all of them. Treat that specific
 >      warning as a build failure when a non-empty split was supplied.
+>
+> **PRE-FLIGHT RULINGS added 2026-09-29 — this task's own code below violates three
+> of its own obligations, and the mechanism the acceptance criterion recommends does
+> not work as described. All verified by execution.**
+>
+> **T10-R1 — `build_from_archive` must pass the full 52-week grid to
+> `hierarchical_estimate`, and the observed cells explicitly.** The code below calls
+> `hierarchical_estimate(ratios, species)` with no `weeks=`. The backoff's documented
+> default is "the observed axes", so on the plan's own end-to-end fixture the grid
+> comes out as **3 weeks, not 52** (measured: weeks [2, 24, 46], 6 rows instead of
+> 104). Every unobserved week then never reaches `to_tensor`, becomes a **structural
+> zero** in the CSR matrix, and `lookup` returns a hard `0.0` for it — not the floor
+> (see T8-R5). That is precisely the "prior vetoes a correct detection" outcome the
+> floor exists to prevent, arriving by a different route, and it is silent: the
+> artifact is well-formed, every stored value is right, and only the absent columns
+> are wrong. On the real data nearly every cell-week is unobserved, so this is the
+> normal case, not an edge case. Pass `weeks=list(range(1, WEEKS_PER_YEAR + 1))` and
+> `cells=<the observed cells>`, and assert in the test that the full prior's tensor
+> has exactly `n_cells * 52` columns with no structural zero among them.
+>
+> **T10-R2 — Arrow schema metadata does NOT survive `group_by().aggregate()`, so the
+> acceptance criterion's "have `aggregate_counts` propagate it" cannot mean "it is
+> carried automatically".** Measured: metadata survives `filter()` and is `None`
+> after `group_by(...).aggregate(...)`, and `rename_columns`/`select` do not restore
+> it. `aggregate_counts` must therefore **re-stamp the marker explicitly on its
+> output, conditional on its input carrying it** — never unconditionally, or the
+> guard authenticates any table that passes through it and the whole check becomes
+> decorative. Add a test that an unstamped input yields an unstamped output and that
+> `target_group_ratios` then raises.
+>
+> **T10-R3 — `main()` below passes `test_recordings=[]` unconditionally, which
+> violates obligations 1, 3 and 4 in the block above.** The CLI has no
+> `--test-split`, no `--no-test-split`, no logging configuration, and re-derives
+> nothing per resolution. The obligations are correct; the code is the stale copy.
+> Implement the CLI to match the obligations, not this snippet. Concretely: require
+> exactly one of `--test-split PATH` / `--no-test-split`; load the split as
+> (lat, lon, week, recorded_by) and build each `TestRecording`'s `cell` **inside**
+> the resolution loop with the same `resolution` handed to `assign_cells`; call
+> `logging.basicConfig(level=logging.INFO)` before any pipeline call; and let a guard
+> `ValueError` propagate — no try/except around the loop body — so a mismatched
+> resolution fails that artifact and exits non-zero rather than writing a
+> leak-contaminated file under a normal-looking name.
 
 - [ ] **Step 1: Write the failing test**
 
