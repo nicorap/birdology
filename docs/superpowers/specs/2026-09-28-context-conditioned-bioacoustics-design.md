@@ -94,6 +94,20 @@ than "absent". Three-level hierarchical backoff:
 with shrinkage weight set by the observation count behind each level. Plus smoothing across the 6
 adjacent hexes and ±1 week. Both bandwidths are swept axes.
 
+**Stated limitation — the probability floor erases the absence distinction at scale.**
+A non-zero floor (1e-6) keeps an unobserved cell-week from collapsing to a hard zero, so
+"nobody looked" stays distinguishable from "looked and did not find". That distinction holds
+only while the global denominator stays below `1/floor`. Above it — i.e. once a region
+accumulates more than ~1e6 bird records, which is the normal GBIF regime — a species
+*surveyed and not found* becomes bit-identical to a species *never recorded anywhere*.
+Verified empirically: at 1e6 records in a cell, a species with one sighting elsewhere scores
+exactly 1e-6 in a surveyed week where it was absent, and an unrecorded species also scores
+exactly 1e-6. The floor is still necessary — a hard zero would make the prior veto a correct
+detection outright — but the paper must state the threshold rather than claim the
+distinction holds everywhere. Report it as a known boundary of the method, and if a reviewer
+asks what the prior says about a surveyed absence, the honest answer is "below `1/floor`
+records, less than the cell profile; above it, indistinguishable from unrecorded".
+
 ### Leakage guards
 
 Xeno-Canto is itself a GBIF publisher. If a test recording's own occurrence record is in the prior,
