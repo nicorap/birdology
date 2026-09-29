@@ -1292,12 +1292,21 @@ def hierarchical_estimate(
 
     for row in rows:
         sk, cell, week, n = row["species_key"], row["cell"], int(row["week"]), row["n"]
+        total = row["total"]
         cell_week_species[(sk, cell, week)] = cell_week_species.get((sk, cell, week), 0.0) + n
-        cell_week_n[(cell, week)] = cell_week_n.get((cell, week), 0.0) + n
+        # CORRECTED 2026-09-29: the DENOMINATOR must read `total`, never re-derive
+        # itself by summing `n`. The two agree only while the table holds EVERY
+        # species; filtering to a label set is an ordinary pipeline step, and after
+        # it a species with 1 record in a cell-week of 100 (true share 0.01) scores
+        # ~0.1-1.0 instead — up to a hundredfold error toward confident presence,
+        # raising nothing. `total` is counted ONCE per (cell, week), not per row:
+        # per-row accumulation multiplies effort by the species count.
+        if (cell, week) not in cell_week_n:
+            cell_week_n[(cell, week)] = total
+            cell_n[cell] = cell_n.get(cell, 0.0) + total
+            global_n += total
         cell_species[(sk, cell)] = cell_species.get((sk, cell), 0.0) + n
-        cell_n[cell] = cell_n.get(cell, 0.0) + n
         global_species[sk] = global_species.get(sk, 0.0) + n
-        global_n += n
 
     all_cells = list(cells) if cells is not None else sorted(cell_n)
     all_weeks = list(weeks) if weeks is not None else sorted({w for _, w in cell_week_n})
