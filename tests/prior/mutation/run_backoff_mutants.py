@@ -701,8 +701,11 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
     ),
     (
         "B36",
-        "the `n <= total` check removed, so an unpaired numerator/denominator "
-        "emits p > 1 and is then silently clamped to exactly 1.0",
+        "the `n <= total` ROW-PAIRING check removed. Subsumed as a rejection "
+        "PREDICATE by the cell-week coherence check (B46) -- with every n >= 1, "
+        "a row exceeding its own total also makes its cell-week sum exceed it -- "
+        "so the kill is by MESSAGE: the row check LOCALISES the defect to a "
+        "(species, cell, week) where the aggregate one can only say 'somewhere'",
         "test_a_numerator_exceeding_its_own_total_is_rejected",
         [
             (

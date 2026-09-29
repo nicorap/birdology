@@ -592,7 +592,17 @@ def test_a_cell_week_whose_total_disagrees_between_rows_is_rejected():
 def test_a_numerator_exceeding_its_own_total_is_rejected():
     """n > total cannot happen on a real RatioTable; it means numerator and
     denominator are no longer paired, and it would emit p > 1 before the
-    clamp hides it."""
+    clamp hides it.
+
+    Asserted by MESSAGE, and it has to be. As a rejection PREDICATE the
+    per-row check is subsumed by the cell-week coherence check: every `n` is
+    >= 1, so a single row exceeding its own total also makes the cell-week sum
+    exceed it, and removing the per-row check still raises -- from the other
+    guard, with a message about an aggregate. What the per-row check uniquely
+    does is LOCALISE the defect to a (species, cell, week), which is the
+    difference between "this table is incoherent somewhere" and "this row is
+    wrong". Matching its own wording keeps the two guards distinguishable.
+    """
     bad = pa.table(
         {
             "species_key": pa.array([1], pa.int64()),
@@ -603,8 +613,12 @@ def test_a_numerator_exceeding_its_own_total_is_rejected():
             "ratio": pa.array([5.0], pa.float64()),
         }
     )
-    with pytest.raises(ValueError, match="exceed"):
+    with pytest.raises(ValueError, match=r"has n=50 which exceeds its own total=10") as caught:
         hierarchical_estimate(bad, [1])
+    # PRECONDITION: it is the ROW-PAIRING guard talking, not the cell-week
+    # coherence guard standing in for it.
+    assert "summing to" not in str(caught.value)
+    assert "(1, 'c', 5)" in str(caught.value)
 
 
 def test_a_non_positive_total_is_rejected_not_divided_by():
