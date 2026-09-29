@@ -174,8 +174,29 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
             (
                 '        _validate_week(int(week), "a tensor lookup")\n'
                 "        ci = self._cell_index.get(cell)",
-                "        ci = self._cell_index.get(cell)\n"
-                '        _validate_week(int(week), "a tensor lookup")',
+                "        ci = self._cell_index.get(cell)",
+            ),
+            (
+                "        return int(_column_index(ci, int(week)))",
+                '        _validate_week(int(week), "a tensor lookup")\n'
+                "        return int(_column_index(ci, int(week)))",
+            ),
+        ],
+    ),
+    (
+        "T63",
+        "the species lookup moved BEFORE the cell/week one in `lookup`, so an "
+        "out-of-range week combined with an unknown species raises the SPECIES "
+        "error instead of the WEEK one. Separate mutant from T4, which reorders "
+        "the CELL guard: a fixture with an unknown cell never reaches the "
+        "species lookup, so neither deletion can detect the other's",
+        "test_an_out_of_range_week_raises_the_WEEK_error_even_for_an_unknown_species",
+        [
+            (
+                "        col = self._column(cell, week)\n"
+                "        row = self._row(species_key)",
+                "        row = self._row(species_key)\n"
+                "        col = self._column(cell, week)",
             )
         ],
     ),
