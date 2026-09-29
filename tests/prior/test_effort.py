@@ -860,7 +860,7 @@ def test_apply_leakage_guards_is_what_stamps_the_marker():
         }
     )
     assert occurrences.schema.metadata is None
-    guarded = apply_leakage_guards(occurrences, [])
+    guarded = apply_leakage_guards(occurrences, []).table
     assert guarded.schema.metadata == {GUARD_MARKER_KEY: b"1"}
 
 

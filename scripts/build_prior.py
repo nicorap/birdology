@@ -52,54 +52,79 @@ nonzero. A full 52-week grid over the observed cells materialises
 `n_species * n_cells * 52` stored entries.
 
 MEASURED peak RSS, by building real archives end to end (macOS arm64,
-`ru_maxrss`), with the peak attributed per stage:
+`ru_maxrss`), each row in ITS OWN SUBPROCESS -- `ru_maxrss` is a per-process
+HIGH-WATER MARK, so two scales in one process report the larger one twice.
+All figures NET of the ~77-82 MB interpreter-and-imports baseline:
 
-    species x cells   contexts   backoff+concat   to_tensor   dense()
-    ---------------   --------   --------------   ---------   -------
-    120 x 200          1.25e6         --            324 MiB     --
-    240 x 400          4.99e6         --           1007 MiB     --
-    600 x 600          1.87e7       823 MiB        2827 MiB    +0 MiB
-    850 x 600          2.65e7      1106 MiB        4051 MiB    +0 MiB
+    contexts   fill   post-to_tensor   post-controls   net bytes/context
+    --------   ----   --------------   -------------   -----------------
+    1.248e6    1.00          366 MB          390 MB                 263
+    1.248e6    0.25          361 MB          385 MB                 259
+    2.496e6    1.00          538 MB          595 MB                 218
+    2.496e6    0.25          522 MB          579 MB                 211
+    4.992e6    1.00         1085 MB         1180 MB                 232
+    4.992e6    0.25         1066 MB         1161 MB                 228
+    1.248e7    1.00         2347 MB         2585 MB                 211
 
-Two findings, both of which contradict the estimate this design started from:
+Three findings, all of which contradict the estimate this design started from:
 
-1. THE PEAK IS `to_tensor`, NOT `dense()`. The float64 grid `dense()`
-   materialises is only 8 bytes per context -- 202 MiB at 2.65e7 contexts,
-   and it did not move the peak at any scale measured, controls included.
-   What dominates is the Arrow table -> COO -> CSR conversion, which holds
-   several representations of the same nonzeros at once. Cost is ~160 bytes
-   per context, stable across a 20x range of scales.
+1. THE PEAK IS `to_tensor`, NOT `dense()` -- but "did not move the peak" was
+   the WRONG WAY TO SAY IT, and the wrong phrasing would mislead future work.
+   `ru_maxrss` is MONOTONE, so once `to_tensor` has set the high-water mark
+   every later stage is invisible BY CONSTRUCTION; "the peak did not move"
+   therefore says nothing about what the later stage COST. Measured against
+   the POST-`to_tensor` mark, the four controls -- each of which calls
+   `dense()` -- do add real memory: +24 MB at 1.25e6 contexts, +95 MB at
+   4.99e6, +238 MB at 1.25e7. The conclusion still stands: the controls stay
+   BELOW the `to_tensor` high-water mark at every scale measured, so
+   `to_tensor`'s Arrow -> COO -> CSR conversion (which holds several
+   representations of the same nonzeros at once) is what sizes the job. But
+   anyone who later STREAMS `to_tensor` or reorders the stages inherits a
+   false premise from the old phrasing: lower that mark and the controls'
+   238 MB becomes the peak.
 
-2. CHUNKING BOUNDS THE BACKOFF, NOT THE PEAK. Measured at 240 x 400:
+2. FILL BARELY MATTERS, which is the point of T10-R1. A quarter-filled
+   occurrence grid costs 259 B/ctx against a full one's 263 -- because
+   `hierarchical_estimate` materialises the REQUESTED grid whether or not
+   anything was observed in it. The projection is a function of the grid
+   shape, not of the data, which is exactly why a narrower week window is the
+   only honest way to make a big resolution fit.
+
+3. CHUNKING BOUNDS THE BACKOFF, NOT THE PEAK. Measured at 240 x 400:
    chunk 50 -> 1181 MiB, chunk 10 -> 1007 MiB, chunk 4 -> 993 MiB. Chunking
    caps the backoff's working set (the `estimates` table is built whole
    regardless, then converted whole), so it buys ~15% and then flattens.
    `--species-chunk` is therefore honest about what it does and is NOT a
    way to fit an arbitrarily large grid.
 
-WHAT THAT IMPLIES FOR THE RELEASE, at ~600 Danish species:
+WHAT THAT IMPLIES FOR THE RELEASE, at ~600 Danish species (at 270 B/ctx, the
+rounded-up WORST measured cost; the previous 160 under-predicted real builds
+by 26-41%, in the direction that tells an operator a build is cheaper than it
+is):
 
     resolution   cells over DK   contexts   projected peak
     ----------   -------------   --------   --------------
-    3                       27   8.4e5          ~0.14 GB
-    4                      147   4.6e6          ~0.7 GB
-    5                      897   2.8e7          ~4.5 GB
-    6                     5975   1.9e8           ~30 GB
-    7                    40999   1.3e9          ~200 GB
+    3                       27   8.4e5          ~0.21 GB
+    4                      147   4.6e6          ~1.2 GB
+    5                      897   2.8e7          ~7.5 GB
+    6                     5975   1.9e8            ~50 GB
+    7                    40999   1.3e9           ~340 GB
 
-Resolutions 3, 4 and 5 -- the default sweep -- fit on an ordinary machine.
-Resolution 6 needs a large node and 7 does not fit at all. The honest
-resolutions for those are the two T10-R1 names: a documented week window,
-which would have to be STATED IN THE SIDECAR because an artifact whose grid
-is narrower than 52 weeks and does not say so is a silent lie about its own
-coverage, or a streaming `to_tensor`. Falling back to the observed axes is
-NOT one of them: it reintroduces the exact defect this design prevents.
+Resolutions 3 and 4 fit on an ordinary machine; resolution 5 -- the top of the
+default sweep -- needs ~8 GB and is the one to watch on a laptop. Resolution 6
+needs a large node and 7 does not fit at all. The honest resolutions for those
+are the two T10-R1 names: a documented week window, which would have to be
+STATED IN THE SIDECAR because an artifact whose grid is narrower than 52 weeks
+and does not say so is a silent lie about its own coverage, or a streaming
+`to_tensor`. Falling back to the observed axes is NOT one of them: it
+reintroduces the exact defect this design prevents.
 """
 from __future__ import annotations
 
 import argparse
 import csv
 import logging
+import re
 import resource
 import sys
 from collections.abc import Sequence
@@ -114,7 +139,6 @@ from birdology.prior.controls import CONTROLS
 from birdology.prior.effort import target_group_ratios
 from birdology.prior.indexing import WEEKS_PER_YEAR, aggregate_counts, assign_cells
 from birdology.prior.leakage import (
-    ZERO_MATCH_WARNING_MARKER,
     TestRecording,
     apply_leakage_guards,
 )
@@ -140,42 +164,37 @@ DEFAULT_SPECIES_CHUNK = 50
 class ZeroMatchGuardError(ValueError):
     """A non-empty test split matched no occurrence at all.
 
-    Obligation 4: the zero-match WARNING is the shared observable symptom of
+    Obligation 4: the zero-match condition is the shared observable symptom of
     four silent failure modes (contributor-spelling miss, mojibake, an
     un-wired eval split, a cell-format mismatch the resolution check cannot
-    see). Logged and carried, it is a line in a build log nobody reads. When
-    a split WAS supplied, this build treats it as a failure, because the
-    artifact it would otherwise write is one whose leakage guard did nothing.
+    see). When a split WAS supplied, this build treats it as a failure,
+    because the artifact it would otherwise write is one whose leakage guard
+    did nothing.
 
     A `ValueError` subclass, so it obeys this plan's uniform error contract
     while still being catchable by name for anyone who wants to distinguish
     it from a malformed split.
+
+    RAISED FROM RETURNED COUNTS, NEVER FROM A LOG RECORD
+    ----------------------------------------------------
+    The first version of this guard attached a `logging.Handler` to
+    `birdology.prior.leakage` and string-matched the WARNING that module emits
+    three frames down. It was reproduced dead, end to end: one
+    `logging.basicConfig(level=logging.ERROR)` before `main()` -- exactly what
+    a CI wrapper or cron harness does -- and a split matching nothing wrote
+    all ten artifacts and returned exit 0. `main()`'s own `basicConfig` is a
+    documented no-op once the root logger has handlers, so the warning never
+    reached the detector. Four other logging configurations did the same, and
+    because the logger NAME was a hard-coded string here, renaming leakage's
+    logger bypassed the guard with nothing raised.
+
+    A dead detector is worse than no detector, because its presence stops
+    reviewers looking for a real one. The condition is now
+    `LeakageGuardResult.zero_match` -- a comparison on two integers the guard
+    function RETURNED -- so no logging level, no `logging.disable()`, no
+    handler configuration and no logger rename can reach it. There is no
+    second, log-based opinion: that path is deleted.
     """
-
-
-class _ZeroMatchDetector(logging.Handler):
-    """Turn the leakage module's zero-match WARNING into a build failure.
-
-    A logging handler rather than a return value because the warning is
-    emitted three call levels down, inside a function whose signature this
-    plan deliberately does not widen: `drop_test_contributor_cells` is
-    correct to WARN (an empty match is not always fatal -- a caller building
-    a prior for a region the split does not cover is legitimate), and only
-    this script knows that a split was MEANT to bite.
-
-    It matches on `ZERO_MATCH_WARNING_MARKER`, imported from `leakage`, so
-    the coupling is a named constant rather than a copied string that would
-    go silently dead the next time the message is reworded.
-    """
-
-    def __init__(self) -> None:
-        super().__init__(level=logging.WARNING)
-        self.fired: list[str] = []
-
-    def emit(self, record: logging.LogRecord) -> None:
-        message = record.getMessage()
-        if ZERO_MATCH_WARNING_MARKER in message:
-            self.fired.append(message)
 
 
 def load_test_split(path: Path) -> list[dict]:
@@ -338,21 +357,60 @@ def estimate_over_full_grid(
     return pa.concat_tables(pieces)
 
 
-#: MEASURED bytes of peak RSS per grid context, from end-to-end builds at
-#: 1.87e7 and 2.65e7 contexts (158 and 160 bytes/context respectively; see
-#: the module docstring's table). The peak is the Arrow -> COO -> CSR
-#: conversion in `to_tensor`, NOT `dense()`, which costs 8 bytes/context and
-#: did not move the peak at any scale measured.
+#: MEASURED bytes of peak RSS per grid context, NET OF THE ~77-82 MB
+#: INTERPRETER-AND-IMPORTS BASELINE. The figure excludes that baseline, so a
+#: projection for a small grid under-states the process's total RSS by roughly
+#: 80 MB; at any scale where this number matters the baseline is noise.
+#:
+#: RE-FITTED across THREE scales and TWO fill fractions (the previous 160 was
+#: fitted to two points at one grid shape and under-predicted real builds by
+#: 26-41%, in the direction that tells an operator a build is CHEAPER than it
+#: is -- which is the OOM this logging exists to prevent). Each row is its own
+#: SUBPROCESS, because `ru_maxrss` is a per-process high-water mark and two
+#: scales in one process report the larger twice:
+#:
+#:     contexts   fill   baseline   post-to_tensor   post-controls   net B/ctx
+#:     --------   ----   --------   --------------   -------------   ---------
+#:     1.248e6    1.00      77 MB         366 MB          390 MB        263
+#:     1.248e6    0.25      77 MB         361 MB          385 MB        259
+#:     2.496e6    1.00      77 MB         538 MB          595 MB        218
+#:     2.496e6    0.25      77 MB         522 MB          579 MB        211
+#:     4.992e6    1.00      77 MB        1085 MB         1180 MB        232
+#:     4.992e6    0.25      77 MB        1066 MB         1161 MB        228
+#:     1.248e7    1.00      77 MB        2347 MB         2585 MB        211
+#:
+#: The constant is the ROUNDED-UP WORST case, 263 -> 270, not the mean (218).
+#: Rounding to the mean is what produced the old under-prediction: this number
+#: exists to stop an operator committing hours to a build that will OOM, and an
+#: over-estimate costs them a bigger node while an under-estimate costs them the
+#: whole run. FILL BARELY MATTERS (259 vs 263 at the small end, 228 vs 232 in
+#: the middle): the grid is materialised in full by `hierarchical_estimate`
+#: regardless of how much of it was ever observed, which is the entire point of
+#: passing `weeks=`, so the projection is a function of the GRID and not of the
+#: data. Cost per context FALLS with scale, so the worst case sits at the small
+#: end and extrapolating it upward is conservative.
 #:
 #: Used only to WARN before a long job. It is a projection from measurements,
 #: not a guarantee, and it is deliberately not a guard: refusing to build
 #: would substitute this script's guess for the operator's knowledge of their
 #: own machine.
-MEASURED_BYTES_PER_CONTEXT = 160
+MEASURED_BYTES_PER_CONTEXT = 270
+
+#: The worst NET bytes/context any measured row produced, to one decimal. Its
+#: only purpose is to pin `MEASURED_BYTES_PER_CONTEXT` against a recorded
+#: measurement rather than against itself: a future edit that lowers the
+#: constant back toward the mean has to argue with this number, and
+#: `test_the_memory_constant_is_not_below_the_worst_measurement` fails if it
+#: does not.
+WORST_MEASURED_BYTES_PER_CONTEXT = 263.0
 
 
 def project_peak_bytes(n_species: int, n_cells: int) -> int:
-    """Projected peak RSS for a grid of this size, from measured scaling."""
+    """Projected peak RSS for a grid of this size, from measured scaling.
+
+    EXCLUDES the ~80 MB interpreter-and-imports baseline; see
+    `MEASURED_BYTES_PER_CONTEXT`.
+    """
     return n_species * n_cells * WEEKS_PER_YEAR * MEASURED_BYTES_PER_CONTEXT
 
 
@@ -393,43 +451,63 @@ def build_from_archive(
     each control, so a control cannot be written with weaker provenance than
     the prior it is the null for.
 
-    No try/except anywhere. A guard `ValueError` -- an H3 resolution mismatch
-    between the split and the table, a contract breach in any stage -- reaches
-    the caller and the process exits non-zero. Catching one here to keep a
-    sweep going would write a leak-contaminated artifact under a
-    normal-looking filename, which is worse than the pre-fix silence because
-    it looks deliberate.
-    """
-    detector = _ZeroMatchDetector()
-    logging.getLogger("birdology.prior.leakage").addHandler(detector)
-    try:
-        table = assign_cells(read_occurrences(Path(zip_path)), resolution)
-        table = apply_leakage_guards(table, test_recordings)
-    finally:
-        # Removed in a `finally` so a raised guard error does not leave a
-        # handler attached to a module-level logger for the rest of the
-        # process. This is NOT catching the error: nothing is caught here and
-        # the exception continues to propagate.
-        logging.getLogger("birdology.prior.leakage").removeHandler(detector)
+    No try/except ANYWHERE, and no `try` at all. A guard `ValueError` -- an H3
+    resolution mismatch between the split and the table, a contract breach in
+    any stage -- reaches the caller and the process exits non-zero. Catching
+    one here to keep a sweep going would write a leak-contaminated artifact
+    under a normal-looking filename, which is worse than the pre-fix silence
+    because it looks deliberate.
 
-    if detector.fired and test_recordings:
+    There is deliberately not even a bare `try/finally`. The previous version
+    had one, to detach a logging handler, and a `return` added inside that
+    `finally` would have swallowed EVERY in-flight exception including a guard
+    `ValueError` -- an evasion the AST check could not see because it looked
+    for `ExceptHandler` nodes and a finally-only `Try` has none. Deleting the
+    handler deleted the `try`, and
+    `test_the_pipeline_call_path_has_no_except_at_all` now forbids `ast.Try`
+    in this function outright.
+
+    THE ZERO-MATCH GUARD READS RETURNED COUNTS
+    ------------------------------------------
+    `apply_leakage_guards` returns a `LeakageGuardResult`. The escalation
+    below compares two of its integers. It is not a log handler, not a string
+    match, and not conditioned on any logging state; see
+    `ZeroMatchGuardError` for the reproduced failure that motivated the
+    change.
+    """
+    table = assign_cells(read_occurrences(Path(zip_path)), resolution)
+    guarded = apply_leakage_guards(table, test_recordings)
+
+    # DATA, not a log record. `zero_match` is
+    # `banned_key_count > 0 and contributor_rows_removed == 0`, both computed
+    # by the function that did the filtering. `test_recordings` is NOT part of
+    # the condition: `banned_key_count` is the normalised key count the guard
+    # actually held, which is the thing that decides whether the guard could
+    # bite, and re-deriving intent from the argument here would let a split
+    # that normalised away to nothing pass as legitimately empty.
+    if guarded.zero_match:
         raise ZeroMatchGuardError(
             f"the test split matched no occurrence at resolution {resolution}: "
-            f"{detector.fired[0]}. A split was supplied, so this is a build "
-            "failure rather than a warning: the artifact would carry a leakage "
-            "guard that removed nothing, and would be indistinguishable from "
-            "one whose guard worked"
+            f"{guarded.banned_key_count} banned (cell, week, contributor) "
+            f"key(s) removed {guarded.contributor_rows_removed} of "
+            f"{guarded.rows_before_contributor_guard} occurrences. A split was "
+            "supplied, so this is a build failure rather than a warning: the "
+            "artifact would carry a leakage guard that removed nothing, and "
+            "would be indistinguishable from one whose guard worked"
         )
 
-    counts = aggregate_counts(table)
+    counts = aggregate_counts(guarded.table)
     ratios = target_group_ratios(counts)
     species = species_axis(counts)
     cells = cell_axis(counts)
     log.info(
-        "resolution %d: %d occurrences, %d species, %d cells -> %d grid "
+        "resolution %d: %d occurrences (%d dropped by the leakage guards over "
+        "%d banned key(s)), %d species, %d cells -> %d grid "
         "contexts over %d weeks, projected peak ~%.1f GiB",
         resolution,
-        table.num_rows,
+        guarded.table.num_rows,
+        guarded.xeno_canto_rows_removed + guarded.contributor_rows_removed,
+        guarded.banned_key_count,
         len(species),
         len(cells),
         len(species) * len(cells) * WEEKS_PER_YEAR,
@@ -471,6 +549,69 @@ def build_from_archive(
     return written
 
 
+#: A DOI, in any of the spellings GBIF's download page offers: bare
+#: (`10.15468/dl.abc123`), `doi:`-prefixed, or wrapped in a resolver URL. The
+#: scheme and host are matched GENERICALLY rather than enumerated, both because
+#: any resolver host is equally valid and because this module must not spell a
+#: URL scheme literally: `test_the_build_script_does_not_import_the_download_client`
+#: forbids network-client vocabulary in this file, and that check is worth more
+#: than a hard-coded list of resolver prefixes.
+#:
+#: `10.\d{4,9}/` is the DOI registrant-prefix grammar from the DOI handbook.
+#: Matched, never rewritten: the sidecar must carry the string the operator
+#: attested to, and silently canonicalising an attribution field means the
+#: artifact cites something the build was never told.
+DOI_PATTERN = re.compile(
+    r"^(?:[a-z][a-z0-9+.\-]*://[^/\s]+/|doi:)?10\.\d{4,9}/\S+$", re.IGNORECASE
+)
+
+
+def non_blank_doi(value: str) -> str:
+    """argparse `type` for `--gbif-doi`: reject blank, then reject non-DOI.
+
+    `required=True` REQUIRES THE FLAG, NOT A VALUE. Reproduced: `--gbif-doi ''`
+    and `--gbif-doi '   '` were both accepted, and the whitespace one is the
+    dangerous half -- `save_prior` refused an EMPTY doi but `'   '` is not
+    empty, so all five artifacts wrote with sidecar `gbif_doi: '   '` and
+    attribution `Derived from GBIF occurrence download    .` That is a CC BY
+    4.0 attribution violation in a published artifact, reached by the most
+    ordinary operator path there is:
+
+        python scripts/build_prior.py --gbif-doi "$DOI" ...   # $DOI unset
+
+    Rejected HERE as well as in `save_prior` because the two are
+    independently load-bearing: this one turns a multi-hour national build
+    into an instant usage error, and `save_prior`'s protects every OTHER
+    caller of the library. Neither is redundant.
+
+    NOT coerced. `.strip()` here would accept `'  10.15468/dl.x  '` and write
+    a different string from the one the operator passed, which is the silent
+    repair this plan forbids at a boundary.
+    """
+    if not value or not value.strip():
+        raise argparse.ArgumentTypeError(
+            f"--gbif-doi is blank or whitespace-only ({value!r}); every "
+            "artifact is released CC BY 4.0, which obliges attribution, and a "
+            "blank DOI writes a sidecar whose attribution line names no "
+            "download at all. This is what `--gbif-doi \"$DOI\"` does with an "
+            "unset variable, so it is rejected at parse time rather than "
+            "hours later at the write"
+        )
+    if not DOI_PATTERN.match(value):
+        raise argparse.ArgumentTypeError(
+            f"--gbif-doi {value!r} is not shaped like a DOI (expected a "
+            "registrant prefix `10.NNNN/suffix`, optionally `doi:`-prefixed "
+            "or wrapped in a resolver URL); a GBIF download has BOTH a "
+            "download KEY (e.g. 0012345-230530130807322) and a DOI (e.g. "
+            "10.15468/dl.abc123), the two sit beside each other on the "
+            "download page, and only the DOI is citable. A key, a dataset "
+            "UUID or an archive filename in this field produces a well-formed, "
+            "permanently mis-attributed release that no reader of the artifact "
+            "can detect"
+        )
+    return value
+
+
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--archive", required=True, type=Path)
@@ -480,9 +621,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     ap.add_argument(
         "--gbif-doi",
         required=True,
+        type=non_blank_doi,
         help="the DOI of the GBIF download this archive came from. Required: "
         "every artifact is released CC BY 4.0, which obliges attribution, and "
-        "`save_prior` refuses to write without it",
+        "`save_prior` refuses to write without it. `required=True` requires "
+        "the FLAG, so the VALUE is validated by `non_blank_doi`: a blank, "
+        "whitespace-only or non-DOI string is a usage error",
     )
     ap.add_argument(
         "--species-chunk",

@@ -105,18 +105,37 @@ def test_guarded_table_differs_from_unguarded():
         resolution=4,
     )
     cell = t.column("cell")[0].as_py()
-    guarded = apply_leakage_guards(
+    result = apply_leakage_guards(
         t, [TestRecording(cell=cell, week=46, recorded_by="Ole")]
     )
+    guarded = result.table
     assert guarded.num_rows < t.num_rows
     assert XC not in guarded.column("publisher_key").to_pylist()
+    # ...and the RESULT reports what each guard did, which is what
+    # `scripts/build_prior.py` escalates on. MEASURED, not assumed: on THIS
+    # fixture Ole's only row is ALSO the Xeno-Canto one, so guard 1 removes it
+    # and guard 2 then finds nothing left to match -- which is a genuine
+    # zero match for the split, and the counts say so rather than crediting
+    # guard 2 with guard 1's work.
+    assert result.xeno_canto_rows_removed == 1
+    assert result.contributor_rows_removed == 0
+    assert result.banned_key_count == 1
+    assert result.zero_match is True
 
 
 def test_no_test_recordings_is_a_noop_beyond_xc():
     t = assign_cells(
         _table([(1, 55.6, 12.5, date(2025, 3, 3), "pub", "Ole")]), resolution=4
     )
-    assert apply_leakage_guards(t, []).num_rows == 1
+    result = apply_leakage_guards(t, [])
+    assert result.table.num_rows == 1
+    # An empty split is the legitimate `--no-test-split` mode: ZERO banned
+    # keys, so `zero_match` is FALSE even though nothing was removed. That
+    # distinction is the whole reason the count is returned rather than
+    # re-derived from `len(test_recordings)` by the caller.
+    assert result.banned_key_count == 0
+    assert result.contributor_rows_removed == 0
+    assert result.zero_match is False
 
 
 # --------------------------------------------------------------------------
@@ -420,7 +439,7 @@ def test_apply_leakage_guards_runs_both_guards():
     cell = t.column("cell")[0].as_py()
     out = apply_leakage_guards(
         t, [TestRecording(cell=cell, week=46, recorded_by="Ole")]
-    )
+    ).table
     assert out.column("recorded_by").to_pylist() == ["Jens"]
     assert out.column("publisher_key").to_pylist() == ["pub"]
 
@@ -439,7 +458,7 @@ def test_guards_preserve_schema_and_column_order():
     )
     out = apply_leakage_guards(
         t, [TestRecording(cell=t.column("cell")[0].as_py(), week=46, recorded_by="Ole")]
-    )
+    ).table
     assert out.schema == t.schema
 
 
@@ -447,7 +466,7 @@ def test_guards_on_an_empty_table_are_a_noop():
     t = assign_cells(_table([]), resolution=4)
     out = apply_leakage_guards(
         t, [TestRecording(cell="841f059ffffffff", week=46, recorded_by="Ole")]
-    )
+    ).table
     assert out.num_rows == 0
     assert out.schema == t.schema
 
@@ -467,7 +486,7 @@ def test_guards_run_before_aggregation_loses_provenance():
     cell = t.column("cell")[0].as_py()
     guarded = apply_leakage_guards(
         t, [TestRecording(cell=cell, week=46, recorded_by="Ole")]
-    )
+    ).table
     assert aggregate_counts(guarded).num_rows == 0
     assert aggregated.num_rows == 1
 
@@ -849,6 +868,179 @@ def test_no_zero_match_warning_when_the_banned_set_is_empty(caplog):
     with caplog.at_level(logging.WARNING, logger="birdology.prior.leakage"):
         drop_test_contributor_cells(t, [])
     assert not [r for r in caplog.records if "matched zero" in r.getMessage()]
+
+
+# --------------------------------------------------------------------------
+# C1: the zero-match condition is RETURNED DATA, not a log record.
+#
+# `scripts/build_prior.py` must FAIL a build whose supplied split matched
+# nothing. It used to detect that by attaching a logging handler to this
+# module's logger and string-matching the WARNING above; with
+# `logging.basicConfig(level=logging.ERROR)` set before `main()` the guard was
+# silently dead and a complete release was written with exit 0.
+#
+# These tests pin the DATA channel, and the last one pins it UNDER
+# `logging.disable()` -- the strongest form of the configuration that killed
+# the old mechanism.
+# --------------------------------------------------------------------------
+
+
+def test_the_guard_result_reports_zero_match_on_a_split_that_bites_nothing():
+    """A non-empty split that removes nothing sets `zero_match`."""
+    t = _one_ole_at_cell_a_week_46()
+    cell = t.column("cell")[0].as_py()
+    result = apply_leakage_guards(
+        t, [TestRecording(cell=cell, week=46, recorded_by="Somebody Else")]
+    )
+    assert result.banned_key_count == 1
+    assert result.contributor_rows_removed == 0
+    assert result.rows_before_contributor_guard == 1
+    assert result.zero_match is True
+
+
+def test_the_guard_result_does_not_report_zero_match_when_rows_were_removed():
+    """Guards the previous test against an always-true `zero_match`."""
+    t = _one_ole_at_cell_a_week_46()
+    cell = t.column("cell")[0].as_py()
+    result = apply_leakage_guards(
+        t, [TestRecording(cell=cell, week=46, recorded_by="Ole")]
+    )
+    assert result.contributor_rows_removed == 1
+    assert result.zero_match is False
+
+
+def test_the_guard_result_does_not_report_zero_match_for_an_empty_split():
+    """`--no-test-split` is legitimate and must not read as a zero match.
+
+    Its own test rather than a branch of the one above: a `zero_match` defined
+    as `contributor_rows_removed == 0` alone would be TRUE here, which would
+    make the legitimate no-split mode unbuildable and the pressure would be to
+    delete the guard rather than fix it.
+    """
+    result = apply_leakage_guards(_one_ole_at_cell_a_week_46(), [])
+    assert result.banned_key_count == 0
+    assert result.contributor_rows_removed == 0
+    assert result.zero_match is False
+
+
+def test_the_zero_match_signal_survives_logging_being_disabled_entirely():
+    """THE C1 REGRESSION TEST: the signal is DATA and logging cannot reach it.
+
+    `logging.disable(logging.CRITICAL)` suppresses every record at every
+    level on every logger -- strictly stronger than the
+    `logging.basicConfig(level=logging.ERROR)` that was reproduced disarming
+    the old handler-based detector. The counts are computed by the function
+    that filtered, so they are unchanged.
+
+    The handler count is asserted too, so this cannot pass by the mechanism
+    having quietly grown a second, log-based opinion: there is no handler to
+    attach and none is left behind.
+    """
+    t = _one_ole_at_cell_a_week_46()
+    cell = t.column("cell")[0].as_py()
+    recordings = [TestRecording(cell=cell, week=46, recorded_by="Nobody At All")]
+
+    logging.disable(logging.CRITICAL)
+    try:
+        records_before = len(logging.getLogger("birdology.prior.leakage").handlers)
+        result = apply_leakage_guards(t, recordings)
+    finally:
+        logging.disable(logging.NOTSET)
+
+    assert result.zero_match is True
+    assert result.banned_key_count == 1
+    assert result.contributor_rows_removed == 0
+    # No handler was added or left behind: the mechanism does not touch logging
+    # at all, so there is nothing to leak into the rest of the process.
+    assert len(logging.getLogger("birdology.prior.leakage").handlers) == records_before
+
+
+def test_the_zero_match_signal_survives_the_module_logger_being_renamed(monkeypatch):
+    """The other half of C1: the old detector hard-coded the LOGGER NAME.
+
+    Renaming this module's logger -- one letter -- bypassed the guard with
+    nothing raised, because the caller attached its handler to
+    `"birdology.prior.leakage"` by string. Nothing the data path does depends
+    on the logger's identity, so rebinding it to a logger nobody is listening
+    to changes no count.
+    """
+    monkeypatch.setattr(
+        leakage_module, "logger", logging.getLogger("somewhere.else.entirely")
+    )
+    t = _one_ole_at_cell_a_week_46()
+    cell = t.column("cell")[0].as_py()
+    result = apply_leakage_guards(
+        t, [TestRecording(cell=cell, week=46, recorded_by="Nobody At All")]
+    )
+    assert result.zero_match is True
+    assert result.banned_key_count == 1
+
+
+def test_the_banned_key_count_is_KEYS_not_the_recording_count():
+    """Two recordings that normalise to ONE key report one key, not two.
+
+    The count is what the guard HELD, which is what decides whether it could
+    bite. A caller re-deriving intent from `len(test_recordings)` -- which is
+    what the old `and test_recordings` conjunct did -- would be counting
+    something else, and a split whose rows all collided would be reported as
+    two keys where the guard only ever had one.
+    """
+    t = _one_ole_at_cell_a_week_46()
+    cell = t.column("cell")[0].as_py()
+    result = apply_leakage_guards(
+        t,
+        [
+            TestRecording(cell=cell, week=46, recorded_by="Ole"),
+            # Same key after normalisation: casefold + whitespace collapse.
+            TestRecording(cell=cell.upper(), week=46, recorded_by="  OLE  "),
+        ],
+    )
+    assert result.banned_key_count == 1
+
+
+def test_the_guard_result_separates_the_two_guards_row_counts():
+    """One mutant per guard needs one count per guard.
+
+    A single `rows_removed` total cannot tell a Xeno-Canto drop from a
+    contributor drop, so an escalation on "the split matched nothing" would be
+    satisfied by the XC guard having removed something entirely unrelated.
+    """
+    t = assign_cells(
+        _table(
+            [
+                (1, 55.6867, 12.5700, date(2025, 11, 14), XC, "Nobody"),
+                (1, 55.6867, 12.5700, date(2025, 11, 14), "pub", "Ole"),
+                (1, 55.6867, 12.5700, date(2025, 11, 14), "pub", "Jens"),
+            ]
+        ),
+        resolution=4,
+    )
+    cell = t.column("cell")[0].as_py()
+    result = apply_leakage_guards(
+        t, [TestRecording(cell=cell, week=46, recorded_by="Ole")]
+    )
+    assert result.xeno_canto_rows_removed == 1
+    assert result.contributor_rows_removed == 1
+    # The contributor guard saw the POST-XC table, so its denominator is 2.
+    assert result.rows_before_contributor_guard == 2
+    assert result.table.num_rows == 1
+
+
+def test_the_guard_result_is_not_a_table_so_an_old_caller_fails_loudly():
+    """Widening a return value must BREAK old call sites, not accommodate them.
+
+    `apply_leakage_guards` used to return a `pa.Table`. If the new result were
+    a tuple or a table subclass, a caller that never learned about the counts
+    would keep working and the escalation would be silently absent -- which is
+    exactly how the log-scraping mechanism survived three review passes. A
+    `LeakageGuardResult` has no `num_rows`, so such a caller raises at the
+    line that needs changing.
+    """
+    result = apply_leakage_guards(_one_ole_at_cell_a_week_46(), [])
+    assert not isinstance(result, pa.Table)
+    with pytest.raises(AttributeError):
+        getattr(result, "num_rows")  # noqa: B009 - the point is that it raises
+    assert isinstance(result.table, pa.Table)
 
 
 # --------------------------------------------------------------------------

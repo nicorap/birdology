@@ -102,6 +102,7 @@ cron or launchd entry invokes it; wire one up yourself if you want nightly refre
 | `scripts/reason.py` | Parallel pure-Python reasoner → materialised `output/birdology_reasoned.ttl` |
 | `scripts/chat.py` | Graph-RAG chat — LLM queries the graph via tool-calling (Ollama / Anthropic) |
 | `scripts/web_chat.py` | Flask web UI for the Graph-RAG chat with session history |
+| `scripts/build_prior.py` | Build the released spatiotemporal occurrence prior from a GBIF Darwin Core archive. Writes one full prior plus four controls per resolution, each with a `.json` provenance sidecar. Requires `--archive PATH`, `--source {eod,dof,eod+dof}`, `--gbif-doi DOI` (the citable DOI of the GBIF download — blank, whitespace-only and non-DOI values are refused at parse time, because every artifact is released CC BY 4.0 and must be attributable), and exactly one of `--test-split PATH` / `--no-test-split`. A supplied split that matches no occurrence fails the build rather than shipping a prior whose leakage guard removed nothing. |
 
 ## Query examples
 

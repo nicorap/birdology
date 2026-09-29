@@ -574,9 +574,19 @@ def _sidecar_path(npz: Path) -> Path:
 
 def save_prior(tensor: PriorTensor, path: Path) -> Path:
     """Write the matrix and its citable sidecar; return the `.npz` written."""
-    if not tensor.gbif_doi:
+    # `.strip()` is load-bearing, not tidying. `--gbif-doi '   '` from an unset
+    # shell variable is NOT empty, so `not tensor.gbif_doi` alone accepted it
+    # and wrote five artifacts whose attribution read `Derived from GBIF
+    # occurrence download    .` -- a CC BY 4.0 violation in a published
+    # release. The DOI is not repaired to `""` or stripped for storage: a
+    # blank attribution field is REFUSED, never coerced, because a repaired
+    # provenance string is indistinguishable from a real one for every reader
+    # that follows.
+    if not tensor.gbif_doi or not tensor.gbif_doi.strip():
         raise ValueError(
-            "refusing to write a prior artifact with an empty gbif_doi; this "
+            "refusing to write a prior artifact with an empty gbif_doi -- and "
+            "a whitespace-only one is empty for every purpose attribution has "
+            f"(got {tensor.gbif_doi!r}). This "
             f"release is licensed {LICENCE}, which REQUIRES attribution, and "
             "the GBIF download DOI is the only thing tying this tensor to the "
             "occurrence records it was derived from. Shipped without it the "

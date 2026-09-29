@@ -66,11 +66,14 @@ MUTANTS: list[tuple[str, str, list[tuple[str, str]]]] = [
     ),
     (
         "M3",
-        "XC guard disabled (no-op)",
+        "XC guard disabled (no-op). Returns (table, 0) rather than `table`: "
+        "the guard now REPORTS how many rows it removed, so a no-op that "
+        "returned a bare table would crash the module instead of exercising "
+        "the contract, and a crash is not a mutant",
         [
             (
                 '    keys = pa.array(sorted(XENO_CANTO_PUBLISHER_KEYS), pa.string())',
-                '    return table\n    keys = pa.array(sorted(XENO_CANTO_PUBLISHER_KEYS), pa.string())',
+                '    return table, 0\n    keys = pa.array(sorted(XENO_CANTO_PUBLISHER_KEYS), pa.string())',
             )
         ],
     ),
@@ -267,8 +270,8 @@ MUTANTS: list[tuple[str, str, list[tuple[str, str]]]] = [
         "apply_leakage_guards skips the XC guard",
         [
             (
-                "    return drop_test_contributor_cells(drop_xeno_canto(table), test_recordings)",
-                "    return drop_test_contributor_cells(table, test_recordings)",
+                "    after_xc, xc_removed = _drop_xeno_canto(table)",
+                "    after_xc, xc_removed = table, 0",
             )
         ],
     ),
@@ -277,8 +280,10 @@ MUTANTS: list[tuple[str, str, list[tuple[str, str]]]] = [
         "apply_leakage_guards skips the contributor guard",
         [
             (
-                "    return drop_test_contributor_cells(drop_xeno_canto(table), test_recordings)",
-                "    return drop_xeno_canto(table)",
+                "    kept, contributor_removed, banned_count = _drop_test_contributor_cells(\n"
+                "        after_xc, test_recordings\n"
+                "    )",
+                "    kept, contributor_removed, banned_count = after_xc, 0, 0",
             )
         ],
     ),
@@ -287,8 +292,8 @@ MUTANTS: list[tuple[str, str, list[tuple[str, str]]]] = [
         "empty-banned early return becomes a full wipe",
         [
             (
-                "    if not banned:\n        return table",
-                "    if not banned:\n        return table.slice(0, 0)",
+                "    if not banned:\n        return table, 0, 0",
+                "    if not banned:\n        return table.slice(0, 0), 0, 0",
             )
         ],
     ),
@@ -406,8 +411,20 @@ MUTANTS: list[tuple[str, str, list[tuple[str, str]]]] = [
     ),
     (
         "M34",
-        "F3: zero-match warning removed",
-        [("    elif banned:", "    elif False:")],
+        "F3: zero-match warning removed. It is now ONLY a warning: the build "
+        "script escalates on `LeakageGuardResult.zero_match`, so deleting this "
+        "deafens the log without disarming the guard. Both facts are pinned -- "
+        "this mutant by the leakage suite's own warning test, and the guard's "
+        "independence by "
+        "`test_the_zero_match_signal_survives_logging_being_disabled_entirely`",
+        [
+            (
+                "        logger.warning(\n"
+                '            "drop_test_contributor_cells: %d banned (cell, week, contributor) "',
+                "        _ = (\n"
+                '            "drop_test_contributor_cells: %d banned (cell, week, contributor) "',
+            )
+        ],
     ),
     (
         "M35",
@@ -415,10 +432,9 @@ MUTANTS: list[tuple[str, str, list[tuple[str, str]]]] = [
         "warning made unconditional, so an EMPTY banned set warns too",
         [
             (
-                "    banned = banned_keys(test_recordings)\n    if not banned:\n        return table",
-                "    banned = banned_keys(test_recordings)\n    if False:\n        return table",
+                "    banned = banned_keys(test_recordings)\n    if not banned:\n        return table, 0, 0",
+                "    banned = banned_keys(test_recordings)\n    if False:\n        return table, 0, 0",
             ),
-            ("    elif banned:", "    else:"),
         ],
     ),
     (
@@ -456,6 +472,95 @@ MUTANTS: list[tuple[str, str, list[tuple[str, str]]]] = [
         "M39",
         "F6: TestRecording does not store the coerced week",
         [('        object.__setattr__(self, "week", week)', "        pass")],
+    ),
+    # ---- C1: the zero-match signal is DATA, one mutant per field ----------
+    #
+    # `scripts/build_prior.py` escalates on `LeakageGuardResult.zero_match`.
+    # Each field the property reads gets its own mutant, because a single
+    # "counts are wrong" mutant cannot tell which half of the conjunction is
+    # load-bearing -- and each half fails in the OPPOSITE direction:
+    # `banned_key_count` too low disarms the guard on a real zero match, while
+    # `contributor_rows_removed` too high does the same, and
+    # `contributor_rows_removed` reported when nothing was removed breaks the
+    # legitimate `--no-test-split` mode instead.
+    (
+        "M50",
+        "C1: `banned_key_count` hard-wired to 0, so a supplied split that "
+        "matched nothing reports itself as the legitimate no-split mode and "
+        "the build script's zero-match escalation never fires. This is the "
+        "exact end state of the old log-scraping detector -- a well-formed, "
+        "publishable release whose leakage guard removed nothing -- reached "
+        "through the data channel instead",
+        [("    return kept, removed, len(banned)", "    return kept, removed, 0")],
+    ),
+    (
+        "M51",
+        "C1: `contributor_rows_removed` reported as 1 whatever happened, so "
+        "`zero_match` is always false. Separate mutant from M50: that one "
+        "makes the split look absent, this one makes the guard look like it "
+        "bit. A fixture asserting only that a real zero match is DETECTED "
+        "cannot tell the two apart, and each is reachable by its own "
+        "one-line regression",
+        [("    return kept, removed, len(banned)", "    return kept, 1, len(banned)")],
+    ),
+    (
+        "M52",
+        "C1: `zero_match` drops the `banned_key_count > 0` conjunct, so an "
+        "EMPTY split -- the legitimate `--no-test-split` mode -- reports a "
+        "zero match and every unguarded build fails. Its own mutant because "
+        "a one-sided fixture cannot tell a guard that is too weak from one "
+        "that is too strong, and the pressure from a guard that fires on a "
+        "legal build is to delete the guard rather than fix it",
+        [
+            (
+                "        return self.banned_key_count > 0 and self.contributor_rows_removed == 0",
+                "        return self.contributor_rows_removed == 0",
+            )
+        ],
+    ),
+    (
+        "M53",
+        "C1: `zero_match` drops the `contributor_rows_removed == 0` conjunct, "
+        "so ANY supplied split reports a zero match and a build whose guard "
+        "worked perfectly fails. The mirror of M52: together they prove both "
+        "conjuncts are load-bearing and neither is decoration",
+        [
+            (
+                "        return self.banned_key_count > 0 and self.contributor_rows_removed == 0",
+                "        return self.banned_key_count > 0",
+            )
+        ],
+    ),
+    (
+        "M54",
+        "C1: the XC guard's removal count folded into the contributor guard's, "
+        "so a build in which the XC guard removed rows and the contributor "
+        "guard removed NONE reports a non-zero contributor count and the "
+        "zero-match escalation is silently disarmed. Two guards therefore need "
+        "two counts: the XC guard runs on every build, including "
+        "`--no-test-split`, so one combined total is satisfied by activity "
+        "that has nothing to do with the split",
+        [
+            (
+                "        contributor_rows_removed=contributor_removed,",
+                "        contributor_rows_removed=contributor_removed + xc_removed,",
+            )
+        ],
+    ),
+    (
+        "M55",
+        "C1: `rows_before_contributor_guard` read from the PRE-XC table, so "
+        "the count the build script reports in its failure message names a "
+        "denominator the contributor guard never saw. Not a correctness bug in "
+        "the escalation itself, which is why it is its own mutant: the field "
+        "exists so the operator can read the removal RATE, and a wrong "
+        "denominator there sends them looking at the wrong guard",
+        [
+            (
+                "        rows_before_contributor_guard=after_xc.num_rows,",
+                "        rows_before_contributor_guard=table.num_rows,",
+            )
+        ],
     ),
 ]
 

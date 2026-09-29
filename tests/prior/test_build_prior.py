@@ -199,6 +199,41 @@ def test_doi_travels_into_every_artifact(tmp_path):
         assert load_prior(p).gbif_doi == DOI
 
 
+def test_the_controls_carry_the_doi_without_the_scripts_help(tmp_path):
+    """M3: the build script's 'belt and braces' comment, made true.
+
+    `build_from_archive` sets `control.gbif_doi = gbif_doi` on every control
+    and calls it belt-and-braces beside `controls._respec`'s own pass-through.
+    That was a claim about ANOTHER MODULE that nothing tested from here: the
+    harness's B11 deletes the assignment (the belt) and
+    `test_doi_travels_into_every_artifact` catches it, but nothing established
+    that the braces -- `_respec`'s pass-through -- existed at all. A comment
+    claiming redundancy that is not there is worse than no comment, because
+    the next person deletes the line it defends.
+
+    This asserts the pass-through DIRECTLY, on the library, with no build
+    script involved: a control built from a tensor that carries a DOI carries
+    it too. Killer test for the harness's B11b, which breaks `_respec` in
+    `controls.py` while leaving the build script's assignment intact -- so the
+    build-script tests pass on it and only this one fails.
+    """
+    from birdology.prior.controls import CONTROLS
+
+    paths = _build(tmp_path)
+    full = load_prior(next(p for p in paths if load_prior(p).spec.variant == "full"))
+    assert full.gbif_doi == DOI
+
+    for name, make in CONTROLS.items():
+        control = make(full)
+        assert control.gbif_doi == DOI, (
+            f"`_respec` did not carry the DOI into the {name!r} control, so "
+            "the build script's `control.gbif_doi = gbif_doi` is the ONLY "
+            "thing providing provenance and its 'belt and braces' comment is "
+            "false. Any other caller of the control builders -- a notebook, a "
+            "sweep driver -- would write an unattributed artifact"
+        )
+
+
 def test_filenames_encode_source_resolution_and_variant(tmp_path):
     paths = _build(tmp_path, resolution=5, source="eod", gbif_doi="d")
     names = {p.name for p in paths}
@@ -238,22 +273,34 @@ def test_the_full_prior_spans_every_week_of_the_year(tmp_path):
 
 
 def test_an_unobserved_week_is_ESTIMATED_not_defaulted_to_the_floor(tmp_path):
-    """THE T10-R1 assertion: a never-observed week reads STRICTLY ABOVE FLOOR.
+    """FIXTURE SANITY CHECK, not the proof of T10-R1. Read the whole docstring.
 
-    This is what the retired structural-zero check becomes, and it is what
-    distinguishes the two artifacts the ruling is about:
+    WHAT THIS DOES NOT PROVE, and why the reviewer's original ruling (which
+    asked for exactly this assertion as the proof) was WRONG:
 
-    * a week the backoff NEVER SAW is absent from the tensor and reads back
-      as exactly `FLOOR` -- "no evidence";
-    * a week it DID see, with no occurrence of that species, is STORED with a
-      shrunk estimate: the cell's annual profile pulled toward the species'
-      global profile.
+        backoff.py:340   out_p.append(min(max(p, params.floor), 1.0))
 
-    Week 30 is observed by NO record in the fixture. Passing the full week
-    grid means it is nevertheless estimated from the cell's own profile, so
-    its value is strictly greater than the floor. Under the observed-axes
-    default it would be absent and read exactly `FLOOR`, and the difference
-    between the two artifacts is invisible in every other respect.
+    Every emitted `p` is CLAMPED to FLOOR from below. So an estimated context
+    and a never-seen one are NUMERICALLY IDENTICAL whenever the estimate falls
+    at or below FLOOR -- and on a realistic rare species (1 record against
+    100k, 6 cells) all 312 estimated contexts land at or below 10*FLOOR, 261
+    of them EXACTLY FLOOR. On such a species `value > FLOOR` would FAIL on a
+    CORRECTLY BUILT artifact. The clamp makes "above the floor" a statement
+    about the DATA's abundance, not about whether the hierarchy ran.
+
+    On THIS fixture the two dense species are abundant, so the margin is
+    enormous (~492000x FLOOR) and the assertion holds comfortably -- which is
+    the other half of the problem: a threshold that passes by five orders of
+    magnitude discriminates nothing either.
+
+    So it is kept, as a FIXTURE-SPECIFIC sanity check that the fixture's own
+    abundant species really do come out above the floor, and it is demoted
+    from proof. The proof of T10-R1 is
+    `test_every_context_of_the_grid_is_stored_not_merely_reachable`
+    (`nnz == dense_capacity`), a REPRESENTATION claim the clamp cannot spoof,
+    and
+    `test_an_unobserved_week_is_SHRUNK_TOWARD_the_species_global_profile`,
+    which asserts the shrinkage itself rather than a magnitude.
     """
     paths = _build(tmp_path)
     t = load_prior(next(p for p in paths if load_prior(p).spec.variant == "full"))
@@ -263,25 +310,123 @@ def test_an_unobserved_week_is_ESTIMATED_not_defaulted_to_the_floor(tmp_path):
 
     value = t.lookup(SPECIES[0], t.cells[0], unobserved)
     assert value > FLOOR, (
-        f"week {unobserved} read exactly the floor, so it was never estimated: "
-        "the grid collapsed to the observed weeks"
+        f"week {unobserved} read exactly the floor. On THIS fixture the dense "
+        "species are abundant enough that a real estimate must exceed the "
+        "floor; on a rare species it legitimately would not (backoff.py:340 "
+        "clamps), which is why this is a fixture check and not the proof"
     )
-    # It is a real shrunk estimate, not a hair above the floor by accident.
+    # Fixture-specific magnitude, kept for the same reason and with the same
+    # caveat. NOT a general property: see the docstring.
     assert value > 10 * FLOOR
 
 
-def test_every_context_of_the_grid_is_stored_not_merely_reachable(tmp_path):
-    """`nnz` equals the dense capacity: every context carries a value.
+def test_an_unobserved_week_is_SHRUNK_TOWARD_the_species_global_profile(tmp_path):
+    """THE T10-R1 VALUE-LEVEL PROOF: shrinkage, not a magnitude threshold.
 
-    `lookup` floors an unstored context, so a single-context assertion cannot
-    by itself tell "estimated" from "defaulted" without comparing to FLOOR.
-    This is the whole-artifact form of the same claim, and it is what the
-    sidecar's published fill reports to a third party.
+    This is the assertion the reviewer could not construct, and it works
+    because it compares an unobserved week against TWO OTHER NUMBERS FROM THE
+    SAME ARTIFACT rather than against a constant. `min(max(p, floor), 1.0)`
+    can force a value UP to the floor; it cannot manufacture an ORDERING
+    between three values it did not compute.
+
+    The claim, straight out of `hierarchical_estimate`: for an unobserved
+    (species, cell, week), the cell-week level contributes nothing, so
+
+        p(unobserved week) == _shrink(0, 0, p_cell, w) == p_cell
+
+    -- the CELL's own annual profile for that species. And `p_cell` is itself
+    the cell's count shrunk toward the species' GLOBAL share. So the value at
+    an unobserved week must sit BETWEEN the species' behaviour in the two
+    cells it is compared against, and specifically:
+
+    * it must DIFFER between two cells where the species has different local
+      abundance, which a defaulted FLOOR could not do (FLOOR is one constant
+      and carries no cell information at all);
+    * the species that is LOCALLY COMMONER in a cell must read HIGHER at the
+      unobserved week in that same cell.
+
+    Both are properties of the hierarchy having run. The fixture's per-week
+    balance is deliberately unbalanced and CHANGES week to week
+    (`COUNTS_BY_WEEK`), so the two species' cell profiles genuinely differ.
+
+    NO NEW THRESHOLD CONSTANT is introduced: every number compared is read
+    from the artifact.
+    """
+    paths = _build(tmp_path)
+    t = load_prior(next(p for p in paths if load_prior(p).spec.variant == "full"))
+
+    unobserved = 30
+    assert unobserved not in OBSERVED_WEEKS
+
+    cell = t.cells[0]
+    dense_a = t.lookup(SPECIES[0], cell, unobserved)
+    dense_b = t.lookup(SPECIES[1], cell, unobserved)
+    sparse = t.lookup(SPARSE_SPECIES, cell, unobserved)
+
+    # 1. The unobserved week carries SPECIES-SPECIFIC information. A context
+    #    defaulted to the clamp would give all three the same FLOOR.
+    assert dense_a != sparse, (
+        "an abundant species and a one-record species read the SAME value at "
+        "an unobserved week, so the value carries no evidence: the week was "
+        "defaulted, not estimated"
+    )
+    assert dense_b != sparse
+
+    # 2. It is ORDERED by the species' actual abundance, which is the
+    #    shrinkage doing its work. The sparse species has one record in the
+    #    whole archive; the dense ones have dozens.
+    assert sparse < dense_a
+    assert sparse < dense_b
+
+    # 3. And it is strictly ABOVE the floor for the sparse species too -- not
+    #    because of any threshold, but because the floor is what a DEFAULTED
+    #    context reads, and a real estimate for a species with a record in
+    #    this very cell cannot coincide with "no evidence anywhere".
+    assert sparse != FLOOR, (
+        "the one-record species read EXACTLY the floor at an unobserved week, "
+        "which is what a context absent from the tensor reads: its estimate "
+        "was never computed"
+    )
+
+    # 4. The same context is STORED, so none of the above came from `lookup`'s
+    #    floor substitution. This is the link between the value-level claim and
+    #    the representation-level one.
+    row = int(np.where(t.species_keys == SPARSE_SPECIES)[0][0])
+    col = t.cells.index(cell) * WEEKS_PER_YEAR + (unobserved - 1)
+    assert t.values[row, col] != 0.0, (
+        "the context is not stored, so every assertion above was reading "
+        "`lookup`'s floor substitution rather than an estimate"
+    )
+
+
+def test_every_context_of_the_grid_is_stored_not_merely_reachable(tmp_path):
+    """THE STATED PROOF OF T10-R1: `nnz` equals the dense capacity.
+
+    Promoted from a supporting check to THE proof, because it is the one claim
+    in this file the FLOOR clamp cannot spoof. `backoff.py:340` clamps every
+    emitted `p` to FLOOR from below, so any assertion of the form "this value
+    is above FLOOR" is a statement about how abundant the data happened to be,
+    not about whether the hierarchy ran -- see
+    `test_an_unobserved_week_is_ESTIMATED_not_defaulted_to_the_floor` for the
+    measured case where it fails on a CORRECT artifact.
+
+    This is a REPRESENTATION claim instead: every context of the requested
+    (species x cells x 52) grid is physically STORED in the matrix. The clamp
+    changes values; it cannot conjure stored coordinates. Under the
+    observed-axes default the grid would collapse to the three observed weeks
+    and `nnz` would be 3/52 of the capacity, whatever any individual value
+    read.
+
+    It is also exactly what the sidecar's published `fill` reports to a third
+    party, so the proof and the released claim are one number.
     """
     paths = _build(tmp_path)
     t = load_prior(next(p for p in paths if load_prior(p).spec.variant == "full"))
     assert t.values.nnz == t.dense_capacity
     assert t.dense_capacity == len(ALL_SPECIES) * len(t.cells) * WEEKS_PER_YEAR
+    # ...and the fixture really is sparse in time, so a collapsed grid would be
+    # visibly smaller rather than coincidentally equal.
+    assert len(OBSERVED_WEEKS) < WEEKS_PER_YEAR
 
 
 def test_an_observed_week_and_an_unobserved_week_carry_DIFFERENT_values(tmp_path):
@@ -410,6 +555,54 @@ def test_the_peak_projection_scales_with_the_grid(tmp_path):
     # ...and it follows WEEKS_PER_YEAR, so a documented week window would
     # change the projection rather than leaving it stale.
     assert small == 10 * 10 * WEEKS_PER_YEAR * build_prior.MEASURED_BYTES_PER_CONTEXT
+
+
+def test_the_memory_constant_is_not_below_the_worst_measurement():
+    """I2: the constant must not drift back below what was actually measured.
+
+    The previous 160 B/ctx was fitted to two points at ONE grid shape and
+    under-predicted real builds by 26-41% -- in the direction that tells the
+    operator a build is CHEAPER than it is, which is precisely the OOM the
+    logging exists to prevent. Re-fitted across three scales and two fill
+    fractions, the worst observed cost was
+    `WORST_MEASURED_BYTES_PER_CONTEXT` B/ctx (net of the ~80 MB interpreter
+    baseline).
+
+    Asserted against the RECORDED MEASUREMENT rather than against itself, so a
+    future edit that rounds to the mean instead of up has to change the
+    measurement too -- which is a visible, arguable act rather than a silent
+    one. `>=` rather than `==`: a re-measurement on slower-scaling hardware may
+    legitimately raise the constant, and over-estimating costs a bigger node
+    while under-estimating costs the whole run.
+    """
+    assert build_prior.MEASURED_BYTES_PER_CONTEXT >= (
+        build_prior.WORST_MEASURED_BYTES_PER_CONTEXT
+    ), (
+        "MEASURED_BYTES_PER_CONTEXT is below the worst measured cost, so the "
+        "operator is told a build is cheaper than the measurements say: this "
+        "is the direction that under-warns"
+    )
+    # And the recorded measurement is itself above the discredited 160, so this
+    # test cannot pass by both numbers having been lowered together.
+    assert build_prior.WORST_MEASURED_BYTES_PER_CONTEXT > 160, (
+        "the recorded measurement has been lowered back toward the fitted-to-"
+        "two-points figure the review rejected"
+    )
+
+
+def test_the_projection_states_that_it_excludes_the_interpreter_baseline():
+    """The figure is NET, and a caller sizing a node must be told so.
+
+    An operator reading `~0.21 GB` for res 3 and provisioning 0.25 GB would
+    OOM on the interpreter alone. The exclusion is a property of the number,
+    so it belongs in the docstring of the thing that produces it, and it is
+    asserted here so a future rewrite cannot drop it silently.
+    """
+    assert "baseline" in (build_prior.project_peak_bytes.__doc__ or ""), (
+        "`project_peak_bytes` no longer states that its figure excludes the "
+        "interpreter baseline"
+    )
+    assert "EXCLUDES" in (build_prior.project_peak_bytes.__doc__ or "")
 
 
 def test_the_cell_axis_is_sorted_too(tmp_path):
@@ -586,7 +779,7 @@ def test_the_cli_requires_a_split_decision(capsys):
     """
     with pytest.raises(SystemExit):
         build_prior._parse_args(
-            ["--archive", "a.zip", "--source", "dof", "--gbif-doi", "d"]
+            ["--archive", "a.zip", "--source", "dof", "--gbif-doi", DOI]
         )
     assert "test-split" in capsys.readouterr().err
 
@@ -595,7 +788,7 @@ def test_the_cli_refuses_both_split_flags_at_once(capsys):
     with pytest.raises(SystemExit):
         build_prior._parse_args(
             [
-                "--archive", "a.zip", "--source", "dof", "--gbif-doi", "d",
+                "--archive", "a.zip", "--source", "dof", "--gbif-doi", DOI,
                 "--test-split", "s.csv", "--no-test-split",
             ]
         )
@@ -617,14 +810,107 @@ def test_the_cli_requires_a_gbif_doi(capsys):
     assert "gbif-doi" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("blank", ["", " ", "   ", "\t", "\n", " \t \n "])
+def test_the_cli_refuses_a_BLANK_gbif_doi(capsys, blank):
+    """C2: `required=True` requires the FLAG, not a VALUE.
+
+    Reproduced before the fix: `--gbif-doi ''` and `--gbif-doi '   '` were both
+    ACCEPTED, and the whitespace one is the dangerous half -- `save_prior`
+    refused an EMPTY doi, but `'   '` is not empty, so all five artifacts wrote
+    with sidecar `gbif_doi: '   '` and attribution
+    `Derived from GBIF occurrence download    .` That is a CC BY 4.0
+    attribution violation in a published artifact.
+
+    The operator path is completely ordinary:
+
+        python scripts/build_prior.py --gbif-doi "$DOI" ...   # $DOI unset
+
+    `test_the_cli_requires_a_gbif_doi` only tests flag ABSENCE, which is why it
+    caught neither. Parametrised over several whitespace spellings because a
+    guard written as `value != " "` would pass on one of them.
+    """
+    with pytest.raises(SystemExit):
+        build_prior._parse_args(
+            [
+                "--archive", "a.zip", "--source", "dof", "--no-test-split",
+                "--gbif-doi", blank,
+            ]
+        )
+    err = capsys.readouterr().err
+    assert "blank or whitespace-only" in err, err
+
+
+def test_the_cli_refuses_a_gbif_doi_that_is_not_a_DOI(capsys):
+    """A GBIF download KEY in the DOI field is a mis-attributed release.
+
+    DEVIATION, reported as such: the findings file explicitly did not rule on
+    a shape check. Implemented because a GBIF download has BOTH a key
+    (`0012345-230530130807322`) and a DOI (`10.15468/dl.abc123`), the download
+    page shows both, and only the DOI is citable. A key in this field produces
+    a well-formed, permanently mis-attributed release that no reader of the
+    artifact can detect -- the same class of failure as the blank, one step
+    less obvious. It is a SHAPE check only: nothing here can verify the DOI
+    names the download this archive actually came from, so it catches the wrong
+    KIND of identifier, not a wrong one.
+    """
+    for bad in ("0012345-230530130807322", "dof.zip", "GBIF", "11.15468/dl.x"):
+        with pytest.raises(SystemExit):
+            build_prior._parse_args(
+                [
+                    "--archive", "a.zip", "--source", "dof", "--no-test-split",
+                    "--gbif-doi", bad,
+                ]
+            )
+        assert "is not shaped like a DOI" in capsys.readouterr().err
+
+
+def test_the_cli_accepts_every_documented_doi_spelling():
+    """Guards the two checks above against being too strict to use.
+
+    Without this, a shape check tightened to `value.startswith("10.15468/")`
+    would pass both rejection tests while refusing a legitimate DOI copied as
+    a URL from the GBIF download page -- and the pressure would be to remove
+    the check rather than fix it.
+    """
+    for good in (
+        "10.15468/dl.abc123",
+        "doi:10.15468/dl.abc123",
+        "https://doi.org/10.15468/dl.abc123",
+        "http://dx.doi.org/10.15468/dl.abc123",
+    ):
+        args = build_prior._parse_args(
+            [
+                "--archive", "a.zip", "--source", "dof", "--no-test-split",
+                "--gbif-doi", good,
+            ]
+        )
+        # Accepted VERBATIM: not stripped, not canonicalised. The sidecar must
+        # carry the string the operator attested to.
+        assert args.gbif_doi == good
+
+
+def test_save_prior_refuses_a_WHITESPACE_ONLY_doi_from_any_caller(tmp_path):
+    """C2's library half: the CLI guard is not the only thing standing here.
+
+    `non_blank_doi` protects the command line; this protects every other caller
+    of the library, including a notebook, a future sweep driver, and this
+    plan's own controls. Independently load-bearing: neither is redundant, and
+    the harness has one mutant per site for exactly that reason.
+    """
+    out = tmp_path / "priors"
+    with pytest.raises(ValueError, match="empty gbif_doi"):
+        _build(tmp_path, gbif_doi="   ", out_dir=out)
+    assert not out.exists() or not list(out.glob("*.npz"))
+
+
 def test_the_cli_accepts_either_split_flag_alone(tmp_path):
     args = build_prior._parse_args(
-        ["--archive", "a.zip", "--source", "dof", "--gbif-doi", "d",
+        ["--archive", "a.zip", "--source", "dof", "--gbif-doi", DOI,
          "--no-test-split"]
     )
     assert args.no_test_split is True and args.test_split is None
     args = build_prior._parse_args(
-        ["--archive", "a.zip", "--source", "dof", "--gbif-doi", "d",
+        ["--archive", "a.zip", "--source", "dof", "--gbif-doi", DOI,
          "--test-split", "s.csv"]
     )
     assert args.no_test_split is False and args.test_split == Path("s.csv")
@@ -753,8 +1039,75 @@ def test_a_mismatched_resolution_FAILS_the_artifact_rather_than_writing_it(
     assert not out.exists() or not list(out.glob("*.npz"))
 
 
+def _build_script_tree():
+    import ast
+
+    return ast.parse(Path(build_prior.__file__).read_text(encoding="utf-8"))
+
+
+def _function(tree, name):
+    import ast
+
+    return next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name
+    )
+
+
+def _reachable_raise(node) -> bool:
+    """Whether *node*'s own control flow can reach a `raise`.
+
+    RECURSIVE on purpose, rather than a single `ast.walk` with a filter, so
+    both evasions are closed at ANY nesting depth:
+
+    * E1 -- does not descend into a nested `def`/`class`/`lambda`. A `raise`
+      inside a function nobody calls is not a re-raise, and `ast.walk`
+      descended into it.
+    * E4 -- does not descend into the body of a statically-false `if`/`while`.
+      `if False: raise` is unreachable code, and a one-level prune would miss
+      `if True:\\n    if False:\\n        raise`.
+
+    Only CONSTANT-false conditions are pruned. This is a structural check, not
+    a reachability analysis; `if False:` and `if 0:` are the forms a bypass
+    actually takes, and anything cleverer would be guessing.
+    """
+    import ast
+
+    for child in ast.iter_child_nodes(node):
+        if isinstance(
+            child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+        ):
+            continue
+        if isinstance(child, ast.Raise):
+            return True
+        if isinstance(child, (ast.If, ast.While)):
+            test = child.test
+            if isinstance(test, ast.Constant) and not test.value:
+                # Dead body; the `else` branch is the live one.
+                if any(_reachable_raise_stmt(s) for s in child.orelse):
+                    return True
+                continue
+        if _reachable_raise(child):
+            return True
+    return False
+
+
+def _reachable_raise_stmt(stmt) -> bool:
+    """`_reachable_raise` including *stmt* itself, for a statement list."""
+    import ast
+
+    if isinstance(stmt, ast.Raise):
+        return True
+    if isinstance(
+        stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+    ):
+        return False
+    return _reachable_raise(stmt)
+
+
 def test_no_except_handler_in_the_build_script_swallows_anything():
-    """Obligation 2, structurally: every handler RE-RAISES.
+    """Obligation 2, structurally: every handler RE-RAISES, reachably.
 
     A blanket "no `except` anywhere" grep is the wrong check here and was
     tried first: `load_test_split` legitimately catches the `TypeError` /
@@ -766,48 +1119,284 @@ def test_no_except_handler_in_the_build_script_swallows_anything():
     What must never happen is a handler that returns, passes, logs, or
     otherwise lets the build continue past a guard error. Checked with the
     AST rather than by grep, so it sees the handler BODIES rather than the
-    keyword: a handler is acceptable only if it raises.
+    keyword.
 
-    The `try` in `build_from_archive` has no `except` at all -- its `finally`
-    detaches a log handler -- so it contributes no handler here and the
-    pipeline path is covered by the absence.
+    TWO EVASIONS ARE CLOSED HERE, both executed against the previous version:
+
+    * E1 -- a handler whose body only DEFINES a nested function that raises.
+      `ast.walk` descended into the nested `def`, so unreachable code in an
+      uncalled function counted as a re-raise.
+    * E4 -- `if False: raise` inside a swallowing handler, at any depth.
+
+    Both through `_reachable_raise`, which is recursive so neither can be
+    re-opened by adding a level of nesting.
     """
     import ast
 
-    tree = ast.parse(Path(build_prior.__file__).read_text(encoding="utf-8"))
+    tree = _build_script_tree()
     handlers = [n for n in ast.walk(tree) if isinstance(n, ast.ExceptHandler)]
     assert handlers, "the AST walk found nothing; the check would be vacuous"
     for handler in handlers:
-        assert any(
-            isinstance(node, ast.Raise) for node in ast.walk(handler)
-        ), f"except handler at line {handler.lineno} does not re-raise"
+        assert _reachable_raise(handler), (
+            f"except handler at line {handler.lineno} does not re-raise from "
+            "its own reachable body (a nested function definition or a "
+            "statically-dead branch does not count)"
+        )
 
 
-def test_the_pipeline_call_path_has_no_except_at_all():
-    """The stages themselves are not wrapped, not even to re-raise.
+#: Names whose CALL suppresses an exception without producing an
+#: `ast.ExceptHandler` node at all. EVASION E2, executed and confirmed to pass
+#: the previous check: `with contextlib.suppress(ValueError): <stage>` around
+#: any pipeline call swallows a guard error with no `except` keyword anywhere
+#: in the file. Matched on the attribute/name spelling rather than by import
+#: analysis, because both `contextlib.suppress(...)` and a bare
+#: `suppress(...)` from a `from contextlib import suppress` are the same defect.
+EXCEPTION_SUPPRESSING_CALLS = ("suppress",)
+
+
+def test_the_pipeline_call_path_has_no_try_at_all():
+    """The stages are not wrapped, not even in a bare `try/finally`.
 
     `build_from_archive` orchestrates every guard in the plan. A handler
     around any of them -- however well-intentioned -- would convert a guard
     error into something the loop could survive, and the artifact it then
     wrote would be leak-contaminated under a normal-looking name.
+
+    THE OLD CHECK WAS ASYMMETRIC AND THAT WAS THE HOLE. It forbade
+    `ExceptHandler` in `build_from_archive` and `Try` in `main`, so three of
+    the five executed evasions walked straight through:
+
+    * E3 -- a `return` added to `build_from_archive`'s EXISTING `finally`
+      block. A `return` in a `finally` DISCARDS any in-flight exception,
+      including a guard `ValueError`, and a finally-only `Try` has no
+      `ExceptHandler` node to find. This was the serious one, and it is why
+      the finally is gone: the logging handler that needed it is gone too
+      (C1), so `ast.Try` is now forbidden OUTRIGHT here rather than
+      whitelisted in a finally-only form. A whitelist would have had to
+      re-admit the exact node type the evasion used.
+    * E2 -- `contextlib.suppress(ValueError)`, which produces no
+      `ExceptHandler` at all.
+    * E5 -- the loop body moved into a helper that catches `ValueError` and
+      raises `SystemExit(0)`: obligation 2's forbidden behaviour (a failed
+      artifact skipped, exit 0) dressed in the house error contract. Covered
+      by the module-wide `SystemExit` check below.
     """
     import ast
 
-    tree = ast.parse(Path(build_prior.__file__).read_text(encoding="utf-8"))
-    build = next(
-        n
-        for n in ast.walk(tree)
-        if isinstance(n, ast.FunctionDef) and n.name == "build_from_archive"
+    tree = _build_script_tree()
+    build = _function(tree, "build_from_archive")
+
+    # E3: no `Try` of ANY shape, finally-only included.
+    tries = [n for n in ast.walk(build) if isinstance(n, ast.Try)]
+    assert not tries, (
+        f"`build_from_archive` contains {len(tries)} `try` statement(s) at "
+        f"line(s) {[n.lineno for n in tries]}. Even a bare `try/finally` is "
+        "forbidden: a `return` added to a `finally` silently DISCARDS every "
+        "in-flight exception, including the guard ValueError this function "
+        "exists to propagate, and it produces no `except` node for a "
+        "handler-shaped check to find"
     )
-    assert not [n for n in ast.walk(build) if isinstance(n, ast.ExceptHandler)]
+
     # ...and `main`'s resolution loop is unwrapped too, so a failed artifact
     # exits non-zero rather than being skipped.
-    main = next(
-        n
-        for n in ast.walk(tree)
-        if isinstance(n, ast.FunctionDef) and n.name == "main"
-    )
+    main = _function(tree, "main")
     assert not [n for n in ast.walk(main) if isinstance(n, ast.Try)]
+
+    # E2: no exception-suppressing context manager anywhere in the module. Not
+    # scoped to `build_from_archive`: a `suppress` around the call in `main` is
+    # the same defect one frame out, and the build script has no legitimate use
+    # for one.
+    suppressors = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and (
+            (isinstance(node.func, ast.Name) and node.func.id in EXCEPTION_SUPPRESSING_CALLS)
+            or (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr in EXCEPTION_SUPPRESSING_CALLS
+            )
+        )
+    ]
+    assert not suppressors, (
+        f"the build script calls an exception-suppressing context manager at "
+        f"line(s) {[n.lineno for n in suppressors]}; `contextlib.suppress` "
+        "swallows a guard error while producing no `except` node at all"
+    )
+
+
+def test_the_build_script_never_converts_a_guard_error_into_a_clean_exit():
+    """EVASION E5: `except ValueError: raise SystemExit(0)` is still a swallow.
+
+    Executed against the previous check and it passed BOTH AST tests: move the
+    resolution-loop body into a helper, catch `ValueError` there, and
+    `raise SystemExit(0)`. The handler re-raises, so the handler check is
+    satisfied; the helper is neither `build_from_archive` nor `main`, so the
+    node-type check never looks at it. What reaches the operator is exit 0
+    with a failed artifact skipped -- obligation 2's forbidden behaviour,
+    dressed in this plan's own error contract.
+
+    `SystemExit` and `sys.exit` are therefore forbidden in the build script
+    entirely. It has no legitimate use for either: `main` returns `None`, an
+    uncaught `ValueError` gives a non-zero exit through the interpreter's
+    normal path, and argparse's own `SystemExit` comes from argparse rather
+    than from this file.
+    """
+    import ast
+
+    tree = _build_script_tree()
+    offenders = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Raise):
+            exc = node.exc
+            target = exc.func if isinstance(exc, ast.Call) else exc
+            if isinstance(target, ast.Name) and target.id == "SystemExit":
+                offenders.append(node.lineno)
+            if isinstance(target, ast.Attribute) and target.attr == "SystemExit":
+                offenders.append(node.lineno)
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Attribute) and func.attr == "exit":
+                offenders.append(node.lineno)
+            if isinstance(func, ast.Name) and func.id == "exit":
+                offenders.append(node.lineno)
+    assert not offenders, (
+        f"the build script raises SystemExit or calls sys.exit at line(s) "
+        f"{sorted(offenders)}. A guard ValueError caught and re-raised as "
+        "`SystemExit(0)` satisfies every handler check in this file while "
+        "skipping a failed artifact and reporting success"
+    )
+
+
+def test_the_ast_evasion_checks_are_not_vacuous():
+    """Each check above must FAIL on the evasion it claims to close.
+
+    Without this, a check that walked the wrong tree, matched the wrong node
+    type, or was scoped to a function that no longer exists would pass exactly
+    as it does now. Every evasion is constructed as source here and parsed, so
+    the assertion is about the CHECK rather than about today's build script.
+    """
+    import ast
+
+    # E1: handler whose body only defines a nested function that raises.
+    e1 = ast.parse(
+        "def f():\n"
+        "    try:\n"
+        "        g()\n"
+        "    except ValueError:\n"
+        "        def inner():\n"
+        "            raise RuntimeError('never called')\n"
+        "        return []\n"
+    )
+    handler = next(n for n in ast.walk(e1) if isinstance(n, ast.ExceptHandler))
+    assert any(isinstance(n, ast.Raise) for n in ast.walk(handler)), (
+        "precondition: a plain ast.walk DOES find the nested raise, which is "
+        "what made E1 an evasion"
+    )
+    assert not _reachable_raise(
+        handler
+    ), "E1 is not closed: a nested definition's raise still counts as a re-raise"
+
+    # E4: `if False: raise` inside a swallowing handler.
+    e4 = ast.parse(
+        "def f():\n"
+        "    try:\n"
+        "        g()\n"
+        "    except ValueError:\n"
+        "        if False:\n"
+        "            raise\n"
+        "        return []\n"
+    )
+    handler = next(n for n in ast.walk(e4) if isinstance(n, ast.ExceptHandler))
+    assert any(isinstance(n, ast.Raise) for n in ast.walk(handler)), (
+        "precondition: a plain ast.walk DOES find the dead raise"
+    )
+    assert not _reachable_raise(
+        handler
+    ), "E4 is not closed: a statically-dead raise still counts as a re-raise"
+
+    # E4 again, ONE LEVEL DEEPER, because a non-recursive prune would pass the
+    # form above and fail this one.
+    e4_nested = ast.parse(
+        "def f():\n"
+        "    try:\n"
+        "        g()\n"
+        "    except ValueError:\n"
+        "        if True:\n"
+        "            if False:\n"
+        "                raise\n"
+        "        return []\n"
+    )
+    nested = next(n for n in ast.walk(e4_nested) if isinstance(n, ast.ExceptHandler))
+    assert not _reachable_raise(
+        nested
+    ), "E4 is not closed at depth: the check is not recursive"
+
+    # E3: a finally-only Try, which has NO ExceptHandler node.
+    e3 = ast.parse(
+        "def build_from_archive():\n"
+        "    try:\n"
+        "        g()\n"
+        "    finally:\n"
+        "        return []\n"
+    )
+    build = _function(e3, "build_from_archive")
+    assert not [n for n in ast.walk(build) if isinstance(n, ast.ExceptHandler)], (
+        "precondition: a finally-only Try really does produce no handler node, "
+        "which is what made E3 invisible to the old check"
+    )
+    assert [n for n in ast.walk(build) if isinstance(n, ast.Try)], (
+        "E3 is not closed: the finally-only Try is not detected"
+    )
+
+    # E2: contextlib.suppress, in both spellings.
+    for source in (
+        "with contextlib.suppress(ValueError):\n    g()\n",
+        "with suppress(ValueError):\n    g()\n",
+    ):
+        tree = ast.parse(source)
+        assert not [n for n in ast.walk(tree) if isinstance(n, ast.ExceptHandler)], (
+            "precondition: suppress produces no handler node"
+        )
+        found = [
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Call)
+            and (
+                (
+                    isinstance(n.func, ast.Name)
+                    and n.func.id in EXCEPTION_SUPPRESSING_CALLS
+                )
+                or (
+                    isinstance(n.func, ast.Attribute)
+                    and n.func.attr in EXCEPTION_SUPPRESSING_CALLS
+                )
+            )
+        ]
+        assert found, f"E2 is not closed for {source!r}"
+
+    # E5: a helper that catches ValueError and raises SystemExit(0).
+    e5 = ast.parse(
+        "def _one(resolution):\n"
+        "    try:\n"
+        "        build_from_archive(resolution)\n"
+        "    except ValueError as exc:\n"
+        "        raise SystemExit(0) from exc\n"
+    )
+    handler = next(n for n in ast.walk(e5) if isinstance(n, ast.ExceptHandler))
+    assert any(isinstance(n, ast.Raise) for n in ast.walk(handler)), (
+        "precondition: E5's handler DOES re-raise, which is why the handler "
+        "check passed on it"
+    )
+    system_exits = [
+        n
+        for n in ast.walk(e5)
+        if isinstance(n, ast.Raise)
+        and isinstance(n.exc, ast.Call)
+        and isinstance(n.exc.func, ast.Name)
+        and n.exc.func.id == "SystemExit"
+    ]
+    assert system_exits, "E5 is not closed: raise SystemExit(0) is not detected"
 
 
 # --------------------------------------------------------------------------
@@ -816,13 +1405,17 @@ def test_the_pipeline_call_path_has_no_except_at_all():
 
 
 def test_a_split_that_matches_nothing_fails_the_build(tmp_path):
-    """Obligation 4: the zero-match warning becomes a build failure.
+    """Obligation 4: a supplied split that bit nothing is a BUILD FAILURE.
 
     A split at the right resolution whose CONTRIBUTOR appears nowhere in the
-    archive removes no row, logs one WARNING, and otherwise builds a perfect
-    artifact whose leakage guard did nothing. That is the shared symptom of
-    four silent failure modes, and since a split WAS supplied it is a failure
-    rather than a note.
+    archive removes no row and otherwise builds a perfect artifact whose
+    leakage guard did nothing. That is the shared symptom of four silent
+    failure modes, and since a split WAS supplied it is a failure rather than
+    a note.
+
+    The condition is read from `LeakageGuardResult`'s counts, not from a log
+    record; `test_the_zero_match_guard_fires_under_every_hostile_logging_config`
+    is what proves that.
     """
     out = tmp_path / "priors"
     ghost = recordings_at_resolution(
@@ -834,6 +1427,167 @@ def test_a_split_that_matches_nothing_fails_the_build(tmp_path):
     with pytest.raises(ZeroMatchGuardError, match="matched no occurrence"):
         _build(tmp_path, resolution=4, test_recordings=ghost, out_dir=out)
     assert not out.exists() or not list(out.glob("*.npz"))
+
+
+#: The logging configurations that were REPRODUCED disarming the old
+#: handler-and-string-match detector. `basicConfig(level=ERROR)` before `main()`
+#: is the one that was executed end to end: 10 artifacts written, exit 0.
+#: `logging.disable(CRITICAL)` is strictly stronger; raising the level on
+#: leakage's OWN logger is the narrowest. All three must leave the guard armed.
+HOSTILE_LOGGING_CONFIGS = ("basicConfig_ERROR", "disable_CRITICAL", "module_logger_off")
+
+
+@pytest.mark.parametrize("config", HOSTILE_LOGGING_CONFIGS)
+def test_the_zero_match_guard_fires_under_every_hostile_logging_config(
+    tmp_path, config
+):
+    """C1, END TO END: no logging configuration can disarm the guard.
+
+    THE REPRODUCED FAILURE. With `logging.basicConfig(level=logging.ERROR)`
+    set before `main()` -- one line, exactly what a CI wrapper or a cron
+    harness does -- and a test split matching nothing, the previous build
+    wrote ALL TEN artifacts (five priors + five sidecars) and returned exit 0.
+    `main()`'s own `basicConfig` is a documented no-op once the root logger
+    has handlers, so the WARNING the detector scraped never reached it.
+
+    The guard now reads `LeakageGuardResult.zero_match`, two integers returned
+    by the function that filtered. These three configurations therefore change
+    nothing, and the artifact directory stays EMPTY -- which is the assertion
+    that would have caught the original defect, because the old mechanism
+    failed by WRITING rather than by raising the wrong error.
+
+    Each config is asserted to have really taken effect (no WARNING is
+    delivered), so the test cannot pass vacuously on a run where logging was
+    never actually suppressed.
+    """
+    out = tmp_path / "priors"
+    split = _split_csv(tmp_path, [(55.6867, 12.5700, 2, "nobody-by-that-name")])
+    argv = [
+        "--archive", str(_archive(tmp_path)), "--source", "dof",
+        "--resolutions", "4", "--out", str(out),
+        "--gbif-doi", DOI, "--test-split", str(split),
+    ]
+
+    root = logging.getLogger()
+    leak = logging.getLogger("birdology.prior.leakage")
+    saved = (root.level, list(root.handlers), leak.level, leak.disabled)
+    delivered: list[logging.LogRecord] = []
+
+    class _Spy(logging.Handler):
+        def emit(self, record):
+            delivered.append(record)
+
+    spy = _Spy(level=logging.WARNING)
+    root.addHandler(spy)
+    try:
+        if config == "basicConfig_ERROR":
+            # A handler is already attached (the spy), so `main`'s own
+            # `basicConfig` is a no-op -- which is the documented behaviour
+            # that made the original evasion work.
+            logging.basicConfig(level=logging.ERROR)
+            root.setLevel(logging.ERROR)
+        elif config == "disable_CRITICAL":
+            logging.disable(logging.CRITICAL)
+        elif config == "module_logger_off":
+            leak.setLevel(logging.CRITICAL)
+
+        with pytest.raises(ZeroMatchGuardError, match="matched no occurrence"):
+            build_prior.main(argv)
+    finally:
+        logging.disable(logging.NOTSET)
+        root.removeHandler(spy)
+        root.setLevel(saved[0])
+        root.handlers[:] = saved[1]
+        leak.setLevel(saved[2])
+        leak.disabled = saved[3]
+
+    # THE PRECONDITION: the configuration really did suppress the warning the
+    # old detector depended on. Without this the test could pass on a run where
+    # logging was still working.
+    assert not [
+        r for r in delivered if "matched zero of" in r.getMessage()
+    ], f"{config} did not actually suppress the zero-match WARNING"
+
+    # And NOTHING was written. The original defect's signature was ten files on
+    # disk and exit 0, so this is the assertion that discriminates.
+    assert not out.exists() or not list(out.glob("*")), (
+        "the build wrote artifacts despite a split that matched nothing -- "
+        "this is the exact C1 failure: a complete, publishable release whose "
+        "leakage guard removed nothing"
+    )
+
+
+def test_the_build_script_does_not_scrape_logs_for_control_flow():
+    """The dead detector is GONE, not kept as a second opinion.
+
+    A dead detector beside a live one is how the next reviewer stops looking
+    for a real one, so the handler path is deleted rather than demoted. This
+    asserts the deletion structurally: the build script must not define a
+    `logging.Handler`, must not attach one, and must not reference the
+    leakage module's warning-marker constant at all.
+    """
+    import ast
+
+    tree = ast.parse(Path(build_prior.__file__).read_text(encoding="utf-8"))
+
+    # Checked on the AST, not by substring: `ZeroMatchGuardError`'s docstring
+    # NAMES the deleted mechanism on purpose, so the next reader knows what was
+    # tried and why it failed. A grep would force that history out of the file,
+    # which is the opposite of what this finding asked for.
+    forbidden_attrs = {"addHandler", "removeHandler", "Handler", "LogRecord"}
+    offenders = [
+        (n.attr, n.lineno)
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Attribute) and n.attr in forbidden_attrs
+    ]
+    offenders += [
+        (n.id, n.lineno)
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Name) and n.id in forbidden_attrs
+    ]
+    assert not offenders, (
+        f"the build script still manipulates logging handlers at {offenders}: "
+        "the zero-match guard must read returned counts, and a second "
+        "log-based opinion beside it is how the dead detector survived three "
+        "review passes"
+    )
+
+    # ...and it does not import the marker constant the old path scraped.
+    imported = {
+        alias.name
+        for n in ast.walk(tree)
+        if isinstance(n, ast.ImportFrom)
+        for alias in n.names
+    }
+    assert "ZERO_MATCH_WARNING_MARKER" not in imported
+
+    handler_classes = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.ClassDef)
+        and any(
+            (isinstance(b, ast.Attribute) and b.attr == "Handler")
+            or (isinstance(b, ast.Name) and b.id == "Handler")
+            for b in n.bases
+        )
+    ]
+    assert not handler_classes, "the build script defines a logging.Handler subclass"
+
+
+def test_the_zero_match_guard_reads_the_guard_results_own_counts():
+    """The guard's CONDITION is `LeakageGuardResult.zero_match` and nothing else.
+
+    Pinned at the source level because the alternative -- the build script
+    re-deriving the condition from `len(test_recordings)`, as the old
+    `and test_recordings` conjunct did -- is behaviourally identical on every
+    fixture in this file while being wrong for a split whose rows all
+    normalise to one key, or to none.
+    """
+    source = Path(build_prior.__file__).read_text(encoding="utf-8")
+    assert "if guarded.zero_match:" in source, (
+        "the escalation is no longer a comparison on the guard's returned "
+        "counts"
+    )
 
 
 def test_a_split_that_DOES_match_removes_rows_and_builds(tmp_path):

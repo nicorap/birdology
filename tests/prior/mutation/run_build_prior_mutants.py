@@ -45,8 +45,16 @@ ONE MUTANT PER DISJUNCT
   mutual exclusion)
 * the per-resolution cell derivation -> B24 (hoisted out of the loop), B25
   (a fixed resolution inside it)
-* the zero-match guard's two clauses -> B30 (the detector fires at all),
-  B31 (the `and test_recordings` conjunct)
+* the zero-match guard -> B30 (the escalation exists at all), B31 (the
+  CALLER's condition, so `--no-test-split` stays legal), B32 (the condition is
+  the guard's OWN returned count, not a re-derivation from the argument),
+  B33 (it is logging-INDEPENDENT), B33b (the LIBRARY's disjunct, in
+  `leakage.py`)
+* `--gbif-doi` -> B13 (the flag is required), B13b (a VALUE is required at
+  all), B13c (the whitespace disjunct), B13d/B13e (the shape check, both
+  directions), B13f (the independent LIBRARY guard in `tensor.py`)
+* the AST no-swallow checks -> B28-E1..E5, one per EXECUTED evasion, plus
+  B28-E6 for their vacuity guard
 * `load_test_split`'s empty / missing-column checks -> B34, B35
 
 WHAT THIS SET DOES NOT COVER -- stated so the table is not read as more than
@@ -64,7 +72,19 @@ it is
   set -- both are derived from the same `counts` table. B2 therefore mutates
   the estimator function's contract (does it honour the axis it is GIVEN),
   which is observable, rather than claiming an end-to-end kill that does not
-  exist. The `weeks=` half is genuinely different: B1 dies twice over.
+  exist. The `weeks=` half is genuinely different -- BUT THE KILL COUNT
+  DEPENDS ON THE EXACT MUTATION, and an earlier version of this note
+  understated it by not saying which:
+
+    - dropping `weeks=` from the SEAM (`estimate_over_full_grid`'s call into
+      `hierarchical_estimate`, which is what B1 edits) fails TWO tests;
+    - dropping it from the build script's own call into
+      `estimate_over_full_grid` fails FIVE.
+
+  Both are real; they are different mutations of different lines, and
+  reporting the larger number for the smaller mutation is the kind of
+  overstatement this file exists to avoid. B1 applies the SEAM edit, so B1's
+  kill set is two.
   This asymmetry is real and is reported as such rather than papered over
   with a mutant that would have had to be labelled dishonestly.
 * SCALE. The largest fixture is 3 species x 4 cells x 52 weeks = 624
@@ -74,9 +94,13 @@ it is
   build script's docstring table) rather than asserted by a test, because a
   peak-RSS assertion on a 624-context fixture would pin nothing and a
   national-scale one would take minutes per run. B16/B17 pin that the
-  measured scaling is SURFACED to the operator and varies with the grid;
-  they do NOT pin that 160 bytes/context is still the right constant, which
-  would drift silently if `to_tensor`'s representation changed.
+  measured scaling is SURFACED to the operator and varies with the grid, and
+  B17b/B17c/B17d now pin the CONSTANT against a recorded measurement -- which
+  is a different and weaker claim than pinning it against reality: if
+  `to_tensor`'s representation changed, both the constant and the recorded
+  measurement would be stale together and no test here would notice. Only a
+  re-measurement can establish that, and the measurement harness is not part
+  of this suite.
 * THAT THE DOI IS THE RIGHT ONE. B10/B11 prove the DOI the caller supplied
   reaches every artifact. That it NAMES the GBIF download this archive
   actually came from is not checkable by any test: `--gbif-doi` is a free
@@ -90,11 +114,19 @@ it is
 * CONCURRENCY. Two builds writing into one `--out` interleave. The sidecar's
   nnz check would catch the common case on load, but nothing here exercises
   it and no lock is taken.
-* THE `_ZeroMatchDetector`'s COUPLING TO THE LOG MESSAGE. B32 pins that the
-  marker constant is what is matched, so a reworded message cannot silently
-  deafen the detector. What is NOT pinned is that the leakage module keeps
-  EMITTING a warning at all in that situation: deleting the warning entirely
-  is a mutation of `leakage.py`, and `run_leakage_mutants.py` owns it.
+* THE LEAKAGE MODULE'S OWN COUNTS. B30-B33b pin that the build script's
+  escalation reads `LeakageGuardResult` correctly and cannot be disarmed by
+  logging. What they do NOT pin is that those counts are themselves right --
+  that `contributor_rows_removed` really is `before - after`, that
+  `banned_key_count` really is the normalised key count. Those are mutations
+  of `leakage.py` and `run_leakage_mutants.py` owns them (M50-M55). This is
+  the seam between the two harnesses and it is deliberate: a build-script
+  mutant that broke a leakage-module invariant would be scored against the
+  wrong file.
+* THE WARNING ITSELF. The zero-match WARNING still exists in `leakage.py` and
+  is still useful to a human reading a log, but NOTHING in this repository
+  now depends on it for control flow, so nothing here pins it. That is the
+  point of C1: see `ZeroMatchGuardError`.
 """
 from __future__ import annotations
 
@@ -282,6 +314,22 @@ MUTANTS: list[Mutant] = [
         [("        control.gbif_doi = gbif_doi", '        control.gbif_doi = ""')],
     ),
     (
+        "B11b",
+        "M3: `_respec`'s gbif_doi PASS-THROUGH broken, in `controls.py`, with "
+        "the build script's own `control.gbif_doi = gbif_doi` line left in "
+        "place. The build script's comment calls that line 'belt and braces "
+        "beside `_respec`'s pass-through', a claim about ANOTHER module that "
+        "no mutant tested: B11 deletes the belt, and nothing established that "
+        "the braces existed. This mutant is the braces. It SURVIVES the "
+        "build-script tests by design -- the assignment repairs it -- so its "
+        "killer is `controls`' own pass-through test, and that is the point: "
+        "the redundancy is real, and it is `test_controls.py` that holds it "
+        "up, not this harness",
+        "test_the_controls_carry_the_doi_without_the_scripts_help",
+        [("        gbif_doi=t.gbif_doi,", '        gbif_doi="",')],
+        Path("src/birdology/prior/controls.py"),
+    ),
+    (
         "B12",
         "only the FIRST control written, so the paper's credibility section "
         "ships one null hypothesis instead of four. Nothing raises: the three "
@@ -308,6 +356,82 @@ MUTANTS: list[Mutant] = [
                 '        "--gbif-doi",\n        default="",',
             )
         ],
+    ),
+    (
+        "B13b",
+        "C2, THE CLI SITE: the `type=non_blank_doi` validator dropped, which "
+        "is EXACTLY the released code's state. `required=True` requires the "
+        "FLAG, NOT A VALUE, so `--gbif-doi ''` and `--gbif-doi '   '` were "
+        "both accepted -- and since `'   '` is not empty, `save_prior`'s own "
+        "check passed it too and all five artifacts wrote with attribution "
+        "`Derived from GBIF occurrence download    .` A CC BY 4.0 violation in "
+        "a published artifact, reached by `--gbif-doi \"$DOI\"` with an unset "
+        "variable. B13 does not catch it: B13 tests flag ABSENCE",
+        "test_the_cli_refuses_a_BLANK_gbif_doi",
+        [
+            (
+                '        "--gbif-doi",\n        required=True,\n'
+                "        type=non_blank_doi,",
+                '        "--gbif-doi",\n        required=True,',
+            )
+        ],
+    ),
+    (
+        "B13c",
+        "the blank check narrowed to EMPTY only, by dropping the `.strip()` "
+        "disjunct. `--gbif-doi ''` is still rejected and `--gbif-doi '   '` "
+        "ships the whole release -- the precise half of C2 that got through "
+        "`save_prior` as well, because `'   '` is truthy. One mutant per "
+        "disjunct: this is the whitespace clause, B13b is the presence of the "
+        "validator at all",
+        "test_the_cli_refuses_a_BLANK_gbif_doi",
+        [("    if not value or not value.strip():", "    if not value:")],
+    ),
+    (
+        "B13d",
+        "the DOI SHAPE check dropped, so a GBIF download KEY passes as a DOI. "
+        "A download has BOTH (`0012345-230530130807322` and "
+        "`10.15468/dl.abc123`) and they sit beside each other on the download "
+        "page; only the DOI is citable. The artifact is well-formed and "
+        "permanently mis-attributed, and no reader can detect it. DEVIATION: "
+        "the findings file did not rule on a shape check -- see the fix "
+        "report",
+        "test_the_cli_refuses_a_gbif_doi_that_is_not_a_DOI",
+        [("    if not DOI_PATTERN.match(value):", "    if False:")],
+    ),
+    (
+        "B13e",
+        "the shape check TIGHTENED to bare DOIs only, rejecting the `doi:` and "
+        "resolver-URL spellings GBIF's own download page offers. Every "
+        "rejection test above still passes -- this mutant is only visible to a "
+        "test that asserts the ACCEPTED spellings, and without one the "
+        "pressure on an operator whose pasted DOI is refused is to delete the "
+        "check rather than fix it",
+        "test_the_cli_accepts_every_documented_doi_spelling",
+        [
+            (
+                'r"^(?:[a-z][a-z0-9+.\\-]*://[^/\\s]+/|doi:)?10\\.\\d{4,9}/\\S+$"',
+                'r"^10\\.\\d{4,9}/\\S+$"',
+            )
+        ],
+    ),
+    (
+        "B13f",
+        "C2, THE LIBRARY SITE, in `tensor.py`: `save_prior`'s refusal narrowed "
+        "back to EMPTY only. A SEPARATE mutant from B13b/B13c because the two "
+        "guards are independently load-bearing -- the CLI one protects the "
+        "command line, this one protects every OTHER caller of the library "
+        "(a notebook, a sweep driver, this plan's own controls). With the CLI "
+        "guard intact the build script cannot reach this, which is exactly "
+        "why it needs its own fixture calling `save_prior` directly",
+        "test_save_prior_refuses_a_WHITESPACE_ONLY_doi_from_any_caller",
+        [
+            (
+                "    if not tensor.gbif_doi or not tensor.gbif_doi.strip():",
+                "    if not tensor.gbif_doi:",
+            )
+        ],
+        Path("src/birdology/prior/tensor.py"),
     ),
     (
         "B14",
@@ -375,6 +499,55 @@ MUTANTS: list[Mutant] = [
             (
                 "    return n_species * n_cells * WEEKS_PER_YEAR * MEASURED_BYTES_PER_CONTEXT",
                 "    return 512 * (1 << 20)",
+            )
+        ],
+    ),
+    (
+        "B17b",
+        "I2: `MEASURED_BYTES_PER_CONTEXT` LOWERED back to the discredited 160. "
+        "This is not a hypothetical -- 160 is what the released code carried, "
+        "fitted to two points at ONE grid shape, and it under-predicted real "
+        "builds by 26-41%: 2.34e6 contexts projected 374 MB against 639 MB "
+        "actual, 1.25e7 projected 1997 MB against 2711 MB. Under-predicting is "
+        "the direction that UNDER-WARNS, so the operator provisions a node the "
+        "build cannot fit in and loses the whole run. Nothing raises and the "
+        "log line still looks like a measurement, which is why the killer test "
+        "asserts the constant against a RECORDED measurement instead of "
+        "against itself",
+        "test_the_memory_constant_is_not_below_the_worst_measurement",
+        [("MEASURED_BYTES_PER_CONTEXT = 270", "MEASURED_BYTES_PER_CONTEXT = 160")],
+    ),
+    (
+        "B17c",
+        "the recorded measurement lowered ALONGSIDE the constant, so the two "
+        "agree again and B17b's killer test passes. This is the way to defeat "
+        "a self-referential pin, and it is why the killer test ALSO asserts "
+        "that the recorded worst case exceeds the discredited 160: a "
+        "re-measurement is legitimate and must be arguable, but silently "
+        "restoring the number the review rejected is not",
+        "test_the_memory_constant_is_not_below_the_worst_measurement",
+        [
+            ("MEASURED_BYTES_PER_CONTEXT = 270", "MEASURED_BYTES_PER_CONTEXT = 158"),
+            (
+                "WORST_MEASURED_BYTES_PER_CONTEXT = 263.0",
+                "WORST_MEASURED_BYTES_PER_CONTEXT = 158.0",
+            ),
+        ],
+    ),
+    (
+        "B17d",
+        "the docstring's statement that the projection EXCLUDES the interpreter "
+        "baseline deleted. Purely documentary, and that is the point: an "
+        "operator reading `~0.21 GB` for a small grid and provisioning 0.25 GB "
+        "OOMs on the interpreter alone. The exclusion is a property of the "
+        "number, so losing it silently makes the figure wrong without changing "
+        "it",
+        "test_the_projection_states_that_it_excludes_the_interpreter_baseline",
+        [
+            (
+                "    EXCLUDES the ~80 MB interpreter-and-imports baseline; see\n"
+                "    `MEASURED_BYTES_PER_CONTEXT`.\n",
+                "    See `MEASURED_BYTES_PER_CONTEXT`.\n",
             )
         ],
     ),
@@ -494,7 +667,7 @@ MUTANTS: list[Mutant] = [
         "leakage guard did nothing, under a filename indistinguishable from "
         "every correct one -- worse than the pre-fix silence because it looks "
         "deliberate",
-        "test_the_pipeline_call_path_has_no_except_at_all",
+        "test_the_pipeline_call_path_has_no_try_at_all",
         [
             (
                 "        paths = build_from_archive(\n",
@@ -521,19 +694,169 @@ MUTANTS: list[Mutant] = [
         "test_no_except_handler_in_the_build_script_swallows_anything",
         [
             (
-                "        table = assign_cells(read_occurrences(Path(zip_path)), resolution)\n"
-                "        table = apply_leakage_guards(table, test_recordings)",
-                "        try:\n"
-                "            table = assign_cells(\n"
-                "                read_occurrences(Path(zip_path)), resolution\n"
-                "            )\n"
-                "            table = apply_leakage_guards(table, test_recordings)\n"
-                "        except ValueError:\n"
-                "            return []",
+                "    table = assign_cells(read_occurrences(Path(zip_path)), resolution)\n"
+                "    guarded = apply_leakage_guards(table, test_recordings)",
+                "    try:\n"
+                "        table = assign_cells(\n"
+                "            read_occurrences(Path(zip_path)), resolution\n"
+                "        )\n"
+                "        guarded = apply_leakage_guards(table, test_recordings)\n"
+                "    except ValueError:\n"
+                "        return []",
             )
         ],
     ),
-    # ---- the zero-match guard, one mutant per clause ---------------------
+    # ---- I3: the five EXECUTED evasions of the AST check ------------------
+    # Each passed BOTH AST tests in the released code. The old check was
+    # asymmetric -- ExceptHandler on `build_from_archive`, Try on `main` -- and
+    # that asymmetry was the hole. One mutant per evasion, each named for the
+    # specific hole it reopens.
+    (
+        "B28-E3",
+        "I3/E3, THE SERIOUS ONE: a `return` added to a `try/finally` in "
+        "`build_from_archive`. A `return` in a `finally` DISCARDS every "
+        "in-flight exception, including the guard `ValueError` this function "
+        "exists to propagate, and a finally-only `Try` produces NO "
+        "ExceptHandler node -- so the old handler-shaped check saw nothing and "
+        "the old `main`-only Try check was looking at the wrong function. The "
+        "build reports success having written nothing, or having written a "
+        "leak-contaminated artifact. Closed by forbidding `ast.Try` in this "
+        "function OUTRIGHT, not by whitelisting a finally-only form: a "
+        "whitelist would have had to re-admit the exact node type the evasion "
+        "used",
+        "test_the_pipeline_call_path_has_no_try_at_all",
+        [
+            (
+                "    table = assign_cells(read_occurrences(Path(zip_path)), resolution)\n"
+                "    guarded = apply_leakage_guards(table, test_recordings)",
+                "    try:\n"
+                "        table = assign_cells(\n"
+                "            read_occurrences(Path(zip_path)), resolution\n"
+                "        )\n"
+                "        guarded = apply_leakage_guards(table, test_recordings)\n"
+                "    finally:\n"
+                "        log.info(\"leakage guards done\")\n"
+                "        return []",
+            )
+        ],
+    ),
+    (
+        "B28-E2",
+        "I3/E2: `contextlib.suppress(ValueError)` around the guarded stage. "
+        "Produces no ExceptHandler node AT ALL, so a check that only inspects "
+        "handler bodies is blind to it however thorough it is about the "
+        "handlers it can see. Closed by rejecting the suppressing call BY "
+        "NAME, in both spellings",
+        "test_the_pipeline_call_path_has_no_try_at_all",
+        [
+            (
+                "import argparse\nimport csv",
+                "import argparse\nimport contextlib\nimport csv",
+            ),
+            (
+                "    guarded = apply_leakage_guards(table, test_recordings)",
+                "    with contextlib.suppress(ValueError):\n"
+                "        guarded = apply_leakage_guards(table, test_recordings)",
+            ),
+        ],
+    ),
+    (
+        "B28-E5",
+        "I3/E5, THE OTHER SERIOUS ONE: the resolution-loop body moved into a "
+        "helper that catches `ValueError` and raises `SystemExit(0)`. The "
+        "handler DOES re-raise, so the handler check passes; the helper is "
+        "neither `build_from_archive` nor `main`, so the node-type check never "
+        "looked at it. What the operator gets is EXIT 0 with a failed artifact "
+        "silently skipped -- obligation 2's forbidden behaviour, dressed in "
+        "this plan's own error contract. Closed by forbidding SystemExit and "
+        "sys.exit in this script entirely",
+        "test_the_build_script_never_converts_a_guard_error_into_a_clean_exit",
+        [
+            (
+                "def main(argv: Sequence[str] | None = None) -> None:",
+                "def _one(resolution, args, recordings):\n"
+                "    try:\n"
+                "        return build_from_archive(\n"
+                "            args.archive, args.source, resolution, args.out,\n"
+                "            args.gbif_doi, recordings,\n"
+                "        )\n"
+                "    except ValueError as exc:\n"
+                "        log.warning(\"resolution %s skipped: %s\", resolution, exc)\n"
+                "        raise SystemExit(0) from exc\n"
+                "\n"
+                "\n"
+                "def main(argv: Sequence[str] | None = None) -> None:",
+            )
+        ],
+    ),
+    (
+        "B28-E1",
+        "I3/E1: a swallowing handler whose body only DEFINES a nested function "
+        "that raises. `ast.walk` descends into the nested `def`, so a `raise` "
+        "in a function NOBODY CALLS satisfied 'the handler contains a Raise' "
+        "and the handler returned an empty list regardless. Closed by not "
+        "descending into nested definitions",
+        "test_no_except_handler_in_the_build_script_swallows_anything",
+        [
+            (
+                "    table = assign_cells(read_occurrences(Path(zip_path)), resolution)\n"
+                "    guarded = apply_leakage_guards(table, test_recordings)",
+                "    try:\n"
+                "        table = assign_cells(\n"
+                "            read_occurrences(Path(zip_path)), resolution\n"
+                "        )\n"
+                "        guarded = apply_leakage_guards(table, test_recordings)\n"
+                "    except ValueError:\n"
+                "        def _explain():\n"
+                "            raise RuntimeError(\"never called\")\n"
+                "        return []",
+            )
+        ],
+    ),
+    (
+        "B28-E4",
+        "I3/E4: `if False: raise` inside a swallowing handler. The `Raise` node "
+        "is there and unreachable, which satisfied a check that only asked "
+        "whether the node EXISTED. Closed by pruning statically-false "
+        "branches, recursively, so adding a level of nesting does not reopen "
+        "it",
+        "test_no_except_handler_in_the_build_script_swallows_anything",
+        [
+            (
+                "    table = assign_cells(read_occurrences(Path(zip_path)), resolution)\n"
+                "    guarded = apply_leakage_guards(table, test_recordings)",
+                "    try:\n"
+                "        table = assign_cells(\n"
+                "            read_occurrences(Path(zip_path)), resolution\n"
+                "        )\n"
+                "        guarded = apply_leakage_guards(table, test_recordings)\n"
+                "    except ValueError:\n"
+                "        if False:\n"
+                "            raise\n"
+                "        return []",
+            )
+        ],
+    ),
+    (
+        "B28-E6",
+        "the VACUITY GUARD of the evasion checks removed, by making "
+        "`_reachable_raise` return True unconditionally. Every evasion check "
+        "above then passes on every input, including the constructed evasions "
+        "-- which is the failure mode a structural check is most prone to and "
+        "least likely to be noticed for. Killed by the test that asserts each "
+        "check FAILS on the evasion it claims to close; its target is the TEST "
+        "FILE, because that is where the check lives",
+        "test_the_ast_evasion_checks_are_not_vacuous",
+        [
+            (
+                "def _reachable_raise(node) -> bool:",
+                "def _reachable_raise(node) -> bool:\n    return True",
+            )
+        ],
+        Path(TESTS),
+    ),
+    # ---- C1: the zero-match guard, one mutant per disjunct of `zero_match`,
+    #      plus the logging-independence claim ------------------------------
     (
         "B30",
         "the zero-match guard removed entirely, so a split that matches NO "
@@ -544,70 +867,95 @@ MUTANTS: list[Mutant] = [
         "test_a_split_that_matches_nothing_fails_the_build",
         [
             (
-                "    if detector.fired and test_recordings:",
+                "    if guarded.zero_match:",
                 "    if False:",
             )
         ],
     ),
     (
         "B31",
-        "the `and test_recordings` CONJUNCT removed. The guard still fires on "
-        "a real zero-match, so B30's fixture dies to this mutant too -- what "
-        "breaks is the legitimate `--no-test-split` mode, which would now "
-        "fail whenever anything else in the leakage module emitted a matching "
-        "warning. Its own mutant because a one-sided fixture cannot tell a "
+        "the guard's condition replaced by `not test_recordings`, which is the "
+        "shape the ORIGINAL guard's second conjunct had. The zero-match "
+        "fixture still dies, so this mutant is not about detection -- what "
+        "breaks is the legitimate `--no-test-split` mode, which now fails "
+        "every time. Its own mutant because a one-sided fixture cannot tell a "
         "guard that is too weak from one that is too strong, and the pressure "
         "from a guard that fires on a legal build is to delete the guard",
         "test_a_no_split_build_does_not_fail_on_the_zero_match_check",
         [
             (
-                "    if detector.fired and test_recordings:",
-                "    if detector.fired or not test_recordings:",
+                "    if guarded.zero_match:",
+                "    if not test_recordings:",
             )
         ],
     ),
     (
         "B32",
-        "the detector's marker replaced by a HARD-CODED copy of the log "
-        "message's wording instead of the constant `leakage` exports. It "
-        "matches the same text TODAY, so every test passes -- and the day the "
-        "message is reworded the detector goes silently deaf and the "
-        "zero-match guard stops firing with nothing to notice. Killed by a "
-        "deliberately MISMATCHED spelling, which is why the edit changes the "
-        "wording rather than merely inlining it",
-        "test_a_split_that_matches_nothing_fails_the_build",
+        "RETIRED and REPLACED, not deleted -- read this before restoring it. "
+        "B32 used to pin the detector's MESSAGE COUPLING: the marker was a "
+        "constant `leakage` exported, and a hard-coded copy of the same "
+        "wording matched identically today while going silently deaf the day "
+        "the message was reworded. That mutant pinned a MECHANISM THAT NO "
+        "LONGER EXISTS (C1 deleted the handler and the string match), so "
+        "leaving it would leave a mutant defending a dead detector. The idea "
+        "it protected -- the guard must not depend on a spelling that can "
+        "drift -- survives as this mutant: `zero_match`'s condition is "
+        "re-derived in the CALLER from `len(test_recordings)`, the quantity "
+        "the old second conjunct used, instead of from the count the guard "
+        "actually held. It is EQUIVALENT on every fixture where each split row "
+        "yields one distinct key, and wrong for a split whose rows collide "
+        "under normalisation or are skipped -- the same class of defect as the "
+        "reworded message: correct today, silently wrong after an unrelated "
+        "change elsewhere",
+        "test_the_zero_match_guard_reads_the_guard_results_own_counts",
         [
             (
-                "        if ZERO_MATCH_WARNING_MARKER in message:",
-                '        if "matched exactly zero of" in message:',
+                "    if guarded.zero_match:",
+                "    if len(list(test_recordings)) > 0 and "
+                "guarded.contributor_rows_removed == 0:",
             )
         ],
     ),
     (
         "B33",
-        "the detector attached but never REMOVED, and attached to the ROOT "
-        "logger rather than the leakage one, so every later build in the same "
-        "process inherits the previous build's fired list and the second "
-        "resolution of a sweep fails on the first's warning. A cross-artifact "
-        "contamination that only appears when more than one build runs in one "
-        "process -- which is exactly what a `--resolutions 3 4 5` sweep does",
-        "test_a_split_that_DOES_match_removes_rows_and_builds",
+        "the guard made LOGGING-DEPENDENT again, in the cheapest form that "
+        "still looks defensible: the escalation is gated on the leakage "
+        "logger being enabled for WARNING. Every test that does not touch "
+        "logging passes, and the guard is disarmed by one line of ordinary CI "
+        "config -- `logging.basicConfig(level=logging.ERROR)` before `main()`, "
+        "which is the EXACT reproduction that made C1 a release blocker: ten "
+        "artifacts written, exit 0. This is the mutant that proves the "
+        "mechanism is data rather than logs, so its killer test is the one "
+        "that suppresses logging and asserts the guard STILL fires",
+        "test_the_zero_match_guard_fires_under_every_hostile_logging_config",
         [
             (
-                "        logging.getLogger(\"birdology.prior.leakage\").removeHandler(detector)",
-                "        pass",
-            ),
-            (
-                "    detector = _ZeroMatchDetector()\n"
-                '    logging.getLogger("birdology.prior.leakage").addHandler(detector)',
-                "    global _DETECTOR\n"
-                "    try:\n"
-                "        detector = _DETECTOR\n"
-                "    except NameError:\n"
-                "        detector = _DETECTOR = _ZeroMatchDetector()\n"
-                '        logging.getLogger("birdology.prior.leakage").addHandler(detector)',
-            ),
+                "    if guarded.zero_match:",
+                "    if guarded.zero_match and logging.getLogger(\n"
+                '        "birdology.prior.leakage"\n'
+                "    ).isEnabledFor(logging.WARNING):",
+            )
         ],
+    ),
+    (
+        "B33b",
+        "the guard's `banned_key_count > 0` disjunct weakened to `>= 0` INSIDE "
+        "`LeakageGuardResult.zero_match`. A cross-module mutant: the caller is "
+        "untouched and correct, and the defect is in the property it reads. "
+        "`--no-test-split` then fails on every build, because a guard with no "
+        "banned keys removed no rows. Separate from B31 because B31 breaks the "
+        "CALLER's condition and this breaks the LIBRARY's, and the two are "
+        "fixed in different files",
+        "test_a_no_split_build_does_not_fail_on_the_zero_match_check",
+        [
+            (
+                "        return self.banned_key_count > 0 and "
+                "self.contributor_rows_removed == 0",
+                "        return self.banned_key_count >= 0 and "
+                "self.contributor_rows_removed == 0",
+            )
+        ],
+        Path("src/birdology/prior/leakage.py"),
     ),
     # ---- load_test_split: one mutant per check ---------------------------
     (

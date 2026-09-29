@@ -11,6 +11,16 @@ recording's own occurrence record reaches the prior, the prior trivially
 Both guards MUST run on the ``assign_cells`` output, before
 ``aggregate_counts``, which discards ``publisher_key`` and ``recorded_by``.
 
+THE GUARDS REPORT THEIR OWN COUNTS
+----------------------------------
+:func:`apply_leakage_guards` returns a :class:`LeakageGuardResult`, not a
+table: the guarded table plus the banned-key count and the rows each guard
+removed. That is not convenience. A caller that must FAIL when a supplied
+split matched nothing can only do so on data; reading it off a log WARNING
+made the guard depend on logging configuration, and one
+``logging.basicConfig(level=logging.ERROR)`` disarmed it silently while a
+complete release was written with exit 0. See :class:`LeakageGuardResult`.
+
 THE GUARD MARKER
 ----------------
 :func:`apply_leakage_guards` stamps its output with the Arrow schema-metadata
@@ -111,11 +121,20 @@ def guards_applied(table: pa.Table) -> bool:
 
 #: The WARNING `drop_test_contributor_cells` emits when a NON-EMPTY banned
 #: set matches nothing at all. It is the shared observable symptom of every
-#: remaining silent-failure mode in this module, so the build script matches
-#: on this marker to turn it into a build failure. Single-sourced here rather
-#: than re-spelled there: a caller string-matching a message defined in
-#: another module goes silently dead the day the message is reworded, which
-#: is precisely the failure this warning exists to make visible.
+#: remaining silent-failure mode in this module, and it exists for the HUMAN
+#: reading a build log.
+#:
+#: IT IS NOT A CONTROL-FLOW CHANNEL, AND NOTHING MAY ESCALATE ON IT.
+#: `scripts/build_prior.py` used to attach a logging handler and turn this
+#: message into a build failure. That made the highest-consequence guard in
+#: the plan depend on logging CONFIGURATION: one `logging.basicConfig(
+#: level=logging.ERROR)` in a CI wrapper, or a rename of this module's
+#: logger, and the guard was silently dead while a complete, well-formed,
+#: publishable release was written with exit 0. The escalation now reads
+#: :class:`LeakageGuardResult`'s COUNTS, which no logging level, logger
+#: rename or `logging.disable()` can reach. Keep this constant for the log
+#: message and for the tests that pin the message's wording; do not
+#: reintroduce a caller that branches on it.
 ZERO_MATCH_WARNING_MARKER = "matched zero of"
 
 
@@ -238,6 +257,84 @@ class TestRecording:
         object.__setattr__(self, "week", week)
 
 
+@dataclass(frozen=True)
+class LeakageGuardResult:
+    """What :func:`apply_leakage_guards` did, as DATA rather than as log lines.
+
+    THIS EXISTS BECAUSE A LOG RECORD IS NOT CONTROL FLOW
+    ----------------------------------------------------
+    ``scripts/build_prior.py`` must fail the build when a split was supplied
+    and the contributor guard matched NOTHING -- the shared observable symptom
+    of a contributor-spelling miss, mojibake, an un-wired eval split and a
+    cell-format mismatch the resolution check cannot see. It used to detect
+    that by attaching a :class:`logging.Handler` to this module's logger and
+    string-matching the WARNING three frames down. Reproduced end to end: with
+    ``logging.basicConfig(level=logging.ERROR)`` set before ``main()`` and a
+    split matching nothing, the build wrote all ten artifacts and returned
+    exit 0. Four other logging configurations did the same, and the logger
+    NAME was a hard-coded string in the caller, so renaming this module's
+    logger bypassed the guard too.
+
+    Every field here is returned by the function that FILTERED, derived from
+    the same two row counts the log line reports, so the caller's escalation
+    is a comparison on integers. No logging level, no ``logging.disable()``,
+    no handler configuration and no logger rename can reach it.
+
+    ``banned_key_count`` is the count of normalised (cell, week, contributor)
+    keys the split actually produced -- NOT ``len(test_recordings)``. The two
+    differ when recordings collide after normalisation or when one is skipped,
+    and it is the KEYS that decide what the guard can remove.
+    """
+
+    #: The guarded, STAMPED table. The reason this is a named attribute rather
+    #: than the return value itself: a caller that forgets to unwrap gets an
+    #: immediate `AttributeError` on a `pa.Table` method, never a silently
+    #: mis-typed table flowing on into `aggregate_counts`.
+    table: pa.Table
+    #: Normalised keys derived from the split. Zero means NO split was in
+    #: effect, which is the legitimate `--no-test-split` mode.
+    banned_key_count: int
+    #: Rows guard 1 removed (Xeno-Canto publisher).
+    xeno_canto_rows_removed: int
+    #: Rows guard 2 removed (test contributor's own cell-weeks).
+    contributor_rows_removed: int
+    #: Rows the contributor guard was offered, so a caller can report a rate.
+    rows_before_contributor_guard: int
+
+    @property
+    def zero_match(self) -> bool:
+        """A non-empty split removed NOTHING: the guard was a silent no-op.
+
+        The exact condition :func:`drop_test_contributor_cells` warns on,
+        recomputed from the returned counts rather than read off the warning.
+        ``banned_key_count > 0`` is what makes an empty split a legitimate
+        no-op: it is derived from what the guard HELD, so it cannot be
+        satisfied by a split that was supplied and then dropped.
+        """
+        return self.banned_key_count > 0 and self.contributor_rows_removed == 0
+
+
+def _drop_xeno_canto(table: pa.Table) -> tuple[pa.Table, int]:
+    """Guard 1, returning (kept, removed). The ONE derivation of the count.
+
+    :func:`drop_xeno_canto` is the table-only projection of this and the log
+    line below is the human-readable one; both read this single subtraction,
+    so the number an escalation sees and the number a log reports can never
+    disagree.
+    """
+    keys = pa.array(sorted(XENO_CANTO_PUBLISHER_KEYS), pa.string())
+    mask = pc.invert(pc.is_in(table.column("publisher_key"), value_set=keys))
+    kept = table.filter(mask)
+    removed = table.num_rows - kept.num_rows
+    if removed:
+        logger.info(
+            "drop_xeno_canto: removed %d of %d occurrences",
+            removed,
+            table.num_rows,
+        )
+    return kept, removed
+
+
 def drop_xeno_canto(table: pa.Table) -> pa.Table:
     """Remove occurrences published by Xeno-Canto.
 
@@ -245,16 +342,7 @@ def drop_xeno_canto(table: pa.Table) -> pa.Table:
     row is KEPT — the correct direction: an unattributed record is not evidence
     of Xeno-Canto provenance.
     """
-    keys = pa.array(sorted(XENO_CANTO_PUBLISHER_KEYS), pa.string())
-    mask = pc.invert(pc.is_in(table.column("publisher_key"), value_set=keys))
-    kept = table.filter(mask)
-    if kept.num_rows != table.num_rows:
-        logger.info(
-            "drop_xeno_canto: removed %d of %d occurrences",
-            table.num_rows - kept.num_rows,
-            table.num_rows,
-        )
-    return kept
+    return _drop_xeno_canto(table)[0]
 
 
 def banned_keys(
@@ -375,28 +463,20 @@ def _assert_one_resolution(
             )
 
 
-def drop_test_contributor_cells(
+def _drop_test_contributor_cells(
     table: pa.Table, test_recordings: Iterable[TestRecording]
-) -> pa.Table:
-    """Remove rows matching a test recording's (cell, week, contributor).
+) -> tuple[pa.Table, int, int]:
+    """Guard 2, returning (kept, rows_removed, banned_key_count).
 
-    Every key component is normalised on BOTH sides before the join — cell via
-    :func:`normalise_cell`, week via :func:`normalise_week`, contributor via
-    :func:`normalise_contributor`. A row whose ``recorded_by`` is null can
-    never match, since a blank key is rejected at ``TestRecording`` construction.
-
-    Raises ``ValueError`` if the test split's H3 resolution differs from the
-    table's, which would make the whole guard a silent no-op.
-
-    CONTRACT — *table* must carry a non-null, integral ``week`` column, as
-    written by ``assign_cells`` (``pa.int8()`` from a non-null ``event_date``).
-    :func:`keep_mask` routes every week through :func:`normalise_week`, which
-    raises rather than coercing, so a null or fractional week from a table built
-    some other way is a hard build failure, not a silently mis-banned week.
+    The ONE derivation of both counts. :func:`drop_test_contributor_cells` is
+    the table-only projection; the WARNING below and
+    :attr:`LeakageGuardResult.zero_match` are two readings of these same
+    integers, so a caller escalating on the data and a human reading the log
+    can never be told different stories.
     """
     banned = banned_keys(test_recordings)
     if not banned:
-        return table
+        return table, 0, 0
 
     cells = table.column("cell").to_pylist()
     weeks = table.column("week").to_pylist()
@@ -417,21 +497,28 @@ def drop_test_contributor_cells(
 
     keep = keep_mask(cells, weeks, who_raw, banned)
     kept = table.filter(pa.array(keep, pa.bool_()))
-    if kept.num_rows != table.num_rows:
+    removed = table.num_rows - kept.num_rows
+    if removed:
         logger.info(
             "drop_test_contributor_cells: removed %d of %d occurrences "
             "over %d banned (cell, week, contributor) keys",
-            table.num_rows - kept.num_rows,
+            removed,
             table.num_rows,
             len(banned),
         )
-    elif banned:
+    else:
         # A non-empty banned set that matches NOTHING used to be completely
         # silent. That one line is the shared observable symptom of every
         # remaining silent-failure mode in this module — contributor-spelling
         # miss, mojibake, an un-wired eval split — so it fires unconditionally
         # rather than trying to diagnose which one it was. An EMPTY banned set
         # legitimately matches nothing and returned earlier, so it never warns.
+        #
+        # THE WARNING IS FOR THE HUMAN. The build script's escalation reads
+        # the RETURNED COUNTS (see `LeakageGuardResult.zero_match`), because a
+        # handler-and-string-match detector died silently under one line of
+        # ordinary logging config. Deleting this warning deafens the log; it
+        # does not disarm the guard.
         logger.warning(
             "drop_test_contributor_cells: %d banned (cell, week, contributor) "
             "key(s) %s %d occurrences; check the H3 resolution and "
@@ -440,13 +527,54 @@ def drop_test_contributor_cells(
             ZERO_MATCH_WARNING_MARKER,
             table.num_rows,
         )
-    return kept
+    return kept, removed, len(banned)
+
+
+def drop_test_contributor_cells(
+    table: pa.Table, test_recordings: Iterable[TestRecording]
+) -> pa.Table:
+    """Remove rows matching a test recording's (cell, week, contributor).
+
+    Every key component is normalised on BOTH sides before the join — cell via
+    :func:`normalise_cell`, week via :func:`normalise_week`, contributor via
+    :func:`normalise_contributor`. A row whose ``recorded_by`` is null can
+    never match, since a blank key is rejected at ``TestRecording`` construction.
+
+    Raises ``ValueError`` if the test split's H3 resolution differs from the
+    table's, which would make the whole guard a silent no-op.
+
+    CONTRACT — *table* must carry a non-null, integral ``week`` column, as
+    written by ``assign_cells`` (``pa.int8()`` from a non-null ``event_date``).
+    :func:`keep_mask` routes every week through :func:`normalise_week`, which
+    raises rather than coercing, so a null or fractional week from a table built
+    some other way is a hard build failure, not a silently mis-banned week.
+    """
+    return _drop_test_contributor_cells(table, test_recordings)[0]
 
 
 def apply_leakage_guards(
     table: pa.Table, test_recordings: Iterable[TestRecording]
-) -> pa.Table:
-    """Both guards, in order, and STAMP the result as guarded.
+) -> LeakageGuardResult:
+    """Both guards, in order, STAMP the result, and REPORT WHAT THEY DID.
+
+    Returns a :class:`LeakageGuardResult`, NOT a ``pa.Table``. That is the
+    whole point: the caller that has to escalate on "a split was supplied and
+    matched nothing" -- ``scripts/build_prior.py`` -- can only do so on DATA,
+    and the previous signature forced it to attach a logging handler and
+    string-match a WARNING three frames down. One
+    ``logging.basicConfig(level=logging.ERROR)`` in a CI wrapper silently
+    disarmed the highest-consequence guard in the plan while a complete,
+    publishable release was written with exit 0.
+
+    The return type is deliberately NOT a ``pa.Table`` subclass and the table
+    is NOT the first element of a tuple that could be indexed by accident:
+    every existing caller that treated the return value as a table now fails
+    IMMEDIATELY with ``AttributeError`` on ``.num_rows`` / ``.schema``, at the
+    line that needs updating. Widening a return value in a way that lets old
+    call sites keep working is how a mechanism goes quietly dead.
+    :func:`drop_xeno_canto` and :func:`drop_test_contributor_cells` still
+    return bare tables for callers that genuinely want one guard and no
+    counts.
 
     The stamp is applied here and nowhere else: this function is the only
     definition of "both guards have run", so a table that carries the marker
@@ -455,14 +583,25 @@ def apply_leakage_guards(
     consequence is that the effort denominator can only be computed over a
     table this function produced.
 
-    An EMPTY ``test_recordings`` still stamps. That is deliberate: ``[]`` is a
-    legitimate mode (no evaluation split is wired in), the Xeno-Canto guard
-    ran regardless, and refusing to stamp it would push every caller toward
-    stamping by hand -- which is exactly the bypass the marker exists to
-    close. Whether a split SHOULD have been supplied is knowledge only the
-    build script has, and it is enforced there, by requiring an explicit
-    ``--no-test-split`` opt-out.
+    An EMPTY ``test_recordings`` still stamps, and reports
+    ``banned_key_count == 0``. That is deliberate: ``[]`` is a legitimate mode
+    (no evaluation split is wired in), the Xeno-Canto guard ran regardless,
+    and refusing to stamp it would push every caller toward stamping by hand
+    -- which is exactly the bypass the marker exists to close. Whether a split
+    SHOULD have been supplied is knowledge only the build script has, and it
+    is enforced there, by requiring an explicit ``--no-test-split`` opt-out.
+    ``banned_key_count == 0`` is what makes that mode distinguishable from a
+    supplied-but-inert split without the build script having to re-derive the
+    keys itself.
     """
-    return mark_guards_applied(
-        drop_test_contributor_cells(drop_xeno_canto(table), test_recordings)
+    after_xc, xc_removed = _drop_xeno_canto(table)
+    kept, contributor_removed, banned_count = _drop_test_contributor_cells(
+        after_xc, test_recordings
+    )
+    return LeakageGuardResult(
+        table=mark_guards_applied(kept),
+        banned_key_count=banned_count,
+        xeno_canto_rows_removed=xc_removed,
+        contributor_rows_removed=contributor_removed,
+        rows_before_contributor_guard=after_xc.num_rows,
     )
