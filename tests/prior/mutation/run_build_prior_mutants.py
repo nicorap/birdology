@@ -344,16 +344,27 @@ MUTANTS: list[Mutant] = [
     ),
     (
         "B13",
-        "the `--gbif-doi` flag made OPTIONAL with an empty default, the stale "
-        "form the brief's own snippet carries. The build then runs the whole "
-        "pipeline -- hours, at national scale -- before `save_prior` refuses "
-        "at the write. The refusal is not lost, but the failure moves from an "
-        "instant usage error to the end of a long job",
+        "the `--gbif-doi` flag made OPTIONAL, the stale form the brief's own "
+        "snippet carries. The build then runs the whole pipeline -- hours, at "
+        "national scale -- before `save_prior` refuses at the write. The "
+        "refusal is not lost, but the failure moves from an instant usage "
+        "error to the end of a long job.\n"
+        "\n"
+        "        NOTE ON THE EXACT EDIT. The obvious mutation -- "
+        "`required=True` -> `default=\"\"` -- is now EQUIVALENT and was "
+        "observed surviving: argparse feeds a STRING default through `type=`, "
+        "so `non_blank_doi(\"\")` still raises at parse time and the operator "
+        "still gets an instant usage error. C2's validator subsumes that "
+        "mutation. Dropping `required` with NO default is the form that still "
+        "expresses the defect: `gbif_doi` is then `None`, `type=` is never "
+        "called on it, and the failure really does move to the write. Fixed at "
+        "the cause rather than by relabelling a survivor",
         "test_the_cli_requires_a_gbif_doi",
         [
             (
-                '        "--gbif-doi",\n        required=True,',
-                '        "--gbif-doi",\n        default="",',
+                '        "--gbif-doi",\n        required=True,\n'
+                "        type=non_blank_doi,",
+                '        "--gbif-doi",\n        type=non_blank_doi,',
             )
         ],
     ),
@@ -1021,8 +1032,9 @@ MUTANTS: list[Mutant] = [
         "test_the_table_reaching_the_effort_stage_is_the_guarded_one",
         [
             (
-                "        table = apply_leakage_guards(table, test_recordings)",
-                "        table = table",
+                "    guarded = apply_leakage_guards(table, test_recordings)",
+                "    from birdology.prior.leakage import LeakageGuardResult\n"
+                "    guarded = LeakageGuardResult(table, 0, 0, 0, table.num_rows)",
             )
         ],
     ),
@@ -1036,8 +1048,16 @@ MUTANTS: list[Mutant] = [
         "test_a_xeno_canto_record_never_reaches_the_prior",
         [
             (
-                "        table = apply_leakage_guards(table, test_recordings)",
-                "        apply_leakage_guards(table, test_recordings)",
+                "    guarded = apply_leakage_guards(table, test_recordings)",
+                "    from birdology.prior.leakage import LeakageGuardResult\n"
+                "    _r = apply_leakage_guards(table, test_recordings)\n"
+                "    guarded = LeakageGuardResult(\n"
+                "        table,\n"
+                "        _r.banned_key_count,\n"
+                "        _r.xeno_canto_rows_removed,\n"
+                "        _r.contributor_rows_removed,\n"
+                "        _r.rows_before_contributor_guard,\n"
+                "    )",
             )
         ],
     ),
