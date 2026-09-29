@@ -779,18 +779,258 @@ def test_a_non_positive_n_is_rejected():
 
 
 def test_an_absent_species_is_at_the_floor_in_every_cell_INCLUDING_rich_ones():
-    """The floor holds wherever the species is missing, not only in empty cells.
-
-    NOT a kill for mutant B10 (dropping the floor from `p_global`): that
-    mutation is EQUIVALENT under the emitted clamp. Measured over 1.2M
-    parameter/count configurations the two differ by at most 3.1e-10, because
-    the floor-scale mass `p_global` contributes is itself far below the floor
-    the output is clamped to. The `p_global` floor is kept as defence in depth
-    and documented as such rather than defended by a contrived assertion.
-    """
+    """The floor holds wherever the species is missing, not only in empty cells."""
     rows = [(1, "c", 5, 1000), (2, "c", 5, 1000), (1, "d", 9, 1)]
     out = _p(rows, [999], cells=["c", "d", "empty"], weeks=[5, 30])
     assert out and all(v == pytest.approx(FLOOR) for v in out.values())
+
+
+def test_the_floor_on_p_global_CHANGES_the_answer_above_one_over_floor():
+    """Kills B10 by name: the floor dropped from `p_global`.
+
+    This mutant was once retired as "equivalent" on a sweep measuring a maximum
+    difference of 3.1e-10. The sweep was wrong, and wrong in the way an
+    equivalence argument fails most dangerously: it never entered the regime
+    where the mutated branch is LIVE.
+
+    `max(p_global, floor)` only does anything when the raw global share falls
+    below `floor`, i.e. when `global_n > 1/floor` -- above a million records.
+    Every fixture in that sweep was tiny, so `p_global` was always already
+    above the floor and the two chains were arithmetically identical. That is
+    not equivalence; it is a fixture that never reaches the code.
+
+    Above the threshold the difference is in the FIFTH significant digit, and
+    it is a difference in the direction of under-confidence for a species that
+    genuinely holds the whole of its cell-week. The regime is the normal GBIF
+    one, so it is pinned exactly.
+    """
+    rows = [(2, "big", 5, 2_000_000), (1, "c", 5, 1)]
+    params = BackoffParams()
+
+    # PRECONDITIONS: the mutated branch must be REACHABLE in this fixture.
+    global_n = 2_000_000 + 1
+    p_global_raw = 1 / global_n
+    assert global_n > 1 / params.floor, (
+        "the global denominator is below 1/floor, so `max(p_global, floor)` is "
+        "a no-op here and this fixture cannot see the floor at all"
+    )
+    assert p_global_raw < params.floor
+
+    # The full chain, written out with the floor and without it. `p` for
+    # species 1 in cell `c` is not near the floor -- it is ~0.109 -- so this is
+    # not a contrived probe of a clamped value.
+    p_cell = (1 + params.cell_weight * params.floor) / (1 + params.cell_weight)
+    expected = (1 + params.cell_week_weight * p_cell) / (
+        1 + params.cell_week_weight
+    )
+    unfloored_cell = (1 + params.cell_weight * p_global_raw) / (
+        1 + params.cell_weight
+    )
+    unfloored = (1 + params.cell_week_weight * unfloored_cell) / (
+        1 + params.cell_week_weight
+    )
+    assert unfloored != pytest.approx(expected, rel=1e-9), (
+        "with and without the `p_global` floor this fixture gives the same "
+        "answer at rel=1e-9, so it cannot pin the floor"
+    )
+
+    out = _p(rows, [1], cells=["c"], weeks=[5], params=params)
+    assert out[(1, "c", 5)] == pytest.approx(expected, rel=1e-9)
+    assert out[(1, "c", 5)] == pytest.approx(0.10873529411764705, rel=1e-12)
+
+
+def test_the_absence_distinction_is_STRICT_below_the_floor_threshold():
+    """The ordering the floor exists to protect, asserted STRICTLY.
+
+    Three quantities for one species in one cell, on a deliberately LARGE
+    denominator (900 000 records -- just below `1/floor`):
+
+      * a week that WAS surveyed and did not hold the species: lowest, because
+        its own effort argues against presence;
+      * a week nobody surveyed: the cell profile itself, higher;
+
+    and the surveyed-absent value must sit strictly BELOW the cell profile
+    while staying strictly ABOVE the floor. If either inequality degenerates
+    to equality the prior has stopped distinguishing "looked and did not find"
+    from "nobody looked", which is the whole point of the level structure.
+
+    The right-hand relation is an IDENTITY, not an inequality: an unvisited
+    cell-week has no local data, so `_shrink(0, 0, p_cell, w)` is exactly
+    `p_cell`. It is asserted as such rather than dressed up as `<`.
+    """
+    rows = [(1, "c", 5, 250_000), (2, "c", 5, 250_000), (2, "c", 6, 400_000)]
+    params = BackoffParams()
+    out = _p(rows, [1], cells=["c"], weeks=[5, 6, 30], params=params)
+
+    global_n = 500_000 + 400_000
+    # PRECONDITION: BELOW the threshold, which is the only regime where the
+    # distinction survives at all (see the collapse test below).
+    assert global_n < 1 / params.floor
+    p_global = 250_000 / global_n
+    assert p_global > params.floor
+    p_cell = (250_000 + params.cell_weight * p_global) / (
+        global_n + params.cell_weight
+    )
+
+    visited_without_species = out[(1, "c", 6)]
+    unvisited = out[(1, "c", 30)]
+
+    assert unvisited == pytest.approx(p_cell, rel=1e-12)
+    assert visited_without_species < p_cell
+    assert params.floor < visited_without_species, (
+        "the surveyed-absent value has been clamped to the floor, so it is no "
+        "longer distinguishable from a species never recorded anywhere"
+    )
+    assert visited_without_species < unvisited
+
+
+def test_the_absence_distinction_COLLAPSES_above_1_over_floor():
+    """The stated LIMITATION, tested so the boundary is known rather than met.
+
+    Above `global_n > 1/floor` the floor clamps both ends of the ordering the
+    previous test asserts, and a species SURVEYED AND NOT FOUND becomes
+    bit-identical to a species NEVER RECORDED ANYWHERE. This is a property of
+    the method, recorded in the module docstring and in the design spec.
+
+    It is asserted here rather than left as a surprise: if a future change to
+    `floor` or to the shrinkage moves this boundary, this test says so instead
+    of the paper quietly claiming a distinction it does not have.
+    """
+    rows = [(1, "c", 5, 1), (2, "c", 5, 999_999), (2, "c", 6, 500_000)]
+    params = BackoffParams()
+    out = _p(rows, [1, 999], cells=["c"], weeks=[5, 6, 30], params=params)
+
+    global_n = 1_000_000 + 500_000
+    # PRECONDITION: ABOVE the threshold. Below it the values differ.
+    assert global_n > 1 / params.floor
+
+    surveyed_absent = out[(1, "c", 6)]
+    never_recorded = out[(999, "c", 30)]
+    assert surveyed_absent == params.floor
+    assert never_recorded == params.floor
+    assert surveyed_absent == never_recorded, (
+        "if these have become distinguishable the stated limitation in the "
+        "module docstring and the design spec is now wrong and must be revised"
+    )
+
+
+def test_cell_week_counts_summing_above_their_own_total_are_rejected():
+    """Kills B46 by name: the cell-week count-coherence guard removed.
+
+    `n <= total` per row, one `total` per cell-week and no duplicate
+    (species, cell, week) key are each satisfiable by an INCOHERENT table:
+    two partial RatioTables covering DISJOINT species of the same cell-week.
+    Concatenated they carry no duplicate key, agreeing totals and a legal `n`
+    on every row -- and 60 + 80 records against a total of 100 emits
+    p = [0.6, 0.8], shares summing to 1.4.
+
+    `total` counts ALL bird records in the cell-week, so the species present
+    in it cannot out-count it. This is the last door left open onto the
+    `pa.concat_tables`-of-partials hazard the module docstring names.
+    """
+    incoherent = pa.table(
+        {
+            "species_key": pa.array([1, 2], pa.int64()),
+            "cell": pa.array(["c", "c"], pa.string()),
+            "week": pa.array([5, 5], pa.int8()),
+            "n": pa.array([60, 80], pa.int64()),
+            "total": pa.array([100, 100], pa.int64()),
+            "ratio": pa.array([0.6, 0.8], pa.float64()),
+        }
+    )
+    # PRECONDITIONS: every OTHER guard is satisfied, so only the coherence
+    # check can be what rejects this.
+    keys = [(r["species_key"], r["cell"], r["week"]) for r in incoherent.to_pylist()]
+    assert len(keys) == len(set(keys)), "a duplicate key would reject this first"
+    assert set(incoherent.column("total").to_pylist()) == {100}
+    assert all(
+        r["n"] <= r["total"] for r in incoherent.to_pylist()
+    ), "a per-row n > total would reject this first"
+    assert sum(incoherent.column("n").to_pylist()) == 140 > 100
+
+    with pytest.raises(ValueError, match="summing to 140"):
+        hierarchical_estimate(incoherent, [1, 2], cells=["c"], weeks=[5])
+
+
+def test_a_coherent_cell_week_summing_exactly_to_its_total_is_accepted():
+    """The coherence guard must be `>`, not `>=`.
+
+    A cell-week where every record belongs to a listed species sums EXACTLY to
+    its total, and that is the ordinary complete-table case -- rejecting it
+    would reject the module's main input.
+    """
+    exact = _counts([(1, "c", 5, 40), (2, "c", 5, 60)])
+    assert exact.column("total").to_pylist() == [100, 100]
+    out = _p([(1, "c", 5, 40), (2, "c", 5, 60)], [1, 2], cells=["c"], weeks=[5])
+    assert len(out) == 2
+
+
+def test_an_empty_table_with_DEFAULT_weeks_yields_an_EMPTY_grid():
+    """Kills B48 by name: a fallback week invented for an empty table.
+
+    The default axes are the OBSERVED axes. An empty table has no observed
+    weeks, so the grid is empty -- even when `cells=` names cells explicitly.
+    The module deliberately does NOT invent a week here: week 1 (or any other)
+    would be an arbitrary shape decision made silently on the caller's behalf,
+    and a caller who wants a grid over an empty table must name its `weeks=`.
+
+    Pinned in both directions, because the previous implementation's
+    `if not all_weeks: all_weeks = [1]` was reachable only this way and no test
+    saw it: replacing that condition with `if False:` survived the whole suite.
+    """
+    empty = _counts([])
+    assert empty.num_rows == 0
+
+    assert hierarchical_estimate(empty, [1]).num_rows == 0
+    # `cells=` alone is not enough: the WEEK axis is what is empty.
+    assert hierarchical_estimate(empty, [1], cells=["a", "b"]).num_rows == 0
+
+    # Naming the weeks is how a caller gets a grid, and it still gets floor.
+    named = _lookup(hierarchical_estimate(empty, [1], cells=["a"], weeks=[3]))
+    assert named == {(1, "a", 3): pytest.approx(FLOOR)}
+
+
+def test_a_wrong_input_dtype_is_not_silently_CAST_to_the_required_schema():
+    """Kills B47 by name: `_validate_table` replaced by a silent cast.
+
+    Rejecting an int64 `week` and CASTING it are two different behaviours, and
+    only one of them raises. A cast is rule (C)'s second derivation: `week` and
+    `cell` are derived exactly once, upstream, and a table arriving with the
+    wrong dtype means something bypassed that derivation. Casting would make
+    the bypass invisible and produce a plausible prior from a table nobody
+    validated.
+
+    The existing dtype test asserts the raise; this one asserts the cast is not
+    quietly equivalent, by checking the message names the dtype rather than
+    accepting any failure.
+    """
+    wrong = pa.table(
+        {
+            "species_key": pa.array([1], pa.int64()),
+            "cell": pa.array(["c"], pa.string()),
+            "week": pa.array([5], pa.int64()),
+            "n": pa.array([1], pa.int64()),
+            "total": pa.array([1], pa.int64()),
+            "ratio": pa.array([1.0], pa.float64()),
+        }
+    )
+    # PRECONDITION: a cast really would succeed, so raising is a CHOICE.
+    castable = wrong.cast(
+        pa.schema(
+            [
+                pa.field("species_key", pa.int64()),
+                pa.field("cell", pa.string()),
+                pa.field("week", pa.int8()),
+                pa.field("n", pa.int64()),
+                pa.field("total", pa.int64()),
+                pa.field("ratio", pa.float64()),
+            ]
+        )
+    )
+    assert castable.column("week").to_pylist() == [5]
+
+    with pytest.raises(ValueError, match="must be int8, got int64"):
+        hierarchical_estimate(wrong, [1])
 
 
 def test_the_upper_clamp_holds_when_a_weight_is_negative():
@@ -834,9 +1074,10 @@ def test_a_duplicate_species_cell_week_ROW_is_rejected():
     denominator (a share of 0.6 where the truth is 0.3); keeping one silently
     discards records. Neither is recoverable here, so it is rejected.
 
-    This is also why mutant B27 (numerator overwritten rather than summed) is
-    recorded as EQUIVALENT rather than killed: with keys unique, accumulate
-    and overwrite are the same operation.
+    This is also why the mutants on this guard come in a PAIR: B27 removes the
+    check and ACCUMULATES the numerator (0.6 where the truth is 0.3), B27b
+    removes it and OVERWRITES (records silently discarded). Both are killed
+    here; neither is equivalent once the guard itself is the thing mutated.
     """
     dup = pa.concat_tables(
         [

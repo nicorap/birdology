@@ -40,10 +40,17 @@ must not be derived a second time locally.
 
 PARENT LEVELS COME FROM PARENT COUNTS
 -------------------------------------
-Both coarser levels are ratios of sums, never means of child ratios:
+Both coarser levels are ratios of sums, never means of child ratios. The
+GLOBAL level is that raw ratio, floored; the CELL level is that raw ratio
+SHRUNK toward the global one, which is what the code returns and what the
+levels below consume:
 
-    p_cell   = sum(n over the cell) / sum(total over the cell's cell-weeks)
-    p_global = sum(n everywhere)    / sum(total over all cell-weeks)
+    p_global = max(sum(n everywhere) / sum(total over all cell-weeks), floor)
+    p_cell   = _shrink(sum_n_cell, sum_total_cell, p_global, cell_weight)
+
+where `sum_n_cell` sums `n` over the cell and `sum_total_cell` sums `total`
+over the cell's distinct cell-weeks. Writing `p_cell` as the raw ratio alone
+would understate it wherever the cell is thin, which is most of the grid.
 
 Averaging child ratios instead would weight a one-record cell-week exactly as
 heavily as a thousand-record one, which silently reintroduces the observer
@@ -55,6 +62,27 @@ Each cell-week's `total` is counted ONCE per (cell, week) when summing a parent
 denominator, not once per row -- otherwise a cell-week with ten species present
 would contribute ten times its own effort.
 
+STATED LIMITATION -- THE FLOOR ERASES THE ABSENCE DISTINCTION ABOVE 1/floor
+---------------------------------------------------------------------------
+The floor keeps an unobserved cell-week off a hard zero, so "nobody looked"
+stays distinguishable from "looked and did not find". That distinction holds
+only while the GLOBAL DENOMINATOR stays below `1/floor` -- with the default
+`floor = 1e-6`, below 1e6 total bird records.
+
+Above that threshold -- the normal GBIF regime -- both quantities are clamped
+to `floor` and a species SURVEYED AND NOT FOUND becomes bit-identical to a
+species NEVER RECORDED ANYWHERE. Verified: with 1e6 records in a cell, a
+species holding one record elsewhere scores exactly 1e-6 in a surveyed week
+where it was absent, and an unrecorded species also scores exactly 1e-6.
+
+This is a property of the method, not a bug to route around. The floor is
+still necessary (a hard zero would let the prior veto a correct detection
+outright), so the boundary is documented and TESTED in both regimes rather
+than papered over -- see `test_the_absence_distinction_is_STRICT_below_the_
+floor_threshold` and `test_the_absence_distinction_COLLAPSES_above_1_over_
+floor`. The same limitation is recorded in the design spec, because the paper
+must state the threshold rather than claim the distinction holds everywhere.
+
 WEEKS
 -----
 `week` is 1..52 on input and on output, validated at both ends. Circular
@@ -63,6 +91,13 @@ toward coarser levels, and blending neighbouring weeks belongs to the smoothing
 stage. A week outside 1..52 is rejected rather than silently dropped from the
 emitted grid, which would delete its records from the cell profile with no
 error.
+
+The DEFAULT axes are the OBSERVED axes: `cells=None` means the cells present
+in the table and `weeks=None` means the weeks present in it. An empty table
+therefore yields an EMPTY grid under default axes, even when `cells=` is given
+explicitly. There is no invented fallback week: a caller who wants a grid over
+a table with no rows must name the `weeks=` it wants, because any week this
+module chose for it would be arbitrary and silent.
 
 CELLS
 -----
@@ -186,6 +221,7 @@ def hierarchical_estimate(
     # week). Counting it per row would multiply a cell-week's effort by the
     # number of species present in it.
     cell_week_total: dict[tuple[str, int], int] = {}
+    cell_week_n_sum: dict[tuple[str, int], int] = {}
     cell_week_species: dict[tuple[int, str, int], float] = {}
     cell_species: dict[tuple[int, str], float] = {}
     global_species: dict[int, float] = {}
@@ -226,6 +262,7 @@ def hierarchical_estimate(
                 "denominator depend on row order"
             )
         cell_week_total[key] = total
+        cell_week_n_sum[key] = cell_week_n_sum.get(key, 0) + n
 
         row_key = (sk, cell, week)
         if row_key in cell_week_species:
@@ -241,6 +278,23 @@ def hierarchical_estimate(
         cell_species[(sk, cell)] = cell_species.get((sk, cell), 0.0) + n
         global_species[sk] = global_species.get(sk, 0.0) + n
 
+    # Cell-week COUNT COHERENCE. `n <= total` per row is not enough: two
+    # partial RatioTables covering DISJOINT species of the same cell-week
+    # produce no duplicate key, agreeing totals and a legal `n` on every row,
+    # yet their shares sum above 1.0 (60 + 80 against a total of 100 emits
+    # p = [0.6, 0.8]). `total` covers ALL records in the cell-week, so the
+    # species present in it can never out-count it.
+    for (cell, week), n_sum in cell_week_n_sum.items():
+        if n_sum > cell_week_total[(cell, week)]:
+            raise ValueError(
+                f"RatioTable cell-week {(cell, week)!r} has species counts "
+                f"summing to {n_sum}, which exceeds its total="
+                f"{cell_week_total[(cell, week)]}; `total` counts ALL records "
+                "in the cell-week, so the rows present cannot out-count it -- "
+                "this is two partial tables of DISJOINT species concatenated, "
+                "each `n` paired with a `total` for the whole cell-week"
+            )
+
     # Parent denominators: sums of COUNTS, over distinct cell-weeks.
     cell_n: dict[str, float] = {}
     global_n = 0.0
@@ -248,14 +302,15 @@ def hierarchical_estimate(
         cell_n[cell] = cell_n.get(cell, 0.0) + total
         global_n += total
 
+    # DEFAULT AXES ARE THE OBSERVED AXES. An empty table yields an empty grid;
+    # no fallback week is invented, because any week chosen here would be an
+    # arbitrary, silent shape decision made on the caller's behalf.
     all_cells = list(cells) if cells is not None else sorted(cell_n)
     all_weeks = (
         [int(w) for w in weeks]
         if weeks is not None
         else sorted({w for _, w in cell_week_total})
     )
-    if not all_weeks:
-        all_weeks = [1]
 
     out_species: list[int] = []
     out_cells: list[str] = []

@@ -40,6 +40,28 @@ edit AND some fixture actually reaches the mutated path. Two guards here:
   some unrelated test is exactly the "coverage that does not exist" failure
   mode, and this turns it from a silent pass into a loud one.
 
+AN EQUIVALENCE ARGUMENT IS ONLY AS GOOD AS THE REGIME IT SAMPLED
+---------------------------------------------------------------
+B10 (the floor dropped from `p_global`) was retired here as EQUIVALENT on the
+evidence "max difference 3.1e-10 over 1.2M configurations". The sweep was real
+and the number was real, and the conclusion was still false: the mutated branch
+is only LIVE when the raw global share falls below the floor, i.e. when
+`global_n > 1/floor = 1e6`, and the sweep never sampled a global denominator
+above a million. In the regime it never entered -- the normal GBIF regime -- the
+two chains differ by 4.46e-07, which is 1438x the "bound", a difference in the
+FIFTH significant digit. B10 is back, live, with a killer test whose fixture
+holds a 2,000,000-record cell-week.
+
+THE RULE, therefore: before retiring a mutant as equivalent, STATE THE
+PARAMETER RANGE SWEPT and VERIFY THE MUTATED BRANCH IS REACHABLE WITHIN IT. A
+sweep that never enters the branch's live regime proves nothing -- it measures
+the difference between two identical computations and reports it as a bound.
+This failure mode is MORE DANGEROUS than a mislabelled mutant, because it
+arrives with a number attached and the number is not wrong, only irrelevant.
+Retire nothing on an aggregate statistic alone: name the condition under which
+the mutation changes behaviour, and show a fixture that satisfies it (then the
+mutant is live and needs a test) or prove no input can (then it is equivalent).
+
 WHAT THIS SET DOES NOT COVER -- stated so the table is not read as more than it
 is
 ------------------------------------------------------------------------------
@@ -52,9 +74,12 @@ is
   gives a bit-different float64; the suite asserts invariance at rel=1e-12,
   not bit-identity, so a reassociation mutant would survive. Accepted: at
   1e-12 the prior is unaffected.
-* SCALE. Every fixture is tiny (single-digit cells, <= 8 chunks). Nothing here
-  would catch a defect that only appears at millions of cell-weeks, e.g. a
-  dict that grows without bound or an int64 overflow in a global denominator.
+* SCALE. Most fixtures are tiny (single-digit cells, <= 8 chunks). Three are
+  deliberately LARGE (900k and 2M records) because the floor's live regime
+  starts at 1e6 -- see B10 and the two absence-distinction tests. Nothing here
+  would still catch a defect that only appears at millions of DISTINCT
+  cell-weeks, e.g. a dict that grows without bound or an int64 overflow in a
+  global denominator.
 * THE UPSTREAM/DOWNSTREAM SEAM. Mutating `effort.py` or a future
   `smoothing.py` is out of scope; this harness only mutates `backoff.py`, so a
   contract drift on either side is caught only insofar as `test_backoff.py`
@@ -242,19 +267,26 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
             )
         ],
     ),
-    # B10 REMOVED as an EQUIVALENT MUTANT, not as a kill.
-    #
-    # It dropped the floor from `p_global`. Over 1.2M count/parameter
-    # configurations the mutated and original chains differ by at most 3.1e-10:
-    # the floor-scale mass `p_global` contributes is itself far below the floor
-    # the output is clamped to, so the emitted clamp subsumes it. No fixture can
-    # kill it, and a contrived one would be exactly the "coverage that does not
-    # exist" this harness exists to prevent. The `p_global` floor stays as
-    # defence in depth; see the test of the same name.
+    (
+        "B10",
+        "the floor dropped from `p_global`, so a species whose raw global "
+        "share falls BELOW the floor is scored from that raw share instead. "
+        "Live only when `global_n > 1/floor` (1e6 records) -- the normal GBIF "
+        "regime, and the regime an earlier equivalence sweep never sampled",
+        "test_the_floor_on_p_global_CHANGES_the_answer_above_one_over_floor",
+        [
+            (
+                "        p_global = max(p_global, params.floor)",
+                "        pass  # p_global = max(p_global, params.floor)",
+            )
+        ],
+    ),
     (
         "B11",
-        "the upper clamp removed, so a poisoned row (n > total) emits p > 1.0 "
-        "instead of being rejected",
+        "the upper clamp removed, so a NEGATIVE shrinkage weight (a caller "
+        "error, not a data error -- no contract-conforming table can do it, "
+        "since n <= total makes every level a weighted average of values <= 1) "
+        "emits p > 1.0 instead of being bounded",
         "test_the_upper_clamp_holds_when_a_weight_is_negative",
         [
             (
@@ -367,14 +399,29 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
     # ---- contract 6: weeks ---------------------------------------------------
     (
         "B19",
-        "the requested-grid week-range check removed, so week 0 / 53 are "
-        "emitted; int8 accepts them and the smoothing stage inherits a seam "
-        "it cannot close",
+        "the SHARED `_validate_week` body disabled, which removes BOTH ends of "
+        "the range check at once -- the requested-grid one and the input-side "
+        "one (B22's territory). The weakest form of the check, kept because a "
+        "refactor that guts the helper must be loud",
         "test_a_week_outside_1_52_is_rejected",
         [
             (
                 "    if not 1 <= week <= WEEKS_PER_YEAR:",
                 "    if False:",
+            )
+        ],
+    ),
+    (
+        "B19b",
+        "only the REQUESTED-GRID call site removed (`_validate_week` itself "
+        "intact, so the input side still checks). Week 0 / 53 are then emitted "
+        "on the output axis; int8 accepts them and the smoothing stage "
+        "inherits a seam it cannot close",
+        "test_a_week_outside_1_52_is_rejected",
+        [
+            (
+                '            _validate_week(int(week), "the requested weeks")',
+                '            pass  # _validate_week(int(week), "the requested weeks")',
             )
         ],
     ),
@@ -526,15 +573,33 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
     ),
     (
         "B29",
-        "the conflicting-`total` check replaced by silently KEEPING THE "
-        "FIRST value seen, so the denominator of a stitched-together table "
-        "depends on row order",
+        "the conflicting-`total` check disabled, so the assignment on the next "
+        "line silently keeps the LAST value seen and the denominator of a "
+        "stitched-together table depends on row order",
         "test_a_cell_week_whose_total_disagrees_between_rows_is_rejected",
         [
             (
                 "        if key in cell_week_total and cell_week_total[key] != total:",
                 "        if False:",
             )
+        ],
+    ),
+    (
+        "B29b",
+        "the conflicting-`total` check disabled AND the assignment made "
+        "first-wins, the same order-dependence in the opposite direction -- so "
+        "the test cannot pass by happening to prefer whichever value the "
+        "shipped code keeps",
+        "test_a_cell_week_whose_total_disagrees_between_rows_is_rejected",
+        [
+            (
+                "        if key in cell_week_total and cell_week_total[key] != total:",
+                "        if False:",
+            ),
+            (
+                "        cell_week_total[key] = total",
+                "        cell_week_total[key] = cell_week_total.get(key, total)",
+            ),
         ],
     ),
     # ---- input validation ---------------------------------------------------
@@ -565,13 +630,34 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
     ),
     (
         "B32",
-        "the dtype check CASTS instead of raising -- rule (C)'s second "
-        "derivation, accepting an int64 `week` from a bypassed pipeline",
+        "the dtype check DISABLED, so an int64 `week` from a bypassed pipeline "
+        "passes validation unremarked (the cast form is B47)",
         "test_a_wrong_input_dtype_is_rejected_not_cast",
         [
             (
                 "        if actual != expected:",
                 "        if False and actual != expected:",
+            )
+        ],
+    ),
+    (
+        "B47",
+        "the dtype check CASTS instead of raising -- rule (C)'s SECOND "
+        "DERIVATION, the dangerous form: the table is silently coerced to the "
+        "required schema, so a bypassed pipeline produces a plausible prior "
+        "with nothing raised anywhere",
+        "test_a_wrong_input_dtype_is_not_silently_CAST_to_the_required_schema",
+        [
+            (
+                "    _validate_table(ratios)",
+                "    ratios = ratios.cast(\n"
+                "        pa.schema(\n"
+                "            [\n"
+                "                pa.field(_f.name, _REQUIRED_TYPES.get(_f.name, _f.type))\n"
+                "                for _f in ratios.schema\n"
+                "            ]\n"
+                "        )\n"
+                "    )",
             )
         ],
     ),
@@ -760,6 +846,64 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
             )
         ],
     ),
+    # ---- cell-week count coherence (the last concat-of-partials door) -------
+    (
+        "B46",
+        "the cell-week COUNT-COHERENCE guard removed, so two partial "
+        "RatioTables covering DISJOINT species of one cell-week are accepted: "
+        "no duplicate key, agreeing totals, every row satisfying n <= total, "
+        "and 60 + 80 against a total of 100 emits shares summing to 1.4",
+        "test_cell_week_counts_summing_above_their_own_total_are_rejected",
+        [
+            (
+                "        if n_sum > cell_week_total[(cell, week)]:",
+                "        if False:",
+            )
+        ],
+    ),
+    (
+        "B46b",
+        "the coherence guard weakened from `>` to `>=`, which REJECTS the "
+        "ordinary complete-table case where a cell-week's listed species "
+        "account for every one of its records -- the module's main input",
+        "test_a_coherent_cell_week_summing_exactly_to_its_total_is_accepted",
+        [
+            (
+                "        if n_sum > cell_week_total[(cell, week)]:",
+                "        if n_sum >= cell_week_total[(cell, week)]:",
+            )
+        ],
+    ),
+    (
+        "B46c",
+        "the coherence sum re-derived from the LAST row per cell-week instead "
+        "of accumulated, so the guard only ever sees one species' `n` and the "
+        "incoherent concat slips past it",
+        "test_cell_week_counts_summing_above_their_own_total_are_rejected",
+        [
+            (
+                "        cell_week_n_sum[key] = cell_week_n_sum.get(key, 0) + n",
+                "        cell_week_n_sum[key] = n",
+            )
+        ],
+    ),
+    # ---- default axes: no invented fallback week ---------------------------
+    (
+        "B48",
+        "a FALLBACK WEEK invented when the observed week set is empty (the "
+        "`if not all_weeks: all_weeks = [1]` this module deliberately does "
+        "NOT have), so an empty table under default axes silently returns a "
+        "species x cells grid at an arbitrary week 1 instead of no rows",
+        "test_an_empty_table_with_DEFAULT_weeks_yields_an_EMPTY_grid",
+        [
+            (
+                "    out_species: list[int] = []",
+                "    if not all_weeks:\n"
+                "        all_weeks = [1]\n"
+                "    out_species: list[int] = []",
+            )
+        ],
+    ),
 ]
 
 
@@ -793,7 +937,17 @@ def _run_tests() -> tuple[int, str, set[str]]:
         text=True,
     )
     out = proc.stdout + proc.stderr
-    failed = set(re.findall(r"^(?:FAILED|ERROR) \S+::(\w+)", out, re.MULTILINE))
+    # Take the LAST `::` segment and strip any `[...]` parametrisation. The
+    # previous `(\w+)` stopped at the first non-word character, so a
+    # PARAMETRISED id (`test_name[param-0]`) was captured as `test_name` only by
+    # luck of `\w` excluding `[`, and a class-nested id was captured as the
+    # CLASS name. Either would score a real kill as MISLABELLED the moment
+    # someone parametrises or nests a killer test.
+    failed = {
+        raw.rsplit("::", 1)[-1].split("[", 1)[0]
+        for raw in re.findall(r"^(?:FAILED|ERROR) (\S+)", out, re.MULTILINE)
+        if "::" in raw
+    }
     match = re.search(r"(\d+) failed", out)
     if match:
         return int(match.group(1)), out, failed
@@ -836,9 +990,7 @@ def main() -> int:
                 print("  !! NOT APPLICABLE: a pattern does not occur exactly once")
                 bad.append(mid)
                 continue
-            if not any(t.__name__ == killer for t in []) and killer not in (
-                REPO / TESTS
-            ).read_text():
+            if f"def {killer}(" not in (REPO / TESTS).read_text():
                 print(f"  !! killer test {killer!r} does not exist in {TESTS}")
                 bad.append(mid)
             print(
