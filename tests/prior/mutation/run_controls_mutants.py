@@ -38,27 +38,43 @@ scale, or that permutes the wrong axis, still emits finite probabilities in
 range, with the right shape and the right axes. There is no downstream
 consistency check that could catch it -- the sweep simply reports a smaller
 gap and the paper reports a weaker or stronger effect than exists. So the
-mutants below concentrate on the two failure modes that produce a plausible
-wrong number rather than an error:
+mutants below concentrate on the failure modes that produce a plausible wrong
+number rather than an error:
 
-* SCALE (T9-R2). C10..C16 reintroduce, one at a time, every spelling that
+* THE GRID (C5-C10). Every control must read the prior through
+  `PriorTensor.dense()`, the one definition of "an unstored context reads the
+  floor". A control that re-derives the grid locally answers every unsurveyed
+  context with a hard 0.0 while the sweep answers it with FLOOR, which puts
+  the control below the full prior's scale by exactly the floor mass.
+* SCALE (T9-R2). C11-C22 reintroduce, one at a time, every spelling that
   rescales a control away from the full prior: `1 / n_species`, the
   `per_species / total` renormalisation, a median, a max, a sum, a per-cell
-  denominator. Each is individually defensible-looking and each turns the
-  comparison into a scale difference reported as a context effect.
-* AXIS (T9-R3/T9-R4). C17..C25 permute the wrong axis, permute per-species
-  instead of once, reuse one permutation for both shuffles, drop the seed, or
-  reshape against a hard-coded stride.
+  denominator, and -- the two the FLOOR-for-missing reversal makes newly
+  possible -- an `nnz` denominator in place of the dense capacity.
+* AXIS (T9-R3/T9-R4). C23-C33 permute the wrong axis, permute per-species
+  instead of once, collapse the two shuffles into one, drop the seed, or
+  reshape against a transposed stride.
+
+THE TWO REGRESSION MUTANTS (C3, C4) ARE THE POINT OF THIS REVISION
+-------------------------------------------------------------------
+An earlier revision of `controls.py` REFUSED any tensor with `nnz < size`, on
+the then-current premise that an absent context was a structural zero. Under
+`tensor.py`'s FLOOR-for-missing semantics that refusal makes all four controls
+raise on every realistic prior -- and the whole of `test_controls.py` stayed
+GREEN, because every fixture in it was dense. A dense-only fixture set cannot
+see a defect that only fires on sparse input.
+
+C3 re-introduces the dense-grid refusal and C4 the stored-zero refusal, each
+killed by a test that runs a control on a 1.92%-full tensor. They are the
+mutants that make that class of defect unable to return unnoticed, and they
+are the reason `_sparse_tensor()` is not an optional extra fixture.
 
 COMPOUND CONDITIONS ARE MUTATED PER DISJUNCT
 --------------------------------------------
-`_require_dense_grid`'s three clauses are written as SEPARATE statements so
-that a fixture tripping one never exercises another, and each gets its own
-mutant with a fixture violating ONLY that clause:
-
-* the column-count / cell-axis agreement -> C1, C2
-* `nnz != size` (structural zeros)       -> C3, C4
-* `count_nonzero != nnz` (stored zero)   -> C5, C6
+`_control_grid` now carries ONE guard clause (the column-count / cell-axis
+agreement), and it gets one mutant per direction: removed (C1) and inverted so
+a valid tensor is rejected (C2). The two clauses it used to carry are gone;
+C3/C4 pin their ABSENCE instead, which is the mirror obligation.
 
 WHAT THIS SET DOES NOT COVER -- stated so the table is not read as more than
 it is
@@ -76,35 +92,41 @@ it is
   that it compares them against the full prior on the same fold. A sweep that
   silently skipped `marginal` would pass every test in this file. That
   obligation lives downstream and is only as strong as its own tests.
-* THE DENSE-GRID OBLIGATION AT ITS SOURCE. C3/C4 prove these controls REFUSE a
-  tensor with structural zeros, which is the strongest thing this module can
-  do. Whether the pipeline actually hands them a dense grid is `to_tensor`'s
-  caller's obligation (tensor.py's STRUCTURAL ZEROS section, T10-R1). If it
-  does not, the controls now raise rather than silently dilute -- but the run
-  fails loudly instead of producing a control set, and nothing here tests the
-  recovery path, because there is deliberately none.
+* THE FLOORING IS PERMUTATION-INVARIANT, SO THE SHUFFLES CANNOT SEE IT.
+  Mapping "unstored" to FLOOR commutes with a permutation of the grid, and
+  `_respec` re-sparsifies, so for `shuffle_space` and `shuffle_time` reading
+  `t.values.toarray()` instead of `t.dense()` produces a BYTE-IDENTICAL
+  result. C9/C10 are therefore killed by the guard they skip rather than by the
+  flooring they lose -- the flooring genuinely does not matter there today. It
+  would start mattering the moment a shuffle stopped being a pure permutation
+  (a partial shuffle, a within-block shuffle, a resample), and nothing here
+  would notice that the single-definition rule had quietly become load-bearing
+  again.
 * FLOATING-POINT MASS AT NATIONAL SCALE. The mass-preservation tests compare
   with `pytest.approx` on a 312-entry matrix. `mean * size == sum` is exact
   only up to summation order; at ~10^8 contexts the drift is real but bounded
   and far below any effect size the paper reports. Nothing here measures it,
   and a mutant introducing a float32 intermediate inside the mean would be
   caught only if it drifted past `approx`'s default tolerance.
-* THE SEED POLICY. C22/C24 prove the seed is USED and that two seeds differ,
+* THE FLOOR'S SHARE AT REAL SCALE. `test_the_sparse_fixture_floor_does_not_
+  dominate_the_uniform_fill` pins that the floor mass is a ~1e-4 share of the
+  total AT 1.92% FILL WITH VALUES OF ORDER 1e-1. A real national grid is
+  sparser still and its observed values may be smaller, so the floor's share
+  is larger there than anything measured here. The judgement that `uniform`
+  stays data-derived rather than collapsing to FLOOR is pinned on this
+  fixture's numbers, not on the artifact's.
+* THE SEED POLICY. C29/C30 prove the seed is USED and that two seeds differ,
   and the shuffles are deterministic in it. WHICH seeds the paper reports, and
   whether one shuffle replicate is enough to claim a null, is a statistical
   question this table cannot reach: a single-replicate shuffle control is weak
   evidence regardless of how correctly it is computed.
-* SPARSITY AS INFORMATION, ON THE SHUFFLES. `uniform` and `marginal` are dense
-  by construction and the module explains why. The shuffles inherit whatever
-  pattern the input had -- which the dense-grid guard forces to be complete --
-  so nothing here exercises a shuffle over a genuinely sparse prior, because
-  that input is now rejected. If a future task relaxes the guard, C3/C4 would
-  need to be rewritten rather than merely re-run.
-* MEMORY. Every control materialises `t.values.toarray()`. At H3 resolution 4
-  over Denmark that is small; at national resolution 7 with 10^3 species it is
-  not, and nothing here has a peak-allocation test (the smoothing harness does,
-  S31). A control that OOMs is a loud failure, not a silent one, which is why
-  it is out of scope rather than untested by oversight.
+* MEMORY. Every control materialises `t.dense()`, which is
+  `dense_capacity` float64s. At H3 resolution 4 over Denmark that is small; at
+  national resolution 7 with 10^3 species it is ~1 GB, and nothing here has a
+  peak-allocation test (the smoothing harness does, S31). A control that OOMs
+  is a loud failure, not a silent one, which is why it is out of scope rather
+  than untested by oversight -- but it is a real operational limit and the
+  controls are now the only stage that pays it.
 """
 from __future__ import annotations
 
@@ -149,105 +171,132 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
             )
         ],
     ),
-    # ---- structural zeros must not silently dilute a control --------------
+    # ---- THE REGRESSION PAIR: the refusals that must never come back -------
     (
         "C3",
-        "the DENSE-GRID check removed, so a tensor with structural zeros is "
-        "accepted and every control is diluted by nnz/size relative to the "
-        "full prior. This is the T9-R2 defect arriving through the input "
-        "rather than through the formula: nothing errors, every value is "
-        "plausible, and the paper's comparison silently becomes a scale test",
-        "test_a_tensor_with_a_structural_zero_is_rejected_by_every_control",
-        [("    if t.values.nnz != size:", "    if False:")],
-    ),
-    (
-        "C4",
-        "the dense-grid check weakened to `>` so a grid with MISSING contexts "
-        "(nnz < size) passes while only an impossible over-full one is "
-        "rejected -- the exact direction that matters, since nnz can never "
-        "exceed size",
-        "test_a_tensor_with_a_structural_zero_is_rejected_by_every_control",
+        "the DENSE-GRID REFUSAL re-introduced. This is the live defect this "
+        "revision fixes: under FLOOR-for-missing there are no structural "
+        "zeros left to refuse, so the guard makes all four controls RAISE on "
+        "every realistic prior and the paper's credibility section fails "
+        "before it computes anything. It survived the previous suite entirely "
+        "because every fixture in it was dense",
+        "test_every_control_runs_on_a_realistically_sparse_prior",
         [
             (
-                "    if t.values.nnz != size:",
-                "    if t.values.nnz > size:",
+                "    return t.dense()",
+                "    _size = t.values.get_shape()[0] * n_cols\n"
+                "    if t.values.nnz != _size:\n"
+                "        raise ValueError(\n"
+                '            f"the {where} control requires a DENSE grid, but this "\n'
+                '            f"tensor stores {t.values.nnz} of {_size} contexts"\n'
+                "        )\n"
+                "    return t.dense()",
             )
         ],
     ),
     (
-        "C5",
-        "the STORED-ZERO check removed. Separate mutant from C3: an explicit "
-        "0.0 is counted by `nnz`, so the dense-grid clause passes on it, and "
-        "it drags the control's mean below the full prior's scale. A `p` at "
-        "or below 0.0 is an upstream contract breach per `_validate_p`",
-        "test_an_explicitly_stored_zero_is_rejected",
+        "C4",
+        "the STORED-ZERO REFUSAL re-introduced. Separate from C3 because a "
+        "sparse fixture does not exercise it: an explicit stored 0.0 passes "
+        "any nnz count. `tensor.py`'s `_floor_missing` maps it to FLOOR "
+        "exactly as it maps an unstored context, so refusing here would make "
+        "the controls stricter than the boundary they read through, on a "
+        "distinction that boundary has deliberately erased",
+        "test_a_stored_explicit_zero_reads_as_the_floor_rather_than_being_refused",
         [
             (
-                "    if t.values.count_nonzero() != t.values.nnz:",
-                "    if False:",
+                "    return t.dense()",
+                "    if t.values.count_nonzero() != t.values.nnz:\n"
+                "        raise ValueError(\n"
+                '            f"the {where} control was given a tensor storing an "\n'
+                '            "explicit zero"\n'
+                "        )\n"
+                "    return t.dense()",
+            )
+        ],
+    ),
+    # ---- the grid itself: one definition of the flooring, upstream ---------
+    (
+        "C5",
+        "`_control_grid` re-derives the grid LOCALLY with `t.values.toarray()` "
+        "instead of returning `t.dense()`. Every unsurveyed context then reads "
+        "a hard 0.0 here while the sweep reads it as FLOOR, so the controls "
+        "sit below the full prior's scale by exactly the floor mass. On a "
+        "fully stored fixture the two are the SAME ARRAY, which is why only "
+        "the sparse fixture can see this",
+        "test_uniform_on_a_sparse_prior_fills_with_the_mean_over_the_WHOLE_grid",
+        [
+            (
+                "    return t.dense()",
+                "    return np.asarray(t.values.toarray(), dtype=np.float64)",
             )
         ],
     ),
     (
         "C6",
-        "the size computed from `nnz` rather than from the shape, making the "
-        "dense-grid clause a tautology (`nnz != nnz` is never true) while it "
-        "still LOOKS like a check. The most plausible-looking way to disable "
-        "C3 without deleting a line",
-        "test_a_tensor_with_a_structural_zero_is_rejected_by_every_control",
+        "`_control_grid` RE-IMPLEMENTS the flooring locally with a drifted "
+        "constant (1e-09 instead of `backoff.FLOOR`). A second definition of "
+        "an upstream value -- the defect this plan has found most often -- and "
+        "it looks entirely correct at the call site",
+        "test_every_control_preserves_the_sparse_priors_total_mass",
         [
             (
-                "    size = int(n_rows) * int(n_cols)",
-                "    size = int(t.values.nnz)",
+                "    return t.dense()",
+                "    _raw = np.asarray(t.values.toarray(), dtype=np.float64)\n"
+                "    return np.where(_raw == 0.0, 1e-09, _raw)",
             )
         ],
     ),
     (
         "C7",
-        "the guard not CALLED by `uniform_prior` at all, so the control that "
-        "defines the scale is the one control that accepts a diluted input",
-        "test_a_tensor_with_a_structural_zero_is_rejected_by_every_control",
+        "`uniform_prior` bypasses `_control_grid` entirely -- so the control "
+        "that DEFINES the scale is the one that loses both the flooring and "
+        "the column-count guard",
+        "test_uniform_on_a_sparse_prior_fills_with_the_mean_over_the_WHOLE_grid",
         [
             (
-                '    dense = _require_dense_grid(t, "uniform")',
+                '    dense = _control_grid(t, "uniform")',
                 "    dense = np.asarray(t.values.toarray(), dtype=np.float64)",
             )
         ],
     ),
     (
         "C8",
-        "the guard not called by `marginal_prior` -- THE control, the one a "
-        "reviewer will demand, and a separate mutant because C7's deletion "
-        "cannot detect this one's loss",
-        "test_a_tensor_with_a_structural_zero_is_rejected_by_every_control",
+        "`marginal_prior` bypasses `_control_grid` -- THE control, the one a "
+        "reviewer will demand. Each species is then rescaled by its OWN fill, "
+        "so the control reports a label frequency that is really a "
+        "survey-effort frequency",
+        "test_marginal_on_a_sparse_prior_preserves_each_species_own_mass",
         [
             (
-                '    dense = _require_dense_grid(t, "marginal")',
+                '    dense = _control_grid(t, "marginal")',
                 "    dense = np.asarray(t.values.toarray(), dtype=np.float64)",
             )
         ],
     ),
     (
         "C9",
-        "the guard not called by `shuffle_space`, so a structural hole is "
-        "RELOCATED onto a real context: the shuffled control then carries a "
-        "hard zero where the full prior had an estimate, which can veto a "
-        "correct detection and make the control look worse than chance",
-        "test_a_tensor_with_a_structural_zero_is_rejected_by_every_control",
+        "`shuffle_space` bypasses `_control_grid`, losing the column-count "
+        "guard before a reshape. Note the flooring it also loses does NOT "
+        "change its output -- mapping unstored to FLOOR commutes with a "
+        "permutation -- so this is killed by the GUARD, which is exactly why "
+        "the guard is called from all four controls and not only from the two "
+        "that average",
+        "test_a_column_count_that_disagrees_with_the_cell_axis_is_rejected",
         [
             (
-                '    dense = _require_dense_grid(t, "shuffle_space")',
+                '    dense = _control_grid(t, "shuffle_space")',
                 "    dense = np.asarray(t.values.toarray(), dtype=np.float64)",
             )
         ],
     ),
     (
         "C10",
-        "the guard not called by `shuffle_time` -- the time mirror of C9",
-        "test_a_tensor_with_a_structural_zero_is_rejected_by_every_control",
+        "`shuffle_time` bypasses `_control_grid` -- the time mirror of C9",
+        "test_a_column_count_that_disagrees_with_the_cell_axis_is_rejected",
         [
             (
-                '    dense = _require_dense_grid(t, "shuffle_time")',
+                '    dense = _control_grid(t, "shuffle_time")',
                 "    dense = np.asarray(t.values.toarray(), dtype=np.float64)",
             )
         ],
@@ -258,11 +307,10 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         "C11",
         "the brief's own spelling restored: `uniform_prior` fills with "
         "`1 / n_species`. Every context then sums to exactly 1.0 -- a "
-        "renormalisation of a prior that is never renormalised at any stage "
-        "-- and on the plan's own 3-context example the control sits at 2.75x "
-        "the full prior's mass. Every fusion method combines prior and "
-        "posterior multiplicatively or via `log prior`, so the comparison "
-        "measures a scale difference and reports it as a context effect",
+        "renormalisation of a prior that is never renormalised at any stage. "
+        "Every fusion method combines prior and posterior multiplicatively or "
+        "via `log prior`, so the comparison measures a scale difference and "
+        "reports it as a context effect",
         "test_uniform_preserves_the_full_priors_total_mass",
         [
             (
@@ -316,9 +364,25 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
     ),
     (
         "C15",
+        "`uniform_prior` divides by `nnz` instead of by the dense capacity -- "
+        "THE scale defect the FLOOR-for-missing reversal makes newly "
+        "available, and the one a reader who still thinks in structural zeros "
+        "would reach for. It inflates the control by dense_capacity/nnz: ~52x "
+        "on this fixture and far more at national scale, which the results "
+        "table would report as an enormous spatiotemporal effect. On a fully "
+        "stored fixture it is EXACTLY the correct value",
+        "test_uniform_on_a_sparse_prior_is_not_the_mean_over_stored_entries",
+        [
+            (
+                "    fill = float(dense.mean())",
+                "    fill = float(dense.sum() / max(t.values.nnz, 1))",
+            )
+        ],
+    ),
+    (
+        "C16",
         "the brief's `per_species / total` renormalisation restored in "
-        "`marginal_prior`. This is the T9-R2 defect in the control that "
-        "matters most: the divisor depends on HOW MANY SPECIES the tensor "
+        "`marginal_prior`. The divisor depends on HOW MANY SPECIES the tensor "
         "holds, so the control's scale becomes a function of the label set "
         "and the label-frequency null is no longer comparable to the full "
         "prior it is the null for",
@@ -334,7 +398,7 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         ],
     ),
     (
-        "C16",
+        "C17",
         "`marginal_prior` uses each species' SUM over contexts instead of its "
         "mean, inflating the control by the number of contexts. Preserves the "
         "RANKING of species exactly -- so every label-frequency assertion "
@@ -349,10 +413,10 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         ],
     ),
     (
-        "C17",
+        "C18",
         "`marginal_prior` uses each species' MEDIAN over contexts. Preserves "
         "the species ranking and is not mass-preserving on a skewed prior. "
-        "Separate mutant from C16 because a sum is caught by magnitude while "
+        "Separate mutant from C17 because a sum is caught by magnitude while "
         "a median is caught only by a fixture whose mean and median differ",
         "test_marginal_preserves_the_full_priors_total_mass",
         [
@@ -363,7 +427,7 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         ],
     ),
     (
-        "C18",
+        "C19",
         "`marginal_prior` uses the GLOBAL mean for every species, collapsing "
         "it into `uniform_prior`. Total mass is still preserved exactly, so "
         "the mass tests cannot see it -- but the label-frequency signal the "
@@ -378,7 +442,7 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         ],
     ),
     (
-        "C19",
+        "C20",
         "`marginal_prior` takes each species' mean over ONE CELL's block "
         "rather than over every context, so the control keeps that cell's "
         "spatial signal. Per-species mass is wrong and the control is no "
@@ -392,7 +456,7 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         ],
     ),
     (
-        "C20",
+        "C21",
         "`marginal_prior` averages over SPECIES instead of over contexts "
         "(axis=0), so the control varies with cell and week and is constant "
         "across species -- the two properties exactly inverted, while the "
@@ -401,15 +465,32 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         [
             (
                 "    per_species = dense.mean(axis=1, keepdims=True)\n"
-                "    return _respec(t, \"marginal\", np.tile(per_species, (1, dense.shape[1])))",
+                '    return _respec(t, "marginal", np.tile(per_species, (1, dense.shape[1])))',
                 "    _per_context = dense.mean(axis=0, keepdims=True)\n"
-                "    return _respec(t, \"marginal\", np.tile(_per_context, (dense.shape[0], 1)))",
+                '    return _respec(t, "marginal", np.tile(_per_context, (dense.shape[0], 1)))',
+            )
+        ],
+    ),
+    (
+        "C22",
+        "`marginal_prior` divides each species' mass by ITS OWN stored-entry "
+        "count rather than by the number of contexts -- the per-species twin "
+        "of C15. The control then reports each species scaled by how much "
+        "anyone LOOKED for it, which is survey effort wearing label "
+        "frequency's clothes, and survey effort is precisely the spatial "
+        "signal the marginal control exists to remove",
+        "test_marginal_on_a_sparse_prior_preserves_each_species_own_mass",
+        [
+            (
+                "    per_species = dense.mean(axis=1, keepdims=True)",
+                "    _per_row_nnz = np.maximum(np.diff(t.values.indptr), 1).reshape(-1, 1)\n"
+                "    per_species = dense.sum(axis=1, keepdims=True) / _per_row_nnz",
             )
         ],
     ),
     # ---- T9-R3: the axes, the shared permutation, the seed ----------------
     (
-        "C21",
+        "C23",
         "`shuffle_space` permutes the WEEK axis, making it a duplicate of "
         "`shuffle_time`. Two of the four controls then run the same "
         "experiment and the space null is never tested at all -- while every "
@@ -423,8 +504,8 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         ],
     ),
     (
-        "C22",
-        "`shuffle_time` permutes the CELL axis -- the mirror of C21, and a "
+        "C24",
+        "`shuffle_time` permutes the CELL axis -- the mirror of C23, and a "
         "separate mutant because one collapse cannot detect the other",
         "test_shuffle_time_permutes_week_slots_with_one_shared_permutation",
         [
@@ -435,7 +516,7 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         ],
     ),
     (
-        "C23",
+        "C25",
         "`shuffle_space` becomes a NO-OP: the permutation replaced by "
         "`arange`. The value multiset, the total mass and the determinism "
         "tests all pass unchanged -- which is precisely why T9-R3 demands a "
@@ -451,8 +532,8 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         ],
     ),
     (
-        "C24",
-        "`shuffle_time` becomes a NO-OP -- the time mirror of C23",
+        "C26",
+        "`shuffle_time` becomes a NO-OP -- the time mirror of C25",
         "test_shuffle_time_actually_moves_a_week",
         [
             (
@@ -462,7 +543,7 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         ],
     ),
     (
-        "C25",
+        "C27",
         "`shuffle_space` draws a FRESH permutation per species instead of "
         "sharing one (T9-R3). It also destroys which species co-occur in a "
         "cell, so a gain could fail this control for a reason that has "
@@ -480,7 +561,7 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         ],
     ),
     (
-        "C26",
+        "C28",
         "`shuffle_time` draws a fresh permutation per CELL rather than sharing "
         "one across cells, so each cell's weeks are scrambled independently. "
         "Every per-cell multiset and every mass assertion still holds",
@@ -501,7 +582,7 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         ],
     ),
     (
-        "C27",
+        "C29",
         "the SEED IGNORED in `shuffle_space` (a fixed default), so every "
         "replicate of the spatial control is the identical permutation and a "
         "sweep over seeds reports one draw as many",
@@ -514,8 +595,8 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         ],
     ),
     (
-        "C28",
-        "the seed ignored in `shuffle_time` -- the time mirror of C27",
+        "C30",
+        "the seed ignored in `shuffle_time` -- the time mirror of C29",
         "test_shuffle_time_uses_its_seed",
         [
             (
@@ -525,12 +606,10 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         ],
     ),
     (
-        "C29",
-        "`shuffle_space` reshaped against a hard-coded 52 rather than "
-        "WEEKS_PER_YEAR. True today and a silent layout drift the moment the "
-        "stride changes -- the defect this plan forbids a literal 52 to "
-        "prevent. Caught here only because the reshape then disagrees with "
-        "the guard's expected column count",
+        "C31",
+        "`shuffle_space` reshaped against a TRANSPOSED (week, cell) stride "
+        "rather than (cell, week). True-looking and a silent layout drift: "
+        "the 'cell' it permutes is a stride through different weeks",
         "test_shuffle_space_relocates_whole_cells_not_individual_values",
         [
             (
@@ -542,7 +621,7 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         ],
     ),
     (
-        "C30",
+        "C32",
         "`shuffle_time` reshaped with the cell and week axes TRANSPOSED, so "
         "the 'week' it permutes is actually a stride through different cells "
         "and values cross cell boundaries -- a time control that is also a "
@@ -558,7 +637,7 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         ],
     ),
     (
-        "C31",
+        "C33",
         "`shuffle_space` permutes the SPECIES axis instead of the cell axis. "
         "The tensor's total mass and its global value multiset are both "
         "unchanged, and every context still holds real probabilities -- but "
@@ -573,7 +652,7 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
     ),
     # ---- the axes, the labels and the provenance the sweep reads ----------
     (
-        "C32",
+        "C34",
         "`_respec` keeps the INPUT's variant, so every control artifact claims "
         "to be the full prior. A sweep over variants would then attribute "
         "every control's result to the full prior and the results table would "
@@ -587,7 +666,7 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         ],
     ),
     (
-        "C33",
+        "C35",
         "`_respec` case-folds the cell axis -- a second normalisation of a "
         "value derived exactly once upstream. Every lookup by a real "
         "lower-case H3 cell still hits here, but an upper-case release would "
@@ -602,7 +681,7 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         ],
     ),
     (
-        "C34",
+        "C36",
         "the GBIF DOI dropped from every control tensor, so a released "
         "control artifact cannot be traced to the download it was built from "
         "-- the provenance a Datasets & Benchmarks submission must carry",
@@ -615,7 +694,7 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         ],
     ),
     (
-        "C35",
+        "C37",
         "the `marginal` entry dropped from the registry, so the ONE control a "
         "reviewer is guaranteed to demand is never run by a sweep that "
         "iterates `CONTROLS`. The function still exists and still passes its "
@@ -629,7 +708,7 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         ],
     ),
     (
-        "C36",
+        "C38",
         "the registry maps `shuffle_time` to `shuffle_space`, so the time null "
         "is never evaluated and its row in the results table is a second copy "
         "of the space null -- which no shape, range or mass check can detect",

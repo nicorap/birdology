@@ -29,28 +29,96 @@ any stage (``backoff.py``, ``smoothing.py``, ``tensor.py`` all say so), and a
 control that quietly normalises would be the one place in the pipeline that
 does.
 
-WHY THE INPUT MUST BE A DENSE GRID (an addition to T9-R2; see the report)
-------------------------------------------------------------------------
-``uniform_prior`` fills with the mean over the WHOLE matrix, so the
-denominator is ``n_species * n_cells * WEEKS_PER_YEAR`` -- it counts contexts
-this tensor holds no estimate for. Per ``tensor.py``, such a context is a
-STRUCTURAL ZERO: a grid point the tensor was never handed, not a probability
-of zero. Averaging over it is only meaningful when there are none.
+THE FULL PRIOR IS ``dense()``, NOT ``values`` -- T9-R2 RE-DERIVED
+------------------------------------------------------------------
+``tensor.py`` reads a context that is on both axes but carries no stored value
+as ``backoff.FLOOR``, not as a hard zero: most (cell, week, species)
+combinations are empty and empty almost always means "nobody looked" rather
+than "absent". So there is no longer any such thing as an unobserved context.
+Every context the axes span HAS a value, and ``PriorTensor.dense()`` is the
+full prior itself rather than a dense-looking lie about one.
 
-That denominator is nevertheless the right one, and it is the ONLY constant
-that preserves total mass, because both controls must be DENSE. They have to
-be: a control that kept the full prior's sparsity pattern would carry the
-presence/absence structure of the occurrence data, which is a large amount of
-spatiotemporal information -- exactly what these two controls exist to remove.
-Given a dense output, the mass-preserving fill is uniquely ``sum / size``.
+Two consequences, both load-bearing:
 
-The fix is therefore not a different denominator but a GUARD. ``to_tensor``'s
-caller is already obliged to supply a dense grid (see ``tensor.py``'s
-STRUCTURAL ZEROS section and T10-R1), and ``hierarchical_estimate`` emits one.
-If that obligation is ever broken, every control here would be diluted by
-``nnz / size`` relative to the full prior, silently, with no test in this plan
-able to see it. ``_require_dense_grid`` refuses instead, for ALL FOUR
-controls, so a partially-valid control set cannot reach the sweep.
+1. The quantity a control must preserve is ``t.dense().sum()``, NOT
+   ``t.values.sum()``. The stored sum omits the floor mass of every context
+   nobody surveyed, and on a realistically sparse prior -- a national grid is
+   single-digit-percent full -- that is most of the grid. A control built to
+   match the stored sum would sit BELOW the full prior the sweep compares it
+   against, by exactly the floor mass.
+2. The denominator is the DENSE CAPACITY, ``n_species * n_cells * 52``. Under
+   the old structural-zero premise that denominator was a compromise; it is
+   now simply the count of contexts that really do carry a value. Dividing by
+   ``nnz`` instead would inflate every control by ``dense_capacity / nnz`` --
+   a factor of ~52 at 2% fill -- which is the T9-R2 defect at a magnitude the
+   results table would report as an enormous spatiotemporal effect.
+
+Per control, writing ``D = t.dense()`` for the full prior as it is actually
+read:
+
+* ``uniform``       fills with ``D.mean()``. ``mean * size == sum`` exactly,
+  so TOTAL mass is preserved. Per-species mass is destroyed on purpose:
+  per-species mass IS label frequency, and this control has no information.
+* ``marginal``      fills row *i* with ``D[i].mean()``. ``mean * n_contexts``
+  is exactly that species' own mass, so PER-SPECIES mass is preserved and
+  total mass follows. The per-species property is the stronger one and it is
+  what makes this the label-frequency null: a reduction preserving the total
+  while moving mass BETWEEN species would have altered the very signal under
+  test.
+* ``shuffle_space`` permutes whole cell blocks with one permutation shared
+  across species, so the output is a PERMUTATION of ``D``. Every row's value
+  multiset survives, hence every row's mass, hence the total.
+* ``shuffle_time``  permutes week slots inside each (species, cell) block, so
+  mass is preserved per species AND per cell -- a strictly stronger invariant
+  than ``shuffle_space``'s, because a week permutation never crosses a cell
+  boundary.
+
+THE FLOOR MASS PARTICIPATES, AND THAT IS THE HONEST NULL
+---------------------------------------------------------
+On a 2%-full prior ``D`` is mostly ``FLOOR``, so it is worth being explicit
+about what ``D.mean()`` is and is not.
+
+It is NOT dominated by the floor. ``FLOOR`` is 1e-06 and observed values are
+of order 1e-01, so at 2% fill the floor contributes ~4e-04 of total mass and
+the uniform constant lands ~2000x above the floor. The control is data-derived,
+not a flat 1e-06.
+
+What including the floor DOES do is spread the full prior's whole mass over
+every context, which puts the uniform constant at roughly ``nnz/size`` of the
+observed mean. That is not dilution -- it is the correct scale, because the
+FULL PRIOR also answers ~98% of its contexts with the floor. Control and
+prior are then one object measured two ways, which is the entirety of T9-R2.
+
+Averaging over the stored entries only would build a control at ~52x the mass
+of the prior it is the null for, and the sweep would report that scale gap as
+a spatiotemporal effect. That is the defect, not the fix.
+
+So the paper's null hypothesis is: *the released prior's total mass,
+redistributed with no context information at all* (``uniform``), or *with
+label frequency but no context* (``marginal``). It is a statement about the
+artifact AS IT IS READ, floor included -- not about the observed subset of it.
+That is the honest null, because the sweep queries the full prior at every
+context too, including the ones nobody surveyed.
+
+WHY THE DENSE-GRID REFUSAL IS GONE
+-----------------------------------
+An earlier revision of this module REFUSED any tensor with ``nnz < size``, on
+the then-current premise that an absent context was a STRUCTURAL ZERO and that
+averaging over it silently diluted every control by ``nnz/size``. That premise
+has been reversed in ``tensor.py``: an absent context reads ``FLOOR``, there is
+nothing structural left to divide by, and the refusal made all four controls
+raise on every realistic prior -- the paper's credibility section failing
+before it computed anything.
+
+The stored-zero clause went with it. ``tensor.py``'s ``_floor_missing`` maps an
+explicit 0.0 to ``FLOOR`` exactly as it maps an unstored context, so no reader
+-- including this one -- can tell the two apart. Refusing here would make the
+controls stricter than the serialisation boundary they read through, on a
+distinction that boundary has deliberately erased. ``tensor.py`` owns that
+call and ``_validate_p`` makes it at write time.
+
+The column-count guard survives untouched: it is about the RESHAPE, not about
+sparsity, and nothing in the reversal touches it.
 
 Errors
 ------
@@ -69,32 +137,39 @@ from .indexing import WEEKS_PER_YEAR
 from .tensor import PriorSpec, PriorTensor
 
 
-def _require_dense_grid(t: PriorTensor, where: str) -> np.ndarray:
-    """Reject anything that is not a dense (species x cell x week) grid.
+def _control_grid(t: PriorTensor, where: str) -> np.ndarray:
+    """The full grid a control is built from: ``t.dense()``, guarded.
 
-    Returns the dense matrix, because every control needs it anyway and
-    materialising it twice is the only cost of checking.
+    The grid is taken from ``PriorTensor.dense()`` and is NEVER re-floored
+    here. ``dense()`` is the single definition of "an unstored context reads
+    the floor", shared with ``lookup`` and ``vector``, so the controls cannot
+    drift from the readers the sweep uses. A local ``t.values.toarray()`` would
+    be a SECOND derivation of an upstream value -- the defect this plan has
+    found most often -- and it would read every unsurveyed context as 0.0 while
+    the full prior reads it as ``FLOOR``, putting the control below the full
+    prior's scale by exactly the floor mass. Silently: every value finite,
+    in range and plausible.
 
-    Three SEPARATE statements, one per clause, so that a fixture tripping one
-    never exercises the others:
+    One guard, checked BEFORE the grid is materialised so that its message
+    arrives instead of an opaque numpy one: the column count must agree with
+    the cell axis (T9-R4). A reshape into ``(species, cell, week)`` blocks on a
+    mismatch either dies on a numpy message that names no contract or -- worse,
+    if the sizes happen to divide -- SUCCEEDS with a wrong block structure, and
+    then ``shuffle_space`` permutes something that is not a cell.
+    ``PriorTensor`` checks this at construction, but it is a MUTABLE dataclass:
+    reassigning ``cells`` or ``values`` afterwards re-opens the hole, and this
+    module is the one that reshapes.
 
-    1. the column count must agree with the cell axis (T9-R4). A reshape into
-       ``(species, cell, week)`` blocks on a mismatch either raises an opaque
-       numpy message that names no contract, or -- worse, if the sizes happen
-       to divide -- succeeds with a WRONG block structure, and then
-       ``shuffle_space`` permutes something that is not a cell. ``PriorTensor``
-       checks this at construction, but ``PriorTensor`` is a mutable dataclass:
-       reassigning ``cells`` or ``values`` afterwards re-opens the hole, and
-       this module is the one that reshapes.
-    2. every context must be STORED. A missing one is a structural zero, and
-       averaging over it dilutes the control -- see the module docstring.
-    3. no stored value may be zero. ``_validate_p`` forbids a ``p`` at or
-       below 0.0, so an explicitly stored zero means a stage was bypassed; it
-       is invisible to clause 2, which counts stored entries rather than
-       non-zero ones, and it would drag the mean down by exactly the amount
-       clause 2 exists to prevent.
+    ``uniform`` and ``marginal`` do not reshape, and they go through the same
+    guard anyway, on purpose: without it the mismatch surfaces two steps later
+    out of ``_respec`` as ``PriorTensor``'s own dataclass message, which names
+    a different contract and points the caller at the wrong layer.
+
+    The dense-grid and stored-zero clauses this guard used to carry are gone;
+    the module docstring says why, and the mutation table keeps a regression
+    mutant for each so neither can return unnoticed.
     """
-    n_rows, n_cols = t.values.get_shape()
+    n_cols = t.values.get_shape()[1]
     expected_cols = len(t.cells) * WEEKS_PER_YEAR
     if n_cols != expected_cols:
         raise ValueError(
@@ -104,27 +179,7 @@ def _require_dense_grid(t: PriorTensor, where: str) -> np.ndarray:
             "(species, cell, week) blocks would either raise an opaque numpy "
             "error naming no contract or succeed with a WRONG block structure"
         )
-
-    size = int(n_rows) * int(n_cols)
-    if t.values.nnz != size:
-        raise ValueError(
-            f"the {where} control requires a DENSE grid, but this tensor "
-            f"stores {t.values.nnz} of {size} (species, cell, week) contexts. "
-            "A context absent from the tensor is a STRUCTURAL ZERO -- a grid "
-            "point it was never handed, not a probability of zero -- so "
-            "averaging over it would dilute every control by nnz/size and put "
-            "the controls on a different scale from the full prior they are "
-            "compared against"
-        )
-    if t.values.count_nonzero() != t.values.nnz:
-        raise ValueError(
-            f"the {where} control was given a tensor storing an explicit zero; "
-            "the backoff clamps every value into [1e-06, 1.0], so a stored "
-            "0.0 means a stage was bypassed, and it would drag the control's "
-            "mean below the full prior's scale while passing the dense-grid "
-            "count"
-        )
-    return np.asarray(t.values.toarray(), dtype=np.float64)
+    return t.dense()
 
 
 def _respec(t: PriorTensor, variant: str, values: np.ndarray) -> PriorTensor:
@@ -151,16 +206,21 @@ def _respec(t: PriorTensor, variant: str, values: np.ndarray) -> PriorTensor:
 def uniform_prior(t: PriorTensor) -> PriorTensor:
     """No information at all: one constant everywhere, at the full prior's mass.
 
-    The constant is the mean over the whole matrix, so total mass is preserved
-    exactly (``mean * size == sum``). It is deliberately NOT ``1 / n_species``:
-    that would renormalise each context to 1.0 and, on a prior whose contexts
-    sum to whatever the pipeline produced, put this control on a different
-    scale from the full prior -- see the module docstring.
+    The constant is the mean over the whole FLOORED grid, so total mass is
+    preserved exactly (``mean * size == sum``). It is deliberately NOT
+    ``1 / n_species``: that would renormalise each context to 1.0 and, on a
+    prior whose contexts sum to whatever the pipeline produced, put this
+    control on a different scale from the full prior.
+
+    It is also deliberately not the mean over the STORED entries. On a
+    realistically sparse prior that would sit at ~``size/nnz`` times the full
+    prior's scale -- see the module docstring; the floor mass participates
+    because the full prior answers those contexts with the floor too.
 
     Flat across species AND across contexts. Either kind of variation would be
     information, and this control is the one that has none.
     """
-    dense = _require_dense_grid(t, "uniform")
+    dense = _control_grid(t, "uniform")
     fill = float(dense.mean())
     return _respec(t, "uniform", np.full(dense.shape, fill, dtype=np.float64))
 
@@ -179,10 +239,11 @@ def marginal_prior(t: PriorTensor) -> PriorTensor:
     control's scale a function of the label set.
 
     The mean over contexts is what preserves mass: mean * n_contexts is exactly
-    that species' original mass, so this control preserves per-species mass and
-    therefore total mass too. A sum or a median here would not.
+    that species' original mass on the floored grid, so this control preserves
+    per-species mass and therefore total mass too. A sum or a median would not,
+    and neither would a mean over that species' stored entries only.
     """
-    dense = _require_dense_grid(t, "marginal")
+    dense = _control_grid(t, "marginal")
     per_species = dense.mean(axis=1, keepdims=True)
     return _respec(t, "marginal", np.tile(per_species, (1, dense.shape[1])))
 
@@ -196,8 +257,14 @@ def shuffle_space(t: PriorTensor, seed: int = 0) -> PriorTensor:
     and the cross-species structure within a cell, untouched. A per-species
     permutation would also scramble which species co-occur, so a gain could
     then fail this control for a reason that has nothing to do with space.
+
+    It permutes the FLOORED grid, so an observed value can land where nobody
+    ever surveyed and the floor can land on an observed context. That is
+    correct and is the whole construction: "nobody looked here" is one of the
+    prior's values, and a control that held it in place would be leaking the
+    survey-effort map -- which is spatial information.
     """
-    dense = _require_dense_grid(t, "shuffle_space")
+    dense = _control_grid(t, "shuffle_space")
     n_cells = len(t.cells)
     blocks = dense.reshape(dense.shape[0], n_cells, WEEKS_PER_YEAR)
     blocks = blocks[:, np.random.default_rng(seed).permutation(n_cells), :]
@@ -211,8 +278,12 @@ def shuffle_time(t: PriorTensor, seed: int = 0) -> PriorTensor:
     species (T9-R3), for the mirror-image reason: it destroys the association
     between a value and WHEN it was observed while preserving each cell's
     multiset of weekly values and each species' mass within every cell.
+
+    It permutes the FLOORED grid, for the temporal mirror of ``shuffle_space``'s
+    reason: when a survey happened is temporal information, so the floor has to
+    move with everything else.
     """
-    dense = _require_dense_grid(t, "shuffle_time")
+    dense = _control_grid(t, "shuffle_time")
     n_cells = len(t.cells)
     blocks = dense.reshape(dense.shape[0], n_cells, WEEKS_PER_YEAR)
     blocks = blocks[:, :, np.random.default_rng(seed).permutation(WEEKS_PER_YEAR)]
