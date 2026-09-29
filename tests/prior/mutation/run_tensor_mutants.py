@@ -445,9 +445,14 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
     (
         "T26",
         "the cell axis left in DICTIONARY order (Arrow's first-appearance "
-        "order) while `cells` is still reported sorted, so an unsorted input "
-        "files each value under the wrong cell",
-        "test_each_value_lands_under_its_own_key_when_the_input_is_unsorted",
+        "order) rather than sorted. The values still land correctly, because "
+        "the remap is derived from whatever `cells` says -- but the AXIS the "
+        "sidecar publishes then depends on the row order of the input table, "
+        "so two runs over the same data in a different order produce "
+        "artifacts whose columns mean different things. Deliberately labelled "
+        "with the ORDER test, not the placement test: an earlier draft of "
+        "this row claimed a placement defect and was scored MISLABELLED",
+        "test_cells_are_sorted_and_unique",
         [
             (
                 "    cells = sorted(set(dictionary))",
@@ -592,9 +597,10 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
     (
         "T36",
         "`load_prior` reads the sidecar beside the RAW path rather than the "
-        "normalised one, so a tensor saved as `p.dat` cannot be reloaded from "
-        "the path `save_prior` returned",
-        "test_load_reads_back_what_save_returned_for_a_non_npz_name",
+        "normalised one, so a caller who hands back the same non-`.npz` name "
+        "it gave `save_prior` cannot reload its tensor. Invisible to the "
+        "returned-path test, whose path already ends in `.npz`",
+        "test_load_accepts_the_same_non_npz_name_that_save_was_given",
         [
             (
                 "    npz = _npz_path(path)\n"

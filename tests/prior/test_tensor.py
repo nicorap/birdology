@@ -569,6 +569,24 @@ def test_load_reads_back_what_save_returned_for_a_non_npz_name(tmp_path):
     assert back.lookup(1, "cell-a", 46) == pytest.approx(0.25)
 
 
+def test_load_accepts_the_same_non_npz_name_that_save_was_given(tmp_path):
+    """`load_prior` must normalise the suffix too, not only `save_prior`.
+
+    A caller that holds the name it passed to `save_prior` -- a config entry,
+    a CLI argument -- and hands the SAME name to `load_prior` must get its
+    tensor back. Reading the sidecar beside the raw path instead of the
+    normalised one makes that round trip fail on any name not ending in
+    `.npz`, and the returned-path test cannot see it because the returned path
+    already ends in `.npz`.
+    """
+    name = tmp_path / "p.dat"
+    t = to_tensor(_table([(1, "cell-a", 46, 0.25)]), SPEC)
+    save_prior(t, name)
+    assert not name.exists()  # precondition: the raw name is NOT a file
+    back = load_prior(name)
+    assert back.lookup(1, "cell-a", 46) == pytest.approx(0.25)
+
+
 def test_the_sidecar_sits_beside_the_npz_that_was_written(tmp_path):
     t = to_tensor(_table([(1, "cell-a", 46, 0.25)]), SPEC)
     path = save_prior(t, tmp_path / "p.dat")
