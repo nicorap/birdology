@@ -20,6 +20,12 @@ PORT     ?= 8080
 GRAPH    ?= output/birdology_reasoned.ttl
 DOF_MAX  ?= 50000
 
+# Occurrence prior build. PRIOR_OUT is a PARAMETER, never a cluster path.
+# GBIF_DOI is required — every artifact is released CC BY 4.0, which obliges
+# attribution, and the writer refuses without it.
+PRIOR_OUT         ?= output/priors
+PRIOR_RESOLUTIONS ?= 3 4 5
+
 .DEFAULT_GOAL := help
 
 ## ─── Setup ──────────────────────────────────────────────────────────────────
@@ -45,6 +51,12 @@ reindex: ## Rebuild the Wikipedia index alone (needs Ollama + nomic-embed-text)
 .PHONY: reason
 reason: ## Re-run the reasoner over the existing graph
 	uv run python scripts/reason.py
+
+.PHONY: prior
+prior: ## Build occurrence priors + 4 controls (ARCHIVE=path SOURCE=dof GBIF_DOI=10.15468/dl.x SPLIT=path)
+	uv run python scripts/build_prior.py --archive $(ARCHIVE) --source $(SOURCE) \
+		--resolutions $(PRIOR_RESOLUTIONS) --out $(PRIOR_OUT) --gbif-doi $(GBIF_DOI) \
+		$(if $(SPLIT),--test-split $(SPLIT),--no-test-split)
 
 ## ─── Run ────────────────────────────────────────────────────────────────────
 
