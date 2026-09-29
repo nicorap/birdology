@@ -54,6 +54,12 @@ number rather than an error:
 * AXIS (T9-R3/T9-R4). C23-C33 permute the wrong axis, permute per-species
   instead of once, collapse the two shuffles into one, drop the seed, or
   reshape against a transposed stride.
+* THE INTERACTION (M1). C50-C62 cover the fifth control, `separable`, whose
+  entire definition is WHICH AXIS each marginal is taken over: they drop it
+  from the registry, bypass the grid, swap the two marginals' axes, drop or
+  pool the normalisation, make it the identity, and remove, invert or SILENTLY
+  CLAMP its above-one refusal. C57 is the important one -- the identity
+  satisfies every preservation property this control claims.
 
 THE TWO REGRESSION MUTANTS (C3, C4) ARE THE POINT OF THIS REVISION
 -------------------------------------------------------------------
@@ -110,16 +116,20 @@ invisible.
 WHAT THIS SET DOES NOT COVER -- stated so the table is not read as more than
 it is
 ---------------------------------------------------------------------------
-* WHETHER THESE FOUR ARE THE RIGHT CONTROLS. Every mutant here asks whether
+* WHETHER THESE FIVE ARE THE RIGHT CONTROLS. Every mutant here asks whether
   each control computes what it claims. That the set {uniform, marginal,
-  shuffle_space, shuffle_time} is SUFFICIENT to establish a spatiotemporal
-  effect is a claim about experimental design, not about this module, and no
-  mutation of it can speak to it. A reviewer could reasonably demand a fifth
-  control (e.g. a phylogenetically-matched species swap, or a shuffle that
-  permutes space and time jointly), and nothing here would notice its absence.
-* THE SWEEP THAT CONSUMES THEM. `CONTROLS` is pinned as a registry of four
-  callables with matching variant labels, but nothing here proves the sweep
-  actually RUNS all four in every cell (the spec's "run in every cell"), nor
+  shuffle_space, shuffle_time, separable} is SUFFICIENT to establish a
+  spatiotemporal effect is a claim about experimental design, not about this
+  module, and no mutation of it can speak to it. `separable` was added because
+  finding M1 showed the previous four could not separate the joint space x time
+  term from the two marginals acting independently -- and nothing in this table
+  would have noticed its absence. A reviewer could reasonably demand a SIXTH
+  (e.g. a phylogenetically-matched species swap), and nothing here would notice
+  that either.
+* THE SWEEP THAT CONSUMES THEM. `CONTROLS` is pinned as a registry of five
+  callables with matching variant labels, and the pipeline tests prove
+  `build_prior.py` writes all five to disk, but nothing here proves the sweep
+  actually RUNS all five in every cell (the spec's "run in every cell"), nor
   that it compares them against the full prior on the same fold. A sweep that
   silently skipped `marginal` would pass every test in this file. That
   obligation lives downstream and is only as strong as its own tests.
@@ -912,6 +922,229 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
                 "    per_species = dense.mean(axis=1, keepdims=True)",
                 "    _m = dense.mean(axis=1, keepdims=True)\n"
                 "    per_species = _m**2 * (_m.sum() / (_m**2).sum())",
+            )
+        ],
+    ),
+    (
+        "C49",
+        "`marginal_prior` shrinks each species' mean 0.5% toward the global "
+        "mean -- the same defect class as C47 but an order of magnitude "
+        "smaller, sized DELIBERATELY to slip through the fixture's 1% "
+        "tolerance. Total mass is preserved exactly and the fixture contrast "
+        "test (`rel=0.01` on a 4:1 ratio) still passes. It dies only to the "
+        "PIPELINE contrast test, which asserts EXACT equality because a fully "
+        "materialised artifact has no floor mass to excuse any loss. This is "
+        "the mutant that makes finding C2's correction load-bearing rather "
+        "than merely accurate: before the pipeline test existed, a systematic "
+        "sub-percent contrast loss on every released artifact was invisible",
+        "test_marginal_contrast_is_EXACT_on_a_pipeline_artifact",
+        [
+            (
+                "    per_species = dense.mean(axis=1, keepdims=True)",
+                "    per_species = 0.995 * dense.mean(axis=1, keepdims=True) "
+                "+ 0.005 * dense.mean()",
+            )
+        ],
+    ),
+    # ---- M1: `separable`, the fifth control -------------------------------
+    (
+        "C50",
+        "the `separable` entry dropped from the registry, so the ONE control "
+        "that isolates the space x time interaction is never run by a sweep "
+        "that iterates `CONTROLS` -- and `build_prior.py` iterates it, so the "
+        "artifact simply never appears on disk. The function still exists and "
+        "still passes every test that calls it directly. This is the M1 "
+        "finding restored: no control in the remaining four separates the "
+        "joint term from the two marginals acting independently",
+        "test_controls_registry_covers_all_five",
+        [('    "separable": separable_prior,\n', "")],
+    ),
+    (
+        "C51",
+        "`separable_prior` bypasses `_control_grid`, losing the flooring "
+        "before the outer product AND the column-count guard before the "
+        "reshape -- the fifth control's version of C7-C10. On a sparse prior "
+        "every unsurveyed context reads a hard 0.0, so the cell and week "
+        "marginals are computed over a grid the sweep never sees and the "
+        "control lands below the full prior's scale",
+        "test_a_column_count_that_disagrees_with_the_cell_axis_is_rejected",
+        [
+            (
+                '    dense = _control_grid(t, "separable")',
+                "    dense = np.asarray(t.values.toarray(), dtype=np.float64)",
+            )
+        ],
+    ),
+    (
+        "C52",
+        "`separable_prior` computes the WEEK marginal over the week axis "
+        "instead of the cell axis (`axis=2` twice), so the surrogate is the "
+        "square of the cell marginal over the grand mean: CONSTANT in the "
+        "week, which destroys the week marginal it exists to preserve. Every "
+        "value stays finite, positive and plausible, and the CELL marginal is "
+        "still right, so half the contract still holds",
+        "test_separable_preserves_every_species_WEEK_marginal_exactly",
+        [
+            (
+                "    week_mean = blocks.mean(axis=1, keepdims=True)",
+                "    week_mean = blocks.mean(axis=2, keepdims=True)",
+            )
+        ],
+    ),
+    (
+        "C53",
+        "`separable_prior` computes the CELL marginal over the cell axis "
+        "instead of the week axis -- the mirror of C52, and a separate mutant "
+        "because a test that catches a destroyed week marginal need not catch "
+        "a destroyed cell marginal. The surrogate becomes constant across "
+        "cells, which is `shuffle_space`'s target rather than this control's",
+        "test_separable_preserves_every_species_CELL_marginal_exactly",
+        [
+            (
+                "    cell_mean = blocks.mean(axis=2, keepdims=True)",
+                "    cell_mean = blocks.mean(axis=1, keepdims=True)",
+            )
+        ],
+    ),
+    (
+        "C54",
+        "the `/ grand_mean` normalisation DROPPED from the outer product. The "
+        "surrogate is then a bare product of two means, so every value is "
+        "wrong by a factor of the grand mean -- which SHRINKS the control by "
+        "orders of magnitude and is exactly the T9-R2 scale defect the whole "
+        "module is built to prevent. Both marginals stay PROPORTIONAL to the "
+        "right thing, so their shape survives and only the scale is wrong: the "
+        "most plausible-looking failure in this construction",
+        "test_separable_preserves_each_species_own_mass_and_the_total",
+        [
+            (
+                "    surrogate = cell_mean * week_mean / grand_mean",
+                "    surrogate = cell_mean * week_mean",
+            )
+        ],
+    ),
+    (
+        "C55",
+        "`separable_prior` divides by the GLOBAL mean over every species "
+        "rather than by each species' own grand mean. Total mass is NOT "
+        "preserved and, worse, each species is rescaled by the ratio of its "
+        "own mean to the global one -- so the control silently re-weights "
+        "label frequency, which is the signal `marginal` exists to isolate "
+        "and this control must leave untouched",
+        "test_separable_preserves_each_species_own_mass_and_the_total",
+        [
+            (
+                "    grand_mean = blocks.mean(axis=(1, 2), keepdims=True)",
+                "    grand_mean = blocks.mean()",
+            )
+        ],
+    ),
+    (
+        "C56",
+        "`separable_prior` pools BOTH marginals across species instead of "
+        "using each species' own. Every species then gets the same spatial and "
+        "the same seasonal profile, so the control carries a pooled community "
+        "average rather than each species' own marginals -- and the TOTAL mass "
+        "is still preserved, so no total-mass assertion can see it",
+        "test_separable_uses_EACH_SPECIES_OWN_marginals_not_pooled_ones",
+        [
+            (
+                "    cell_mean = blocks.mean(axis=2, keepdims=True)\n"
+                "    week_mean = blocks.mean(axis=1, keepdims=True)\n"
+                "    grand_mean = blocks.mean(axis=(1, 2), keepdims=True)",
+                "    cell_mean = blocks.mean(axis=(0, 2), keepdims=True)\n"
+                "    week_mean = blocks.mean(axis=(0, 1), keepdims=True)\n"
+                "    grand_mean = blocks.mean()",
+            )
+        ],
+    ),
+    (
+        "C57",
+        "`separable_prior` becomes the IDENTITY -- it returns the full prior's "
+        "own grid, relabelled `separable`. EVERY preservation property this "
+        "control claims (both marginals, per-species mass, total mass, "
+        "positivity, fill) holds PERFECTLY on the identity, so the entire "
+        "preservation half of its test set passes. The results table then "
+        "carries a row claiming the interaction was removed when the full "
+        "prior was shipped under a control's label, which reads as the "
+        "interaction contributing NOTHING -- the opposite of the measured "
+        "20-57%",
+        "test_separable_DESTROYS_the_interaction_it_exists_to_isolate",
+        [
+            (
+                "    surrogate = cell_mean * week_mean / grand_mean",
+                "    surrogate = blocks",
+            )
+        ],
+    ),
+    (
+        "C58",
+        "the above-one REFUSAL removed, so a prior whose marginals multiply "
+        "past 1.0 produces a control holding values that are not "
+        "probabilities. `save_prior` would write it -- it validates on the way "
+        "IN, not on a control's way out -- and a fusion step consuming it "
+        "would see a prior above one, which inflates rather than tempers the "
+        "acoustic likelihood",
+        "test_separable_REFUSES_a_prior_whose_outer_product_leaves_the_unit_interval",
+        [("    if surrogate.max() > 1.0:", "    if False:")],
+    ),
+    (
+        "C59",
+        "the above-one refusal replaced by a SILENT CLAMP -- the no-silent-"
+        "repair violation, and the shape of a well-meaning fix. A clamped "
+        "surrogate reproduces NEITHER marginal and no longer preserves mass, "
+        "so the control quietly stops being the null it claims to be while "
+        "every value remains a plausible probability. Separate mutant from "
+        "C58 because a test that catches a missing guard need not catch a "
+        "guard replaced by a coercion",
+        "test_separable_REFUSES_a_prior_whose_outer_product_leaves_the_unit_interval",
+        [
+            (
+                "    if surrogate.max() > 1.0:",
+                "    surrogate = np.minimum(surrogate, 1.0)\n    if False:",
+            )
+        ],
+    ),
+    (
+        "C60",
+        "the above-one refusal INVERTED, so every ordinary prior is rejected "
+        "and only a pathological one is accepted -- the C40-shaped mirror, "
+        "which takes the paper's credibility section down before it computes "
+        "anything rather than corrupting a number",
+        "test_separable_does_not_refuse_an_ordinary_prior",
+        [("    if surrogate.max() > 1.0:", "    if surrogate.max() <= 1.0:")],
+    ),
+    (
+        "C61",
+        "the registry maps `separable` to `marginal_prior`, so the "
+        "interaction-isolating control's row in the results table is a second "
+        "copy of the label-frequency null. Mass-preserving, finite, in range "
+        "and correctly labelled by `_respec` -- and it reports that removing "
+        "the interaction destroys both marginals too, which would make the "
+        "joint term look far more important than it is",
+        "test_every_registered_control_labels_its_own_variant",
+        [
+            (
+                '    "separable": separable_prior,',
+                '    "separable": marginal_prior,',
+            )
+        ],
+    ),
+    (
+        "C62",
+        "`separable_prior` reshaped against a TRANSPOSED (week, cell) stride, "
+        "so the 'cell marginal' is a stride through different weeks and the "
+        "'week marginal' through different cells -- the C31/C32-shaped layout "
+        "drift, on the one control whose entire definition is which axis each "
+        "marginal is taken over. The output is still positive, still "
+        "mass-preserving in total, and still looks like a separable surrogate",
+        "test_separable_preserves_every_species_CELL_marginal_exactly",
+        [
+            (
+                "    blocks = dense.reshape(dense.shape[0], n_cells, WEEKS_PER_YEAR)\n"
+                "    # Per SPECIES, never pooled",
+                "    blocks = dense.reshape(dense.shape[0], WEEKS_PER_YEAR, n_cells)\n"
+                "    # Per SPECIES, never pooled",
             )
         ],
     ),

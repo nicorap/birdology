@@ -1,4 +1,4 @@
-"""The four control priors. A gain surviving all four is a real effect.
+"""The five control priors. A gain surviving all five is a real effect.
 
 Task 9 is the credibility of the paper: a control that is subtly wrong makes
 the headline claim wrong, and nothing downstream can detect it. So these tests
@@ -7,24 +7,36 @@ control on a different scale from the full prior turns the comparison into a
 scale difference) and OBSERVABILITY (T9-R1/T9-R3: a fixture that cannot show
 the effect pins nothing) -- as hard as they pin the obvious ones.
 
-TWO FIXTURES, AND THE SPARSE ONE IS NOT OPTIONAL
--------------------------------------------------
+THREE FIXTURES, AND THE PIPELINE ONE IS THE ANSWER TO C2
+--------------------------------------------------------
 `_tensor()` is a fully stored grid. It distinguishes the right reduction from
 the wrong ones (mean vs median vs max vs sum vs per-cell mean) and it is where
 the axis and permutation properties are pinned.
 
-`_sparse_tensor()` stores 6 of 312 contexts -- 1.92% fill, which is what a
-national prior actually looks like. It exists because a previous revision of
-`controls.py` REFUSED any tensor with `nnz < size`, and every test here passed
-anyway: the fixtures were all dense, so the suite was green while all four
-controls raised on every realistic input. A property that only ever sees a
-dense fixture is a property about the fixture.
+`_sparse_tensor()` stores 10 of 520 contexts -- 1.92% fill. It exists because a
+previous revision of `controls.py` REFUSED any tensor with `nnz < size`, and
+every test here passed anyway: the fixtures were all dense, so the suite was
+green while all four controls raised on every realistic input. A property that
+only ever sees a dense fixture is a property about the fixture.
 
-Under `tensor.py`'s FLOOR-for-missing semantics the two fixtures also separate
-`t.dense()` from `t.values.toarray()`: on the dense fixture they are the same
-array, so ONLY the sparse fixture can tell a control that reads the prior the
-way the sweep reads it from one that re-derives it locally and answers every
-unsurveyed context with a hard zero.
+`_pipeline_artifacts()` builds through `build_from_archive` -- the REAL CLI
+path -- and is the answer to finding C2. BOTH hand-built fixtures above are
+unrepresentative of a released artifact in the one way that matters most: a
+pipeline build passes `cells=` and weeks `1..52` explicitly and `_validate_p`
+forbids `p <= 0`, so every context is an explicit stored nonzero, fill is
+EXACTLY 1.0000, and NOT ONE entry equals FLOOR. The released documentation and
+this module's own docstrings previously quoted a "~98% of the grid is missing"
+regime and a 7.943-nat log-space offset, both measured on the 1.92% fixture and
+both false of anything shipped. Every NUMBER this file asserts about the
+released artifact now comes from the pipeline fixture; the sparse fixture pins
+only what it can legitimately speak for, and is labelled FIXTURE-ONLY where it
+does.
+
+Under `tensor.py`'s FLOOR-for-missing semantics the first two fixtures also
+separate `t.dense()` from `t.values.toarray()`: on the dense fixture they are
+the same array, so ONLY the sparse fixture can tell a control that reads the
+prior the way the sweep reads it from one that re-derives it locally and
+answers every unsurveyed context with a hard zero.
 
 FIVE CELLS, NOT THREE, AND THE SEEDS ARE NOT TRUSTED
 -----------------------------------------------------
@@ -52,7 +64,11 @@ both properties asserted directly.
 Guard messages are matched on wording specific to THAT check -- never a bare
 word (`dense`, `zero`, `cells`) that another layer could also produce.
 """
+import datetime
+import json
+import math
 import sys
+import zipfile
 from pathlib import Path
 
 import numpy as np
@@ -61,17 +77,19 @@ import pytest
 from scipy import sparse
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).parent.parent.parent / "scripts"))
 
 from birdology.prior.backoff import FLOOR
 from birdology.prior.controls import (
     CONTROLS,
     marginal_prior,
+    separable_prior,
     shuffle_space,
     shuffle_time,
     uniform_prior,
 )
 from birdology.prior.indexing import WEEKS_PER_YEAR
-from birdology.prior.tensor import PriorSpec, PriorTensor, to_tensor
+from birdology.prior.tensor import PriorSpec, PriorTensor, load_prior, to_tensor
 
 SPEC = PriorSpec(resolution=4, source="dof", variant="full")
 
@@ -1051,8 +1069,9 @@ def test_the_controls_read_an_unsurveyed_context_as_the_floor_not_zero():
 @pytest.mark.parametrize("outer", list(CONTROLS))
 @pytest.mark.parametrize("inner", list(CONTROLS))
 def test_a_control_of_a_control_is_refused(outer, inner):
-    """All SIXTEEN compositions, because each control is a different reduction
-    and a guard that fired for three of them would still relabel the fourth."""
+    """All TWENTY-FIVE compositions, because each control is a different
+    reduction and a guard that fired for four of them would still relabel the
+    fifth."""
     control = CONTROLS[inner](_tensor())
     assert control.spec.variant == inner
     with pytest.raises(ValueError, match="a control of a control is meaningless"):
@@ -1132,10 +1151,13 @@ def test_a_column_count_that_disagrees_with_the_cell_axis_is_rejected(name):
     dataclass: reassigning `cells` re-opens the hole, and this module is the one
     that reshapes into (species, cell, week) blocks.
 
-    Parametrized over all four because `uniform` and `marginal` do not reshape
-    and would otherwise surface the mismatch two steps later, out of `_respec`,
-    as `PriorTensor`'s own message -- which names a different contract and
-    points the caller at the wrong layer.
+    Parametrized over all five because `uniform` and `marginal` do not reshape
+    at all and would otherwise surface the mismatch two steps later, out of
+    `_respec`, as `PriorTensor`'s own message -- which names a different
+    contract and points the caller at the wrong layer. `separable` DOES
+    reshape, so for it the guard is the difference between a named contract and
+    an opaque numpy error (or, if the sizes divide, a silently wrong block
+    structure whose "cell marginal" is a stride through different weeks).
     """
     t = _tensor()
     t.cells = list(t.cells) + ["8418c53ffffffff"]
@@ -1165,8 +1187,10 @@ def test_the_column_count_guard_does_not_raise_on_a_valid_tensor():
 # ---------------------------------------------------------------------------
 
 
-def test_controls_registry_covers_all_four():
-    assert set(CONTROLS) == {"uniform", "marginal", "shuffle_space", "shuffle_time"}
+def test_controls_registry_covers_all_five():
+    assert set(CONTROLS) == {
+        "uniform", "marginal", "shuffle_space", "shuffle_time", "separable"
+    }
 
 
 def test_every_registered_control_labels_its_own_variant():
@@ -1197,8 +1221,558 @@ def test_no_control_renormalises_a_context_to_one():
 
 
 def test_every_control_preserves_the_full_priors_total_mass():
-    """The single T9-R2 property, asserted across all four at once: whatever the
+    """The single T9-R2 property, asserted across all five at once: whatever the
     sweep compares, it compares at one scale."""
     t = _tensor()
     for name, fn in CONTROLS.items():
         assert fn(t).dense().sum() == pytest.approx(t.dense().sum()), name
+
+
+# ---------------------------------------------------------------------------
+# M1: `separable` -- the fifth control, which isolates the SPACE x TIME
+# INTERACTION.
+#
+# Before it existed, NO control in the set preserved both marginals while
+# destroying only their interaction: `uniform` destroys everything, `marginal`
+# destroys space AND time AND the interaction together, and BOTH shuffles
+# relabel one axis and carry the joint structure along with it, leaving the
+# interaction's magnitude EXACTLY unchanged. A reviewer could fairly say the
+# reported gain was never separated from "common in this region" plus "common
+# in this week" acting independently.
+#
+# The measured numbers here are PIPELINE numbers -- see the pipeline fixture at
+# the bottom of this file -- not fixture numbers.
+# ---------------------------------------------------------------------------
+
+
+def _blocks(dense, n_cells=None):
+    n_cells = len(CELLS) if n_cells is None else n_cells
+    return dense.reshape(dense.shape[0], n_cells, WEEKS_PER_YEAR)
+
+
+def _interaction(block):
+    """The two-way ANOVA residual of one species' (cell x week) block."""
+    return (
+        block
+        - block.mean(axis=1, keepdims=True)
+        - block.mean(axis=0, keepdims=True)
+        + block.mean()
+    )
+
+
+def _interaction_std(dense, n_cells=None, log=False):
+    b = _blocks(np.log(dense) if log else dense, n_cells)
+    return float(
+        np.concatenate([_interaction(b[s]).ravel() for s in range(b.shape[0])]).std()
+    )
+
+
+# A SEPARATE fixture, and finding out why is the point. `_p` is
+# `cell_term + week_term`, multiplied by a per-species constant, so it is
+# ADDITIVELY separable: its two-way ANOVA residual is 4.9e-17, i.e. ZERO. That
+# makes it useless as the fixture for this control in BOTH directions -- there
+# is no arithmetic interaction to observe being destroyed, and (measured) the
+# multiplicative surrogate actually INCREASES the arithmetic residual there,
+# from 4.9e-17 to 3.2e-02, because an additively separable grid is not a
+# multiplicatively separable one.
+#
+# `_p` is NOT changed: the existing four controls' reduction tests
+# (mean-vs-median, per-cell-mean, quadratic-in-cell) all depend on its precise
+# shape. This fixture is added beside it, with a phase-shifted seasonal peak per
+# CELL, which is what makes a grid genuinely non-separable in both senses: WHEN
+# a species peaks depends on WHERE, which is the real ecological joint structure
+# (a wader's passage weeks differ between the west coast and the Sound) and is
+# precisely the term the fifth control exists to isolate.
+_INTERACTION_PHASE_STEP = 9.0
+
+
+def _interacting_p(cell_index: int, week: int, species_index: int) -> float:
+    """A value whose seasonal PEAK WEEK depends on the cell. Non-separable.
+
+    Two Gaussian peaks half a year apart, whose phase advances with the cell
+    index, plus a small monotone week term so that no two week slots inside a
+    block carry the same value (a repeated value would let a real permutation
+    look like a no-op). Every value stays inside (0, 1] as `_validate_p`
+    requires, and the per-species scaling is `_MASS_RATIO` as elsewhere.
+    """
+    phase = 6.0 + _INTERACTION_PHASE_STEP * cell_index
+    seasonal = math.exp(-0.5 * ((week - phase) / 5.0) ** 2) + math.exp(
+        -0.5 * ((week - (phase + 26)) / 5.0) ** 2
+    )
+    base = 0.02 + 0.0002 * week + 0.5 * seasonal
+    return base * (_MASS_RATIO if species_index else 1.0)
+
+
+def _interacting_tensor():
+    """A fully stored grid carrying a REAL space x time interaction."""
+    return _to_tensor(
+        [
+            (SPECIES[si], cell, week, _interacting_p(ci, week, si))
+            for si in range(len(SPECIES))
+            for ci, cell in enumerate(CELLS)
+            for week in range(1, WEEKS_PER_YEAR + 1)
+        ]
+    )
+
+
+def test_the_MAIN_fixture_has_NO_arithmetic_interaction_so_it_cannot_pin_this():
+    """The trap, pinned so nobody re-uses `_tensor()` for a separable test.
+
+    `_p` is `cell_term + week_term` times a per-species constant, so its
+    two-way ANOVA residual is ZERO to float rounding: there is no arithmetic
+    interaction for the fifth control to be seen destroying. Worse than merely
+    vacuous -- the multiplicative surrogate INCREASES the residual on this
+    fixture, so a naive "the interaction shrinks" assertion would FAIL here for
+    a correct implementation and invite someone to weaken it.
+
+    Asserted rather than discovered a second time, and it is why
+    `_interacting_tensor()` exists.
+    """
+    dense = _tensor().dense()
+    assert _interaction_std(dense) == pytest.approx(0.0, abs=1e-12)
+    # Additively separable is NOT multiplicatively separable: the log-space
+    # interaction is real here, and the control removes exactly that.
+    assert _interaction_std(dense, log=True) > 0.1
+    after = separable_prior(_tensor()).dense()
+    assert _interaction_std(after, log=True) == pytest.approx(0.0, abs=1e-12)
+    # The arithmetic residual GROWS, which is the trap stated as a number.
+    assert _interaction_std(after) > _interaction_std(dense)
+
+
+def test_the_interacting_fixture_really_does_have_an_interaction_to_destroy():
+    """The precondition without which every `separable` assertion is vacuous.
+
+    Measured on this fixture: interaction residual standard deviation 0.1179
+    arithmetic and 0.929 in log space, against `_tensor()`'s 4.9e-17.
+    """
+    dense = _interacting_tensor().dense()
+    assert _interaction_std(dense) > 0.1
+    assert _interaction_std(dense, log=True) > 0.5
+    # And it is a real share of the grid's own spread, not float noise.
+    assert _interaction_std(dense) > 0.1 * dense.std()
+
+
+def test_the_interacting_fixture_satisfies_the_shared_fixture_preconditions():
+    """It is a legitimate prior and it is observable, asserted directly rather
+    than inherited from `_tensor()`'s own precondition tests."""
+    t = _interacting_tensor()
+    dense = t.dense()
+    assert dense.min() > 0.0 and dense.max() <= 1.0
+    assert t.values.nnz == t.dense_capacity
+    assert not np.isclose(dense[0].sum(), dense[1].sum())
+    blocks = _blocks(dense)
+    for s in range(len(SPECIES)):
+        for c in range(len(CELLS)):
+            assert len(set(blocks[s, c].tolist())) == WEEKS_PER_YEAR
+        for i in range(len(CELLS)):
+            for j in range(i + 1, len(CELLS)):
+                assert not np.allclose(blocks[s, i], blocks[s, j])
+
+
+def test_separable_variant_is_labelled():
+    assert separable_prior(_interacting_tensor()).spec.variant == "separable"
+
+
+def test_separable_preserves_every_species_CELL_marginal_exactly():
+    """Half of the contract, and the half a within-cell week permutation also
+    satisfies -- which is why the week marginal below is the discriminating
+    one."""
+    t = _interacting_tensor()
+    before = _blocks(t.dense())
+    after = _blocks(separable_prior(t).dense())
+    assert after.mean(axis=2) == pytest.approx(before.mean(axis=2))
+
+
+def test_separable_preserves_every_species_WEEK_marginal_exactly():
+    """The other half, and THE reason the outer product was chosen over an
+    independently-drawn within-cell week permutation: that alternative was
+    built and measured and destroys this marginal (max relative error 1.383 on
+    a pipeline artifact, against float rounding here), because each cell's
+    weekly values land under different week labels."""
+    t = _interacting_tensor()
+    before = _blocks(t.dense())
+    after = _blocks(separable_prior(t).dense())
+    assert after.mean(axis=1) == pytest.approx(before.mean(axis=1))
+
+
+def test_separable_preserves_each_species_own_mass_and_the_total():
+    """Follows from either marginal, asserted directly because it is the T9-R2
+    scale property and must not depend on a derivation."""
+    t = _interacting_tensor()
+    s = separable_prior(t)
+    assert s.dense().sum(axis=1) == pytest.approx(t.dense().sum(axis=1))
+    assert s.dense().sum() == pytest.approx(t.dense().sum())
+
+
+def test_separable_DESTROYS_the_interaction_it_exists_to_isolate():
+    """The point of the control, and not implied by any marginal assertion: a
+    control that returned its input unchanged would pass every preservation
+    test above -- and on `_tensor()` it WOULD be the identity, which is why this
+    uses the interacting fixture.
+
+    The construction is exact in LOG space -- a product is additive there -- so
+    the log-space interaction residual must vanish to float rounding while the
+    arithmetic one merely shrinks (measured: 0.1179 -> 0.0107, a factor 0.09).
+    """
+    t = _interacting_tensor()
+    before = t.dense()
+    after = separable_prior(t).dense()
+    assert _interaction_std(before) > 0.1, "precondition: there is one to destroy"
+    assert _interaction_std(after, log=True) == pytest.approx(0.0, abs=1e-12)
+    assert _interaction_std(after) < 0.2 * _interaction_std(before)
+    # And the output is NOT the input: the preservation tests above are all
+    # satisfied by the identity function.
+    assert not np.allclose(after, before)
+
+
+def test_separable_is_NOT_a_shuffle_and_NOT_the_marginal_control():
+    """Three controls could be confused for one another by a mass assertion.
+
+    Both shuffles preserve the interaction's magnitude exactly (they permute
+    it), and `marginal` destroys the marginals too. This separates all three.
+    """
+    t = _interacting_tensor()
+    before = t.dense()
+    sep = separable_prior(t).dense()
+    for shuffled in (
+        shuffle_space(t, seed=SPACE_SEED).dense(),
+        shuffle_time(t, seed=TIME_SEED).dense(),
+    ):
+        assert _interaction_std(shuffled) == pytest.approx(_interaction_std(before))
+        assert _interaction_std(sep) < _interaction_std(shuffled)
+    # `marginal` flattens both marginals; `separable` keeps them.
+    b = _blocks(before)
+    m = _blocks(marginal_prior(t).dense())
+    assert not np.allclose(m.mean(axis=2), b.mean(axis=2))
+    assert np.allclose(_blocks(sep).mean(axis=2), b.mean(axis=2))
+
+
+def test_separable_uses_EACH_SPECIES_OWN_marginals_not_pooled_ones():
+    """Pooling across species would mix label frequency into the marginals and
+    the control would stop preserving each species' own mass -- while still
+    preserving the TOTAL, so the total-mass test could not see it."""
+    t = _interacting_tensor()
+    dense = t.dense()
+    b = _blocks(dense)
+    expected = (
+        b.mean(axis=2, keepdims=True)
+        * b.mean(axis=1, keepdims=True)
+        / b.mean(axis=(1, 2), keepdims=True)
+    ).reshape(dense.shape)
+    assert separable_prior(t).dense() == pytest.approx(expected)
+    # A POOLED version is a different array on this fixture, so "each species'
+    # own" is pinned rather than assumed.
+    pooled = (
+        b.mean(axis=(0, 2), keepdims=True)
+        * b.mean(axis=(0, 1), keepdims=True)
+        / b.mean()
+    )
+    assert not np.allclose(
+        expected, np.broadcast_to(pooled, b.shape).reshape(dense.shape)
+    )
+
+
+def test_separable_runs_on_a_realistically_sparse_prior_too():
+    """The C3-class regression, for the fifth control: the floor participates
+    and the grand mean is over the FLOORED grid, so a sparse prior must
+    compute rather than refuse or divide by zero."""
+    t = _sparse_tensor()
+    s = separable_prior(t)
+    assert s.dense().min() > 0.0
+    assert np.isfinite(s.dense()).all()
+    assert s.dense().sum() == pytest.approx(t.dense().sum())
+    assert s.values.nnz == t.dense_capacity
+
+
+def test_separable_REFUSES_a_prior_whose_outer_product_leaves_the_unit_interval():
+    """No silent repair at a boundary.
+
+    The outer product can exceed 1.0 even when every input is a probability: a
+    block whose mass is concentrated in ONE cell AND ONE week has a large cell
+    marginal and a large week marginal in the same place, and their product
+    over a small grand mean is large. Clamping would break BOTH marginals and
+    mass preservation -- the invariants the control is defined by -- and the
+    sweep would read a quietly renormalised control as a weak spatiotemporal
+    effect. So it raises, naming the check.
+    """
+    rows = []
+    for sk in SPECIES:
+        for ci, cell in enumerate(CELLS):
+            for week in range(1, WEEKS_PER_YEAR + 1):
+                hot = ci == 0 or week == 1
+                rows.append((sk, cell, week, 0.6 if hot else 1e-06))
+    t = _to_tensor(rows)
+    # Precondition: every INPUT value is a legitimate probability, so the
+    # refusal is about the CONSTRUCTION and not about bad input.
+    assert 0.0 < t.dense().min() and t.dense().max() <= 1.0
+    with pytest.raises(ValueError, match="outer product of its marginals reaches"):
+        separable_prior(t)
+
+
+def test_separable_does_not_refuse_an_ordinary_prior():
+    """The mirror of the guard: it must not be so strict it rejects what the
+    pipeline or any of the hand-built fixtures produce."""
+    for fixture in (_tensor, _sparse_tensor, _interacting_tensor):
+        out = separable_prior(fixture())
+        assert out.dense().max() <= 1.0
+        assert out.spec.variant == "separable"
+
+
+# ---------------------------------------------------------------------------
+# C2: THE PIPELINE FIXTURE.
+#
+# Every fixture above is hand-built and NONE of them is representative of a
+# released artifact in the way that matters: a pipeline build stores EVERY
+# context. The released documentation claimed the opposite for both, and the
+# doc's own pinning test could not catch it because it also saves a hand-built
+# sparse fixture. This section builds through `build_from_archive` -- the real
+# CLI path -- and asserts the documented regime against what it writes.
+#
+# Deliberately small (6 species x 3 points x 52 weeks) so it runs in well under
+# a second, but built through the SAME function `scripts/build_prior.py` calls,
+# so the fill regime it exhibits is the pipeline's and not a fixture's.
+# ---------------------------------------------------------------------------
+
+_PIPE_HEADER = "\t".join(
+    ["gbifID", "datasetKey", "publishingOrgKey", "speciesKey", "species",
+     "decimalLatitude", "decimalLongitude", "eventDate", "recordedBy"]
+)
+_PIPE_DOI = "10.15468/dl.pipeline5"
+#: Two residents (flat season), two summer migrants (peak week 26), two waders
+#: (double passage peaks, west-coast biased). THREE archetypes so the artifact
+#: carries a real space x time INTERACTION -- with one archetype the grid would
+#: be near-separable and `separable` would be near-identity.
+_PIPE_RESIDENT = (2001, 2002)
+_PIPE_SUMMER = (3001, 3002)
+_PIPE_WADER = (4001, 4002)
+_PIPE_SPECIES = _PIPE_RESIDENT + _PIPE_SUMMER + _PIPE_WADER
+#: Three Danish longitudes at four latitudes: west Jutland, Funen, Zealand.
+_PIPE_POINTS = [
+    (lat, lon) for lat in (54.9, 55.7, 56.5, 57.2) for lon in (8.4, 10.5, 12.6)
+]
+
+
+def _pipe_lambda(sk, week, lon):
+    if sk in _PIPE_RESIDENT:
+        return 5.0
+    if sk in _PIPE_SUMMER:
+        season = math.exp(-0.5 * ((week - 26) / 6.0) ** 2) + 0.05
+        return 5.0 * season * (0.2 + (lon - 8.4) / 4.2)
+    season = (
+        math.exp(-0.5 * ((week - 17) / 3.0) ** 2)
+        + math.exp(-0.5 * ((week - 35) / 3.0) ** 2)
+        + 0.05
+    )
+    return 5.0 * season * (0.1 + math.exp(-((lon - 8.4) ** 2) / 0.8))
+
+
+def _pipeline_archive(tmp_path):
+    rng = np.random.default_rng(7)
+    rows = []
+    gid = 0
+    for week in range(1, WEEKS_PER_YEAR + 1):
+        day = datetime.date.fromisocalendar(2025, week, 3).isoformat()
+        for lat, lon in _PIPE_POINTS:
+            for sk in _PIPE_SPECIES:
+                for _ in range(int(rng.poisson(_pipe_lambda(sk, week, lon)))):
+                    gid += 1
+                    rows.append("\t".join([
+                        str(gid), "ds", "pub", str(sk), f"sp{sk}",
+                        f"{lat + rng.normal(0, 0.01):.6f}",
+                        f"{lon + rng.normal(0, 0.01):.6f}", day, "obs",
+                    ]))
+    path = tmp_path / "pipeline_occ.zip"
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("occurrence.txt", "\n".join([_PIPE_HEADER, *rows]) + "\n")
+    return path
+
+
+def _pipeline_artifacts(tmp_path):
+    """variant -> (PriorTensor, sidecar dict), via the real build function."""
+    from build_prior import build_from_archive
+
+    out = tmp_path / "priors"
+    paths = build_from_archive(
+        _pipeline_archive(tmp_path),
+        resolution=4,
+        source="dof",
+        test_recordings=[],
+        out_dir=out,
+        gbif_doi=_PIPE_DOI,
+    )
+    artifacts = {}
+    for p in paths:
+        t = load_prior(p)
+        artifacts[t.spec.variant] = (
+            t,
+            json.loads(p.with_suffix(".json").read_text(encoding="utf-8")),
+        )
+    return artifacts
+
+
+def test_the_pipeline_fixture_writes_the_full_prior_and_all_five_controls(tmp_path):
+    """The precondition for everything below, and the registry's reach into the
+    build loop: `build_prior.py` iterates `CONTROLS.items()`, so a fifth
+    registry entry must appear on disk with no build-script edit."""
+    artifacts = _pipeline_artifacts(tmp_path)
+    assert set(artifacts) == {
+        "full", "uniform", "marginal", "shuffle_space", "shuffle_time", "separable"
+    }
+    for variant, (t, meta) in artifacts.items():
+        assert t.gbif_doi == _PIPE_DOI, variant
+        assert meta["spec"]["variant"] == variant
+
+
+def test_the_documented_fill_regime_holds_on_a_PIPELINE_artifact(tmp_path):
+    """C2. `docs/prior-artifact-format.md` section 2a, pinned to a real build.
+
+    The document previously asserted that treating unstored entries as 0.0
+    "gives the wrong answer on roughly 98% of the grid" and that "a legitimate
+    national-scale prior really does have a fill of a couple of percent". Both
+    are FALSE of every artifact the pipeline writes: `build_prior.py` passes
+    `cells=` and weeks 1..52 explicitly and `_validate_p` forbids `p <= 0`, so
+    every context is an explicit stored nonzero.
+
+    The doc's existing pinning test in `test_tensor.py` cannot catch this
+    because it saves a hand-built SPARSE fixture. This one builds through
+    `build_from_archive`, so the document is pinned to a PIPELINE artifact and
+    the error cannot recur.
+    """
+    doc = (
+        Path(__file__).parent.parent.parent / "docs" / "prior-artifact-format.md"
+    ).read_text(encoding="utf-8")
+    # The document must state the regime it is now pinned to.
+    assert "nnz == dense_capacity" in doc
+    assert "fill == 1.0000" in doc
+    # And must NOT re-assert the corrected claims.
+    assert "roughly 98% of the grid" not in doc
+    assert "a fill of a couple of percent" not in doc
+
+    artifacts = _pipeline_artifacts(tmp_path)
+    for variant, (t, meta) in artifacts.items():
+        dense = t.dense()
+        assert meta["nnz"] == meta["dense_capacity"], variant
+        assert meta["nnz"] == t.dense_capacity == dense.size, variant
+        assert meta["nnz"] / meta["dense_capacity"] == 1.0, variant
+        # The load-bearing half: NOTHING reads as the floor, so a decoder that
+        # wrongly fills with 0.0 differs from a correct one by exactly zero.
+        assert int((dense == FLOOR).sum()) == 0, variant
+        assert dense.min() > 0.0, variant
+        # `missing_value` is still published, for forward compatibility and for
+        # hand-built sparse tensors.
+        assert meta["missing_value"] == FLOOR, variant
+
+
+def test_the_uniform_log_space_offset_is_ONE_nat_on_a_pipeline_artifact(tmp_path):
+    """C2, second site. `controls.py` quoted 7.943 nats, measured on the
+    1.92%-fill fixture, which is ~8x the released magnitude.
+
+    The AM-GM argument is unchanged and its SIGN is structural: among all fills
+    with the same arithmetic total the constant one maximises the geometric
+    mean, so `uniform` sits ABOVE the full prior in log space. The MAGNITUDE is
+    a property of the artifact, and on a fully materialised one it is of order
+    one nat -- measured 0.681 on this fixture's geometry -- because there is no
+    floor mass to drag the prior's mean log down.
+    """
+    artifacts = _pipeline_artifacts(tmp_path)
+    full = np.log(artifacts["full"][0].dense()).mean()
+    uniform = np.log(artifacts["uniform"][0].dense()).mean()
+    offset = float(uniform - full)
+    assert offset > 0.0, "AM-GM: the constant fill maximises the geometric mean"
+    # Order ONE nat, not order eight. Bounded on both sides so a drift toward
+    # either the old fixture figure or zero fails.
+    assert 0.2 < offset < 2.5
+    # And the fixture's own figure is a DIFFERENT number, so the two cannot
+    # drift into standing for one another.
+    t = _sparse_tensor()
+    fixture_offset = float(
+        np.log(uniform_prior(t).dense()).mean() - np.log(t.dense()).mean()
+    )
+    assert fixture_offset > 4 * offset
+
+
+def test_marginal_contrast_is_EXACT_on_a_pipeline_artifact(tmp_path):
+    """C2, third site. The contrast-decay table quoted a decay to 1.007 and a
+    3.994-from-4.000 loss, both fixture figures.
+
+    With no floor mass there is no common additive baseline to dilute, so the
+    ratio `marginal` emits equals the full prior's per-species-mean ratio
+    EXACTLY -- not to within 1%, exactly. The decay is real and is a property
+    of a hand-built SPARSE tensor, which `test_marginals_contrast_is_squeezed_
+    toward_one_by_the_floor` still pins.
+    """
+    artifacts = _pipeline_artifacts(tmp_path)
+    full = artifacts["full"][0].dense()
+    emitted = artifacts["marginal"][0].dense()[:, 0]
+    reference = full.mean(axis=1)
+    assert emitted == pytest.approx(reference, rel=0, abs=1e-15)
+    # Precondition: there IS a contrast to preserve, so "exact" is not exact
+    # agreement between two constants.
+    assert reference.max() / reference.min() > 2.0
+    assert float(emitted.max() / emitted.min()) == pytest.approx(
+        float(reference.max() / reference.min()), rel=0, abs=1e-12
+    )
+
+
+def test_the_interaction_carries_a_real_share_of_a_PIPELINE_artifact(tmp_path):
+    """M1's premise, measured rather than asserted.
+
+    If the interaction were negligible on a real artifact, the fifth control
+    would be answering a question nobody needs to ask. Measured on this build:
+    the interaction carries 20-57% of each species' total variation (mean 32%).
+    Pinned as a floor on the MINIMUM across species, so a smoothing change that
+    flattened the joint term would fail here rather than quietly making the
+    control vacuous.
+    """
+    full = _pipeline_artifacts(tmp_path)["full"][0]
+    b = _blocks(full.dense(), len(full.cells))
+    shares = []
+    for s in range(b.shape[0]):
+        blk = b[s]
+        total = ((blk - blk.mean()) ** 2).sum()
+        shares.append((_interaction(blk) ** 2).sum() / total)
+    shares = np.asarray(shares)
+    assert shares.min() > 0.10, f"interaction shares {shares}"
+    assert shares.mean() > 0.20
+
+
+def test_only_separable_destroys_the_interaction_on_a_PIPELINE_artifact(tmp_path):
+    """M1's conclusion, on the artifact rather than on a fixture.
+
+    Both shuffles leave the interaction standard deviation IDENTICAL to the
+    full prior's -- they relabel an axis and carry the joint structure along
+    with it. `uniform` and `marginal` destroy it along with both marginals.
+    Only `separable` removes it while keeping the marginals, which is what
+    makes the reported gain attributable to the joint term.
+    """
+    artifacts = _pipeline_artifacts(tmp_path)
+    full = artifacts["full"][0]
+    n_cells = len(full.cells)
+    base = _interaction_std(full.dense(), n_cells)
+    assert base > 0.0
+
+    def istd(variant):
+        return _interaction_std(artifacts[variant][0].dense(), n_cells)
+
+    # The two shuffles: unchanged, which is the finding.
+    assert istd("shuffle_space") == pytest.approx(base)
+    assert istd("shuffle_time") == pytest.approx(base)
+    # The two blunt controls: gone, but so are the marginals.
+    assert istd("uniform") == pytest.approx(0.0, abs=1e-12)
+    assert istd("marginal") == pytest.approx(0.0, abs=1e-12)
+    # `separable`: interaction gone (exactly, in log space), marginals kept.
+    assert istd("separable") < 0.6 * base
+    sep = artifacts["separable"][0].dense()
+    assert _interaction_std(sep, n_cells, log=True) == pytest.approx(0.0, abs=1e-12)
+    b = _blocks(full.dense(), n_cells)
+    sb = _blocks(sep, n_cells)
+    assert sb.mean(axis=2) == pytest.approx(b.mean(axis=2))
+    assert sb.mean(axis=1) == pytest.approx(b.mean(axis=1))
+
+
+def test_every_control_preserves_a_PIPELINE_priors_mass(tmp_path):
+    """T9-R2 on the artifact the sweep will actually read, all five at once."""
+    artifacts = _pipeline_artifacts(tmp_path)
+    reference = artifacts["full"][0].dense().sum()
+    for variant, (t, _meta) in artifacts.items():
+        assert t.dense().sum() == pytest.approx(reference), variant

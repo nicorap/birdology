@@ -6,9 +6,10 @@ decode it with their own tooling. Everything below was derived by reading
 `src/birdology/prior/tensor.py` and inspecting an artifact it actually wrote.
 
 If you read nothing else, read
-[**A missing entry is NOT zero**](#a-missing-entry-is-not-zero). Decoding this
-matrix with a plain sparse reader and treating unstored entries as `0.0` gives
-the wrong answer on roughly 98% of the grid, silently.
+[**A missing entry is NOT zero**](#a-missing-entry-is-not-zero) and
+[**What is actually shipped**](#what-is-actually-shipped). The first is the
+decoding convention; the second is the fact that every artifact released here
+satisfies it trivially, because it stores every context it spans.
 
 ---
 
@@ -88,7 +89,7 @@ species and two cells:
 |---|---|
 | `spec.resolution` | the H3 resolution the cell axis was cut at |
 | `spec.source` | which occurrence sources were pooled (`eod`, `dof`, `eod+dof`) |
-| `spec.variant` | `full` for the prior itself; `uniform` / `marginal` / `shuffle_space` / `shuffle_time` identify **controls**, which are null models and not the prior |
+| `spec.variant` | `full` for the prior itself; `uniform` / `marginal` / `shuffle_space` / `shuffle_time` / `separable` identify **controls**, which are null models and not the prior |
 | `species_keys` | the row axis: GBIF species keys, ascending. Row *i* of the matrix is `species_keys[i]` |
 | `cells` | the cell axis: H3 cell strings, sorted, opaque and case-sensitive. Byte-for-byte what the source data carried |
 | `weeks_per_year` | the column stride (52). ISO week 53 is folded into 52 upstream, so weeks run 1..52 inclusive |
@@ -101,9 +102,54 @@ species and two cells:
 | `attribution` | a ready-made attribution string naming both the DOI and the licence |
 
 `nnz` and `dense_capacity` are published so a release carries visible evidence
-of how much of its own grid was ever observed. A legitimate national-scale
-prior really does have a fill of a couple of percent; that is information about
-sampling effort, not a defect.
+of how much of its own grid is stored. See
+[What is actually shipped](#what-is-actually-shipped): on every artifact
+released here the two are EQUAL.
+
+| `spec.variant` | what it is |
+|---|---|
+| `full` | the prior itself |
+| `uniform` | control: one constant everywhere, at the prior's total mass |
+| `marginal` | control: species frequency only, no space, no time |
+| `shuffle_space` | control: real values, wrong cells |
+| `shuffle_time` | control: real values, wrong weeks |
+| `separable` | control: both marginals right, their interaction destroyed |
+
+---
+
+## 2a. What is actually shipped
+
+**Every artifact produced by `scripts/build_prior.py` is fully materialised:
+`nnz == dense_capacity`, `fill == 1.0000`, and NO stored value equals
+`missing_value`.**
+
+This is not an accident and it is not going to change quietly. The build passes
+the cell axis and the weeks `1..52` explicitly, and the writer refuses a
+probability at or below `0.0`, so every context the axes span is written out as
+an explicit non-zero entry. Measured on real builds (26 species x 115 H3 res-4
+cells x 52 weeks): `nnz` 155 480 of `dense_capacity` 155 480, fill 1.0000,
+`(dense == missing_value).sum()` 0 — for the full prior and for every control
+alike.
+
+Two things follow for you as a decoder:
+
+1. **The artifact you downloaded has no missing entries**, so a decoder that
+   fills with `0.0` and one that fills with `missing_value` will agree on it
+   exactly. The convention in section 3 is still the contract, and you should
+   still implement it, but on these files it is not what separates a correct
+   read from a wrong one.
+2. **`fill` is not a coverage statistic on these files.** It is 1.0 on the full
+   prior *and* on every control, so it tells you nothing about how much of the
+   grid was ever observed. The prior answers every context because the backoff
+   and smoothing stages ESTIMATE every context — an entry is not evidence that
+   anyone surveyed that cell in that week. If you need survey coverage, it is
+   not in this artifact.
+
+`missing_value` is retained in the sidecar for two reasons: forward
+compatibility, so a future genuinely-sparse release decodes under a stated
+convention rather than a guessed one; and because the reader in this repository
+accepts **hand-built sparse tensors** that a third party may assemble, for which
+the rule in section 3 is load-bearing.
 
 ---
 
@@ -113,31 +159,40 @@ sampling effort, not a defect.
 whose cell is on `cells`, but which has no stored entry, has the value
 `missing_value` = `1e-06`. It does not have the value `0.0`.**
 
-This is not the serialiser inventing data. Most (cell, week, species)
-combinations are empty, and empty almost always means *nobody looked* rather
-than *the species is absent*. `1e-06` is the floor the upstream backoff defines
-for exactly that case: a species with no occurrences anywhere still gets the
-floor, never zero. An unstored context is therefore not a grid point that does
-not exist — it is a grid point whose value is known a priori, and it is exactly
-the value it would have carried had it been written out. Storing tens of
-millions of explicit copies of one constant into a container whose entire
+On the artifacts released here this rule is **vacuous but still binding**: they
+store every context (section 2a), so there is nothing for it to apply to. It
+matters for a hand-built or re-sparsified tensor, and it is the convention any
+future sparse release will be published under, so implement it.
+
+The reasoning, which is the part worth carrying:
+
+An empty `(cell, week, species)` combination almost always means *nobody
+looked* rather than *the species is absent*. `1e-06` is the floor the upstream
+backoff defines for exactly that case: a species with no occurrences anywhere
+still gets the floor, never zero. An unstored context is therefore not a grid
+point that does not exist — it is a grid point whose value is known a priori,
+and it is exactly the value it would have carried had it been written out.
+Storing many explicit copies of one constant into a container whose entire
 purpose is sparsity would change no answer.
 
 A hard `0.0` would be a defect rather than a conservative reading: the floor
 exists so the prior can never veto a correct detection, and a zero for "nobody
-looked there" does exactly that.
+looked there" does exactly that. The prior is fused **multiplicatively** with
+an acoustic likelihood, so a zero is an absolute veto — and it would land on
+precisely the rare and out-of-season detections that are hardest to get right.
 
 Two consequences for a decoder:
 
 1. **Fill the dense grid with `missing_value`, not with zeros.** Any sparse
    reader that materialises implicit zeros disagrees with the artifact's own
-   semantics across the whole unobserved region, which is most of the grid.
-2. **The sparsity pattern is the record of what was observed; the values are
-   not.** Because an unstored context reads as the floor, you cannot recover
-   "was this triple observed?" from a value. You recover it from the stored
-   coordinates (`row`/`col`), or in aggregate from `nnz` against
-   `dense_capacity`. Coverage, support size and any denominator must come from
-   there.
+   semantics wherever a context is unstored. On a released file that is
+   nowhere; on a sparse one it is everywhere it matters.
+2. **The values never tell you what was observed.** Because an unstored context
+   reads as the floor, you cannot recover "was this triple observed?" from a
+   value. Nor can you recover it from the stored coordinates on a released
+   artifact, which stores all of them. **Survey coverage is not recoverable
+   from this artifact at all** — `nnz` against `dense_capacity` describes what
+   is STORED, and on these files that is everything.
 
 `0.0` never appears as a stored value: the writer refuses a probability at or
 below `0.0`, precisely so that "reads as zero" and "was never stored" cannot be
@@ -229,17 +284,22 @@ def lookup(meta, grid, species_key, cell, week):
 
 `lookup` above is **total** over the axis cross-product: it answers every
 (species, cell, week) the axes span, returning `missing_value` where nothing
-was stored. It therefore never tells you that something was *not* observed. For
-coverage, use the stored coordinates or `nnz` against `dense_capacity`:
+was stored. It therefore never tells you that something was *not* observed, and
+neither does anything else in the file:
 
 ```text
 fill = nnz / dense_capacity
 ```
 
+is the fraction of the grid that is **stored**, which on every artifact released
+here is exactly `1.0` (section 2a). It is not a coverage or sampling-effort
+statistic and must not be reported as one.
+
 Materialising the dense grid costs 8 bytes per context — `dense_capacity`
-float64s. At national resolutions that is large; if you only need a few
-contexts, index the COO coordinates directly and substitute `missing_value` for
-anything you do not find.
+float64s — and since these artifacts store every context, that is also roughly
+what the `.npz` itself holds. At national resolutions that is large; if you only
+need a few contexts, index the COO coordinates directly and substitute
+`missing_value` for anything you do not find.
 
 ---
 
@@ -271,15 +331,35 @@ this release.
 ## 7. Controls are not the prior
 
 An artifact whose `spec.variant` is not `"full"` is a **control**: a null model
-built by destroying one kind of structure in the prior (`uniform`, `marginal`,
-`shuffle_space`, `shuffle_time`). Controls exist to be compared against the
-prior, not to be used as one. Controls are also dense by construction, so their
-`nnz` equals their `dense_capacity` and their fill is 1.0 — that number is not
-comparable with the full prior's fill.
+built by destroying one kind of structure in the prior. There are five:
+
+| variant | what is destroyed | what survives |
+|---|---|---|
+| `uniform` | everything | total mass only |
+| `marginal` | space, time and their interaction | each species' own mass |
+| `shuffle_space` | which cell a value belongs to | every cell's weekly profile, all masses |
+| `shuffle_time` | which week a value belongs to | every cell's value multiset, all masses |
+| `separable` | ONLY the space x time interaction | both marginals exactly, all masses |
+
+Controls exist to be compared against the prior, not to be used as one.
+`separable` is the one that isolates the joint space x time term: the two
+shuffles relabel an axis and carry the joint structure along with it, so they
+leave the interaction's magnitude unchanged.
+
+Every control preserves the full prior's total mass exactly, and all but
+`uniform` preserve each species' own mass, so a control is on the same scale as
+the prior it is the null for. Controls are dense by construction, so their `nnz`
+equals their `dense_capacity` — as does the released full prior's (section 2a),
+so `fill` does not distinguish them either.
 
 ---
 
-*This file is kept honest by
-`tests/prior/test_tensor.py::test_the_artifact_documentation_matches_a_freshly_saved_artifact`,
-which parses the sidecar example and the decoding recipe above and runs them
-against an artifact saved by the current code.*
+*This file is kept honest by two tests. Field names, constants and the decoding
+recipe are executed against a freshly saved artifact by
+`tests/prior/test_tensor.py::test_the_artifact_documentation_matches_a_freshly_saved_artifact`.
+The fill regime section 2a asserts is pinned against an artifact built through
+`build_from_archive` — a real pipeline output, not a hand-built fixture — by
+`tests/prior/test_controls.py::test_the_documented_fill_regime_holds_on_a_PIPELINE_artifact`.
+That second test exists because an earlier revision of this document claimed the
+released grid was ~2% full, which was measured on a hand-built sparse fixture
+and is false of everything the pipeline writes.*

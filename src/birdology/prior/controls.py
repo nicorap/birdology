@@ -1,4 +1,4 @@
-"""Control priors. A reported gain must survive all four or it is not real.
+"""Control priors. A reported gain must survive all five or it is not real.
 
 This module is where the paper's headline claim is either earned or lost. Each
 control answers one alternative explanation for a measured gain:
@@ -11,6 +11,12 @@ control answers one alternative explanation for a measured gain:
                       demand.
 - ``shuffle_space`` : real values, wrong places.
 - ``shuffle_time``  : real values, wrong weeks.
+- ``separable``     : BOTH marginals right, their INTERACTION destroyed. The
+                      one that isolates the joint space x time term, and the
+                      only control in the set that separates "this species is
+                      common in this region" plus "this species is common in
+                      this week" acting INDEPENDENTLY from the two acting
+                      TOGETHER. See ``separable_prior``.
 
 SCALE IS PART OF THE NULL HYPOTHESIS (T9-R2)
 --------------------------------------------
@@ -72,44 +78,88 @@ read:
   mass is preserved per species AND per cell -- a strictly stronger invariant
   than ``shuffle_space``'s, because a week permutation never crosses a cell
   boundary.
+* ``separable``     replaces each (species) block by the outer product of its
+  own cell and week marginals, ``cellmean * weekmean / grandmean``. That
+  identity is exactly mass-preserving per species (and so in total), and it
+  reproduces BOTH marginals exactly; only the interaction between them is
+  destroyed.
+
+THE ARTIFACT THE PIPELINE ACTUALLY SHIPS IS FULLY MATERIALISED (fill 1.0)
+-------------------------------------------------------------------------
+Everything below about the floor mass is CORRECT AS SEMANTICS and was
+MEASURED ON THE WRONG THING. ``scripts/build_prior.py`` passes an explicit
+``cells=`` axis and weeks ``1..52``, and ``tensor._validate_p`` forbids
+``p <= 0``, so every context the axes span is an explicit stored nonzero:
+artifacts built by the CLI have ``nnz == dense_capacity``, fill exactly
+1.0000, and NOT ONE entry equal to ``FLOOR``. Measured on pipeline builds
+through ``build_from_archive``: 26 species x 115 res-4 cells x 52 weeks =
+155 480 contexts, nnz 155 480, fill 1.0000, ``(dense == FLOOR).sum() == 0``,
+for the full prior AND for every control.
+
+So on a RELEASED artifact the floor mass is ZERO and every "at 2% fill"
+magnitude in this docstring is a statement about
+``tests/prior/test_controls.py``'s deliberately sparse 1.92%-fill fixture,
+NOT about anything shipped. Every such figure below is now labelled
+FIXTURE-ONLY and given the pipeline figure beside it. The DIRECTION of each
+argument survives unchanged -- a hand-built sparse tensor, which this module
+still accepts, lands in the fixture regime -- but a reader must not size the
+effect from the fixture number.
 
 THE FLOOR MASS PARTICIPATES, AND THAT IS THE HONEST NULL
 ---------------------------------------------------------
-On a 2%-full prior ``D`` is mostly ``FLOOR``, so it is worth being explicit
-about what ``D.mean()`` is and is not.
+On a 2%-full prior ``D`` is mostly ``FLOOR`` (FIXTURE-ONLY regime; a released
+artifact has no floored context at all), so it is worth being explicit about
+what ``D.mean()`` is and is not.
 
 It is NOT dominated by the floor. ``FLOOR`` is 1e-06 and observed values are
-of order 1e-01, so at 2% fill the floor contributes ~4e-04 of total mass and
-the uniform constant lands ~2000x above the floor. The control is data-derived,
+of order 1e-01, so at 1.92% fill the floor contributes ~2.7e-04 of total mass and
+the uniform constant lands ~3600x above the floor. The control is data-derived,
 not a flat 1e-06.
 
 What including the floor DOES do is spread the full prior's whole mass over
 every context, which puts the uniform constant at roughly ``nnz/size`` of the
 observed mean. That is not dilution -- it is the correct scale, because the
-FULL PRIOR also answers ~98% of its contexts with the floor.
+FULL PRIOR also answers every floored context with the floor. On a released
+artifact ``nnz/size`` is 1.0 and this correction is the identity, which is why
+the decision is invisible there and load-bearing on a hand-built sparse
+tensor.
 
 Averaging over the stored entries only would build a control at ~52x the mass
-of the prior it is the null for, and the sweep would report that scale gap as
-a spatiotemporal effect. That is the defect, not the fix.
+of the prior it is the null for ON THE FIXTURE (and at exactly 1x on a
+released artifact, where the two denominators coincide), and the sweep would
+report that scale gap as a spatiotemporal effect. That is the defect, not the
+fix.
 
 ARITHMETIC MASS IS MATCHED; LOG-SPACE LOCATION IS NOT, AND CANNOT BE
 ---------------------------------------------------------------------
 An earlier revision of this docstring claimed control and prior were "one
-object measured two ways". That is FALSE, and measurably so. On the sparse
-fixture in ``tests/prior/test_controls.py`` (10 stored contexts of 520,
-1.92% fill):
+object measured two ways". That is FALSE, and measurably so.
 
-    mean log, full prior : -13.595   (geometric mean 1.25e-06)
-    mean log, ``uniform``:  -5.652   (geometric mean 3.51e-03)
-    offset               :   7.943 nats per context
+FIXTURE-ONLY, on the sparse fixture in ``tests/prior/test_controls.py``
+(10 stored contexts of 520, 1.92% fill):
 
-and the sign of that offset is STRUCTURAL rather than incidental: among all
-fills with the same arithmetic total, the CONSTANT one maximises the
+    mean log, full prior : -13.593   (geometric mean 1.25e-06)
+    mean log, ``uniform``:  -5.635   (geometric mean 3.57e-03)
+    offset               :   7.958 nats per context
+
+PIPELINE, on artifacts written by ``build_from_archive`` (fill 1.0000, no
+floored context anywhere):
+
+    26 species x 115 res-4 cells : mean log full -4.291, uniform -3.258,
+                                   offset +1.033 nats
+     6 species x  15 res-4 cells : mean log full -2.472, uniform -1.792,
+                                   offset +0.681 nats
+
+So the offset is REAL and its SIGN is structural, but on anything released it
+is of order ONE nat rather than eight: the fixture's 7.958 is ~8x the
+released magnitude and comes almost entirely from the floor mass a released
+artifact does not have. The sign is structural rather than incidental: among
+all fills with the same arithmetic total, the CONSTANT one maximises the
 geometric mean (AM-GM, with equality only when the prior is already
 constant). So ``uniform`` is the mass-preserving control sitting furthest
 ABOVE the full prior in log space, and no mass-preserving control can match
-both the arithmetic total and the log-space location of a floor-dominated
-grid. The two are different functionals of the same mass and a 98%-floor grid
+both the arithmetic total and the log-space location of a non-constant grid.
+The two are different functionals of the same mass and any non-constant grid
 separates them by construction.
 
 Arithmetic mass is still the right thing to match, because that is what the
@@ -119,20 +169,20 @@ arithmetic scale turns the headline comparison into a scale difference
 be resolved.
 
 The consequence to carry downstream: a fusion mode that consumes ``log
-prior`` ADDITIVELY sees a near-constant offset (~7.9 nats on this fixture,
-larger the sparser the grid) between every control and the full prior. Any
-decision threshold, calibration fit or tuned mixing weight learnt against one
-must be refit against the other; a threshold transplanted from the full prior
-to a control -- or a mixing weight tuned on the full prior and reused -- is
-reading that offset as evidence. The arithmetic comparison the sweep reports
-is unaffected.
+prior`` ADDITIVELY sees a near-constant offset between every control and the
+full prior -- ~0.7 to 1.0 nats on a released artifact, ~7.9 on the sparse
+fixture, larger the sparser the grid. Any decision threshold, calibration fit
+or tuned mixing weight learnt against one must be refit against the other; a
+threshold transplanted from the full prior to a control -- or a mixing weight
+tuned on the full prior and reused -- is reading that offset as evidence. The
+arithmetic comparison the sweep reports is unaffected.
 
 So the paper's null hypothesis is: *the released prior's total mass,
 redistributed with no context information at all* (``uniform``), or *with
-label frequency but no context* (``marginal``). It is a statement about the
-artifact AS IT IS READ, floor included -- not about the observed subset of it.
-That is the honest null, because the sweep queries the full prior at every
-context too, including the ones nobody surveyed.
+label frequency but no context* (``marginal``), or *with both marginals but no
+interaction* (``separable``). It is a statement about the artifact AS IT IS
+READ, floor included -- not about the observed subset of it. That is the
+honest null, because the sweep queries the full prior at every context too.
 
 WHY THE DENSE-GRID REFUSAL IS GONE
 -----------------------------------
@@ -140,7 +190,7 @@ An earlier revision of this module REFUSED any tensor with ``nnz < size``, on
 the then-current premise that an absent context was a structural zero and that
 averaging over it silently diluted every control by ``nnz/size``. That premise
 has been reversed in ``tensor.py``: an absent context reads ``FLOOR``, there is
-nothing structural left to divide by, and the refusal made all four controls
+nothing structural left to divide by, and the refusal made every control
 raise on every realistic prior -- the paper's credibility section failing
 before it computed anything.
 
@@ -204,14 +254,22 @@ def _control_grid(t: PriorTensor, where: str) -> np.ndarray:
     The consumed contract is a ``PriorTensor`` whose ``spec.variant`` is
     ``"full"``. Every control is defined as a reduction OF THE FULL PRIOR, and
     each is a fixed point or a near-fixed point of the others: ``uniform`` of
-    ``uniform`` is ``uniform``, ``marginal`` of ``uniform`` is ``uniform``, and
-    a shuffle of ``uniform`` is ``uniform`` again. Every one of them preserves
+    ``uniform`` is ``uniform``, ``marginal`` of ``uniform`` is ``uniform``,
+    a shuffle of ``uniform`` is ``uniform`` again, and ``separable`` of
+    ``marginal`` is ``marginal`` (a per-species constant is already separable,
+    so the outer product reproduces it exactly). Every one of them preserves
     mass, stays finite, stays in range, has the right shape and the right axes
     -- and ``_respec`` then RELABELS the output with the outer variant, so a
     second-order ``shuffle_space``-of-``uniform`` lands in the results table
     under a label that claims it is a first-order spatial null. Nothing
     downstream can detect that: the only evidence is the variant string this
     module just overwrote.
+
+    ``separable`` makes this guard MORE load-bearing rather than less: it is
+    the control most likely to be reached for twice, because "remove the
+    interaction from a shuffled prior" reads like a sharper null than either
+    alone, and ``separable`` of ``shuffle_time`` is a perfectly well-formed
+    tensor that is not the null its label would claim.
 
     A sweep loop that accumulated variants, or a rerun over a directory of
     saved priors that globbed the controls it wrote on the previous pass,
@@ -257,30 +315,34 @@ def _respec(t: PriorTensor, variant: str, values: np.ndarray) -> PriorTensor:
 
     EVERY CONTROL IS DENSE, SO ITS ``fill`` IS 1.0 BY CONSTRUCTION
     --------------------------------------------------------------
-    All four controls are built from ``t.dense()``, in which every context on
-    the axes carries a value (most of them ``FLOOR``), and none of them can
-    produce a zero from a positive grid -- a constant, a per-species constant
-    and two permutations all map positive to positive. So the re-sparsified
-    matrix stores ``dense_capacity`` entries, and each control's sidecar
-    publishes ``nnz == dense_capacity`` -- a fill of 1.000 -- where the full
-    prior it controls publishes, on the test fixture, 10 of 520 (0.019).
+    All five controls are built from ``t.dense()``, in which every context on
+    the axes carries a value, and none of them can produce a zero from a
+    positive grid -- a constant, a per-species constant, two permutations and
+    a strictly-positive outer product all map positive to positive. So the
+    re-sparsified matrix stores ``dense_capacity`` entries, and each control's
+    sidecar publishes ``nnz == dense_capacity`` -- a fill of 1.000.
 
-    That number is NOT comparable with the full prior's and must not be read
-    as the control being better covered: it is a property of the construction,
-    and the two ``fill`` values answer different questions (the prior's is
-    "what fraction was observed", the control's is "what fraction is stored",
-    which for a control is always all of it).
+    THE FULL PRIOR BUILT BY THE PIPELINE PUBLISHES THE SAME 1.000. Measured on
+    ``build_from_archive`` output: 26 species x 115 res-4 cells, nnz 155 480 of
+    dense capacity 155 480, for the full prior and all five controls alike.
+    ``build_prior.py`` passes the cell axis and weeks 1..52 explicitly, so
+    every context is stored. The two ``fill`` values still answer DIFFERENT
+    questions (the prior's is "what fraction was observed", the control's is
+    "what fraction is stored") -- they just happen to agree at 1.000 on
+    everything the CLI writes. They separate only on a HAND-BUILT sparse
+    tensor, such as ``test_controls.py``'s 1.92%-fill fixture, where the full
+    prior publishes 10 of 520 (0.019) and every control publishes 520 of 520.
 
     The storage consequence, beside the peak-memory one the mutation harness
-    records: a control is not a sparse artifact. At national figures each
-    control is ~750 MB of float64 values plus ~375 MB of int32 CSR indices ON
-    DISK, times four, to encode a matrix with a handful of distinct values --
-    ONE for ``uniform``, at most ``n_species`` for ``marginal``, and the full
-    prior's own multiset for the two shuffles. The released bundle is therefore
-    dominated by the controls rather than by the prior, and a consumer sizing
-    a download from the full prior's ``fill`` will be wrong by ~52x per control
-    at 2% fill. Compression recovers much of it for ``uniform`` and
-    ``marginal`` and almost none of it for the shuffles.
+    records: a control is not a sparse artifact, and neither is the released
+    full prior. At national figures each control is ~750 MB of float64 values
+    plus ~375 MB of int32 CSR indices ON DISK, times FIVE, to encode a matrix
+    with a handful of distinct values -- ONE for ``uniform``, at most
+    ``n_species`` for ``marginal``, ``n_species * (n_cells + 52)`` degrees of
+    freedom for ``separable``, and the full prior's own multiset for the two
+    shuffles. Compression recovers much of it for ``uniform`` and ``marginal``,
+    some for ``separable`` (it is low-rank per species but not
+    low-cardinality), and almost none for the shuffles.
     """
     return PriorTensor(
         spec=PriorSpec(t.spec.resolution, t.spec.source, variant),
@@ -331,41 +393,60 @@ def marginal_prior(t: PriorTensor) -> PriorTensor:
     per-species mass and therefore total mass too. A sum or a median would not,
     and neither would a mean over that species' stored entries only.
 
-    ITS CONTRAST DECAYS WITH FILL, AND THAT IS A PROPERTY OF THE CONSTRUCTION
+    ITS CONTRAST DECAYS WITH FILL -- ON A SPARSE TENSOR, AND NOT ON A RELEASED
+    ONE
     -------------------------------------------------------------------------
-    The signal this control exists to carry is the RATIO between species. The
+    The signal this control exists to carry is the RATIO between species.
+
+    ON A RELEASED ARTIFACT THERE IS NO DECAY AT ALL, and this is the headline
+    correction: a pipeline build has fill 1.0000 and no floored context, so
+    there is no common additive baseline to dilute and the emitted ratio equals
+    the full prior's per-species-mean ratio EXACTLY. Measured on
+    ``build_from_archive`` output (6 species x 15 res-4 cells): full prior
+    per-species mean ratio 7.161461, ``marginal`` emitted 7.161461, maximum
+    absolute difference 0.000e+00 across every species. The 26-species build
+    agrees: 16.962 against 16.962.
+
+    The decay below is therefore a property of a HAND-BUILT SPARSE tensor --
+    the regime ``test_controls.py``'s fixture and any third-party sparse
+    artifact live in -- not of anything ``scripts/build_prior.py`` writes. The
     floor is a common ADDITIVE baseline in every row, so with fill ``f``,
     observed value scale ``v`` and a true observed-mass ratio ``r``, the ratio
-    this control actually emits is
+    this control emits is
 
         (f*v + (1-f)*FLOOR) / (f*v/r + (1-f)*FLOOR)  ->  1 as f*v -> FLOOR
 
-    Measured (``FLOOR`` = 1e-06, r = 4):
+    Measured (``FLOOR`` = 1e-06, r = 4), ALL FIXTURE-ONLY:
 
+        f=1.00e+00           -> 4.000   <-- every PIPELINE artifact: exact
         f=1.92e-02, v=1e-01 -> 3.994   <-- the sparse test fixture
         f=1.00e-03, v=1e-01 -> 3.885
         f=1.00e-04, v=1e-01 -> 3.143
         f=1.00e-04, v=1e-02 -> 1.600
         f=1.00e-05, v=1e-03 -> 1.007   <-- signal gone
 
-    This is NOT a shared limitation of prior and control. It is asymmetric,
-    and that asymmetry is why it matters: the FULL prior's label signal is
-    concentrated in the ``f`` share of contexts it actually observed and is
-    undiluted there, while ``marginal`` smears each species' mass across 100%
-    of contexts, where the floor is most of the baseline. The floor dilutes the
-    control's contrast without diluting the prior's. At sufficient sparsity
-    ``marginal`` converges toward ``uniform``, stops carrying label frequency
-    at all, and a gain then "survives the marginal control" trivially -- which
-    is precisely the reviewer question the paper claims to answer.
+    Where it does bite it is NOT a shared limitation of prior and control. It
+    is asymmetric, and that asymmetry is why it matters: the FULL prior's label
+    signal is concentrated in the ``f`` share of contexts it actually observed
+    and is undiluted there, while ``marginal`` smears each species' mass across
+    100% of contexts, where the floor is most of the baseline. The floor
+    dilutes the control's contrast without diluting the prior's. At sufficient
+    sparsity ``marginal`` converges toward ``uniform``, stops carrying label
+    frequency at all, and a gain then "survives the marginal control"
+    trivially -- which is precisely the reviewer question the paper claims to
+    answer. A released artifact is immune to this because it is fully
+    materialised; a consumer who re-sparsifies one to save space is not.
 
     ``uniform`` is far more robust by comparison: at f=1e-03, v=1e-01 it still
     sits 101x above ``FLOOR``, and only collapses toward the floor around
     f<=1e-04 with v<=1e-02.
 
     ``test_marginal_reproduces_a_known_species_mass_ratio_on_a_sparse_prior``
-    pins the ratio on the fixture; the build script must report the observed
-    contrast on the real artifact, because these numbers are a function of the
-    artifact's own ``f`` and ``v`` and no fixture can stand in for them.
+    pins the ratio on the fixture, and
+    ``test_marginal_contrast_is_EXACT_on_a_pipeline_artifact`` in
+    ``tests/prior/test_controls.py`` pins the no-decay result against an
+    artifact built through ``build_from_archive``, so neither number can drift
+    into standing for the other.
     """
     dense = _control_grid(t, "marginal")
     per_species = dense.mean(axis=1, keepdims=True)
@@ -414,9 +495,133 @@ def shuffle_time(t: PriorTensor, seed: int = 0) -> PriorTensor:
     return _respec(t, "shuffle_time", blocks.reshape(dense.shape))
 
 
+def separable_prior(t: PriorTensor) -> PriorTensor:
+    """Both marginals EXACTLY right, their INTERACTION destroyed. M1.
+
+    The control a NeurIPS reviewer will demand and the only one in this set
+    that isolates the joint space x time term. Each species' block is replaced
+    by the outer product of its OWN cell and week marginals::
+
+        out[s, c, w] = cellmean[s, c] * weekmean[s, w] / grandmean[s]
+
+    WHAT IT PRESERVES, exactly and not approximately:
+
+    * the per-cell annual marginal of every species (``block.mean(axis=week)``),
+    * the per-week national marginal of every species
+      (``block.mean(axis=cell)``),
+    * therefore each species' own mass, and therefore the total mass.
+
+    Measured on a ``build_from_archive`` artifact (6 species x 15 res-4 cells x
+    52 weeks, fill 1.0000): cell-marginal max relative error 3.6e-16,
+    week-marginal max relative error 6.0e-16, per-species mass max relative
+    error 3.4e-16, total mass relative error 1.5e-16. On the 26 x 115 build the
+    same four are 6.8e-16, 1.1e-15, 6.2e-16 and 0.0. All at float64 rounding.
+
+    WHAT IT DESTROYS: the interaction, and only the interaction. The guarantee
+    is EXACT IN LOG SPACE, which is where this construction is defined -- a
+    product is additive in logs, so the log-space two-way ANOVA residual of the
+    output is identically zero (measured 5.6e-16). The ARITHMETIC residual is
+    what the sweep reads, and on real artifacts it falls sharply: 3.6766e-02 ->
+    1.4248e-02 (factor 0.388) on a 6-species x 15-cell pipeline build, and
+    9.7362e-03 -> 3.3908e-03 on a 26-species x 115-cell one.
+
+    That arithmetic reduction is an EMPIRICAL property of real priors, not a
+    theorem, and the difference matters. On a grid that is ADDITIVELY separable
+    but not multiplicatively separable the arithmetic residual can GROW: on
+    ``test_controls.py``'s ``_tensor()`` fixture, whose values are
+    ``cell_term + week_term``, it goes from 4.9e-17 to 3.2e-02 while the
+    log-space residual is correctly driven to zero. A real occurrence prior is
+    multiplicative in character (abundance scales, it does not offset), so the
+    arithmetic figure is the relevant one for anything released -- but a test
+    that asserted "the arithmetic interaction always shrinks" would be asserting
+    something false, and ``test_the_MAIN_fixture_has_NO_arithmetic_interaction_
+    so_it_cannot_pin_this`` pins that trap as a number.
+
+    WHY THIS CONTROL HAD TO EXIST. On that same artifact the interaction
+    carries 20-57% of each species' total variation (mean 32%; the two
+    flat-season residents are the most interaction-dominated at 52% and 57%,
+    because their space and time marginals are nearly flat and nearly all their
+    structure IS the joint term). And BOTH shuffles leave the interaction
+    standard deviation at 3.6766e-02, byte-identical to the full prior's: they
+    relabel one axis and carry the joint structure along with it, permuted.
+    ``uniform`` destroys everything (0.0) and ``marginal`` destroys space AND
+    time AND the interaction together (4.4e-17). So before this control there
+    was no way to separate "this species is common in this region" plus "this
+    species is common in this week" acting INDEPENDENTLY from the two acting
+    TOGETHER, and a reviewer could fairly say the reported gain was never
+    attributed to the joint term at all.
+
+    WHY THE OUTER PRODUCT AND NOT A WITHIN-CELL WEEK PERMUTATION
+    ------------------------------------------------------------
+    The obvious alternative -- draw an INDEPENDENT week permutation inside each
+    (species, cell) block -- was built and measured, and it FAILS the contract
+    this control exists to satisfy. It preserves each cell's marginal (a
+    permutation inside a block cannot change the block's own mean) but it
+    DESTROYS the week marginal, because each cell's weekly values land under
+    different week labels: measured week-marginal maximum relative error 1.36 on
+    the 6 x 15 build and 2.57 on the 26 x 115 one, against 6.0e-16 here. It also
+    INCREASES the interaction standard deviation -- to 4.665e-02 from the full
+    prior's 3.6766e-02, and to 1.392e-02 from 9.7362e-03 -- because an
+    independent permutation per cell manufactures joint structure rather than
+    removing it. (Those two figures depend on the permutation drawn; the SIGN
+    does not, and the week marginal is destroyed for every draw that is not the
+    identity in every cell at once.) It is a fine control for something else;
+    it is not this one.
+
+    The ADDITIVE decomposition (``cellmean + weekmean - grandmean``) was also
+    measured and is REFUSED as a construction: it emits NEGATIVE values -- 334
+    of 4680 contexts on the 6 x 15 artifact (minimum -1.665e-02) and 17 741 of
+    155 480 on the 26 x 115 one (minimum -8.993e-03) -- and a negative prior is
+    not a probability, so ``save_prior`` could not write it. The multiplicative
+    form is the one that stays inside the positive orthant for a strictly
+    positive input, which the prior always is.
+
+    NO SILENT REPAIR AT THE (0, 1] BOUNDARY
+    ----------------------------------------
+    The outer product can exceed 1.0 even when every input value is a
+    probability: a block whose mass is concentrated in one cell AND one week
+    (a "cross") has a large cell marginal and a large week marginal in the same
+    place, and their product over a small grand mean can be arbitrarily large.
+    Constructed and measured: a 15-cell block with one hot row and one hot
+    column at 0.6 and 1e-06 elsewhere maps 0.6 to 7.09. Real Danish artifacts
+    are nowhere near it (measured maxima 0.500 on the 6 x 15 build and 0.145 on
+    the 26 x 115 one, both BELOW one), but "nowhere near on the builds we tried"
+    is not a contract.
+
+    So this raises, naming the check, rather than clamping. Clamping would
+    silently break the very invariants this control is defined by -- a clamped
+    grid no longer reproduces either marginal and no longer preserves mass --
+    and the sweep would read a quietly-renormalised control as a weak
+    spatiotemporal effect. ``ValueError`` is the honest answer; the operator
+    then knows their prior is too concentrated for a separable surrogate to be
+    a probability distribution.
+    """
+    dense = _control_grid(t, "separable")
+    n_cells = len(t.cells)
+    blocks = dense.reshape(dense.shape[0], n_cells, WEEKS_PER_YEAR)
+    # Per SPECIES, never pooled: pooling would mix label frequency into the
+    # marginals and the control would stop preserving each species' own mass.
+    cell_mean = blocks.mean(axis=2, keepdims=True)
+    week_mean = blocks.mean(axis=1, keepdims=True)
+    grand_mean = blocks.mean(axis=(1, 2), keepdims=True)
+    surrogate = cell_mean * week_mean / grand_mean
+    if surrogate.max() > 1.0:
+        raise ValueError(
+            "the separable control cannot represent this prior as a "
+            f"probability: the outer product of its marginals reaches "
+            f"{float(surrogate.max()):.6g}, above 1.0, because some species' "
+            "mass is concentrated in one cell AND one week at once. Clamping "
+            "is refused -- a clamped surrogate reproduces NEITHER marginal "
+            "and no longer preserves mass, so the sweep would read a silently "
+            "renormalised control as a weak spatiotemporal effect"
+        )
+    return _respec(t, "separable", surrogate.reshape(dense.shape))
+
+
 CONTROLS: dict[str, Callable[..., PriorTensor]] = {
     "uniform": uniform_prior,
     "marginal": marginal_prior,
     "shuffle_space": shuffle_space,
     "shuffle_time": shuffle_time,
+    "separable": separable_prior,
 }
