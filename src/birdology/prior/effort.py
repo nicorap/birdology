@@ -11,10 +11,21 @@ observer preference. Rarities are reported disproportionately.
 
 Input contract (from `indexing.aggregate_counts`, AFTER the leakage guards):
 `species_key` int64, `cell` non-null normalised lowercase H3 string, `week`
-int8 in 1..52, `n` int64 >= 1. This module VALIDATES that contract and raises;
-it never re-derives `week` or `cell`, and it never repairs a violation. Two
-defects earlier in this plan came from a second, local derivation of a value
-that already had one.
+int8 in 1..52, `n` int64 >= 1.
+
+What this module actually checks, stated precisely because a later task will
+otherwise lean on a guarantee that is not here: it validates the four column
+DTYPES, the PRESENCE of each column, NULLITY of `cell`/`week`/`n`, and the
+`n >= 1` floor. It does NOT check the VALUE RANGE of `week` (1..52), and it
+does NOT check that `cell` is lowercase or a well-formed H3 index -- those
+belong to `indexing.py`, upstream, and are deliberately not re-derived here.
+A `week` of 0 or 99 passes through this module untouched. (Not hypothetical:
+Task 6 found exactly such a week being accepted here and then silently
+dropped one module downstream.)
+
+Whatever it does check, it raises on; it never re-derives `week` or `cell`,
+and it never repairs a violation. Two defects earlier in this plan came from a
+second, local derivation of a value that already had one.
 
 The denominator is the sum of the very `n` values that form the numerator, so
 it is >= 1 whenever the contract holds and the row is present. It can only

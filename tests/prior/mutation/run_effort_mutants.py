@@ -44,8 +44,38 @@ All three create the same false confidence. THE RULE: a green mutation table
 means nothing unless each mutant's label matches its edit AND some fixture
 actually reaches the mutated path. Where a test depends on a precondition
 (multi-chunk, reordering, mixed case, non-empty, multi-threaded), ASSERT THE
-PRECONDITION in the test -- otherwise the coverage can evaporate silently under
-a library change or a different machine.
+PRECONDITION in the test -- and where the precondition is a property of the
+MACHINE rather than of the fixture, FORCE it (see the `parallel_arrow`
+fixture) rather than skipping, since a skip hides the lost coverage under a
+"Survivors: none" banner just as effectively as a vacuous pass.
+
+THE FOURTH VARIANT -- ONE MUTANT PER DISJUNCT, NOT PER STATEMENT
+----------------------------------------------------------------
+A mutant that deletes a WHOLE `if` cannot detect the weakening of ONE
+DISJUNCT inside its condition. E29/E30/E31 each replace an entire condition
+with `False`, so they prove the check EXISTS -- not that every clause of it is
+load-bearing. Coarse mutants give coarse guarantees.
+
+This was not theoretical. With E29/E30/E31 all killed and the table green,
+deleting just `ratio.null_count or` from the finiteness guard left the whole
+suite passing, and so did deleting just `pc.min(ratio).as_py() < 0.0 or` from
+the range guard. In the first case the surviving clause genuinely cannot
+substitute: `pc.all(pc.is_finite([0.5, None]))` is **True**, because Arrow's
+`is_finite` returns null for a null element and `pc.all` skips nulls. A null
+share with a valid total escaped the post-condition entirely.
+
+The reason is always the same: the existing fixture trips BOTH disjuncts at
+once, so either one alone still raises and the deletion is invisible.
+
+    RULE: for any compound condition (`a or b`, `a and b`), add one mutant
+    PER DISJUNCT, not one per statement. Each such mutant needs a fixture in
+    which ONLY that disjunct can fire -- the other clause must be SATISFIED,
+    not merely absent.
+
+E29a/E29b, E30a/E30b, E31a/E31b and E10a/E10b below are that per-disjunct
+layer. Where a disjunct is genuinely unreachable in isolation, say so in the
+label with the reason rather than inventing a contrived assertion: an
+honestly-recorded equivalent mutant is a real result, a fabricated kill is not.
 """
 from __future__ import annotations
 
@@ -359,6 +389,32 @@ MUTANTS: list[tuple[str, str, list[tuple[str, str]]]] = [
             )
         ],
     ),
+    # PER-DISJUNCT layer for `counts.num_rows and pc.min(n) < 1` (see header).
+    (
+        "E10a",
+        "(per-disjunct) the `counts.num_rows` guard deleted, leaving the bare "
+        "`pc.min(n) < 1`. On an EMPTY table `pc.min` is None and the "
+        "comparison raises TypeError, so the empty-input contract dies on a "
+        "raw TypeError instead of returning an empty RatioTable",
+        [
+            (
+                '    if counts.num_rows and pc.min(counts.column("n")).as_py() < 1:',
+                '    if pc.min(counts.column("n")).as_py() < 1:',
+            )
+        ],
+    ),
+    (
+        "E10b",
+        "(per-disjunct) the `pc.min(n) < 1` half deleted, leaving `if "
+        "counts.num_rows:` -- EVERY non-empty table is now rejected, so the "
+        "guard fires on valid input rather than on a violated contract",
+        [
+            (
+                '    if counts.num_rows and pc.min(counts.column("n")).as_py() < 1:',
+                "    if counts.num_rows:",
+            )
+        ],
+    ),
     # ---- rule (D): null keys silently drop rows ---------------------------
     (
         "E14",
@@ -390,6 +446,47 @@ MUTANTS: list[tuple[str, str, list[tuple[str, str]]]] = [
             (
                 '    for name in ("cell", "week", "n"):',
                 '    for name in ("week", "n"):',
+            )
+        ],
+    ),
+    # PER-COLUMN layer for the null loop. E15/E16 each drop TWO columns at
+    # once, so a kill only proves that SOME dropped column was checked. These
+    # three skip exactly one column each, the way E18a-E18d do for dtypes.
+    (
+        "E14a",
+        "(per-column) the null check SKIPS `cell` only: a null cell joins to "
+        "nothing and the row vanishes from the prior",
+        [
+            (
+                '    for name in ("cell", "week", "n"):\n'
+                "        if counts.column(name).null_count:",
+                '    for name in ("cell", "week", "n"):\n'
+                '        if counts.column(name).null_count and name != "cell":',
+            )
+        ],
+    ),
+    (
+        "E14b",
+        "(per-column) the null check SKIPS `week` only",
+        [
+            (
+                '    for name in ("cell", "week", "n"):\n'
+                "        if counts.column(name).null_count:",
+                '    for name in ("cell", "week", "n"):\n'
+                '        if counts.column(name).null_count and name != "week":',
+            )
+        ],
+    ),
+    (
+        "E14c",
+        "(per-column) the null check SKIPS `n` only: a null count reaches the "
+        "sum, where Arrow skips it, so the denominator silently omits a row",
+        [
+            (
+                '    for name in ("cell", "week", "n"):\n'
+                "        if counts.column(name).null_count:",
+                '    for name in ("cell", "week", "n"):\n'
+                '        if counts.column(name).null_count and name != "n":',
             )
         ],
     ),
@@ -678,6 +775,84 @@ MUTANTS: list[tuple[str, str, list[tuple[str, str]]]] = [
             )
         ],
     ),
+    # ---- PER-DISJUNCT layer for the three _check_output guards -------------
+    #
+    # E29/E30/E31 above delete a WHOLE condition, which proves only that the
+    # check exists. These six delete ONE CLAUSE each. E29a and E31a were
+    # SURVIVORS when first written -- the round-3 finding that motivated the
+    # rule in this module's header.
+    (
+        "E29a",
+        "(per-disjunct) `total.null_count or` deleted. `pc.min` SKIPS nulls, "
+        "so on total=[None, 2] the surviving clause sees 2 and is satisfied: "
+        "a null denominator reaches the prior",
+        [
+            (
+                "    if total.null_count or pc.min(total).as_py() < 1:",
+                "    if pc.min(total).as_py() < 1:",
+            )
+        ],
+    ),
+    (
+        "E29b",
+        "(per-disjunct) `pc.min(total).as_py() < 1` deleted: a zero or "
+        "negative denominator with no nulls anywhere is emitted",
+        [
+            (
+                "    if total.null_count or pc.min(total).as_py() < 1:",
+                "    if total.null_count:",
+            )
+        ],
+    ),
+    (
+        "E30a",
+        "(per-disjunct) `ratio.null_count or` deleted -- the round-3 F9 "
+        "SURVIVOR. NOT redundant with the clause beside it: "
+        "pc.all(pc.is_finite([0.5, None])) is TRUE, because is_finite returns "
+        "null for a null element and pc.all skips nulls. A null share with a "
+        "valid total escapes _check_output entirely",
+        [
+            (
+                "    if ratio.null_count or not pc.all(pc.is_finite(ratio)).as_py():",
+                "    if not pc.all(pc.is_finite(ratio)).as_py():",
+            )
+        ],
+    ),
+    (
+        "E30b",
+        "(per-disjunct) the finiteness clause deleted, leaving only the null "
+        "check: inf/nan ratios are emitted as if they were shares",
+        [
+            (
+                "    if ratio.null_count or not pc.all(pc.is_finite(ratio)).as_py():",
+                "    if ratio.null_count:",
+            )
+        ],
+    ),
+    (
+        "E31a",
+        "(per-disjunct) `pc.min(ratio).as_py() < 0.0 or` deleted -- the "
+        "round-3 F10 SURVIVOR. Every pre-existing range fixture used "
+        "ratio > 1, which trips only the max half, so the negative half was "
+        "asserted by nobody and a negative share passed",
+        [
+            (
+                "    if pc.min(ratio).as_py() < 0.0 or pc.max(ratio).as_py() > 1.0:",
+                "    if pc.max(ratio).as_py() > 1.0:",
+            )
+        ],
+    ),
+    (
+        "E31b",
+        "(per-disjunct) `pc.max(ratio).as_py() > 1.0` deleted: a share larger "
+        "than its own denominator is emitted",
+        [
+            (
+                "    if pc.min(ratio).as_py() < 0.0 or pc.max(ratio).as_py() > 1.0:",
+                "    if pc.min(ratio).as_py() < 0.0:",
+            )
+        ],
+    ),
     (
         "E32",
         "the post-condition WARNS instead of raising (rule B's "
@@ -717,6 +892,27 @@ MUTANTS: list[tuple[str, str, list[tuple[str, str]]]] = [
                 "        if name in counts.column_names:",
                 '    for name in ("total", "ratio"):\n'
                 "        if False:",
+            )
+        ],
+    ),
+    # PER-NAME layer for the re-run guard: E34 disables both names at once.
+    (
+        "E34a",
+        "(per-name) the re-run guard ignores `total`, catching only `ratio`",
+        [
+            (
+                '    for name in ("total", "ratio"):',
+                '    for name in ("ratio",):',
+            )
+        ],
+    ),
+    (
+        "E34b",
+        "(per-name) the re-run guard ignores `ratio`, catching only `total`",
+        [
+            (
+                '    for name in ("total", "ratio"):',
+                '    for name in ("total",):',
             )
         ],
     ),

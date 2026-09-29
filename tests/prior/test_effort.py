@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
@@ -191,7 +192,118 @@ def test_a_null_total_is_caught_on_output():
             "ratio": pa.array([None], pa.float64()),
         }
     )
-    with pytest.raises(ValueError, match="total"):
+    with pytest.raises(ValueError, match="total is null or < 1"):
+        effort._check_output(bad)
+
+
+# --------------------------------------------------------------------------
+# PER-DISJUNCT coverage of the `_check_output` guards.
+#
+# Each guard above is a compound condition, and the fixtures that reach them
+# so far happen to trip BOTH disjuncts at once -- which means deleting either
+# one alone leaves the suite green. A mutant that deletes the whole `if`
+# proves the check exists; it cannot prove every clause of it is load-bearing.
+#
+# The fixtures below are built so that exactly ONE disjunct can fire: the
+# other column is valid, and the other clause of the same condition is
+# satisfied. See `tests/prior/mutation/run_effort_mutants.py`'s header.
+# --------------------------------------------------------------------------
+
+
+def _poisoned(total, ratio):
+    """A RatioTable-shaped table with hand-chosen `total` / `ratio` columns."""
+    width = len(ratio)
+    return pa.table(
+        {
+            "species_key": pa.array(list(range(width)), pa.int64()),
+            "cell": pa.array(["c"] * width, pa.string()),
+            "week": pa.array([5] * width, pa.int8()),
+            "n": pa.array([1] * width, pa.int64()),
+            "total": pa.array(total, pa.int64()),
+            "ratio": pa.array(ratio, pa.float64()),
+        }
+    )
+
+
+def test_a_null_ratio_is_caught_even_when_the_total_is_valid():
+    """The `ratio.null_count` disjunct, isolated -- nothing else can catch this.
+
+    It is NOT redundant with the finiteness check beside it:
+    `pc.all(pc.is_finite([0.5, None]))` is **True**, because Arrow's
+    `is_finite` returns null for a null element and `pc.all` skips nulls. So
+    without `ratio.null_count` a null share with a perfectly valid `total`
+    walks straight out of `_check_output` and into the prior.
+
+    `test_a_null_total_is_caught_on_output` cannot stand in for this: its
+    table has a null `total` too, so the total clause fires first and masks
+    the ratio clause entirely. Here `total = [2, 2]` is valid, so the ratio
+    guard is the ONLY thing that can raise.
+
+    That shape -- some rows joined, one row not -- is exactly what a
+    misaligned append or a left-outer-join regression produces.
+    """
+    import birdology.prior.effort as effort
+
+    bad = _poisoned(total=[2, 2], ratio=[0.5, None])
+    assert bad.column("total").null_count == 0, "the total must be blameless"
+    # The finiteness clause genuinely does not see this row.
+    assert pc.all(pc.is_finite(bad.column("ratio"))).as_py() is True
+
+    with pytest.raises(ValueError, match="null or non-finite"):
+        effort._check_output(bad)
+
+
+def test_a_negative_ratio_is_caught_on_output():
+    """The `pc.min(ratio) < 0.0` disjunct, isolated.
+
+    Every other range fixture uses `ratio > 1`, which trips only the `max`
+    half of the same condition. A negative share is the other half and is
+    reachable: with `_validate` bypassed, `n = [-2, 5, 5]` emits
+    `[-0.25, 0.625, 0.625]` verbatim. A negative prior is not a mild prior --
+    it is a sign error that propagates silently through normalisation.
+    """
+    import birdology.prior.effort as effort
+
+    bad = _poisoned(total=[2], ratio=[-0.5])
+    assert pc.max(bad.column("ratio")).as_py() <= 1.0, "the max half must not fire"
+    with pytest.raises(ValueError, match=r"outside \[0, 1\]"):
+        effort._check_output(bad)
+
+
+def test_a_null_total_is_caught_even_when_the_remaining_totals_are_valid():
+    """The `total.null_count` disjunct, isolated.
+
+    `pc.min` SKIPS nulls, so on `total = [None, 2]` the `pc.min(total) < 1`
+    clause sees 2 and is satisfied. Only `null_count` can fire. The existing
+    single-row null fixture cannot isolate this: there `pc.min` of an all-null
+    column is None and the comparison raises `TypeError`, which kills a mutant
+    by crashing rather than by the guard doing its job.
+    """
+    import birdology.prior.effort as effort
+
+    bad = _poisoned(total=[None, 2], ratio=[0.5, 0.5])
+    assert pc.min(bad.column("total")).as_py() == 2, "the min clause is satisfied"
+    with pytest.raises(ValueError, match="total is null or < 1"):
+        effort._check_output(bad)
+
+
+def test_a_sub_one_total_is_caught_even_when_no_total_is_null():
+    """The `pc.min(total) < 1` disjunct, isolated: no nulls anywhere."""
+    import birdology.prior.effort as effort
+
+    bad = _poisoned(total=[0, 5], ratio=[0.5, 0.5])
+    assert bad.column("total").null_count == 0
+    with pytest.raises(ValueError, match="total is null or < 1"):
+        effort._check_output(bad)
+
+
+def test_a_non_finite_ratio_is_caught_even_when_no_ratio_is_null():
+    """The finiteness disjunct, isolated: `null_count` is 0, so it cannot fire."""
+    import birdology.prior.effort as effort
+
+    bad = _poisoned(total=[2], ratio=[float("inf")])
+    assert bad.column("ratio").null_count == 0
+    with pytest.raises(ValueError, match="null or non-finite"):
         effort._check_output(bad)
 
 
@@ -202,8 +314,33 @@ def test_a_re_run_on_its_own_output_is_rejected():
         target_group_ratios(out)
 
 
+@pytest.mark.parametrize("leftover", ["total", "ratio"])
+def test_either_leftover_column_alone_is_rejected(leftover):
+    """Each name in the re-run guard is checked independently.
+
+    A full RatioTable carries BOTH `total` and `ratio`, so it trips whichever
+    name the guard happens to look at and cannot distinguish a guard that
+    checks only one. A half-stripped table -- the shape a partial column
+    selection leaves behind -- reaches exactly one name.
+    """
+    t = _counts([(1, "c", 5, 3)])
+    extra = (
+        pa.array([3], pa.int64())
+        if leftover == "total"
+        else pa.array([1.0], pa.float64())
+    )
+    with pytest.raises(ValueError, match=f"already carries a '{leftover}'"):
+        target_group_ratios(t.append_column(leftover, extra))
+
+
 def test_null_cell_is_rejected_rather_than_silently_dropped():
-    """A null join key matches nothing in an inner join: the row disappears."""
+    """A null join key matches nothing in an inner join: the row disappears.
+
+    The match is on the INPUT guard's exact wording, not a bare "null". A
+    loose match passes on the output post-condition's "null or non-finite
+    ratio" too, so it cannot tell the input guard from a downstream
+    backstop -- which is how a deleted input check goes unnoticed.
+    """
     t = pa.table(
         {
             "species_key": pa.array([1, 2], pa.int64()),
@@ -212,7 +349,7 @@ def test_null_cell_is_rejected_rather_than_silently_dropped():
             "n": pa.array([3, 1], pa.int64()),
         }
     )
-    with pytest.raises(ValueError, match="null"):
+    with pytest.raises(ValueError, match="CountTable column 'cell' contains null"):
         target_group_ratios(t)
 
 
@@ -225,11 +362,20 @@ def test_null_week_is_rejected_rather_than_silently_dropped():
             "n": pa.array([3, 1], pa.int64()),
         }
     )
-    with pytest.raises(ValueError, match="null"):
+    with pytest.raises(ValueError, match="CountTable column 'week' contains null"):
         target_group_ratios(t)
 
 
 def test_null_n_is_rejected():
+    """A null count must be rejected ON INPUT, not caught by the backstop.
+
+    This one is why the match above is exact. A null `n` does not break the
+    join: Arrow's `sum` SKIPS nulls, so the row survives with a valid `total`
+    and a null `ratio`, and the output post-condition raises "null or
+    non-finite ratio". Under `match="null"` that reads as a pass, so deleting
+    the `n` case from the input null check left the suite green (harness
+    mutant E14c). The input guard is what must fire here.
+    """
     t = pa.table(
         {
             "species_key": pa.array([1, 2], pa.int64()),
@@ -238,7 +384,7 @@ def test_null_n_is_rejected():
             "n": pa.array([3, None], pa.int64()),
         }
     )
-    with pytest.raises(ValueError, match="null"):
+    with pytest.raises(ValueError, match="CountTable column 'n' contains null"):
         target_group_ratios(t)
 
 
@@ -323,7 +469,35 @@ def test_mixed_and_lower_case_cells_are_DIFFERENT_cells():
     assert totals == {"8A1F": 3, "8a1f": 1}
 
 
-def test_ratio_is_aligned_with_its_own_row_in_a_multi_chunk_table():
+@pytest.fixture
+def parallel_arrow():
+    """Force Acero's hash join onto its PARALLEL path, then restore.
+
+    `pa.cpu_count()` is 1 under a pinned `ARROW_NUM_THREADS=1`, in a small
+    cgroup, or on a single-core CI container. With one thread Acero's hash
+    join is sequential and NEVER reorders, so the misalignment path below is
+    unreachable and the test would pass vacuously on buggy code.
+
+    An earlier version skipped in that case. Skipping beats a vacuous pass,
+    but it leaves a whole class of runner where this module's ONLY alignment
+    coverage silently evaporates while the mutation harness still prints
+    "Survivors: none" -- the same "coverage disappears on a different machine"
+    failure the harness header warns about, moved from silent-pass to
+    silent-skip rather than eliminated.
+
+    `set_cpu_count` overrides the thread pool regardless of the environment
+    variable, so the parallel path is reached deterministically everywhere.
+    Restored in teardown so no other test inherits the setting.
+    """
+    previous = pa.cpu_count()
+    pa.set_cpu_count(8)
+    try:
+        yield
+    finally:
+        pa.set_cpu_count(previous)
+
+
+def test_ratio_is_aligned_with_its_own_row_in_a_multi_chunk_table(parallel_arrow):
     """The join REORDERS a multi-chunk table; numerator and denominator must
     still come from the same output row.
 
@@ -336,10 +510,11 @@ def test_ratio_is_aligned_with_its_own_row_in_a_multi_chunk_table():
     element-wise identical and every assertion below still holds on the buggy
     code -- the exact way this test's coverage was found to be imaginary.
 
-    So the reordering is asserted as an explicit PRECONDITION, not assumed:
-    eight chunks over eight (cell, week) groups reorder on every observed run,
-    and if a future pyarrow ever preserves that order the precondition fails
-    loudly instead of quietly hollowing the test out.
+    So the parallel path is FORCED by the `parallel_arrow` fixture rather than
+    hoped for, and the reordering is asserted as an explicit PRECONDITION
+    rather than assumed: eight chunks over eight (cell, week) groups reorder
+    on every observed run, and if a future pyarrow ever preserves that order
+    the precondition fails loudly instead of quietly hollowing the test out.
     """
     # Eight chunks, each one (cell, week) group whose four species split it
     # 1:2:3:4. The four `n` values are SCALED PER GROUP, so the concatenated
@@ -358,12 +533,7 @@ def test_ratio_is_aligned_with_its_own_row_in_a_multi_chunk_table():
     ]
     t = pa.concat_tables(chunks)
     assert t.column("n").num_chunks > 1
-
-    if pa.cpu_count() < 2:
-        pytest.skip(
-            "single-threaded pyarrow: Acero's hash join is sequential and "
-            "order-preserving, so no fixture can reach the misalignment path"
-        )
+    assert pa.cpu_count() > 1, "the fixture must have forced the parallel path"
 
     out = target_group_ratios(t)
     assert out.num_rows == t.num_rows
@@ -389,6 +559,32 @@ def test_ratio_is_aligned_with_its_own_row_in_a_multi_chunk_table():
         assert by_species[10 * g + 2]["ratio"] == pytest.approx(0.2)
         assert by_species[10 * g + 3]["ratio"] == pytest.approx(0.3)
         assert by_species[10 * g + 4]["ratio"] == pytest.approx(0.4)
+
+
+@pytest.mark.parametrize("week", [0, 99, -1])
+def test_an_out_of_range_week_is_NOT_validated_here(week):
+    """Pins the docstring's scope claim: the 1..52 RANGE is not this module's.
+
+    `_validate` checks `week`'s DTYPE and NULLITY, never its range -- the
+    range belongs to `indexing.py`, upstream, and re-deriving it here would be
+    the second-derivation defect rule (C) exists to prevent.
+
+    This test asserts the LIMIT of the guarantee, not a desirable behaviour.
+    An earlier docstring claimed this module "validates" week is int8 in
+    1..52; Task 6 then relied on that and a week outside the range was
+    silently dropped one module downstream. If range validation is ever added
+    here deliberately, this test SHOULD fail and be deleted along with the
+    docstring paragraph -- that is the point of pinning it.
+    """
+    t = pa.table(
+        {
+            "species_key": pa.array([1], pa.int64()),
+            "cell": pa.array(["c"], pa.string()),
+            "week": pa.array([week], pa.int8()),
+            "n": pa.array([1], pa.int64()),
+        }
+    )
+    assert target_group_ratios(t).to_pylist()[0]["week"] == week
 
 
 def test_a_wrong_week_type_is_rejected_not_cast():
