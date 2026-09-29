@@ -17,6 +17,7 @@ ARTIFACT PATHS come from the `out_dir` PARAMETER (`tmp_path` here), never
 from a hardcoded cluster path.
 """
 import builtins
+import json
 import logging
 import sys
 import zipfile
@@ -31,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "scripts"))
 
 from birdology.prior.backoff import FLOOR
+from birdology.prior.controls import CONTROLS
 from birdology.prior.indexing import (
     WEEKS_PER_YEAR,
     aggregate_counts,
@@ -58,7 +60,37 @@ HEADER = "\t".join(
      "decimalLatitude", "decimalLongitude", "eventDate", "recordedBy"]
 )
 
+def _measurement_row(n_species: int, n_cells: int, net_peak_bytes: int) -> dict:
+    """A SELF-CONSISTENT synthetic row of `measure_peak_results.json`.
+
+    Built from the raw observations -- grid shape and peak RSS -- with the
+    stated ratio DERIVED, exactly as `measure_peak.py` writes it. A test that
+    needs an inconsistent row makes one by overriding a field on the result,
+    so the inconsistency is explicit at the call site rather than an accident
+    of the fixture.
+    """
+    contexts = n_species * n_cells * WEEKS_PER_YEAR
+    return {
+        "n_species": n_species,
+        "n_cells": n_cells,
+        "fill": 1.0,
+        "contexts": contexts,
+        "net_peak_bytes": net_peak_bytes,
+        "bytes_per_context_net": net_peak_bytes / contexts,
+    }
+
+
 DOI = "10.15468/dl.test"
+
+#: Artifacts one resolution must produce: the full prior plus ONE PER REGISTRY
+#: ENTRY. Derived from `CONTROLS`, never a literal count -- the build loop
+#: iterates the registry, and a hardcoded 4, 5 or a fixed name set makes every
+#: assertion in this file wrong the day a control is added or removed. The
+#: fifth control (`separable`) was added while this file was being written and
+#: broke four hardcoded `== 5` assertions, which is the evidence for doing it
+#: this way rather than an argument for it.
+EXPECTED_VARIANTS = frozenset({"full", *CONTROLS})
+EXPECTED_ARTIFACTS = len(EXPECTED_VARIANTS)
 
 #: Four well-separated Danish points. They land in FOUR DISTINCT H3 cells at
 #: resolutions 3, 4 and 5 alike (verified), so a multi-resolution sweep really
@@ -170,12 +202,21 @@ def _build(tmp_path, **kwargs):
 # --------------------------------------------------------------------------
 
 
-def test_writes_full_prior_and_four_controls(tmp_path):
+def test_writes_full_prior_and_every_registered_control(tmp_path):
+    """One artifact per registry entry, plus the full prior.
+
+    DERIVED FROM `CONTROLS`, never a hardcoded set of names. The build loop
+    iterates the registry, so a control added there must appear on disk with
+    no edit to the build script -- and a test naming the four (or five) it
+    knows about would either fail spuriously on the addition or, worse,
+    silently stop checking the new one. `EXPECTED_VARIANTS` is the one
+    derivation every count in this file reads.
+    """
     paths = _build(tmp_path)
     variants = {load_prior(p).spec.variant for p in paths}
-    assert variants == {
-        "full", "uniform", "marginal", "shuffle_space", "shuffle_time"
-    }
+    assert variants == EXPECTED_VARIANTS
+    # ...and the registry is not empty, so the equality above is not vacuous.
+    assert len(EXPECTED_VARIANTS) > 1
 
 
 def test_full_prior_has_probabilities_for_seen_species(tmp_path):
@@ -194,7 +235,7 @@ def test_doi_travels_into_every_artifact(tmp_path):
     occurrence records, and reported in the same results table.
     """
     paths = _build(tmp_path)
-    assert len(paths) == 5
+    assert len(paths) == EXPECTED_ARTIFACTS
     for p in paths:
         assert load_prior(p).gbif_doi == DOI
 
@@ -574,6 +615,16 @@ def test_the_memory_constant_is_not_below_the_worst_measurement():
     one. `>=` rather than `==`: a re-measurement on slower-scaling hardware may
     legitimately raise the constant, and over-estimating costs a bigger node
     while under-estimating costs the whole run.
+
+    M2: THE SECOND CLAUSE USED TO BE `WORST > 160` AND THAT WAS A TRIPWIRE,
+    NOT AN ANCHOR. Lowering both numbers to 161/161.0 -- one above it -- left
+    this suite green and restored the under-prediction in full. The clause is
+    gone, and `WORST_MEASURED_BYTES_PER_CONTEXT` is now READ from
+    `scripts/measurements/measure_peak_results.json` rather than typed beside
+    the constant, so there is no second number to lower in step. That
+    derivation is what
+    `test_the_recorded_worst_case_is_READ_FROM_the_measurement_file` pins;
+    this test is left to the one comparison it can honestly make.
     """
     assert build_prior.MEASURED_BYTES_PER_CONTEXT >= (
         build_prior.WORST_MEASURED_BYTES_PER_CONTEXT
@@ -581,12 +632,6 @@ def test_the_memory_constant_is_not_below_the_worst_measurement():
         "MEASURED_BYTES_PER_CONTEXT is below the worst measured cost, so the "
         "operator is told a build is cheaper than the measurements say: this "
         "is the direction that under-warns"
-    )
-    # And the recorded measurement is itself above the discredited 160, so this
-    # test cannot pass by both numbers having been lowered together.
-    assert build_prior.WORST_MEASURED_BYTES_PER_CONTEXT > 160, (
-        "the recorded measurement has been lowered back toward the fitted-to-"
-        "two-points figure the review rejected"
     )
 
 
@@ -887,6 +932,104 @@ def test_the_cli_accepts_every_documented_doi_spelling():
         # Accepted VERBATIM: not stripped, not canonicalised. The sidecar must
         # carry the string the operator attested to.
         assert args.gbif_doi == good
+
+
+def test_the_doi_shape_message_names_whitespace_as_a_probable_cause(capsys):
+    """M3: the three whitespace spellings are refused for a NAMED reason.
+
+    `'10.15468/dl.bq3fxc '`, `' 10.15468/dl.bq3fxc'` and
+    `'DOI: 10.15468/dl.bq3fxc'` all land in the shape check, and 'is not
+    shaped like a DOI' sends the operator hunting for a malformed identifier
+    when the identifier is fine and a space is not. Pasting a DOI off a
+    citation line is the most likely operator input after the clean one.
+
+    THE VALUE IS STILL NOT STRIPPED, and that is deliberate: no silent repair
+    at a boundary, because the sidecar must carry the exact string the
+    operator attested to and quietly repairing an attribution field means the
+    artifact cites something the build was never told.
+    `test_save_accepts_a_doi_with_INCIDENTAL_surrounding_whitespace` pins the
+    byte-for-byte round trip from the other side, so this improvement cannot
+    become a provenance change. Only the MESSAGE changes.
+    """
+    for bad in (
+        "10.15468/dl.bq3fxc ",
+        " 10.15468/dl.bq3fxc",
+        "DOI: 10.15468/dl.bq3fxc",
+        "10.15468/dl.bq3\tfxc",
+    ):
+        with pytest.raises(SystemExit):
+            build_prior._parse_args(
+                [
+                    "--archive", "a.zip", "--source", "dof", "--no-test-split",
+                    "--gbif-doi", bad,
+                ]
+            )
+        err = capsys.readouterr().err
+        assert "is not shaped like a DOI" in err, err
+        assert "WHITESPACE" in err, (
+            f"{bad!r} is refused without naming whitespace as a probable "
+            f"cause, so the operator is sent hunting for a malformed "
+            f"identifier: {err}"
+        )
+        # And the message shows what was actually received, repr'd, so the
+        # invisible character is visible in the terminal.
+        assert repr(bad) in err, err
+
+
+def test_a_measurement_row_inconsistent_with_its_own_numbers_is_REFUSED(tmp_path):
+    """M2: committing the file must not just MOVE the retyping into the JSON.
+
+    Committing `measure_peak_results.json` stops a coordinated edit retyping
+    two numbers in the source -- but on its own, `bytes_per_context_net:
+    161.0` in the JSON would pin the constant at 161 with nothing able to
+    object. The stated ratio is redundant with `net_peak_bytes / contexts`,
+    and `contexts` is redundant with the grid shape, so the file is checked
+    against itself: falsifying the pin now requires fabricating a coherent
+    measurement rather than editing one number.
+
+    REFUSED, not recomputed. A row whose stated ratio disagrees with its own
+    peak RSS is a row of unknown provenance, and preferring the recomputed
+    value would be the silent repair at a boundary the house rules forbid.
+    """
+    row = _measurement_row(10, 20, 3_000_000_000)
+
+    lied = tmp_path / "lied.json"
+    lied.write_text(
+        json.dumps([{**row, "bytes_per_context_net": 161.0}]), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="does not follow from"):
+        build_prior.worst_measured_bytes_per_context(lied)
+
+    # ...and inflating `contexts` to make a low ratio arithmetically true is
+    # caught by the grid, which is the other redundancy.
+    stretched = tmp_path / "stretched.json"
+    stretched.write_text(
+        json.dumps(
+            [
+                {
+                    **row,
+                    "contexts": row["contexts"] * 2,
+                    "bytes_per_context_net": row["net_peak_bytes"]
+                    / (row["contexts"] * 2),
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="disagrees with its own grid|contains"):
+        build_prior.worst_measured_bytes_per_context(stretched)
+
+
+def test_the_committed_measurement_is_itself_self_consistent():
+    """And the file actually shipped passes that check.
+
+    Without this, the consistency check above could be asserted entirely
+    against synthetic fixtures while the committed file quietly violated it --
+    a test that cannot fail on the artifact it exists to protect.
+    """
+    assert build_prior.worst_measured_bytes_per_context() == pytest.approx(
+        build_prior.WORST_MEASURED_BYTES_PER_CONTEXT
+    )
 
 
 def test_save_prior_refuses_a_WHITESPACE_ONLY_doi_from_any_caller(tmp_path):
@@ -1613,7 +1756,7 @@ def test_a_split_that_DOES_match_removes_rows_and_builds(tmp_path):
     paths = _build(
         tmp_path, archive=archive, resolution=4, test_recordings=leaked
     )
-    assert len(paths) == 5
+    assert len(paths) == EXPECTED_ARTIFACTS
 
 
 def test_a_no_split_build_does_not_fail_on_the_zero_match_check(tmp_path):
@@ -1624,8 +1767,614 @@ def test_a_no_split_build_does_not_fail_on_the_zero_match_check(tmp_path):
     well. A zero-match check that fired here would make `--no-test-split`
     unusable, and the pressure would be to remove the check rather than the
     bug.
+
+    It must not trip the PARTIAL-match clause either. That clause carries its
+    own `banned_key_count > 0` conjunct, because `match_rate` is undefined on
+    an empty split and RAISES rather than inventing a 0/0 -- so a clause
+    missing the conjunct fails here with a `ValueError` about the rate being
+    undefined, not with a passing build.
     """
-    assert len(_build(tmp_path, test_recordings=[])) == 5
+    assert len(_build(tmp_path, test_recordings=[])) == EXPECTED_ARTIFACTS
+
+
+# --------------------------------------------------------------------------
+# C1 (final gate): ONE MATCHING KEY MUST NOT DISARM THE GUARD.
+#
+# `zero_match` is `banned_key_count > 0 and contributor_rows_removed == 0` --
+# a claim about the WHOLE split. Reproduced at HEAD: a 100-key split with one
+# real contributor and ninety-nine Sydney coordinates BUILT ALL FIVE
+# ARTIFACTS, while the all-hundred-dead control raised. The per-key clause
+# below is what closes that, and these tests pin both directions of it.
+# --------------------------------------------------------------------------
+
+
+def _mostly_dead_split(tmp_path, live, dead, name="partial.csv"):
+    """A split with *live* keys that bite and *dead* keys that cannot.
+
+    The live rows use the archive's own contributor at a real observed
+    (point, week); the dead rows use contributor names that appear nowhere,
+    at the SAME coordinates and week -- so the split is at the right H3
+    resolution, passes the resolution check, and fails only on the join. That
+    is the shape every realistic degradation takes (a spelling convention
+    that changed, a mojibaked column), and it is why a total-only condition
+    cannot see it.
+    """
+    rows = [(55.6867, 12.5700, 2, "obs")] * live
+    rows += [
+        (55.6867, 12.5700, 2, f"nobody-{i:03d}") for i in range(dead)
+    ]
+    return recordings_at_resolution(
+        load_test_split(_split_csv(tmp_path, rows, name=name)), 4
+    )
+
+
+def test_a_split_where_one_key_in_twentyfive_bites_FAILS_the_build(tmp_path):
+    """THE C1 DEFECT, end to end: one live key must not release an artifact.
+
+    25 banned keys, ONE of which matches a real contributor. Rows ARE removed,
+    so `zero_match` is false and the total check passes -- this build wrote a
+    complete artifact set and exited 0 before the per-key clause existed.
+
+    The directory is asserted EMPTY, not merely that an exception was raised:
+    the original C1 failure's signature was files on disk plus exit 0, so the
+    written state is the assertion that discriminates.
+    """
+    out = tmp_path / "priors"
+    recordings = _mostly_dead_split(tmp_path, live=1, dead=24)
+    with pytest.raises(
+        build_prior.PartialMatchGuardError, match="matched any occurrence"
+    ):
+        _build(tmp_path, resolution=4, test_recordings=recordings, out_dir=out)
+    assert not out.exists() or not list(out.glob("*")), (
+        "the build wrote artifacts despite 24 of 25 banned keys being inert"
+    )
+
+
+def test_the_partial_match_failure_reports_the_rate_and_both_counts(tmp_path):
+    """The operator is told WHAT the rate was, not merely that it was low.
+
+    Without the numbers the message is indistinguishable from the zero-match
+    one, and the two demand different investigations: a dead join versus a
+    subpopulation of the split that is broken while the rest works.
+    """
+    recordings = _mostly_dead_split(tmp_path, live=1, dead=24)
+    with pytest.raises(build_prior.PartialMatchGuardError) as excinfo:
+        _build(
+            tmp_path,
+            resolution=4,
+            test_recordings=recordings,
+            out_dir=tmp_path / "priors",
+        )
+    message = str(excinfo.value)
+    assert "only 1 of 25" in message, message
+    assert "0.0400" in message, message
+    assert "--min-split-match-rate" in message, message
+
+
+def test_a_split_where_EVERY_key_bites_still_builds(tmp_path):
+    """The precondition: the per-key clause must not fire on a healthy split.
+
+    Without this the clause could be firing on everything and the test above
+    would still pass. Every key here names the archive's own contributor at
+    an observed (point, week), so the rate is 1.0.
+    """
+    recordings = _mostly_dead_split(tmp_path, live=4, dead=0)
+    paths = _build(tmp_path, resolution=4, test_recordings=recordings)
+    assert len(paths) == EXPECTED_ARTIFACTS
+
+
+def test_a_split_just_ABOVE_the_threshold_builds(tmp_path):
+    """The boundary from the passing side, so the clause is not a blanket ban.
+
+    1 of 10 keys is a 0.10 rate -- sparse, above the 0.05 default, and it
+    builds. Paired with the 1-of-25 failure above, the two bracket the
+    threshold and prove the comparison is a real one rather than
+    "any dead key fails".
+    """
+    recordings = _mostly_dead_split(tmp_path, live=1, dead=9)
+    paths = _build(tmp_path, resolution=4, test_recordings=recordings)
+    assert len(paths) == EXPECTED_ARTIFACTS
+
+
+def test_the_threshold_is_a_PARAMETER_and_an_operator_can_accept_a_sparse_split(
+    tmp_path,
+):
+    """`--min-split-match-rate 0.0` is the explicit, recorded escape.
+
+    A guard with no escape is a guard people delete. The same 1-of-25 split
+    that fails by default builds when the operator says so -- and saying so
+    is a flag in the command line, not a silent default.
+    """
+    recordings = _mostly_dead_split(tmp_path, live=1, dead=24)
+    paths = _build(
+        tmp_path,
+        resolution=4,
+        test_recordings=recordings,
+        min_split_match_rate=0.0,
+    )
+    assert len(paths) == EXPECTED_ARTIFACTS
+
+
+def test_the_TOTAL_zero_match_check_cannot_be_disabled_by_the_threshold(tmp_path):
+    """`0.0` relaxes the rate clause and leaves the total clause armed.
+
+    The two clauses are not one condition with a knob. A split that removed
+    NOTHING is never a release, whatever the operator passes, so the
+    zero-match error must still be the one raised here -- and if the rate
+    clause had subsumed the total one, `0.0` would have released it.
+    """
+    out = tmp_path / "priors"
+    ghost = _mostly_dead_split(tmp_path, live=0, dead=25)
+    with pytest.raises(ZeroMatchGuardError, match="matched no occurrence"):
+        _build(
+            tmp_path,
+            resolution=4,
+            test_recordings=ghost,
+            out_dir=out,
+            min_split_match_rate=0.0,
+        )
+    assert not out.exists() or not list(out.glob("*.npz"))
+
+
+def test_the_zero_match_message_names_the_xeno_canto_guard(tmp_path):
+    """C1, related (Minor): guard 1 may legitimately have eaten the rows.
+
+    The message told the operator to check H3 resolution and cell formatting
+    and never mentioned that the Xeno-Canto guard runs FIRST -- so on a split
+    whose recordings are themselves Xeno-Canto occurrences, guard 2 correctly
+    finds nothing left. `xeno_canto_rows_removed` was returned and unused.
+    """
+    archive = _archive(
+        tmp_path,
+        extra_rows=[
+            _row(
+                9101,
+                1001,
+                55.6867,
+                12.5700,
+                "2025-01-07",
+                pub=next(iter(XENO_CANTO_PUBLISHER_KEYS)),
+                who="xc-only",
+            ),
+        ],
+    )
+    ghost = recordings_at_resolution(
+        load_test_split(
+            _split_csv(tmp_path, [(55.6867, 12.5700, 2, "xc-only")])
+        ),
+        4,
+    )
+    with pytest.raises(ZeroMatchGuardError) as excinfo:
+        _build(
+            tmp_path,
+            archive=archive,
+            resolution=4,
+            test_recordings=ghost,
+            out_dir=tmp_path / "priors",
+        )
+    message = str(excinfo.value)
+    assert "Xeno-Canto" in message, message
+    assert "1 row(s)" in message, message
+
+
+@pytest.mark.parametrize("bad", ["5", "-0.1", "1.5", "percent"])
+def test_the_cli_refuses_a_min_split_match_rate_outside_zero_to_one(capsys, bad):
+    """A FRACTION, rejected rather than clamped.
+
+    `5` meaning five percent is the obvious units bug, and clamping it to 1.0
+    would demand that every banned key bite -- failing every real build --
+    while clamping the other way silently disarms the clause. Both are the
+    silent repair at a boundary this plan forbids.
+    """
+    with pytest.raises(SystemExit):
+        build_prior._parse_args(
+            [
+                "--archive", "a.zip", "--source", "dof", "--no-test-split",
+                "--gbif-doi", DOI, "--min-split-match-rate", bad,
+            ]
+        )
+    err = capsys.readouterr().err
+    assert "min-split-match-rate" in err, err
+
+
+def test_build_from_archive_refuses_an_out_of_range_threshold(tmp_path):
+    """The library half: every other caller is protected too.
+
+    `split_match_rate` guards the command line; this guards a notebook, a
+    sweep driver and this plan's own tests. Independently load-bearing, and
+    the harness has one mutant per site.
+    """
+    with pytest.raises(ValueError, match="min_split_match_rate must be"):
+        _build(tmp_path, test_recordings=[], min_split_match_rate=5.0)
+
+
+def test_the_partial_match_guard_reads_the_guard_results_own_counts():
+    """The CONDITION is the guard's returned rate, pinned at the source level.
+
+    The same discipline `test_the_zero_match_guard_reads_the_guard_results_own_counts`
+    applies to the total clause. A caller re-deriving the rate from
+    `len(test_recordings)` would be behaviourally identical on every fixture
+    in this file while being wrong for a split whose rows collide under
+    normalisation -- and a caller scraping the leakage module's partial-match
+    WARNING would reintroduce the C1 logging defect one clause along.
+    """
+    source = Path(build_prior.__file__).read_text(encoding="utf-8")
+    assert "guarded.match_rate < min_split_match_rate" in source, (
+        "the partial-match escalation is no longer a comparison on the "
+        "guard's returned per-key counts"
+    )
+    assert "guarded.banned_key_count > 0 and guarded.match_rate" in source, (
+        "the partial-match clause lost its `banned_key_count > 0` conjunct; "
+        "`--no-test-split` reaches it with no keys, where the rate is "
+        "undefined and RAISES"
+    )
+
+
+# --------------------------------------------------------------------------
+# I3: a partial artifact set must be distinguishable from a complete one.
+# --------------------------------------------------------------------------
+
+
+def test_the_manifest_names_every_artifact_the_resolution_wrote(tmp_path):
+    """One entry per written artifact, npz and sidecar alike.
+
+    DERIVED from `CONTROLS`, so a control added to the registry appears here
+    with no edit to the build script or to this test. Asserted against the
+    registry rather than against a literal count for exactly that reason.
+    """
+    import json
+
+    out = tmp_path / "priors"
+    paths = _build(tmp_path, out_dir=out)
+    manifest = build_prior.manifest_path(out, "dof", 4)
+    assert manifest.exists()
+
+    meta = json.loads(manifest.read_text(encoding="utf-8"))
+    assert meta["manifest_version"] == build_prior.MANIFEST_VERSION
+    assert meta["source"] == "dof" and meta["resolution"] == 4
+    assert meta["artifact_count"] == EXPECTED_ARTIFACTS
+    assert {e["npz"] for e in meta["artifacts"]} == {p.name for p in paths}
+    assert {e["sidecar"] for e in meta["artifacts"]} == {
+        p.with_suffix(".json").name for p in paths
+    }
+    # The variant set comes from the registry, never from four hardcoded names.
+    assert {
+        e["npz"].removeprefix("prior_dof_r4_").removesuffix(".npz")
+        for e in meta["artifacts"]
+    } == EXPECTED_VARIANTS
+
+
+def test_check_manifest_accepts_a_complete_set(tmp_path):
+    """The precondition: a real build verifies.
+
+    Without this, `check_manifest` could be refusing everything and the
+    truncation tests below would still pass.
+    """
+    out = tmp_path / "priors"
+    paths = _build(tmp_path, out_dir=out)
+    verified = build_prior.check_manifest(out, "dof", 4)
+    assert sorted(verified) == sorted(paths)
+
+
+def test_check_manifest_DETECTS_a_truncated_set(tmp_path):
+    """THE I3 DEFECT: a missing artifact is now nameable.
+
+    Deleting one control leaves every remaining file individually valid and
+    correctly provenanced -- which is precisely why a consumer globbing the
+    directory could not tell a complete release from a truncated one.
+    """
+    out = tmp_path / "priors"
+    paths = _build(tmp_path, out_dir=out)
+    victim = next(p for p in paths if "_full" not in p.name)
+    victim.unlink()
+    with pytest.raises(ValueError, match="truncated artifact set"):
+        build_prior.check_manifest(out, "dof", 4)
+
+
+def test_check_manifest_detects_a_missing_SIDECAR_too(tmp_path):
+    """Its own case: `save_prior` writes two files and `load_prior` needs both.
+
+    A failure between the two leaves an `.npz` whose sidecar never landed --
+    a truncated ARTIFACT rather than a truncated SET, produced by the same
+    mid-resolution failure, and invisible to a check that looked only at
+    `.npz` names.
+    """
+    out = tmp_path / "priors"
+    paths = _build(tmp_path, out_dir=out)
+    paths[0].with_suffix(".json").unlink()
+    with pytest.raises(ValueError, match="truncated artifact set"):
+        build_prior.check_manifest(out, "dof", 4)
+
+
+def test_check_manifest_FAILS_CLOSED_when_there_is_no_manifest(tmp_path):
+    """No manifest means NOT A RELEASE, never "nothing to check".
+
+    This is the state a build that died part-way leaves behind, and the whole
+    finding is that such a directory is indistinguishable from a complete one.
+    A check that treated an absent manifest as a pass would restore that
+    exactly.
+    """
+    out = tmp_path / "priors"
+    _build(tmp_path, out_dir=out)
+    build_prior.manifest_path(out, "dof", 4).unlink()
+    with pytest.raises(ValueError, match="no artifact manifest"):
+        build_prior.check_manifest(out, "dof", 4)
+
+
+def test_a_build_that_dies_part_way_leaves_NO_manifest(tmp_path):
+    """The reproduction, and what the manifest changes about it.
+
+    An exception forced in the third artifact leaves a fully-formed SUBSET on
+    disk -- the finding's exact scenario. The partial artifacts are STILL
+    THERE: this mechanism does not clean up, and that is the failure mode
+    deliberately kept. What it adds is that the truncation is now detectable,
+    because the manifest is written LAST and so is absent.
+    """
+    out = tmp_path / "priors"
+    real_save = build_prior.save_prior
+    calls = []
+
+    def exploding(tensor, path):
+        calls.append(path)
+        if len(calls) == 3:
+            raise RuntimeError("forced failure part-way through the resolution")
+        return real_save(tensor, path)
+
+    build_prior.save_prior = exploding
+    try:
+        with pytest.raises(RuntimeError, match="forced failure"):
+            _build(tmp_path, out_dir=out)
+    finally:
+        build_prior.save_prior = real_save
+
+    # The partial set IS on disk -- individually valid, correctly provenanced.
+    assert len(list(out.glob("*.npz"))) == 2
+    for npz in out.glob("*.npz"):
+        assert load_prior(npz).gbif_doi == DOI
+    # ...and it is now DETECTABLE as incomplete.
+    assert not build_prior.manifest_path(out, "dof", 4).exists()
+    with pytest.raises(ValueError, match="no artifact manifest"):
+        build_prior.check_manifest(out, "dof", 4)
+
+
+def test_a_failed_REBUILD_does_not_leave_a_stale_manifest_verifying(tmp_path):
+    """The manifest is deleted FIRST, and that ordering is the protocol.
+
+    Rebuilding into a directory that already holds a COMPLETE set of the same
+    resolution overwrites artifacts one at a time. A manifest left in place
+    from the earlier build would still name every file -- all of which exist,
+    because they were overwritten in order -- and `check_manifest` would
+    verify a directory whose contents are a mixture of two builds.
+    """
+    out = tmp_path / "priors"
+    _build(tmp_path, out_dir=out)
+    assert build_prior.check_manifest(out, "dof", 4)
+
+    real_save = build_prior.save_prior
+    calls = []
+
+    def exploding(tensor, path):
+        calls.append(path)
+        if len(calls) == 3:
+            raise RuntimeError("forced failure on the rebuild")
+        return real_save(tensor, path)
+
+    build_prior.save_prior = exploding
+    try:
+        with pytest.raises(RuntimeError, match="forced failure"):
+            _build(tmp_path, out_dir=out)
+    finally:
+        build_prior.save_prior = real_save
+
+    assert not build_prior.manifest_path(out, "dof", 4).exists(), (
+        "the previous build's manifest survived a failed rebuild and would "
+        "verify a directory holding a mixture of two builds"
+    )
+    with pytest.raises(ValueError, match="no artifact manifest"):
+        build_prior.check_manifest(out, "dof", 4)
+
+
+def test_check_manifest_refuses_a_manifest_for_another_build(tmp_path):
+    """A manifest naming a different source or resolution attests to nothing.
+
+    Every resolution of a sweep writes into ONE `--out`, so the wrong
+    manifest being consulted is a name collision away rather than a
+    hypothetical.
+    """
+    out = tmp_path / "priors"
+    _build(tmp_path, out_dir=out, resolution=4)
+    stray = build_prior.manifest_path(out, "dof", 5)
+    stray.write_text(
+        build_prior.manifest_path(out, "dof", 4).read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="cannot attest to this one"):
+        build_prior.check_manifest(out, "dof", 5)
+
+
+def test_check_manifest_refuses_an_unknown_manifest_version(tmp_path):
+    """Half-reading a manifest is worse than not reading one.
+
+    A future field carrying part of the artifact list would be skipped, and
+    the check would report a complete set from whatever happened to parse.
+    """
+    import json
+
+    out = tmp_path / "priors"
+    _build(tmp_path, out_dir=out)
+    path = build_prior.manifest_path(out, "dof", 4)
+    meta = json.loads(path.read_text(encoding="utf-8"))
+    meta["manifest_version"] = build_prior.MANIFEST_VERSION + 1
+    path.write_text(json.dumps(meta), encoding="utf-8")
+    with pytest.raises(ValueError, match="manifest_version"):
+        build_prior.check_manifest(out, "dof", 4)
+
+
+def test_check_manifest_refuses_a_manifest_naming_no_artifacts(tmp_path):
+    """An empty list would authenticate an empty directory as a release."""
+    import json
+
+    out = tmp_path / "priors"
+    _build(tmp_path, out_dir=out)
+    path = build_prior.manifest_path(out, "dof", 4)
+    meta = json.loads(path.read_text(encoding="utf-8"))
+    meta["artifacts"] = []
+    path.write_text(json.dumps(meta), encoding="utf-8")
+    with pytest.raises(ValueError, match="names no artifacts"):
+        build_prior.check_manifest(out, "dof", 4)
+
+
+def test_the_manifest_machinery_hardcodes_no_control_COUNT_or_NAME():
+    """I3's forward requirement, checked on the source.
+
+    A fifth control was added to `CONTROLS` while this finding was open. The
+    manifest must carry it from the registry alone, so nothing in the
+    manifest path may name a control or count them.
+
+    CHECKED ON THE CODE, NOT THE DOCSTRINGS. `write_manifest`'s docstring
+    quotes the reproduced failure verbatim -- `prior_dof_r4_{full,uniform,
+    marginal}` -- and that is exactly the history the next reader needs. A
+    grep over the whole function would force it out of the file, which is the
+    opposite of what this finding asked for; the same distinction
+    `test_the_build_script_does_not_scrape_logs_for_control_flow` draws.
+    """
+    import ast
+
+    source = Path(build_prior.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    for name in ("write_manifest", "check_manifest", "artifact_stem"):
+        function = _function(tree, name)
+        body = list(function.body)
+        if (
+            body
+            and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)
+        ):
+            body = body[1:]
+        assert body, f"`{name}` is nothing but a docstring"
+        text = "\n".join(
+            ast.get_source_segment(source, stmt) or "" for stmt in body
+        )
+        for control in CONTROLS:
+            assert control not in text, (
+                f"`{name}` names the {control!r} control literally; the "
+                "manifest must be derived from the registry so a control "
+                "added there is carried with no edit here"
+            )
+        # ...and it does not count them either. `len(CONTROLS)` is fine; a
+        # literal is not, because it is the number that goes stale silently.
+        counts = [
+            node.value
+            for node in ast.walk(ast.parse(text))
+            if isinstance(node, ast.Constant) and node.value in (4, 5)
+        ]
+        assert not counts, (
+            f"`{name}` carries the literal artifact count {counts}; the "
+            "registry has grown from four controls to five once already"
+        )
+
+
+# --------------------------------------------------------------------------
+# M2: the memory constant is pinned against a COMMITTED MEASUREMENT.
+# --------------------------------------------------------------------------
+
+
+def test_the_recorded_worst_case_is_READ_FROM_the_measurement_file():
+    """M2: the pin is an artifact, not a number typed beside the constant.
+
+    The previous pin asserted `MEASURED >= WORST` and `WORST > 160`. That
+    second clause was an arbitrary tripwire, not an anchor: lowering BOTH to
+    161/161.0 -- one above it -- left the suite green and restored the
+    under-prediction in full. A coordinated two-line edit walked through it.
+
+    `WORST_MEASURED_BYTES_PER_CONTEXT` is now the max over
+    `scripts/measurements/measure_peak_results.json`, and this asserts the
+    DERIVATION rather than the value: the module-level binding must be a CALL,
+    so replacing it with a literal (the first step of the coordinated edit)
+    fails here instead of passing silently.
+    """
+    import ast
+    import json
+
+    rows = json.loads(
+        build_prior.MEASURE_PEAK_RESULTS.read_text(encoding="utf-8")
+    )
+    expected = max(float(r["bytes_per_context_net"]) for r in rows)
+    assert build_prior.WORST_MEASURED_BYTES_PER_CONTEXT == expected
+
+    tree = ast.parse(Path(build_prior.__file__).read_text(encoding="utf-8"))
+    assignments = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(t, ast.Name) and t.id == "WORST_MEASURED_BYTES_PER_CONTEXT"
+            for t in node.targets
+        )
+    ]
+    assert len(assignments) == 1, assignments
+    assert isinstance(assignments[0].value, ast.Call), (
+        "WORST_MEASURED_BYTES_PER_CONTEXT is assigned a literal again. That "
+        "is the edit that defeated the old pin: lower the constant and the "
+        "recorded worst case together and every test stays green"
+    )
+
+
+def test_the_worst_case_really_TRACKS_the_measurement_file(tmp_path):
+    """...and the derivation is not a constant dressed as a read.
+
+    A `worst_measured_bytes_per_context` that ignored its argument and
+    returned 263.0 would pass the assertion above. Two synthetic measurement
+    files with different maxima must give two different answers.
+    """
+    import json
+
+    low = tmp_path / "low.json"
+    low.write_text(json.dumps([{"bytes_per_context_net": 11.0}]), encoding="utf-8")
+    high = tmp_path / "high.json"
+    high.write_text(
+        json.dumps(
+            [{"bytes_per_context_net": 11.0}, {"bytes_per_context_net": 99.5}]
+        ),
+        encoding="utf-8",
+    )
+    assert build_prior.worst_measured_bytes_per_context(low) == 11.0
+    assert build_prior.worst_measured_bytes_per_context(high) == 99.5
+
+
+def test_a_missing_measurement_file_RAISES_rather_than_falling_back(tmp_path):
+    """No fallback literal. A default restores the self-referential pin.
+
+    If the constant could quietly fall back to a number in the source when
+    the measurement is unreadable, deleting the file would be a third way to
+    perform the coordinated edit -- and the test above would still pass.
+    """
+    with pytest.raises(ValueError, match="is missing"):
+        build_prior.worst_measured_bytes_per_context(tmp_path / "absent.json")
+    empty = tmp_path / "empty.json"
+    empty.write_text("[]", encoding="utf-8")
+    with pytest.raises(ValueError, match="pins nothing"):
+        build_prior.worst_measured_bytes_per_context(empty)
+
+
+def test_the_measurement_file_is_committed_beside_the_code():
+    """The pin is worthless if the artifact is not in the repository.
+
+    The original `measure_peak_results.json` lived under `.superpowers/`,
+    which `.gitignore` excludes wholesale, and no test read it -- so it
+    anchored nothing. It is committed under `scripts/measurements/` now, and
+    this asserts the path is inside the repository tree rather than in a
+    process directory that a fresh clone would not have.
+    """
+    path = build_prior.MEASURE_PEAK_RESULTS
+    assert path.exists(), path
+    assert ".superpowers" not in path.parts, (
+        "the measurement moved back under a gitignored process directory; a "
+        "fresh clone would not carry it and the pin would fail at import"
+    )
+    assert path.parent.name == "measurements"
+    assert path.stat().st_size > 0
 
 
 def test_an_empty_split_file_is_rejected_at_load(tmp_path):
@@ -1786,7 +2535,7 @@ def test_the_build_path_never_reaches_the_download_client(tmp_path, monkeypatch)
     monkeypatch.delitem(sys.modules, "birdology.prior.gbif_download", raising=False)
     monkeypatch.setattr(builtins, "__import__", blocked)
 
-    assert len(_build(tmp_path)) == 5
+    assert len(_build(tmp_path)) == EXPECTED_ARTIFACTS
 
 
 def test_the_build_script_does_not_import_the_download_client():

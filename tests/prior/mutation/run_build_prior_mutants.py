@@ -334,7 +334,7 @@ MUTANTS: list[Mutant] = [
         "only the FIRST control written, so the paper's credibility section "
         "ships one null hypothesis instead of four. Nothing raises: the three "
         "missing artifacts simply never appear in the output directory",
-        "test_writes_full_prior_and_four_controls",
+        "test_writes_full_prior_and_every_registered_control",
         [
             (
                 "    for name, make in CONTROLS.items():",
@@ -1093,6 +1093,367 @@ MUTANTS: list[Mutant] = [
                 '    return list({str(c) for c in counts.column("cell").to_pylist()})[::-1]',
             )
         ],
+    ),
+    # ---- C1 (final gate): the PER-KEY clause of the leakage escalation ----
+    #
+    # `zero_match` is `banned_key_count > 0 and contributor_rows_removed == 0`
+    # -- a claim about the WHOLE split that ONE live key satisfies. Reproduced
+    # at HEAD: a 100-key split with one real contributor and ninety-nine dead
+    # ones built all five artifacts. One mutant per DISJUNCT of the new
+    # condition, each with a fixture violating only that clause, plus B50
+    # which restores the total-only condition exactly.
+    (
+        "B50",
+        "C1, THE FINDING ITSELF: the per-key clause deleted, restoring the "
+        "TOTAL-ONLY condition this branch shipped. A split where one key in "
+        "twenty-five bites removes rows, so `zero_match` is false and the "
+        "build writes a complete, publishable artifact set whose leakage "
+        "guard touched 4% of the held-out recordings. Killed by a "
+        "PARTIAL-match fixture, which is the fixture class the old condition "
+        "provably cannot see -- every all-dead fixture in this file passes on "
+        "this mutant",
+        "test_a_split_where_one_key_in_twentyfive_bites_FAILS_the_build",
+        [
+            (
+                "    if guarded.banned_key_count > 0 and guarded.match_rate < min_split_match_rate:",
+                "    if False:",
+            )
+        ],
+    ),
+    (
+        "B51",
+        "C1, DISJUNCT 1: the rate clause's `banned_key_count > 0` conjunct "
+        "dropped. `--no-test-split` reaches this line with no banned keys, "
+        "where `match_rate` is UNDEFINED and raises rather than inventing a "
+        "0/0 -- so the legitimate no-split mode dies with an error about a "
+        "rate nobody asked for. Its own mutant because a one-sided fixture "
+        "cannot tell a guard that is too weak from one that is too strong, "
+        "and the pressure from a guard that fires on a legal build is to "
+        "delete the guard",
+        "test_a_no_split_build_does_not_fail_on_the_zero_match_check",
+        [
+            (
+                "    if guarded.banned_key_count > 0 and guarded.match_rate < min_split_match_rate:",
+                "    if guarded.match_rate < min_split_match_rate:",
+            )
+        ],
+    ),
+    (
+        "B52",
+        "C1, DISJUNCT 2: the rate comparison inverted to `>`, so only a "
+        "HEALTHY split fails and the reproduced 1-of-25 sails through. The "
+        "mirror of B51: together they prove both conjuncts are load-bearing "
+        "and neither is decoration",
+        "test_a_split_where_EVERY_key_bites_still_builds",
+        [
+            (
+                "    if guarded.banned_key_count > 0 and guarded.match_rate < min_split_match_rate:",
+                "    if guarded.banned_key_count > 0 and guarded.match_rate > min_split_match_rate:",
+            )
+        ],
+    ),
+    (
+        "B53",
+        "C1: the rate clause SUBSUMES the total one -- `zero_match` deleted on "
+        "the theory that a zero rate is below any threshold. It is not: "
+        "`--min-split-match-rate 0.0` is a legitimate operator choice and "
+        "`0.0 < 0.0` is false, so a split that removed NOTHING would be "
+        "released. The two clauses are not one condition with a knob, and the "
+        "total one is unconditional by design",
+        "test_the_TOTAL_zero_match_check_cannot_be_disabled_by_the_threshold",
+        [("    if guarded.zero_match:", "    if False:")],
+    ),
+    (
+        "B54",
+        "C1: the threshold read from the guard's own reported rate rather "
+        "than from the parameter -- `min_split_match_rate` replaced by "
+        "`guarded.match_rate`, which is trivially never less than itself. A "
+        "self-referential comparison that looks like a threshold check and "
+        "can never fire; the same defect class as the memory constant pinned "
+        "against itself (M2)",
+        "test_a_split_where_one_key_in_twentyfive_bites_FAILS_the_build",
+        [
+            (
+                "    if guarded.banned_key_count > 0 and guarded.match_rate < min_split_match_rate:",
+                "    if guarded.banned_key_count > 0 and guarded.match_rate < guarded.match_rate:",
+            )
+        ],
+    ),
+    (
+        "B55",
+        "C1: the threshold parameter SILENTLY CLAMPED into 0..1 instead of "
+        "rejected, so `--min-split-match-rate 5` (five percent, meant as a "
+        "percentage) becomes 1.0 and demands that EVERY banned key bite. No "
+        "silent repair at a boundary: the units bug must stop the build, not "
+        "become a different policy",
+        "test_build_from_archive_refuses_an_out_of_range_threshold",
+        [
+            (
+                "    if not 0.0 <= min_split_match_rate <= 1.0:\n        raise ValueError(",
+                "    min_split_match_rate = min(max(min_split_match_rate, 0.0), 1.0)\n"
+                "    if False:\n        raise ValueError(",
+            )
+        ],
+    ),
+    (
+        "B56",
+        "C1: the CLI's `--min-split-match-rate` range check removed, leaving "
+        "only the library's. The two are independently load-bearing -- this "
+        "one turns a multi-hour national build into an instant usage error, "
+        "and the library's protects every other caller -- so each has its own "
+        "mutant, exactly as the blank-DOI guard does (B13c / B13f)",
+        "test_the_cli_refuses_a_min_split_match_rate_outside_zero_to_one",
+        [
+            (
+                "    if not 0.0 <= rate <= 1.0:\n        raise argparse.ArgumentTypeError(",
+                "    if False:\n        raise argparse.ArgumentTypeError(",
+            )
+        ],
+    ),
+    (
+        "B57",
+        "C1, related (Minor): the Xeno-Canto count dropped from the "
+        "zero-match message. Guard 1 runs FIRST, and on a split whose "
+        "recordings are themselves Xeno-Canto occurrences it legitimately "
+        "consumes the rows guard 2 would have matched -- so an operator sent "
+        "to check H3 resolution and cell formatting is sent to the wrong "
+        "place. The count was already returned and simply unused",
+        "test_the_zero_match_message_names_the_xeno_canto_guard",
+        [
+            (
+                '            "H3 resolution and cell formatting of the split -- and note that "\n'
+                '            f"the Xeno-Canto guard ran FIRST and removed "\n'
+                '            f"{guarded.xeno_canto_rows_removed} row(s), so on a split whose "\n'
+                '            "recordings are themselves Xeno-Canto occurrences guard 1 may "\n'
+                '            "legitimately have consumed the rows guard 2 would have matched"',
+                '            "H3 resolution and cell formatting of the split"',
+            )
+        ],
+    ),
+    # ---- I3: the artifact manifest ---------------------------------------
+    (
+        "B60",
+        "I3, THE FINDING ITSELF: the manifest never written. A failure "
+        "part-way through a resolution then leaves a fully-formed SUBSET on "
+        "disk -- each file individually valid and correctly provenanced, with "
+        "nothing recording which artifacts are missing -- and a consumer "
+        "globbing the output directory cannot tell a complete release from a "
+        "truncated one",
+        "test_the_manifest_names_every_artifact_the_resolution_wrote",
+        [
+            (
+                "    manifest = write_manifest(out_dir, source, resolution, written, gbif_doi)",
+                "    manifest = manifest_path(out_dir, source, resolution)",
+            )
+        ],
+    ),
+    (
+        "B61",
+        "I3: the manifest written FIRST, before any artifact. The ordering is "
+        "the entire protocol: written first, a manifest naming five artifacts "
+        "sits beside a directory that dies after two, and `check_manifest` "
+        "reports a truncated set as... still truncated, but the manifest now "
+        "EXISTS for a build that never completed, so a crash between the "
+        "manifest and the first save leaves a release-shaped record of "
+        "nothing",
+        "test_a_build_that_dies_part_way_leaves_NO_manifest",
+        [
+            (
+                "    written: list[Path] = []\n    stem = artifact_stem(source, resolution)",
+                "    written: list[Path] = []\n"
+                "    stem = artifact_stem(source, resolution)\n"
+                "    write_manifest(\n"
+                "        out_dir,\n"
+                "        source,\n"
+                "        resolution,\n"
+                "        [out_dir / f\"{stem}_full.npz\"]\n"
+                "        + [out_dir / f\"{stem}_{n}.npz\" for n in CONTROLS],\n"
+                "        gbif_doi,\n"
+                "    )",
+            )
+        ],
+    ),
+    (
+        "B62",
+        "I3: the stale-manifest unlink removed. Re-running a FAILING build "
+        "into a directory that already holds a COMPLETE set of the same "
+        "resolution overwrites artifacts one at a time under a manifest still "
+        "attesting to the old set -- every named file exists, so "
+        "`check_manifest` VERIFIES a directory whose contents are a mixture "
+        "of two builds. Its own mutant because B60 and B61 both pass on it",
+        "test_a_failed_REBUILD_does_not_leave_a_stale_manifest_verifying",
+        [
+            (
+                "    manifest_path(out_dir, source, resolution).unlink(missing_ok=True)\n",
+                "",
+            )
+        ],
+    ),
+    (
+        "B63",
+        "I3: `check_manifest` treats an ABSENT manifest as nothing to check "
+        "and passes. That is precisely the state a build that died part-way "
+        "leaves behind, so failing OPEN restores the finding in full: the "
+        "truncated directory verifies",
+        "test_check_manifest_FAILS_CLOSED_when_there_is_no_manifest",
+        [
+            (
+                "    if not path.exists():\n        raise ValueError(\n"
+                '            f"no artifact manifest at {path}: an artifact set without one is "',
+                "    if not path.exists():\n        return []\n    if False:\n        raise ValueError(\n"
+                '            f"no artifact manifest at {path}: an artifact set without one is "',
+            )
+        ],
+    ),
+    (
+        "B64",
+        "I3: `check_manifest` verifies only the `.npz` and never the sidecar. "
+        "`save_prior` writes two files and `load_prior` requires both, so a "
+        "failure between them leaves an artifact that loads as a hard error "
+        "while the SET reports complete -- a truncated artifact rather than a "
+        "truncated set, produced by the same mid-resolution failure",
+        "test_check_manifest_detects_a_missing_SIDECAR_too",
+        [
+            (
+                '        for key in ("npz", "sidecar"):',
+                '        for key in ("npz",):',
+            )
+        ],
+    ),
+    (
+        "B65",
+        "I3: `check_manifest` compares the artifact COUNT instead of "
+        "verifying the NAMES -- satisfied by any N files in the directory, "
+        "including N copies of the full prior or N files from another "
+        "resolution's build. The manifest names its artifacts for exactly "
+        "this reason",
+        "test_check_manifest_DETECTS_a_truncated_set",
+        [
+            (
+                "    missing = []\n"
+                "    for entry in entries:\n"
+                '        for key in ("npz", "sidecar"):\n'
+                "            name = entry.get(key)\n"
+                "            if not name or not (out_dir / name).exists():\n"
+                "                missing.append(name or f\"<no {key} in manifest entry>\")",
+                "    missing = []\n"
+                "    if len(list(out_dir.glob(\"*.npz\"))) < len(entries):\n"
+                "        missing.append(\"<count mismatch>\")",
+            )
+        ],
+    ),
+    (
+        "B66",
+        "I3 + the fifth control: the manifest's artifact list hardcoded to "
+        "the four control names this branch shipped with, rather than derived "
+        "from what was WRITTEN. A control added to `CONTROLS` -- which "
+        "happened during this very finding -- then lands on disk unnamed by "
+        "the manifest, and `check_manifest` reports a complete set while one "
+        "artifact is unaccounted for",
+        "test_the_manifest_machinery_hardcodes_no_control_COUNT_or_NAME",
+        [
+            (
+                "    artifacts = []\n    for npz in written:",
+                "    artifacts = []\n"
+                "    _shipped = (\"full\", \"uniform\", \"marginal\", \"shuffle_space\", \"shuffle_time\")\n"
+                "    written = [p for p in written if any(p.stem.endswith(s) for s in _shipped)]\n"
+                "    for npz in written:",
+            )
+        ],
+    ),
+    # ---- M2: the memory constant is pinned against a COMMITTED artifact ---
+    (
+        "B17e",
+        "M2, THE FINDING ITSELF: `WORST_MEASURED_BYTES_PER_CONTEXT` assigned "
+        "a LITERAL again instead of being read from the committed "
+        "measurement. That is the first half of the coordinated edit B17c "
+        "showed walking through the old pin: lower the constant and the "
+        "recorded worst case together and the whole suite stayed green, "
+        "because the only thing stopping it was an arbitrary `> 160` "
+        "tripwire. With the value derived from a file there is no second "
+        "number to lower, and re-introducing one is caught here",
+        "test_the_recorded_worst_case_is_READ_FROM_the_measurement_file",
+        [
+            (
+                "WORST_MEASURED_BYTES_PER_CONTEXT = worst_measured_bytes_per_context()",
+                "WORST_MEASURED_BYTES_PER_CONTEXT = 161.0",
+            ),
+            ("MEASURED_BYTES_PER_CONTEXT = 270", "MEASURED_BYTES_PER_CONTEXT = 161"),
+        ],
+    ),
+    (
+        "B17f",
+        "M2: `worst_measured_bytes_per_context` ignores the file and returns "
+        "a constant. Distinct from B17e, which removes the call: this keeps "
+        "the call, so any test asserting merely that the binding IS a call "
+        "passes, and the function is a constant dressed as a measurement",
+        "test_the_worst_case_really_TRACKS_the_measurement_file",
+        [("    return max(values)", "    return 263.0367179487179")],
+    ),
+    (
+        "B17g",
+        "M2: a missing measurement file FALLS BACK to a literal rather than "
+        "raising. Deleting the JSON would then be a third route to the "
+        "coordinated edit -- the constant silently returns to being pinned "
+        "against a number typed in the source while the test still appears to "
+        "read an artifact",
+        "test_a_missing_measurement_file_RAISES_rather_than_falling_back",
+        [
+            (
+                "    if not path.exists():\n        raise ValueError(\n"
+                '            f"the recorded peak-RSS measurement {path} is missing; "',
+                "    if not path.exists():\n        return 263.0\n    if False:\n        raise ValueError(\n"
+                '            f"the recorded peak-RSS measurement {path} is missing; "',
+            )
+        ],
+    ),
+    (
+        "B17h",
+        "M2: the worst case taken as the MEAN rather than the max. This is "
+        "the exact error the re-measurement corrected -- rounding to the mean "
+        "(218) instead of up from the worst (263) is what produced the "
+        "discredited 160 -- reached now through the derivation rather than "
+        "through the literal. `MEASURED >= WORST` then passes with room to "
+        "spare and the operator is under-warned again",
+        "test_the_worst_case_really_TRACKS_the_measurement_file",
+        [("    return max(values)", "    return sum(values) / len(values)")],
+    ),
+    # ---- M3: the DOI whitespace hint -------------------------------------
+    (
+        "B13g",
+        "M3: the whitespace hint removed from the DOI shape message. "
+        "`'10.15468/dl.bq3fxc '` with a trailing space, a leading space and "
+        "`'DOI: 10.15468/dl.bq3fxc'` are all refused as 'not shaped like a "
+        "DOI', which sends the operator hunting for a malformed identifier "
+        "rather than a stray space -- and pasting a DOI off a citation line "
+        "is the most likely operator input after the clean one. The value is "
+        "still NOT stripped (no silent repair at a boundary); only the "
+        "message names the probable cause",
+        "test_the_doi_shape_message_names_whitespace_as_a_probable_cause",
+        [
+            (
+                '            "or wrapped in a resolver URL). CHECK FOR SURROUNDING OR INTERNAL "\n'
+                '            "WHITESPACE FIRST: a DOI pasted off a citation line commonly "\n'
+                '            "carries a leading or trailing space, or a `DOI: ` label, and all "\n'
+                '            "three land here rather than looking malformed. The value is NOT "\n'
+                '            "trimmed for you -- the sidecar must carry the exact string the "\n'
+                '            "operator attested to, and silently repairing an attribution "\n'
+                '            "field means the artifact cites something the build was never "\n'
+                '            "told. Otherwise: a GBIF download has BOTH a "',
+                '            "or wrapped in a resolver URL); a GBIF download has BOTH a "',
+            )
+        ],
+    ),
+    (
+        "B13h",
+        "M3: the whitespace hint bought by STRIPPING the value -- the silent "
+        "repair the finding explicitly forbids. The sidecar would then carry "
+        "a different string from the one the operator attested to, and "
+        "`test_save_accepts_a_doi_with_INCIDENTAL_surrounding_whitespace` "
+        "pins the byte-for-byte round trip precisely so a message improvement "
+        "cannot become a provenance change",
+        "test_the_cli_accepts_every_documented_doi_spelling",
+        [("    if not DOI_PATTERN.match(value):", "    value = value.strip()\n    if not DOI_PATTERN.match(value):")],
     ),
 ]
 

@@ -562,6 +562,149 @@ MUTANTS: list[tuple[str, str, list[tuple[str, str]]]] = [
             )
         ],
     ),
+    # ---- C1 (final gate): the PER-KEY match count ------------------------
+    #
+    # `zero_match` is a claim about the WHOLE split and ONE live key satisfies
+    # it. `matched_key_count` is the quantity that makes a partial failure
+    # visible, so each way of making it lie gets its own mutant: too high
+    # (disarms the build's rate clause), too low (fails a correct build),
+    # counting the wrong thing (rows, or the banned set itself), and the
+    # blank-contributor interaction that would credit the anonymous
+    # population with matches it must never make.
+    (
+        "M56",
+        "C1: `matched_key_count` reported as the FULL banned count, so every "
+        "split looks perfectly live and the build script's rate clause can "
+        "never fire. This is the exact end state of the reproduced defect -- "
+        "a 100-key split with one live key releasing five artifacts -- "
+        "reached through the count instead of through the condition",
+        [
+            (
+                "    return kept, removed, len(banned), len(matched)",
+                "    return kept, removed, len(banned), len(banned)",
+            )
+        ],
+    ),
+    (
+        "M57",
+        "C1: `matched_key_count` reported as ZERO whatever matched, so a "
+        "perfectly healthy split fails the build's rate clause. The mirror of "
+        "M56: together they prove the count tracks reality in both "
+        "directions, and a one-sided fixture cannot tell a count that is too "
+        "generous from one that is too mean. The pressure from a guard that "
+        "fires on a legal build is to delete the guard",
+        [
+            (
+                "    return kept, removed, len(banned), len(matched)",
+                "    return kept, removed, len(banned), 0",
+            )
+        ],
+    ),
+    (
+        "M58",
+        "C1: matches counted as ROWS rather than KEYS -- the matched set "
+        "replaced by the removal count. Numerically identical on every "
+        "one-row-per-key fixture, and on a real archive a contributor with "
+        "many occurrences in one cell-week pushes the rate above 1.0, so no "
+        "threshold comparison means anything any more",
+        [
+            (
+                "    return kept, removed, len(banned), len(matched)",
+                "    return kept, removed, len(banned), removed",
+            )
+        ],
+    ),
+    (
+        "M59",
+        "C1: the matched set collects the BANNED key set rather than the keys "
+        "that bit -- `matched.add` fed from `banned` on every matching row. "
+        "Distinct from M56, which fakes the COUNT: this one keeps a real set "
+        "and fills it wrongly, so any check that merely asserted the set's "
+        "type or non-emptiness passes",
+        [
+            (
+                "            matched.add(cast(\"tuple[str, int, str]\", key))",
+                "            matched.update(banned)",
+            )
+        ],
+    ),
+    (
+        "M60",
+        "C1: a blank-contributor row counted as a MATCH -- the layer-2 "
+        "short-circuit still keeps the row but credits the key. The rate then "
+        "reads healthy on a split whose only 'matches' are the anonymous "
+        "population the guard must never touch, which is the quietest way to "
+        "disarm the rate clause: nothing is deleted and the number looks right",
+        [
+            (
+                "            # Layer 2 of the blank-contributor defence: ALWAYS kept, and the\n"
+                "            # key is never even formed, so a blank key that reached *banned*\n"
+                "            # by some other route cannot match it either.\n"
+                "            keep.append(True)\n"
+                "            continue",
+                "            matched.update(banned)\n"
+                "            keep.append(True)\n"
+                "            continue",
+            )
+        ],
+    ),
+    (
+        "M61",
+        "C1: `match_rate` RETURNS 1.0 for an empty split instead of raising. "
+        "0/0 has no honest value: 1.0 claims a split that does not exist "
+        "worked perfectly, and a caller that forgot its `banned_key_count > "
+        "0` conjunct would then silently pass every `--no-test-split` build "
+        "through a rate check that measured nothing",
+        [
+            (
+                "        if self.banned_key_count <= 0:\n            raise ValueError(",
+                "        if False:\n            raise ValueError(",
+            )
+        ],
+    ),
+    (
+        "M62",
+        "C1: `match_rate` divides by the MATCHED count instead of the banned "
+        "count, giving 1.0 for every split that matched anything at all. Its "
+        "own mutant because it is the plausible typo in a two-name division "
+        "and it is invisible on any fixture where every key bites",
+        [
+            (
+                "        return self.matched_key_count / self.banned_key_count",
+                "        return self.matched_key_count / max(self.matched_key_count, 1)",
+            )
+        ],
+    ),
+    (
+        "M63",
+        "C1: the PARTIAL-match warning removed. It is ONLY a warning -- the "
+        "build script escalates on `LeakageGuardResult.match_rate` -- so "
+        "deleting it deafens the log without disarming the guard, exactly as "
+        "M34 does for the zero-match line. Both facts are pinned: this mutant "
+        "by the partial-warning test, and the guard's independence by "
+        "`test_the_match_rate_survives_logging_being_disabled_entirely`",
+        [
+            (
+                "            logger.warning(\n"
+                '                "drop_test_contributor_cells: only %d of %d banned "',
+                "            _ = (\n"
+                '                "drop_test_contributor_cells: only %d of %d banned "',
+            )
+        ],
+    ),
+    (
+        "M64",
+        "C1: the partial-match warning fires UNCONDITIONALLY, so a split in "
+        "which every key bit is reported as partial. A vacuous warning trains "
+        "the operator to ignore the real one, which is how the zero-match "
+        "line came to need a data channel beside it",
+        [
+            (
+                "        if len(matched) < len(banned):",
+                "        if True:",
+            )
+        ],
+    ),
 ]
 
 

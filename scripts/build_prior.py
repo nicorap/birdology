@@ -175,6 +175,11 @@ class ZeroMatchGuardError(ValueError):
     while still being catchable by name for anyone who wants to distinguish
     it from a malformed split.
 
+    THIS IS THE TOTAL CLAUSE ONLY. It fires when NOT ONE banned key bit.
+    `PartialMatchGuardError` is its per-key sibling and catches the case this
+    one provably cannot see: a split in which a handful of keys are live and
+    the rest are dead. See `build_from_archive` for why both are needed.
+
     RAISED FROM RETURNED COUNTS, NEVER FROM A LOG RECORD
     ----------------------------------------------------
     The first version of this guard attached a `logging.Handler` to
@@ -195,6 +200,114 @@ class ZeroMatchGuardError(ValueError):
     handler configuration and no logger rename can reach it. There is no
     second, log-based opinion: that path is deleted.
     """
+
+
+class PartialMatchGuardError(ValueError):
+    """Most of a supplied test split was inert: the guard barely ran.
+
+    THE DEFECT THIS EXISTS FOR, REPRODUCED
+    --------------------------------------
+    `LeakageGuardResult.zero_match` is `banned_key_count > 0 and
+    contributor_rows_removed == 0` -- a claim about the WHOLE split. A 100-key
+    split in which ONE key matched a real contributor and ninety-nine matched
+    nothing (Sydney coordinates against Danish occurrences) built a complete
+    five-artifact release and exited 0, while the all-hundred-dead control
+    correctly raised. One live key disarms the total condition for an
+    arbitrarily large split.
+
+    That matters because the failure modes the guard exists to catch do not
+    produce a clean 100%:
+
+    * a resolution-free coordinate bug puts most recordings in the wrong cell;
+    * a contributor-spelling convention that changed mid-file kills the rows
+      on one side of the change;
+    * a mojibaked name column kills every non-ASCII contributor, which in
+      Danish data is most of them but never all of them.
+
+    Every one of those degrades 99% of a split rather than 100%, so the total
+    condition catches only the case an operator would probably have noticed
+    anyway. This class is the per-key condition that catches the rest.
+
+    A `ValueError` subclass like every other contract violation here, and a
+    DISTINCT class from `ZeroMatchGuardError` because the two say different
+    things: nothing matched at all, versus almost nothing did. An operator
+    triaging the first looks for a broken join; triaging the second looks for
+    a subpopulation of the split that is broken while the rest works.
+    """
+
+
+#: Minimum fraction of a supplied split's banned keys that must remove at
+#: least one occurrence, below which `build_from_archive` REFUSES.
+#:
+#: THIS IS A POLICY, NOT A MEASUREMENT, AND IT IS SAID SO ON PURPOSE.
+#: `MEASURED_BYTES_PER_CONTEXT` below is fitted to recorded measurements and
+#: this number is not: there is no real evaluation split in this repository to
+#: fit it to, and a threshold fitted to the synthetic fixtures would be a
+#: number dressed as evidence. What CAN be argued is the shape of the choice.
+#:
+#: WHY NOT "FAIL ONLY AT ZERO, AND WARN WITH THE RATE OTHERWISE". That is the
+#: behaviour this file already had, plus a log line, and it leaves the
+#: reproduced defect intact: the 1-of-100 split still writes five artifacts
+#: and exits 0. It also puts the only signal for the partial case back on the
+#: logging channel that `ZeroMatchGuardError` documents as unusable for
+#: control flow. Rejected.
+#:
+#: WHY NOT A MAJORITY (0.5). A test split's keys are (cell, week, contributor)
+#: triples, and a key bites only if that contributor has some OTHER,
+#: non-Xeno-Canto occurrence in the same cell-week -- guard 1 has already
+#: removed the recording's own row. A recordist who publishes to Xeno-Canto
+#: but not to DOFbasen contributes a key that legitimately matches nothing,
+#: and there is no reason to expect most test recordists to be in both. A
+#: majority threshold would therefore fail correct builds routinely, and the
+#: pressure from a guard that fires on a legal build is to delete the guard
+#: rather than to fix it. Rejected.
+#:
+#: WHY ONE KEY IN TWENTY. It is far below any rate at which a split could be
+#: said to be guarding, and comfortably above the sparsity a real split can
+#: produce for the reason above. It fires on the reproduced 1-of-100 (0.01).
+#:
+#: AND WHY THE "LEGITIMATELY STALE SPLIT" OBJECTION DOES NOT LAND. The
+#: objection is that a correct build can fail this check. It can -- but the
+#: artifact such a build would write carries a leakage guard that touched
+#: under 5% of the held-out recordings, and that artifact should not be
+#: released without the operator having looked. The check does not claim the
+#: split FILE is malformed; it claims the leakage protection did not
+#: substantially happen, which in that case is TRUE. So the failure is not a
+#: false positive, it is an unwelcome true one -- and
+#: `--min-split-match-rate` is the explicit, recorded escape for an operator
+#: who has looked and accepts it, in the same spirit as `--no-test-split`.
+#: Passing `0.0` reduces this check to the total clause, which no flag can
+#: disable.
+DEFAULT_MIN_SPLIT_MATCH_RATE = 0.05
+
+
+def split_match_rate(value: str) -> float:
+    """argparse `type` for `--min-split-match-rate`: a fraction in [0, 1].
+
+    REJECTED, never clamped. A value outside the range is a units bug -- `5`
+    meaning five percent is the obvious one -- and clamping it to 1.0 would
+    turn "I meant 5%" into "every key must bite", failing every real build;
+    clamping the other way would silently disarm the check. Both are the
+    silent repair at a boundary this plan forbids.
+    """
+    try:
+        rate = float(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(
+            f"--min-split-match-rate {value!r} is not a number; it is the "
+            "FRACTION of the test split's banned keys that must remove at "
+            "least one occurrence, so it is a value in 0..1 (0.05 = one key "
+            "in twenty)"
+        ) from exc
+    if not 0.0 <= rate <= 1.0:
+        raise argparse.ArgumentTypeError(
+            f"--min-split-match-rate {rate!r} is outside 0..1; it is a "
+            "FRACTION, not a percentage, so five percent is 0.05 and not 5. "
+            "Rejected rather than clamped: clamping 5 to 1.0 would demand "
+            "that EVERY banned key bite and fail every real build, and "
+            "clamping the other way would silently disarm the check"
+        )
+    return rate
 
 
 def load_test_split(path: Path) -> list[dict]:
@@ -396,13 +509,109 @@ def estimate_over_full_grid(
 #: own machine.
 MEASURED_BYTES_PER_CONTEXT = 270
 
-#: The worst NET bytes/context any measured row produced, to one decimal. Its
-#: only purpose is to pin `MEASURED_BYTES_PER_CONTEXT` against a recorded
-#: measurement rather than against itself: a future edit that lowers the
-#: constant back toward the mean has to argue with this number, and
-#: `test_the_memory_constant_is_not_below_the_worst_measurement` fails if it
-#: does not.
-WORST_MEASURED_BYTES_PER_CONTEXT = 263.0
+#: The worst NET bytes/context any measured row produced, to one decimal.
+#:
+#: READ FROM THE RECORDED MEASUREMENT, NOT TYPED BESIDE THE CONSTANT.
+#: `test_the_memory_constant_is_not_below_the_worst_measurement` used to
+#: assert `MEASURED >= WORST` plus `WORST > 160`, and that second clause was
+#: an arbitrary tripwire rather than an anchor: lowering BOTH numbers to
+#: 161/161.0 -- one above the tripwire -- left the whole suite green and
+#: restored the under-prediction the re-measurement existed to remove. A
+#: coordinated edit walked through the pin.
+#:
+#: The value is now DERIVED, at import, from
+#: `scripts/measurements/measure_peak_results.json` -- the output of
+#: `measure_peak.py`, committed (the plan directory holding the original is
+#: gitignored, so it pinned nothing) so the constant is tied to an artifact
+#: that a coordinated edit cannot reach by retyping a number. Lowering the
+#: constant now requires editing the recorded measurements, which is a
+#: visible, arguable act; `test_the_recorded_worst_case_is_READ_FROM_the_
+#: measurement_file` fails if the derivation is replaced by a literal.
+MEASURE_PEAK_RESULTS = (
+    Path(__file__).parent / "measurements" / "measure_peak_results.json"
+)
+
+
+def worst_measured_bytes_per_context(path: Path = MEASURE_PEAK_RESULTS) -> float:
+    """Worst net bytes/context over the recorded measurement rows.
+
+    RAISES rather than falling back to a literal if the file is missing,
+    unreadable or empty. A default would re-create exactly the defect this
+    replaces: the constant would go back to being pinned by a number typed
+    beside it, while the test still appeared to read a measurement.
+    """
+    import json
+
+    if not path.exists():
+        raise ValueError(
+            f"the recorded peak-RSS measurement {path} is missing; "
+            "`MEASURED_BYTES_PER_CONTEXT` is pinned against this file and a "
+            "fallback literal would restore the self-referential pin a "
+            "coordinated 161/161.0 edit walked through. Re-run "
+            "`.superpowers/sdd/2026-09-28-occurrence-prior/measure_peak.py` "
+            "and commit its output here"
+        )
+    rows = json.loads(path.read_text(encoding="utf-8"))
+    values = []
+    for i, row in enumerate(rows):
+        if "bytes_per_context_net" in row:
+            values.append(float(row["bytes_per_context_net"]))
+        # EACH ROW IS CHECKED AGAINST ITS OWN RAW OBSERVATIONS. Committing the
+        # file stops a coordinated edit from retyping two numbers in the
+        # source, but on its own it just moves the retyping into the JSON --
+        # `bytes_per_context_net: 161.0` would pin the constant at 161 with no
+        # test able to object. The derived figure is redundant with
+        # `net_peak_bytes` and `contexts`, and `contexts` is redundant with the
+        # grid shape, so falsifying the ratio requires fabricating a coherent
+        # measurement (a peak RSS, a grid, and a context count that multiply
+        # out) rather than editing one number. That is the "visible, arguable
+        # act" the pin is supposed to demand.
+        _check_measurement_row(path, i, row)
+    if not values:
+        raise ValueError(
+            f"the recorded peak-RSS measurement {path} carries no "
+            "`bytes_per_context_net` row, so it pins nothing"
+        )
+    return max(values)
+
+
+def _check_measurement_row(path: Path, i: int, row: dict) -> None:
+    """Reject a measurement row inconsistent with its own raw observations.
+
+    Rejects rather than recomputing: a row whose stated ratio disagrees with
+    its own peak and context count is not a row with one bad field, it is a
+    row of unknown provenance, and silently preferring the recomputed value
+    would be exactly the silent repair at a boundary the house rules forbid.
+    """
+    needed = ("n_species", "n_cells", "contexts", "net_peak_bytes",
+              "bytes_per_context_net")
+    if any(k not in row for k in needed):
+        return
+    contexts = int(row["contexts"])
+    expected_contexts = int(row["n_species"]) * int(row["n_cells"]) * WEEKS_PER_YEAR
+    if contexts != expected_contexts:
+        raise ValueError(
+            f"{path} row {i}: `contexts` is {contexts} but the recorded grid "
+            f"{row['n_species']}x{row['n_cells']}x{WEEKS_PER_YEAR} contains "
+            f"{expected_contexts}. The context count is what the bytes/context "
+            "ratio is divided by, so a row that disagrees with its own grid "
+            "pins an arbitrary number"
+        )
+    if contexts <= 0:
+        raise ValueError(f"{path} row {i}: `contexts` is {contexts}")
+    stated = float(row["bytes_per_context_net"])
+    recomputed = float(row["net_peak_bytes"]) / contexts
+    if abs(stated - recomputed) > 1e-6 * max(1.0, abs(recomputed)):
+        raise ValueError(
+            f"{path} row {i}: `bytes_per_context_net` is {stated} but "
+            f"{row['net_peak_bytes']} bytes over {contexts} contexts is "
+            f"{recomputed}. `MEASURED_BYTES_PER_CONTEXT` is pinned against "
+            "this ratio, so a stated value that does not follow from the "
+            "row's own peak RSS pins nothing"
+        )
+
+
+WORST_MEASURED_BYTES_PER_CONTEXT = worst_measured_bytes_per_context()
 
 
 def project_peak_bytes(n_species: int, n_cells: int) -> int:
@@ -434,6 +643,180 @@ def cell_axis(counts: pa.Table) -> list[str]:
     return sorted({str(c) for c in counts.column("cell").to_pylist()})
 
 
+#: Schema version of the manifest written beside each resolution's artifacts.
+#: Bumped when the SHAPE changes; `check_manifest` refuses a version it does
+#: not know rather than guessing, because a manifest it half-understands is
+#: worse than none (it would report a complete set from fields it skipped).
+MANIFEST_VERSION = 1
+
+
+def artifact_stem(source: str, resolution: int) -> str:
+    """The filename stem every artifact of one resolution shares.
+
+    One definition, used by the writer, by the manifest and by
+    `check_manifest`. Inlined in two places it drifts silently: a manifest
+    naming `prior_dof_r4_*` beside artifacts named something else reports a
+    complete set as missing and a truncated one as fine.
+    """
+    return f"prior_{source}_r{resolution}"
+
+
+def manifest_path(out_dir: Path, source: str, resolution: int) -> Path:
+    """Where this resolution's manifest lives."""
+    return out_dir / f"{artifact_stem(source, resolution)}_manifest.json"
+
+
+def write_manifest(
+    out_dir: Path,
+    source: str,
+    resolution: int,
+    written: Sequence[Path],
+    gbif_doi: str,
+) -> Path:
+    """Record every artifact this resolution is supposed to contain. I3.
+
+    MANIFEST, NOT ATOMICITY -- AND WHAT THAT DELIBERATELY KEEPS
+    -----------------------------------------------------------
+    The defect: a failure part-way through one resolution leaves a
+    fully-formed SUBSET on disk. Forcing an exception in the third control
+    left `prior_dof_r4_{full,uniform,marginal}.{npz,json}` -- six files, each
+    individually valid, each correctly provenanced, with nothing on disk
+    recording that the remaining controls are missing. A consumer globbing
+    the output directory cannot tell a complete release from a truncated one.
+
+    Two fixes were available.
+
+    ATOMICITY (build into a temp directory, rename on success) was REJECTED,
+    for three reasons. (1) It is not actually atomic for a SET: POSIX
+    guarantees `rename` for one path, so publishing five `.npz` + five `.json`
+    is five-to-ten renames and a crash between them leaves the same partial
+    set one directory along. A single directory rename would be atomic, but it
+    changes the published layout from `--out/*.npz` to `--out/r4/*.npz`, which
+    is the artifact format a third party consumes. (2) It doubles peak disk
+    for the largest artifacts this pipeline produces, at the resolutions where
+    the operator is already watching memory. (3) A crash still leaves the temp
+    directory, so a "clean" output directory is achieved by leaving mess
+    somewhere else, unnamed.
+
+    THE MANIFEST is therefore the mechanism, and THIS IS THE FAILURE MODE IT
+    KEEPS: a failed build STILL LEAVES ITS PARTIAL ARTIFACTS ON DISK. They are
+    not removed, and a consumer that never checks is exactly as fooled as
+    before. What changes is that the truncation is now DETECTABLE by a
+    mechanical check rather than by knowing how many controls there ought to
+    be -- `check_manifest` is that check, and it fails closed on an absent
+    manifest.
+
+    The manifest is deleted FIRST and written LAST. That ordering is the whole
+    protocol and it closes the stale-manifest hole: re-running a failing build
+    into a directory that already holds a COMPLETE set of the same resolution
+    would otherwise overwrite artifacts one by one under a manifest still
+    attesting to the old, complete set, and the check would pass over a
+    directory whose contents are now a mixture of two builds.
+
+    IT NAMES THE ARTIFACTS, IT DOES NOT COUNT THEM. The list is derived from
+    the paths actually written, which come from `CONTROLS`. A fifth control
+    added to that registry appears in the manifest with no edit here, and
+    `check_manifest` then requires it. Nothing in this file hardcodes four,
+    five, or the current control names.
+    """
+    import json
+
+    path = manifest_path(out_dir, source, resolution)
+    artifacts = []
+    for npz in written:
+        artifacts.append(
+            {
+                "npz": npz.name,
+                "sidecar": npz.with_suffix(".json").name,
+            }
+        )
+    payload = {
+        "manifest_version": MANIFEST_VERSION,
+        "source": source,
+        "resolution": resolution,
+        "stem": artifact_stem(source, resolution),
+        "gbif_doi": gbif_doi,
+        # NAMED, never counted. `artifact_count` is recorded too, but
+        # `check_manifest` verifies the NAMES: a count would be satisfied by
+        # any five files, including five copies of the full prior.
+        "artifact_count": len(artifacts),
+        "artifacts": artifacts,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return path
+
+
+def check_manifest(out_dir: Path, source: str, resolution: int) -> list[Path]:
+    """Verify a resolution's artifact set against its manifest. I3's reader.
+
+    Returns the verified `.npz` paths. Raises `ValueError` naming the specific
+    check otherwise.
+
+    FAILS CLOSED ON AN ABSENT MANIFEST. That is the case the finding is about:
+    a build that died part-way leaves artifacts and no manifest, so "no
+    manifest" must mean "not a release", never "nothing to check". A consumer
+    reading an artifact directory written by an older version of this script
+    gets the same refusal, which is correct -- that directory genuinely
+    carries no completion record.
+
+    The `.json` sidecar is checked beside every `.npz`, because `save_prior`
+    writes both and `load_prior` requires both: an `.npz` whose sidecar never
+    landed is a truncated artifact rather than a truncated set, and the same
+    mid-resolution failure produces it.
+    """
+    import json
+
+    path = manifest_path(out_dir, source, resolution)
+    if not path.exists():
+        raise ValueError(
+            f"no artifact manifest at {path}: an artifact set without one is "
+            "not a complete release. A build that failed part-way through a "
+            "resolution leaves a fully-formed SUBSET on disk -- individually "
+            "valid, correctly provenanced files with nothing recording which "
+            "artifacts are missing -- and the manifest is written LAST, so "
+            "its absence is exactly that state"
+        )
+    meta = json.loads(path.read_text(encoding="utf-8"))
+    if meta.get("manifest_version") != MANIFEST_VERSION:
+        raise ValueError(
+            f"artifact manifest {path} has manifest_version "
+            f"{meta.get('manifest_version')!r}, but this build understands "
+            f"{MANIFEST_VERSION}; refusing to half-read it, because a "
+            "manifest whose unknown fields are skipped would report a "
+            "complete set from the fields that happened to parse"
+        )
+    if meta.get("resolution") != resolution or meta.get("source") != source:
+        raise ValueError(
+            f"artifact manifest {path} describes source "
+            f"{meta.get('source')!r} resolution {meta.get('resolution')!r}, "
+            f"not {source!r} resolution {resolution}; a manifest naming a "
+            "different build cannot attest to this one"
+        )
+    entries = meta.get("artifacts") or []
+    if not entries:
+        raise ValueError(
+            f"artifact manifest {path} names no artifacts at all; an empty "
+            "manifest would authenticate an empty directory as a complete "
+            "release"
+        )
+    missing = []
+    for entry in entries:
+        for key in ("npz", "sidecar"):
+            name = entry.get(key)
+            if not name or not (out_dir / name).exists():
+                missing.append(name or f"<no {key} in manifest entry>")
+    if missing:
+        raise ValueError(
+            f"artifact manifest {path} names {len(entries)} artifact(s) but "
+            f"{len(missing)} file(s) are missing from {out_dir}: "
+            f"{sorted(missing)}. This is a truncated artifact set: each file "
+            "present is individually valid and correctly provenanced, which "
+            "is precisely why the absence cannot be seen without the manifest"
+        )
+    return [out_dir / entry["npz"] for entry in entries]
+
+
 def build_from_archive(
     zip_path: Path,
     *,
@@ -443,8 +826,9 @@ def build_from_archive(
     out_dir: Path,
     gbif_doi: str,
     species_chunk: int = DEFAULT_SPECIES_CHUNK,
+    min_split_match_rate: float = DEFAULT_MIN_SPLIT_MATCH_RATE,
 ) -> list[Path]:
-    """Archive -> full prior + four controls. Returns the written paths.
+    """Archive -> full prior + every registered control. Returns written paths.
 
     `gbif_doi` reaches EVERY artifact, controls included: `save_prior` refuses
     an empty one, and `controls._respec` carries it from the full prior into
@@ -467,14 +851,43 @@ def build_from_archive(
     `test_the_pipeline_call_path_has_no_except_at_all` now forbids `ast.Try`
     in this function outright.
 
-    THE ZERO-MATCH GUARD READS RETURNED COUNTS
-    ------------------------------------------
-    `apply_leakage_guards` returns a `LeakageGuardResult`. The escalation
-    below compares two of its integers. It is not a log handler, not a string
-    match, and not conditioned on any logging state; see
-    `ZeroMatchGuardError` for the reproduced failure that motivated the
-    change.
+    THE LEAKAGE ESCALATION READS RETURNED COUNTS, AND IT HAS TWO CLAUSES
+    -------------------------------------------------------------------
+    `apply_leakage_guards` returns a `LeakageGuardResult`. Both clauses below
+    are comparisons on its integers. Neither is a log handler, neither is a
+    string match, and neither is conditioned on any logging state; see
+    `ZeroMatchGuardError` for the reproduced failure that motivated the data
+    channel.
+
+    * CLAUSE 1, `guarded.zero_match` -- NOT ONE key bit. Unconditional: no
+      flag can disable it, because a supplied split that removed nothing is
+      never a release.
+    * CLAUSE 2, the per-key RATE -- too few keys bit. This is the clause C1
+      added, and it exists because clause 1 is a claim about the whole split
+      that ONE live key satisfies for an arbitrarily large one. See
+      `PartialMatchGuardError` and `DEFAULT_MIN_SPLIT_MATCH_RATE`.
+
+    Clause 2 carries its own `banned_key_count > 0` conjunct rather than
+    relying on clause 1 having already returned: `--no-test-split` reaches
+    this code with zero banned keys, `match_rate` is undefined there and
+    RAISES rather than inventing a 0/0, and the legitimate no-split mode must
+    stay buildable. The two conjuncts are separately mutated for that reason.
+
+    THE ARTIFACT SET IS RECORDED IN A MANIFEST (I3)
+    ----------------------------------------------
+    See `write_manifest`: the manifest is written LAST, after every artifact
+    of this resolution, so its presence is the completion record and its
+    absence marks a truncated set. It names the artifacts rather than counting
+    them, so a control added to `CONTROLS` is carried automatically.
     """
+    if not 0.0 <= min_split_match_rate <= 1.0:
+        raise ValueError(
+            f"min_split_match_rate must be a fraction in 0..1, got "
+            f"{min_split_match_rate!r}; it is the share of the split's banned "
+            "keys that must bite, so five percent is 0.05 and not 5. Rejected "
+            "rather than clamped, because clamping either way silently "
+            "changes what the leakage guard demands"
+        )
     table = assign_cells(read_occurrences(Path(zip_path)), resolution)
     guarded = apply_leakage_guards(table, test_recordings)
 
@@ -493,7 +906,34 @@ def build_from_archive(
             f"{guarded.rows_before_contributor_guard} occurrences. A split was "
             "supplied, so this is a build failure rather than a warning: the "
             "artifact would carry a leakage guard that removed nothing, and "
-            "would be indistinguishable from one whose guard worked"
+            "would be indistinguishable from one whose guard worked. Check the "
+            "H3 resolution and cell formatting of the split -- and note that "
+            f"the Xeno-Canto guard ran FIRST and removed "
+            f"{guarded.xeno_canto_rows_removed} row(s), so on a split whose "
+            "recordings are themselves Xeno-Canto occurrences guard 1 may "
+            "legitimately have consumed the rows guard 2 would have matched"
+        )
+
+    # CLAUSE 2. Its own `banned_key_count > 0` conjunct: `--no-test-split`
+    # arrives here with no keys, where a rate is undefined rather than zero.
+    if guarded.banned_key_count > 0 and guarded.match_rate < min_split_match_rate:
+        raise PartialMatchGuardError(
+            f"only {guarded.matched_key_count} of {guarded.banned_key_count} "
+            f"banned (cell, week, contributor) key(s) matched any occurrence "
+            f"at resolution {resolution} -- a match rate of "
+            f"{guarded.match_rate:.4f}, below the required "
+            f"{min_split_match_rate:.4f}. The split removed "
+            f"{guarded.contributor_rows_removed} of "
+            f"{guarded.rows_before_contributor_guard} occurrences, so the "
+            "total zero-match check passed and would have released this "
+            "artifact: one live key disarms a whole-split condition. A "
+            "coordinate bug, a contributor-spelling convention that changed "
+            "mid-file and a mojibaked name column all leave exactly this "
+            "signature. The Xeno-Canto guard removed "
+            f"{guarded.xeno_canto_rows_removed} row(s) first and may "
+            "legitimately have consumed some of them. If the split really is "
+            "this sparse and you accept it, say so explicitly with "
+            "--min-split-match-rate"
         )
 
     counts = aggregate_counts(guarded.table)
@@ -502,11 +942,12 @@ def build_from_archive(
     cells = cell_axis(counts)
     log.info(
         "resolution %d: %d occurrences (%d dropped by the leakage guards over "
-        "%d banned key(s)), %d species, %d cells -> %d grid "
+        "%d of %d banned key(s)), %d species, %d cells -> %d grid "
         "contexts over %d weeks, projected peak ~%.1f GiB",
         resolution,
         guarded.table.num_rows,
         guarded.xeno_canto_rows_removed + guarded.contributor_rows_removed,
+        guarded.matched_key_count,
         guarded.banned_key_count,
         len(species),
         len(cells),
@@ -524,7 +965,12 @@ def build_from_archive(
     full.gbif_doi = gbif_doi
 
     written: list[Path] = []
-    stem = f"prior_{source}_r{resolution}"
+    stem = artifact_stem(source, resolution)
+    # DELETED FIRST, written LAST. A manifest surviving from an earlier,
+    # COMPLETE build of this resolution would otherwise attest to the set
+    # being overwritten right now, and a build that failed half way through
+    # would leave a mixture of two builds under a manifest that verifies.
+    manifest_path(out_dir, source, resolution).unlink(missing_ok=True)
     written.append(save_prior(full, out_dir / f"{stem}_full.npz"))
     for name, make in CONTROLS.items():
         control = make(full)
@@ -536,12 +982,16 @@ def build_from_archive(
         control.gbif_doi = gbif_doi
         written.append(save_prior(control, out_dir / f"{stem}_{name}.npz"))
 
+    # LAST, after every artifact of this resolution. See `write_manifest`.
+    manifest = write_manifest(out_dir, source, resolution, written, gbif_doi)
+
     log.info(
-        "resolution %d: wrote %d artifacts to %s; nnz=%d of dense capacity %d; "
-        "peak RSS %.1f MiB",
+        "resolution %d: wrote %d artifacts to %s (manifest %s); nnz=%d of "
+        "dense capacity %d; peak RSS %.1f MiB",
         resolution,
         len(written),
         out_dir,
+        manifest.name,
         full.values.nnz,
         full.dense_capacity,
         _peak_rss_bytes() / (1 << 20),
@@ -601,7 +1051,14 @@ def non_blank_doi(value: str) -> str:
         raise argparse.ArgumentTypeError(
             f"--gbif-doi {value!r} is not shaped like a DOI (expected a "
             "registrant prefix `10.NNNN/suffix`, optionally `doi:`-prefixed "
-            "or wrapped in a resolver URL); a GBIF download has BOTH a "
+            "or wrapped in a resolver URL). CHECK FOR SURROUNDING OR INTERNAL "
+            "WHITESPACE FIRST: a DOI pasted off a citation line commonly "
+            "carries a leading or trailing space, or a `DOI: ` label, and all "
+            "three land here rather than looking malformed. The value is NOT "
+            "trimmed for you -- the sidecar must carry the exact string the "
+            "operator attested to, and silently repairing an attribution "
+            "field means the artifact cites something the build was never "
+            "told. Otherwise: a GBIF download has BOTH a "
             "download KEY (e.g. 0012345-230530130807322) and a DOI (e.g. "
             "10.15468/dl.abc123), the two sit beside each other on the "
             "download page, and only the DOI is citable. A key, a dataset "
@@ -634,6 +1091,17 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_SPECIES_CHUNK,
         help="species per backoff call. Chunking is bit-exact; it bounds the "
         "working set of the full 52-week grid (default: %(default)s)",
+    )
+    ap.add_argument(
+        "--min-split-match-rate",
+        type=split_match_rate,
+        default=DEFAULT_MIN_SPLIT_MATCH_RATE,
+        help="minimum FRACTION of the test split's banned (cell, week, "
+        "contributor) keys that must remove at least one occurrence "
+        "(default: %(default)s). Below it the build FAILS: a split where "
+        "one key in a hundred bites passes the total zero-match check while "
+        "the leakage guard has effectively not run. `0.0` reduces this to "
+        "the total check, which cannot be disabled",
     )
     split = ap.add_mutually_exclusive_group(required=True)
     split.add_argument(
@@ -687,6 +1155,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             out_dir=args.out,
             gbif_doi=args.gbif_doi,
             species_chunk=args.species_chunk,
+            min_split_match_rate=args.min_split_match_rate,
         )
         for path in paths:
             print(path)

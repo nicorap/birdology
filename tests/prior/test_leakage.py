@@ -1044,6 +1044,262 @@ def test_the_guard_result_is_not_a_table_so_an_old_caller_fails_loudly():
 
 
 # --------------------------------------------------------------------------
+# C1 (final gate): the PER-KEY match count.
+#
+# `zero_match` is a claim about the WHOLE split, and ONE live key satisfies it
+# for an arbitrarily large one. Reproduced: a 100-key split with one real
+# contributor and ninety-nine Sydney coordinates built five artifacts, while
+# the all-dead control raised. `matched_key_count` is the quantity that makes
+# the partial case visible; these tests pin it independently of the build
+# script, which owns the escalation POLICY.
+# --------------------------------------------------------------------------
+
+
+def _three_contributors_at_cell_a_week_46():
+    """Three named contributors sharing one (cell, week)."""
+    return assign_cells(
+        _table(
+            [
+                (1, 55.6867, 12.5700, date(2025, 11, 14), "pub", "Ole"),
+                (1, 55.6867, 12.5700, date(2025, 11, 14), "pub", "Jens"),
+                (1, 55.6867, 12.5700, date(2025, 11, 14), "pub", "Mette"),
+            ]
+        ),
+        resolution=4,
+    )
+
+
+def test_matched_key_count_is_ONE_when_one_of_three_keys_bites():
+    """THE C1 FIXTURE, in miniature: a partial split reports a partial count.
+
+    Two of the three banned contributors appear nowhere in the table. The
+    guard removes a row, so `contributor_rows_removed` is non-zero and
+    `zero_match` is FALSE -- which is exactly the state in which the total
+    condition released the reproduced 1-of-100 split. `matched_key_count`
+    says one, and that is the only quantity here that distinguishes this from
+    a split that worked.
+    """
+    t = _three_contributors_at_cell_a_week_46()
+    cell = t.column("cell")[0].as_py()
+    result = apply_leakage_guards(
+        t,
+        [
+            TestRecording(cell=cell, week=46, recorded_by="Ole"),
+            TestRecording(cell=cell, week=46, recorded_by="nobody-one"),
+            TestRecording(cell=cell, week=46, recorded_by="nobody-two"),
+        ],
+    )
+    assert result.banned_key_count == 3
+    assert result.matched_key_count == 1
+    assert result.contributor_rows_removed == 1
+    # The total condition is satisfied by that one live key -- which is the
+    # defect. Asserted so the fixture is known to exercise the gap.
+    assert result.zero_match is False
+    assert result.match_rate == pytest.approx(1 / 3)
+
+
+def test_matched_key_count_equals_the_banned_count_when_every_key_bites():
+    """Guards the previous test against an always-partial count."""
+    t = _three_contributors_at_cell_a_week_46()
+    cell = t.column("cell")[0].as_py()
+    result = apply_leakage_guards(
+        t,
+        [
+            TestRecording(cell=cell, week=46, recorded_by=who)
+            for who in ("Ole", "Jens", "Mette")
+        ],
+    )
+    assert result.banned_key_count == 3
+    assert result.matched_key_count == 3
+    assert result.match_rate == 1.0
+    assert result.contributor_rows_removed == 3
+
+
+def test_matched_key_count_is_ZERO_when_nothing_bites():
+    t = _three_contributors_at_cell_a_week_46()
+    cell = t.column("cell")[0].as_py()
+    result = apply_leakage_guards(
+        t, [TestRecording(cell=cell, week=46, recorded_by="Nobody At All")]
+    )
+    assert result.matched_key_count == 0
+    assert result.match_rate == 0.0
+    assert result.zero_match is True
+
+
+def test_matched_key_count_counts_KEYS_not_ROWS():
+    """One key removing three rows is ONE match, not three.
+
+    Its own test because the cheap wrong implementation -- counting removed
+    rows, or incrementing per matching row -- is numerically identical on
+    every one-row-per-key fixture above, and makes the rate exceed 1.0 on a
+    real archive where a contributor has many occurrences in one cell-week.
+    """
+    t = assign_cells(
+        _table(
+            [
+                (1, 55.6867, 12.5700, date(2025, 11, 14), "pub", "Ole"),
+                (2, 55.6867, 12.5700, date(2025, 11, 14), "pub", "Ole"),
+                (3, 55.6867, 12.5700, date(2025, 11, 14), "pub", "Ole"),
+            ]
+        ),
+        resolution=4,
+    )
+    cell = t.column("cell")[0].as_py()
+    result = apply_leakage_guards(
+        t, [TestRecording(cell=cell, week=46, recorded_by="Ole")]
+    )
+    assert result.contributor_rows_removed == 3
+    assert result.banned_key_count == 1
+    assert result.matched_key_count == 1
+    assert result.match_rate == 1.0
+
+
+def test_matched_key_count_never_exceeds_the_banned_key_count():
+    """The rate is a fraction, and the invariant that makes it one.
+
+    Asserted on the fixture where over-counting is easiest: three rows, one
+    key. A `matched_key_count` above `banned_key_count` would give a rate
+    above 1 and no threshold comparison would mean anything.
+    """
+    t = _three_contributors_at_cell_a_week_46()
+    cell = t.column("cell")[0].as_py()
+    for recordings in (
+        [TestRecording(cell=cell, week=46, recorded_by="Ole")],
+        [
+            TestRecording(cell=cell, week=46, recorded_by=who)
+            for who in ("Ole", "Jens", "Mette", "Nobody")
+        ],
+    ):
+        result = apply_leakage_guards(t, recordings)
+        assert result.matched_key_count <= result.banned_key_count
+        assert 0.0 <= result.match_rate <= 1.0
+
+
+def test_match_rate_RAISES_for_an_empty_split_rather_than_returning_a_number():
+    """`--no-test-split` has no rate, and 0/0 has no honest value.
+
+    Returning 0.0 would make the legitimate no-split mode fail every rate
+    check; returning 1.0 would claim a split that does not exist worked
+    perfectly. Both fold together the two states this whole class exists to
+    keep apart, so the property refuses instead.
+    """
+    result = apply_leakage_guards(_one_ole_at_cell_a_week_46(), [])
+    assert result.banned_key_count == 0
+    with pytest.raises(ValueError, match="match_rate is undefined"):
+        result.match_rate
+
+
+def test_a_blank_contributor_row_never_contributes_a_match():
+    """Layer 2 short-circuits BEFORE the key is formed, so it cannot match.
+
+    Without this, a blank-contributor row could be credited to a poisoned
+    blank key and inflate `matched_key_count` -- reporting a healthy rate for
+    a split whose only "matches" were the anonymous population it must never
+    touch.
+    """
+    t = _one_anonymous_and_one_named()
+    cell = t.column("cell")[0].as_py()
+    keep, matched = leakage_module._mask_and_matched_keys(
+        t.column("cell").to_pylist(),
+        t.column("week").to_pylist(),
+        t.column("recorded_by").to_pylist(),
+        {(cell, 46, None), (cell, 46, "")},
+    )
+    assert keep == [True, True]
+    assert matched == set()
+
+
+def test_the_matched_key_set_and_the_row_mask_are_ONE_traversal():
+    """The mask and the matched set must agree, by construction.
+
+    `keep_mask` is the projection of `_mask_and_matched_keys`; a second,
+    independent traversal applying the same three normalisations is how the
+    number a guard escalates on and the rows it removed come to disagree.
+    Asserted behaviourally: every False in the mask corresponds to a key in
+    the matched set, and the matched set holds nothing the mask kept.
+    """
+    t = _three_contributors_at_cell_a_week_46()
+    cell = t.column("cell")[0].as_py()
+    cells = t.column("cell").to_pylist()
+    weeks = t.column("week").to_pylist()
+    names = t.column("recorded_by").to_pylist()
+    banned = {(cell, 46, "ole"), (cell, 46, "mette"), (cell, 46, "nobody")}
+
+    keep, matched = leakage_module._mask_and_matched_keys(
+        cells, weeks, names, banned
+    )
+    assert keep == leakage_module.keep_mask(cells, weeks, names, banned)
+    dropped = {
+        (normalise_cell(c), normalise_week(w), normalise_contributor(n))
+        for c, w, n, k in zip(cells, weeks, names, keep)
+        if not k
+    }
+    assert matched == dropped
+    assert matched <= banned
+
+
+def test_a_partial_match_is_WARNED_about_for_the_human(caplog):
+    """The log line beside the data channel. It is NOT the control flow.
+
+    `scripts/build_prior.py` escalates on `match_rate`; this warning exists
+    so a human reading a build log sees the same fact. Deleting it deafens
+    the log without disarming anything, which is the arrangement C1 settled
+    on for the zero-match case and is kept here for the same reason.
+    """
+    t = _three_contributors_at_cell_a_week_46()
+    cell = t.column("cell")[0].as_py()
+    with caplog.at_level(logging.WARNING, logger="birdology.prior.leakage"):
+        apply_leakage_guards(
+            t,
+            [
+                TestRecording(cell=cell, week=46, recorded_by="Ole"),
+                TestRecording(cell=cell, week=46, recorded_by="nobody-one"),
+            ],
+        )
+    messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("only 1 of 2 banned" in m for m in messages), messages
+
+
+def test_no_partial_match_warning_when_every_key_bit(caplog):
+    """Guards the previous test against an always-on warning."""
+    t = _three_contributors_at_cell_a_week_46()
+    cell = t.column("cell")[0].as_py()
+    with caplog.at_level(logging.WARNING, logger="birdology.prior.leakage"):
+        apply_leakage_guards(
+            t,
+            [
+                TestRecording(cell=cell, week=46, recorded_by=who)
+                for who in ("Ole", "Jens", "Mette")
+            ],
+        )
+    assert not [r for r in caplog.records if "matched any occurrence" in r.getMessage()]
+
+
+def test_the_match_rate_survives_logging_being_disabled_entirely():
+    """C1's rule applied to the new clause: it is DATA, not a log record.
+
+    The partial case has a WARNING too, and a caller that scraped it would
+    reintroduce the exact defect the returned counts replaced. Under
+    `logging.disable(CRITICAL)` every count is unchanged.
+    """
+    t = _three_contributors_at_cell_a_week_46()
+    cell = t.column("cell")[0].as_py()
+    recordings = [
+        TestRecording(cell=cell, week=46, recorded_by="Ole"),
+        TestRecording(cell=cell, week=46, recorded_by="nobody-one"),
+        TestRecording(cell=cell, week=46, recorded_by="nobody-two"),
+    ]
+    logging.disable(logging.CRITICAL)
+    try:
+        result = apply_leakage_guards(t, recordings)
+    finally:
+        logging.disable(logging.NOTSET)
+    assert result.matched_key_count == 1
+    assert result.banned_key_count == 3
+    assert result.match_rate == pytest.approx(1 / 3)
+
+
+# --------------------------------------------------------------------------
 # F5: zero-width and soft-hyphen codepoints must not survive normalisation.
 # --------------------------------------------------------------------------
 

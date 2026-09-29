@@ -58,7 +58,7 @@ import operator
 import unicodedata
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import SupportsIndex
+from typing import SupportsIndex, cast
 
 import h3
 import pyarrow as pa
@@ -300,6 +300,17 @@ class LeakageGuardResult:
     contributor_rows_removed: int
     #: Rows the contributor guard was offered, so a caller can report a rate.
     rows_before_contributor_guard: int
+    #: Banned keys that removed AT LEAST ONE row.
+    #:
+    #: NOT DERIVABLE FROM THE ROW COUNTS, and that is the whole reason it
+    #: exists. ``contributor_rows_removed > 0`` is a claim about the WHOLE
+    #: split: one live key among ninety-nine dead ones satisfies it, and a
+    #: 100-key split with a single real contributor and ninety-nine Sydney
+    #: coordinates was REPRODUCED building a complete five-artifact release
+    #: while the all-dead control correctly raised. The failure modes this
+    #: guard exists to catch degrade MOST of a split, not all of it, so the
+    #: quantity that makes them visible is per-key, not per-row.
+    matched_key_count: int
 
     @property
     def zero_match(self) -> bool:
@@ -310,8 +321,36 @@ class LeakageGuardResult:
         ``banned_key_count > 0`` is what makes an empty split a legitimate
         no-op: it is derived from what the guard HELD, so it cannot be
         satisfied by a split that was supplied and then dropped.
+
+        This is the TOTAL condition and it remains necessary: it is the one
+        unambiguous statement about a split, true only when the join
+        mechanism is globally dead. It is NOT sufficient -- see
+        :attr:`match_rate` and :attr:`matched_key_count` for the partial case
+        it cannot see.
         """
         return self.banned_key_count > 0 and self.contributor_rows_removed == 0
+
+    @property
+    def match_rate(self) -> float:
+        """Fraction of the split's banned keys that removed at least one row.
+
+        RAISES on an empty split rather than returning a number. ``0/0`` has
+        no value here and every candidate is a lie: ``0.0`` says the split
+        failed entirely and would make the legitimate ``--no-test-split``
+        mode fail every rate check, ``1.0`` says it worked perfectly. A
+        caller must test :attr:`banned_key_count` first, which is exactly the
+        test that distinguishes "no split was supplied" from "a split was
+        supplied and did nothing" -- the distinction this class exists for.
+        """
+        if self.banned_key_count <= 0:
+            raise ValueError(
+                "match_rate is undefined for a split with no banned keys "
+                "(banned_key_count == 0): that is the legitimate "
+                "`--no-test-split` mode, not a split that matched nothing. "
+                "Test `banned_key_count` before reading the rate; returning "
+                "0.0 or 1.0 here would silently fold the two cases together"
+            )
+        return self.matched_key_count / self.banned_key_count
 
 
 def _drop_xeno_canto(table: pa.Table) -> tuple[pa.Table, int]:
@@ -381,6 +420,61 @@ def banned_keys(
     return banned
 
 
+def _mask_and_matched_keys(
+    cells: list[str],
+    weeks: list[int],
+    names: list[str | None],
+    banned: set[tuple[str, int, str]],
+) -> tuple[list[bool], set[tuple[str, int, str]]]:
+    """The row mask AND the set of banned keys that actually bit.
+
+    THE ONE DERIVATION OF BOTH. :func:`keep_mask` is the mask-only projection
+    of this function, exactly as :func:`drop_xeno_canto` is the table-only
+    projection of :func:`_drop_xeno_canto`. A caller escalating on "how much
+    of this split was live" and a caller filtering rows must never be able to
+    disagree, and two traversals applying the same three normalisations
+    independently is how they would come to.
+
+    WHY PER-KEY MATCHES ARE COMPUTED AT ALL
+    ---------------------------------------
+    A total row count answers "did ANY key bite", which is a claim about the
+    WHOLE split. Reproduced: a 100-key split in which one key matched a real
+    contributor and ninety-nine matched nothing (Sydney coordinates against
+    Danish occurrences) built a complete five-artifact release, while the
+    all-hundred-match-nothing control correctly raised. One live key disarmed
+    the guard for an arbitrarily large split. The realistic degradations --
+    a resolution-free coordinate bug, a contributor-spelling convention that
+    changed mid-file, a mojibaked name column -- ruin 99% of a split, not
+    100%, so a total-only signal is inert for every failure an operator would
+    not already have noticed. The MATCHED KEY SET is what makes the rate
+    knowable, and the rate is what makes a partial failure visible.
+
+    *matched* holds the keys as they appear in *banned*, so its cardinality is
+    directly comparable with ``len(banned)`` and can never exceed it.
+    """
+    keep: list[bool] = []
+    matched: set[tuple[str, int, str]] = set()
+    for cell, week, name in zip(cells, weeks, names):
+        who = normalise_contributor(name)
+        if who is None:
+            # Layer 2 of the blank-contributor defence: ALWAYS kept, and the
+            # key is never even formed, so a blank key that reached *banned*
+            # by some other route cannot match it either.
+            keep.append(True)
+            continue
+        key = (normalise_cell(cell), normalise_week(week), who)
+        if key in banned:
+            # `key in banned` is itself the proof that the cell component is
+            # not None: `banned_keys` RAISES on a None cell, so no such key
+            # can be in the set. The cast states that and costs nothing at
+            # runtime; coercing the cell instead would be a silent repair.
+            matched.add(cast("tuple[str, int, str]", key))
+            keep.append(False)
+        else:
+            keep.append(True)
+    return keep, matched
+
+
 def keep_mask(
     cells: list[str],
     weeks: list[int],
@@ -388,6 +482,9 @@ def keep_mask(
     banned: set[tuple[str, int, str]],
 ) -> list[bool]:
     """Row mask: True to keep. Layer 2 of the blank-contributor defence.
+
+    The mask-only projection of :func:`_mask_and_matched_keys`; see there for
+    why the matched-key set is computed beside it.
 
     Both the cell and the contributor are normalised on THIS, the occurrence,
     side with exactly the transforms :func:`banned_keys` applies on the test
@@ -406,13 +503,10 @@ def keep_mask(
     table not produced by ``assign_cells`` can therefore turn a null week into a
     hard failure whose message talks about units bugs; normalise or drop such
     rows before calling this, and do NOT loosen :func:`normalise_week`.
+    A blank-contributor row short-circuits BEFORE the week is normalised, so
+    that contract binds only rows with a usable contributor.
     """
-    return [
-        normalise_contributor(name) is None
-        or (normalise_cell(cell), normalise_week(week), normalise_contributor(name))
-        not in banned
-        for cell, week, name in zip(cells, weeks, names)
-    ]
+    return _mask_and_matched_keys(cells, weeks, names, banned)[0]
 
 
 def _assert_one_resolution(
@@ -465,18 +559,24 @@ def _assert_one_resolution(
 
 def _drop_test_contributor_cells(
     table: pa.Table, test_recordings: Iterable[TestRecording]
-) -> tuple[pa.Table, int, int]:
-    """Guard 2, returning (kept, rows_removed, banned_key_count).
+) -> tuple[pa.Table, int, int, int]:
+    """Guard 2, returning (kept, rows_removed, banned_key_count, matched_key_count).
 
-    The ONE derivation of both counts. :func:`drop_test_contributor_cells` is
-    the table-only projection; the WARNING below and
-    :attr:`LeakageGuardResult.zero_match` are two readings of these same
-    integers, so a caller escalating on the data and a human reading the log
-    can never be told different stories.
+    The ONE derivation of all three counts. :func:`drop_test_contributor_cells`
+    is the table-only projection; the WARNING below,
+    :attr:`LeakageGuardResult.zero_match` and
+    :attr:`LeakageGuardResult.match_rate` are readings of these same integers,
+    so a caller escalating on the data and a human reading the log can never
+    be told different stories.
+
+    ``matched_key_count`` is the number of banned keys that removed AT LEAST
+    ONE row. It is not derivable from the other two: ``rows_removed`` is a
+    claim about the whole split, and one live key among a hundred dead ones
+    makes it non-zero. See :func:`_mask_and_matched_keys`.
     """
     banned = banned_keys(test_recordings)
     if not banned:
-        return table, 0, 0
+        return table, 0, 0, 0
 
     cells = table.column("cell").to_pylist()
     weeks = table.column("week").to_pylist()
@@ -495,17 +595,35 @@ def _drop_test_contributor_cells(
             flagged,
         )
 
-    keep = keep_mask(cells, weeks, who_raw, banned)
+    keep, matched = _mask_and_matched_keys(cells, weeks, who_raw, banned)
     kept = table.filter(pa.array(keep, pa.bool_()))
     removed = table.num_rows - kept.num_rows
     if removed:
         logger.info(
             "drop_test_contributor_cells: removed %d of %d occurrences "
-            "over %d banned (cell, week, contributor) keys",
+            "over %d of %d banned (cell, week, contributor) keys",
             removed,
             table.num_rows,
+            len(matched),
             len(banned),
         )
+        if len(matched) < len(banned):
+            # The PARTIAL case, which a row total cannot express. One live key
+            # in a hundred dead ones removes rows and looks healthy; the three
+            # failure modes this guard exists to catch (a resolution-free
+            # coordinate bug, a contributor-spelling convention that changed
+            # mid-file, a mojibaked name column) all leave a small live
+            # remainder rather than nothing. The BUILD SCRIPT escalates on
+            # `LeakageGuardResult.match_rate`; this line is for the human, and
+            # deleting it deafens the log without disarming anything.
+            logger.warning(
+                "drop_test_contributor_cells: only %d of %d banned "
+                "(cell, week, contributor) key(s) matched any occurrence "
+                "(%.1f%%); the remainder removed nothing",
+                len(matched),
+                len(banned),
+                100.0 * len(matched) / len(banned),
+            )
     else:
         # A non-empty banned set that matches NOTHING used to be completely
         # silent. That one line is the shared observable symptom of every
@@ -527,7 +645,7 @@ def _drop_test_contributor_cells(
             ZERO_MATCH_WARNING_MARKER,
             table.num_rows,
         )
-    return kept, removed, len(banned)
+    return kept, removed, len(banned), len(matched)
 
 
 def drop_test_contributor_cells(
@@ -595,8 +713,8 @@ def apply_leakage_guards(
     keys itself.
     """
     after_xc, xc_removed = _drop_xeno_canto(table)
-    kept, contributor_removed, banned_count = _drop_test_contributor_cells(
-        after_xc, test_recordings
+    kept, contributor_removed, banned_count, matched_count = (
+        _drop_test_contributor_cells(after_xc, test_recordings)
     )
     return LeakageGuardResult(
         table=mark_guards_applied(kept),
@@ -604,4 +722,5 @@ def apply_leakage_guards(
         xeno_canto_rows_removed=xc_removed,
         contributor_rows_removed=contributor_removed,
         rows_before_contributor_guard=after_xc.num_rows,
+        matched_key_count=matched_count,
     )
