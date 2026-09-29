@@ -26,6 +26,29 @@ array, so ONLY the sparse fixture can tell a control that reads the prior the
 way the sweep reads it from one that re-derives it locally and answers every
 unsurveyed context with a hard zero.
 
+FIVE CELLS, NOT THREE, AND THE SEEDS ARE NOT TRUSTED
+-----------------------------------------------------
+An earlier revision of this file used a THREE-cell axis, and that single
+choice opened two holes at once, both of the "test that cannot fail" class:
+
+* on a 3-element axis `np.random.default_rng(1).permutation(3)` is `[0 1 2]`
+  -- the IDENTITY -- so the two tests seeded with 1 compared an array to
+  itself and a no-op `shuffle_space` survived them;
+* HALF of all permutations of three elements are involutions (`[2 1 0]`,
+  `[0 2 1]`, `[1 0 2]`), and the one test that recomputes the permutation and
+  compares against it was seeded with 3, which is `[2 1 0]`. On an involution
+  a gather (`blocks[:, p, :]`) and a scatter (`blocks[:, argsort(p), :]`) are
+  the SAME array, so the direction of the permutation was unpinned and an
+  inverse-direction mutant survived all 78 tests in this file.
+
+Both are the root cause, not the symptom: the axis was too short for a random
+seed to be trusted. The cell axis is now FIVE cells (only 26 of 120
+permutations of five elements are involutions, and one in 120 is the
+identity), and -- because "unlikely" is not a test -- every seeded shuffle
+test asserts its own precondition inline, against the permutation the
+implementation will draw. `SPACE_SEED` and `TIME_SEED` are pinned below with
+both properties asserted directly.
+
 Guard messages are matched on wording specific to THAT check -- never a bare
 word (`dense`, `zero`, `cells`) that another layer could also produce.
 """
@@ -57,8 +80,24 @@ SPEC = PriorSpec(resolution=4, source="dof", variant="full")
 # would leave alone. NOT pre-sorted: `to_tensor` sorts the axis, and a fixture
 # that hands them in sorted order cannot tell a control that preserves the axis
 # from one that re-derives it.
-CELLS = ("8418c4bffffffff", "8418c1bffffffff", "8418c33ffffffff")
+#
+# FIVE of them, not three: see the module docstring. On a three-element axis
+# half of all permutations are involutions and one seed in six is the identity,
+# which is what made two of the shuffle tests unable to fail.
+CELLS = (
+    "8418c4bffffffff",
+    "8418c1bffffffff",
+    "8418c33ffffffff",
+    "8418c09ffffffff",
+    "8418c47ffffffff",
+)
 SPECIES = (5229499, 2482593)
+
+# The seeds the shuffle tests use. Both are asserted below against the two
+# properties the tests actually depend on -- not the identity, and not its own
+# inverse -- rather than being trusted because they looked fine once.
+SPACE_SEED = 0
+TIME_SEED = 1
 
 # Species 2 carries exactly a quarter of species 1's mass in every context
 # (T9-R1: the brief's fixture gave both species the same value MULTISET, so
@@ -127,9 +166,9 @@ def _tensor():
 
 
 # One stored week per (species, cell), at a DIFFERENT week in each, so no two
-# cell blocks and no two species rows are the same array. 6 of 2 x 3 x 52 =
-# 312 contexts.
-_OBSERVED_WEEKS = ((3, 17, 44), (9, 28, 51))
+# cell blocks and no two species rows are the same array. 10 of 2 x 5 x 52 =
+# 520 contexts.
+_OBSERVED_WEEKS = ((3, 17, 44, 26, 8), (9, 28, 51, 35, 14))
 
 
 def _sparse_rows():
@@ -141,7 +180,7 @@ def _sparse_rows():
 
 
 def _sparse_tensor():
-    """A REALISTICALLY sparse prior: 6 stored contexts of 312 (1.92% fill).
+    """A REALISTICALLY sparse prior: 10 stored contexts of 520 (1.92% fill).
 
     Not a degenerate edge case -- this is the shape of the artifact. Every
     other context is on both axes and reads `FLOOR` through `tensor.py`'s
@@ -253,8 +292,8 @@ def test_the_sparse_fixture_is_realistically_sparse():
     denominator from the stored-entry one.
     """
     t = _sparse_tensor()
-    assert t.values.nnz == 6
-    assert t.dense_capacity == len(SPECIES) * len(CELLS) * WEEKS_PER_YEAR == 312
+    assert t.values.nnz == 10
+    assert t.dense_capacity == len(SPECIES) * len(CELLS) * WEEKS_PER_YEAR == 520
     assert 0.0 < t.values.nnz / t.dense_capacity < 0.05
 
 
@@ -336,6 +375,53 @@ def test_the_sparse_fixture_gives_every_cell_a_distinct_weekly_profile():
         for i in range(len(CELLS)):
             for j in range(i + 1, len(CELLS)):
                 assert not np.allclose(blocks[s, i], blocks[s, j])
+
+
+# ---------------------------------------------------------------------------
+# The SEEDS' own preconditions. An earlier revision trusted them and two tests
+# silently became tautologies: seed 1 on a 3-cell axis is the IDENTITY, and
+# seed 3 on a 3-cell axis is its OWN INVERSE. Asserted here as a fixture
+# property AND again inline in every test that depends on one, because a
+# shared precondition that drifts weakens every test at once while this file
+# stays green.
+# ---------------------------------------------------------------------------
+
+
+def test_the_cell_axis_is_long_enough_for_a_seed_to_be_worth_drawing():
+    """On three cells, half of all permutations are involutions and one seed in
+    six is the identity. Five cells is the root-cause fix; the inline
+    preconditions are the belt to its braces."""
+    assert len(CELLS) >= 5
+
+
+def test_the_space_seed_is_not_the_identity_permutation():
+    """A no-op `shuffle_space` reports the FULL prior's performance as the
+    spatial null, and every multiset and mass assertion still passes."""
+    perm = np.random.default_rng(SPACE_SEED).permutation(len(CELLS))
+    assert not np.array_equal(perm, np.arange(len(CELLS)))
+
+
+def test_the_space_seed_is_not_its_own_inverse():
+    """On an involution a gather `blocks[:, p, :]` and a scatter
+    `blocks[:, argsort(p), :]` are the SAME array, so no test that recomputes
+    the permutation can pin which direction the implementation applies."""
+    perm = np.random.default_rng(SPACE_SEED).permutation(len(CELLS))
+    assert not np.array_equal(perm, np.argsort(perm))
+
+
+def test_the_time_seed_is_not_the_identity_permutation():
+    """A 52-element axis makes the identity vanishingly unlikely -- which is a
+    reason to expect this to hold, not a reason to leave it unasserted."""
+    perm = np.random.default_rng(TIME_SEED).permutation(WEEKS_PER_YEAR)
+    assert not np.array_equal(perm, np.arange(WEEKS_PER_YEAR))
+
+
+def test_the_time_seed_is_not_its_own_inverse():
+    """The time twin of the direction precondition. The week axis has never
+    had the space axis's problem, but the axis length is not the guarantee --
+    the assertion is."""
+    perm = np.random.default_rng(TIME_SEED).permutation(WEEKS_PER_YEAR)
+    assert not np.array_equal(perm, np.argsort(perm))
 
 
 # ---------------------------------------------------------------------------
@@ -501,15 +587,25 @@ def test_marginal_keeps_the_axes_byte_for_byte():
 
 def test_shuffle_space_permutes_cells_deterministically():
     t = _tensor()
-    a = shuffle_space(t, seed=0)
-    b = shuffle_space(t, seed=0)
+    a = shuffle_space(t, seed=SPACE_SEED)
+    b = shuffle_space(t, seed=SPACE_SEED)
     assert np.allclose(a.vector(CELLS[0], 20), b.vector(CELLS[0], 20))
 
 
 def test_shuffle_space_preserves_the_value_multiset():
+    """The precondition is asserted INLINE, not inherited from the seed being
+    lucky: on the previous 3-cell axis this test's seed drew the IDENTITY, so
+    it compared an array to itself and a no-op `shuffle_space` survived it."""
+    perm = np.random.default_rng(SPACE_SEED).permutation(len(CELLS))
+    assert not np.array_equal(
+        perm, np.arange(len(CELLS))
+    ), "the space seed must not be the identity, or this compares an array to itself"
     t = _tensor()
-    s = shuffle_space(t, seed=1)
+    s = shuffle_space(t, seed=SPACE_SEED)
     assert sorted(t.dense().ravel()) == pytest.approx(sorted(s.dense().ravel()))
+    # And the array really did change, so the multiset equality above is a
+    # statement about a permutation rather than about a no-op.
+    assert not np.allclose(s.dense(), t.dense())
 
 
 def test_shuffle_space_actually_moves_a_cell():
@@ -520,10 +616,12 @@ def test_shuffle_space_actually_moves_a_cell():
     silently turn this into a test of nothing.
     """
     n_cells = len(CELLS)
-    perm = np.random.default_rng(3).permutation(n_cells)
-    assert not np.array_equal(perm, np.arange(n_cells)), "seed 3 must not be the identity"
+    perm = np.random.default_rng(SPACE_SEED).permutation(n_cells)
+    assert not np.array_equal(
+        perm, np.arange(n_cells)
+    ), "the space seed must not be the identity"
     t = _tensor()
-    s = shuffle_space(t, seed=3)
+    s = shuffle_space(t, seed=SPACE_SEED)
     moved = [
         c
         for i, c in enumerate(t.cells)
@@ -534,20 +632,40 @@ def test_shuffle_space_actually_moves_a_cell():
 
 def test_shuffle_space_relocates_whole_cells_not_individual_values():
     """The construction T9-R3 names: one permutation of the cell axis, shared
-    across every species, so each cell's weekly profile arrives intact."""
+    across every species, so each cell's weekly profile arrives intact.
+
+    This is the ONLY test that recomputes the permutation and compares against
+    it, so it is the only place the DIRECTION of the indexing is pinned -- and
+    a direction is only pinned if the permutation is not its own inverse. On
+    the previous 3-cell axis this test's seed drew `[2 1 0]`, an involution,
+    and a scatter-instead-of-gather mutant (`np.argsort(...)`) survived the
+    ENTIRE file. Both preconditions are therefore asserted inline.
+    """
+    n_cells = len(CELLS)
+    perm = np.random.default_rng(SPACE_SEED).permutation(n_cells)
+    assert not np.array_equal(
+        perm, np.arange(n_cells)
+    ), "the space seed must not be the identity"
+    assert not np.array_equal(perm, np.argsort(perm)), (
+        "the space seed must not be its own inverse, or gather and scatter are "
+        "the same array here and the direction is unpinned"
+    )
     t = _tensor()
-    s = shuffle_space(t, seed=3)
-    perm = np.random.default_rng(3).permutation(len(CELLS))
+    s = shuffle_space(t, seed=SPACE_SEED)
     before = t.dense().reshape(len(SPECIES), len(CELLS), WEEKS_PER_YEAR)
     after = s.dense().reshape(len(SPECIES), len(CELLS), WEEKS_PER_YEAR)
     assert after == pytest.approx(before[:, perm, :])
+    # The mirror assertion, which is what the involution used to hide: the
+    # INVERSE indexing must be a DIFFERENT array. Without this, "after equals
+    # the gather" is compatible with the implementation scattering.
+    assert not np.allclose(after, before[:, np.argsort(perm), :])
 
 
 def test_shuffle_space_keeps_each_week_slot_in_its_own_week():
     """Space only. A value that also changed week would make a failed
     shuffle_space control unattributable to space."""
     t = _tensor()
-    s = shuffle_space(t, seed=3)
+    s = shuffle_space(t, seed=SPACE_SEED)
     before = t.dense().reshape(len(SPECIES), len(CELLS), WEEKS_PER_YEAR)
     after = s.dense().reshape(len(SPECIES), len(CELLS), WEEKS_PER_YEAR)
     for w in range(WEEKS_PER_YEAR):
@@ -557,12 +675,40 @@ def test_shuffle_space_keeps_each_week_slot_in_its_own_week():
 
 
 def test_shuffle_space_preserves_total_mass():
+    """Inline precondition for the same reason as the multiset twin: on the
+    identity this compares a sum to itself."""
+    perm = np.random.default_rng(SPACE_SEED).permutation(len(CELLS))
+    assert not np.array_equal(
+        perm, np.arange(len(CELLS))
+    ), "the space seed must not be the identity, or this compares a sum to itself"
     t = _tensor()
-    assert shuffle_space(t, seed=1).dense().sum() == pytest.approx(t.dense().sum())
+    s = shuffle_space(t, seed=SPACE_SEED)
+    assert not np.allclose(s.dense(), t.dense())
+    assert s.dense().sum() == pytest.approx(t.dense().sum())
+
+
+def test_the_shuffles_store_every_context_so_a_grid_bypass_cannot_hide():
+    """The single-definition rule made falsifiable on the shuffles.
+
+    Flooring is permutation-invariant, so for the two shuffles reading
+    `t.values.toarray()` instead of `t.dense()` is byte-identical ON THE DENSE
+    VALUES -- and such a bypass would therefore be caught only by the
+    column-count guard it also skips, never by the flooring it loses. That
+    makes the single-definition rule unfalsifiable here, and it stops being a
+    theorem the moment a shuffle stops being a pure permutation.
+
+    It is NOT identical in what gets STORED: `_respec` re-sparsifies, so a
+    bypassed shuffle keeps only the 10 originally-stored entries while the real
+    one keeps all 520. One assertion, and the flooring becomes load-bearing for
+    both shuffles.
+    """
+    t = _sparse_tensor()
+    for out in (shuffle_space(t, seed=SPACE_SEED), shuffle_time(t, seed=TIME_SEED)):
+        assert out.values.nnz == t.dense_capacity, out.spec.variant
 
 
 def test_shuffle_space_variant_is_labelled():
-    assert shuffle_space(_tensor(), seed=0).spec.variant == "shuffle_space"
+    assert shuffle_space(_tensor(), seed=SPACE_SEED).spec.variant == "shuffle_space"
 
 
 def test_shuffle_space_uses_its_seed():
@@ -583,17 +729,28 @@ def test_shuffle_space_uses_its_seed():
 
 
 def test_shuffle_time_preserves_the_value_multiset():
+    """Inline precondition, exactly as for the space twin. A 52-element axis
+    makes the identity vanishingly unlikely -- which is not the same as
+    impossible, and an unasserted precondition is what made the space twin a
+    tautology."""
+    perm = np.random.default_rng(TIME_SEED).permutation(WEEKS_PER_YEAR)
+    assert not np.array_equal(
+        perm, np.arange(WEEKS_PER_YEAR)
+    ), "the time seed must not be the identity, or this compares an array to itself"
     t = _tensor()
-    s = shuffle_time(t, seed=1)
+    s = shuffle_time(t, seed=TIME_SEED)
     assert sorted(t.dense().ravel()) == pytest.approx(sorted(s.dense().ravel()))
+    assert not np.allclose(s.dense(), t.dense())
 
 
 def test_shuffle_time_actually_moves_a_week():
     """T9-R3, the time mirror: the multiset test passes on a no-op permutation."""
-    perm = np.random.default_rng(1).permutation(WEEKS_PER_YEAR)
-    assert not np.array_equal(perm, np.arange(WEEKS_PER_YEAR)), "seed 1 must not be the identity"
+    perm = np.random.default_rng(TIME_SEED).permutation(WEEKS_PER_YEAR)
+    assert not np.array_equal(
+        perm, np.arange(WEEKS_PER_YEAR)
+    ), "the time seed must not be the identity"
     t = _tensor()
-    s = shuffle_time(t, seed=1)
+    s = shuffle_time(t, seed=TIME_SEED)
     moved = [
         w
         for w in range(1, WEEKS_PER_YEAR + 1)
@@ -603,12 +760,22 @@ def test_shuffle_time_actually_moves_a_week():
 
 
 def test_shuffle_time_permutes_week_slots_with_one_shared_permutation():
+    """The time mirror of the space direction test, with both preconditions
+    asserted inline rather than inferred from the axis being 52 long."""
+    perm = np.random.default_rng(TIME_SEED).permutation(WEEKS_PER_YEAR)
+    assert not np.array_equal(
+        perm, np.arange(WEEKS_PER_YEAR)
+    ), "the time seed must not be the identity"
+    assert not np.array_equal(perm, np.argsort(perm)), (
+        "the time seed must not be its own inverse, or gather and scatter are "
+        "the same array here and the direction is unpinned"
+    )
     t = _tensor()
-    s = shuffle_time(t, seed=1)
-    perm = np.random.default_rng(1).permutation(WEEKS_PER_YEAR)
+    s = shuffle_time(t, seed=TIME_SEED)
     before = t.dense().reshape(len(SPECIES), len(CELLS), WEEKS_PER_YEAR)
     after = s.dense().reshape(len(SPECIES), len(CELLS), WEEKS_PER_YEAR)
     assert after == pytest.approx(before[:, :, perm])
+    assert not np.allclose(after, before[:, :, np.argsort(perm)])
 
 
 def test_shuffle_time_keeps_every_value_inside_its_own_cell():
@@ -616,7 +783,7 @@ def test_shuffle_time_keeps_every_value_inside_its_own_cell():
     shuffle_time control unattributable to time -- and it is exactly what a
     reshape against the wrong stride would do."""
     t = _tensor()
-    s = shuffle_time(t, seed=1)
+    s = shuffle_time(t, seed=TIME_SEED)
     before = t.dense().reshape(len(SPECIES), len(CELLS), WEEKS_PER_YEAR)
     after = s.dense().reshape(len(SPECIES), len(CELLS), WEEKS_PER_YEAR)
     for c in range(len(CELLS)):
@@ -626,12 +793,18 @@ def test_shuffle_time_keeps_every_value_inside_its_own_cell():
 
 
 def test_shuffle_time_preserves_total_mass():
+    perm = np.random.default_rng(TIME_SEED).permutation(WEEKS_PER_YEAR)
+    assert not np.array_equal(
+        perm, np.arange(WEEKS_PER_YEAR)
+    ), "the time seed must not be the identity, or this compares a sum to itself"
     t = _tensor()
-    assert shuffle_time(t, seed=1).dense().sum() == pytest.approx(t.dense().sum())
+    s = shuffle_time(t, seed=TIME_SEED)
+    assert not np.allclose(s.dense(), t.dense())
+    assert s.dense().sum() == pytest.approx(t.dense().sum())
 
 
 def test_shuffle_time_variant_is_labelled():
-    assert shuffle_time(_tensor(), seed=0).spec.variant == "shuffle_time"
+    assert shuffle_time(_tensor(), seed=TIME_SEED).spec.variant == "shuffle_time"
 
 
 def test_shuffle_time_is_deterministic_in_its_seed():
@@ -641,6 +814,9 @@ def test_shuffle_time_is_deterministic_in_its_seed():
 
 def test_shuffle_time_uses_its_seed():
     t = _tensor()
+    a = np.random.default_rng(1).permutation(WEEKS_PER_YEAR)
+    b = np.random.default_rng(2).permutation(WEEKS_PER_YEAR)
+    assert not np.array_equal(a, b), "seeds 1 and 2 must differ on the week axis"
     assert not np.allclose(
         shuffle_time(t, seed=1).dense(), shuffle_time(t, seed=2).dense()
     )
@@ -742,6 +918,98 @@ def test_marginal_on_a_sparse_prior_still_varies_across_species():
     assert vec == pytest.approx(t.dense().mean(axis=1))
 
 
+# ---------------------------------------------------------------------------
+# marginal's CONTRAST, which is the only thing this control exists to carry.
+# "Varies across species" is satisfied by a ratio of 1.0001. What the paper
+# needs is that the RATIO between species survives, and the floor is a common
+# ADDITIVE baseline in every row, so that ratio is squeezed toward 1 as fill
+# drops. Measured here on a fixture whose observed ratio is exactly 4:1 by
+# construction.
+# ---------------------------------------------------------------------------
+
+# Both species observe the SAME cells at the SAME weeks, so their observed
+# masses differ by exactly `_MASS_RATIO` and the true contrast is a stated
+# constant rather than something recomputed from the object under test.
+_CONTRAST_WEEKS = (3, 17, 44, 26, 8)
+_CONTRAST_RATIO = 1.0 / _MASS_RATIO  # 4.0
+
+
+def _contrast_tensor():
+    """1.92% fill, and an observed per-species mass ratio of exactly 4:1."""
+    return _to_tensor(
+        [
+            (SPECIES[si], CELLS[ci], _CONTRAST_WEEKS[ci], _p(ci, _CONTRAST_WEEKS[ci], si))
+            for si in range(len(SPECIES))
+            for ci in range(len(CELLS))
+        ]
+    )
+
+
+def test_the_contrast_fixture_has_an_observed_mass_ratio_of_exactly_four():
+    """The known quantity the contrast test measures against, asserted on the
+    STORED values so it cannot be a restatement of what `marginal` emits."""
+    t = _contrast_tensor()
+    assert t.values.nnz == 10
+    assert t.dense_capacity == 520
+    observed = np.asarray(t.values.toarray()).sum(axis=1)
+    assert observed.max() / observed.min() == pytest.approx(_CONTRAST_RATIO)
+
+
+def test_marginal_reproduces_a_known_species_mass_ratio_on_a_sparse_prior():
+    """I4. The label-frequency signal, measured rather than assumed.
+
+    At 1.92% fill with observed values of order 1e-01, `marginal` emits
+    3.997887 for a true 4:1 -- a 5.3e-04 relative loss. Pinned at 1% so the
+    test fails on a real degradation rather than on float noise, and pinned
+    from BELOW as well: a control emitting MORE contrast than the data holds
+    would be manufacturing label frequency, which is the opposite defect and
+    equally invisible to every mass assertion.
+    """
+    t = _contrast_tensor()
+    emitted = marginal_prior(t).vector(CELLS[0], 20)
+    ratio = float(emitted.max() / emitted.min())
+    assert ratio == pytest.approx(_CONTRAST_RATIO, rel=0.01)
+    assert 3.9 < ratio <= _CONTRAST_RATIO
+
+
+def test_marginals_contrast_is_squeezed_toward_one_by_the_floor():
+    """The decay direction, pinned so the docstring's claim is falsifiable.
+
+    The floor is a COMMON additive baseline in every row, so the emitted ratio
+    is strictly below the observed one and approaches 1 as `fill * value`
+    approaches FLOOR. It is asymmetric -- the full prior's label signal is
+    concentrated undiluted in the contexts it observed, while `marginal`
+    smears each species' mass across all of them -- which is why it is a
+    property worth measuring on the real artifact rather than a shared
+    honest limitation.
+    """
+    t = _contrast_tensor()
+    emitted = marginal_prior(t).vector(CELLS[0], 20)
+    ratio = float(emitted.max() / emitted.min())
+    assert ratio < _CONTRAST_RATIO, "the floor can only squeeze the ratio, never widen it"
+    assert ratio > 1.0, "at this fill the signal must still be there at all"
+    # And the squeeze is monotone in the floor's share. A prior whose observed
+    # values are 1000x fainter sits 1000x closer to the floor and keeps only
+    # 2.760 of the same 4:1 -- a 31% loss, against 0.05% here. Built and
+    # measured rather than quoted from the docstring.
+    faint = _to_tensor(
+        [
+            (
+                SPECIES[si],
+                CELLS[ci],
+                _CONTRAST_WEEKS[ci],
+                _p(ci, _CONTRAST_WEEKS[ci], si) / 1000.0,
+            )
+            for si in range(len(SPECIES))
+            for ci in range(len(CELLS))
+        ]
+    )
+    faint_emitted = marginal_prior(faint).vector(CELLS[0], 20)
+    faint_ratio = float(faint_emitted.max() / faint_emitted.min())
+    assert faint_ratio < ratio
+    assert faint_ratio == pytest.approx(2.760, rel=0.01)
+
+
 def test_the_shuffles_move_values_on_a_sparse_prior():
     """A shuffle over a sparse prior must actually relocate something. It also
     relocates the FLOOR -- "nobody looked here" is one of the prior's values,
@@ -749,8 +1017,8 @@ def test_the_shuffles_move_values_on_a_sparse_prior():
     is exactly the spatial/temporal information these controls remove."""
     t = _sparse_tensor()
     before = t.dense()
-    assert not np.allclose(shuffle_space(t, seed=3).dense(), before)
-    assert not np.allclose(shuffle_time(t, seed=1).dense(), before)
+    assert not np.allclose(shuffle_space(t, seed=SPACE_SEED).dense(), before)
+    assert not np.allclose(shuffle_time(t, seed=TIME_SEED).dense(), before)
 
 
 def test_the_controls_read_an_unsurveyed_context_as_the_floor_not_zero():
@@ -766,7 +1034,58 @@ def test_the_controls_read_an_unsurveyed_context_as_the_floor_not_zero():
         out = CONTROLS[name](t)
         assert out.dense().min() > 0.0, name
     # The shuffles carry the floor through as a real value rather than a hole.
-    assert shuffle_space(t, seed=3).dense().min() == pytest.approx(FLOOR)
+    assert shuffle_space(t, seed=SPACE_SEED).dense().min() == pytest.approx(FLOOR)
+
+
+# ---------------------------------------------------------------------------
+# C1: a control of a control is refused. The consumed contract is a
+# `PriorTensor` with `spec.variant == "full"`, and nothing used to enforce it:
+# all four controls accepted a control as input and RELABELLED the output, so
+# a `shuffle_space`-of-`uniform` landed in the results table under a label
+# claiming it was a first-order spatial null. Mass-preserving, finite, in
+# range, right shape, right axes -- the only evidence was the variant string
+# this module then overwrote.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("outer", list(CONTROLS))
+@pytest.mark.parametrize("inner", list(CONTROLS))
+def test_a_control_of_a_control_is_refused(outer, inner):
+    """All SIXTEEN compositions, because each control is a different reduction
+    and a guard that fired for three of them would still relabel the fourth."""
+    control = CONTROLS[inner](_tensor())
+    assert control.spec.variant == inner
+    with pytest.raises(ValueError, match="a control of a control is meaningless"):
+        CONTROLS[outer](control)
+
+
+@pytest.mark.parametrize("inner", list(CONTROLS))
+def test_the_control_of_a_control_message_names_the_variant_it_received(inner):
+    """Naming the OUTER control alone would tell a caller which function
+    raised and not which artifact they passed in -- and the whole failure mode
+    is a sweep loop that lost track of which artifact it was holding."""
+    control = CONTROLS[inner](_tensor())
+    with pytest.raises(ValueError, match=f"already the '{inner}' control"):
+        uniform_prior(control)
+
+
+def test_the_full_prior_itself_is_not_refused():
+    """The mirror of the guard: it must not be so strict it rejects the one
+    input every control is defined on, on either fixture."""
+    for fixture in (_tensor, _sparse_tensor):
+        t = fixture()
+        assert t.spec.variant == "full"
+        for name, fn in CONTROLS.items():
+            assert fn(t).spec.variant == name
+
+
+def test_the_control_of_a_control_guard_runs_before_the_grid_is_materialised():
+    """It is checked first, so the message that arrives names the contract the
+    caller actually broke rather than a downstream reshape or numpy error."""
+    control = uniform_prior(_tensor())
+    control.cells = list(control.cells) + ["8418c53ffffffff"]
+    with pytest.raises(ValueError, match="a control of a control is meaningless"):
+        shuffle_space(control, seed=SPACE_SEED)
 
 
 # ---------------------------------------------------------------------------

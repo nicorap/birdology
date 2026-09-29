@@ -71,10 +71,41 @@ are the reason `_sparse_tensor()` is not an optional extra fixture.
 
 COMPOUND CONDITIONS ARE MUTATED PER DISJUNCT
 --------------------------------------------
-`_control_grid` now carries ONE guard clause (the column-count / cell-axis
-agreement), and it gets one mutant per direction: removed (C1) and inverted so
-a valid tensor is rejected (C2). The two clauses it used to carry are gone;
-C3/C4 pin their ABSENCE instead, which is the mirror obligation.
+`_control_grid` carries TWO independent guard clauses, and each gets its own
+mutants with its own fixture violating only that clause:
+
+* the control-of-a-control check (`spec.variant == "full"`): removed (C39),
+  inverted so the full prior is refused (C40), and with the message naming the
+  wrong variant (C41);
+* the column-count / cell-axis agreement: removed (C1) and inverted so a valid
+  tensor is rejected (C2).
+
+The two clauses this function used to carry -- the dense-grid and stored-zero
+refusals -- are gone; C3/C4 pin their ABSENCE instead, which is the mirror
+obligation.
+
+THE THREE DEFECTS THIS REVISION OF THE TABLE EXISTS FOR
+-------------------------------------------------------
+C39-C41 close the one stated contract that had no guard: every control
+accepted a CONTROL as input and relabelled the output, so a
+`shuffle_space`-of-`uniform` reached the results table claiming to be a
+first-order spatial null.
+
+C42-C46 close two "test that cannot fail" holes that the previous three-cell
+fixture opened. `np.random.default_rng(1).permutation(3)` is the IDENTITY, so
+the two tests seeded with 1 compared an array to itself and the no-op mutant
+survived them; and `np.random.default_rng(3).permutation(3)` is its own
+INVERSE, so the one test that recomputes the permutation could not tell a
+gather from a scatter and the argsort mutant survived ALL 78 tests in the
+file. The root-cause fix is a five-cell axis plus an asserted precondition in
+every seeded test; C42/C43 (identity, one per formerly-tautological test) and
+C44/C45 (scatter instead of gather, both axes) are what keep them closed.
+
+C47/C48 measure marginal's CONTRAST, in both directions. Every previous
+assertion about `marginal` compared it against `dense.mean(axis=1)`
+recomputed from the same grid, so a reduction that systematically squeezed or
+amplified the between-species ratio while preserving total mass exactly was
+invisible.
 
 WHAT THIS SET DOES NOT COVER -- stated so the table is not read as more than
 it is
@@ -92,24 +123,32 @@ it is
   that it compares them against the full prior on the same fold. A sweep that
   silently skipped `marginal` would pass every test in this file. That
   obligation lives downstream and is only as strong as its own tests.
-* THE FLOORING IS PERMUTATION-INVARIANT, SO THE SHUFFLES CANNOT SEE IT.
-  Mapping "unstored" to FLOOR commutes with a permutation of the grid, and
-  `_respec` re-sparsifies, so for `shuffle_space` and `shuffle_time` reading
-  `t.values.toarray()` instead of `t.dense()` produces a BYTE-IDENTICAL
-  result. C9/C10 are therefore killed by the guard they skip rather than by the
-  flooring they lose -- the flooring genuinely does not matter there today. It
-  would start mattering the moment a shuffle stopped being a pure permutation
-  (a partial shuffle, a within-block shuffle, a resample), and nothing here
-  would notice that the single-definition rule had quietly become load-bearing
-  again.
+* THE FLOORING IS PERMUTATION-INVARIANT ON THE VALUES, SO THE SHUFFLES SEE IT
+  ONLY IN WHAT THEY STORE. Mapping "unstored" to FLOOR commutes with a
+  permutation of the grid, so for `shuffle_space` and `shuffle_time` reading
+  `t.values.toarray()` instead of `t.dense()` produces DENSE VALUES that are
+  byte-identical. What it does NOT produce is the same stored matrix: `_respec`
+  re-sparsifies, so a bypassed shuffle keeps only the originally-stored entries
+  while the real one keeps every context. C9/C10 are therefore killed by an
+  `nnz == dense_capacity` assertion -- the flooring they lose, not merely the
+  column-count guard they skip. The value-level invariance remains a theorem
+  about the CURRENT construction: it would stop holding the moment a shuffle
+  stopped being a pure permutation (a partial shuffle, a within-block shuffle,
+  a resample), and at that point the values would start differing too.
+* THE CONTRAST DECAY IS MEASURED ON A FIXTURE, NOT ON THE ARTIFACT. C47/C48
+  pin that `marginal` reproduces a known 4:1 ratio to within 1% at 1.92% fill
+  with observed values of order 1e-01. The decay is a function of
+  `fill * value` against FLOOR, so at real national sparsity the loss is
+  larger than anything measured here -- the fixture pins the reduction, not
+  the artifact's contrast. That obligation belongs to the build script.
 * FLOATING-POINT MASS AT NATIONAL SCALE. The mass-preservation tests compare
-  with `pytest.approx` on a 312-entry matrix. `mean * size == sum` is exact
+  with `pytest.approx` on a 520-entry matrix. `mean * size == sum` is exact
   only up to summation order; at ~10^8 contexts the drift is real but bounded
   and far below any effect size the paper reports. Nothing here measures it,
   and a mutant introducing a float32 intermediate inside the mean would be
   caught only if it drifted past `approx`'s default tolerance.
 * THE FLOOR'S SHARE AT REAL SCALE. `test_the_sparse_fixture_floor_does_not_
-  dominate_the_uniform_fill` pins that the floor mass is a ~1e-4 share of the
+  dominate_the_uniform_fill` pins that the floor mass is a ~2.7e-4 share of the
   total AT 1.92% FILL WITH VALUES OF ORDER 1e-1. A real national grid is
   sparser still and its observed values may be smaller, so the floor's share
   is larger there than anything measured here. The judgement that `uniform`
@@ -276,13 +315,15 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
     ),
     (
         "C9",
-        "`shuffle_space` bypasses `_control_grid`, losing the column-count "
-        "guard before a reshape. Note the flooring it also loses does NOT "
-        "change its output -- mapping unstored to FLOOR commutes with a "
-        "permutation -- so this is killed by the GUARD, which is exactly why "
-        "the guard is called from all four controls and not only from the two "
-        "that average",
-        "test_a_column_count_that_disagrees_with_the_cell_axis_is_rejected",
+        "`shuffle_space` bypasses `_control_grid`, losing the flooring before "
+        "a permutation AND the column-count guard before a reshape. The "
+        "flooring is permutation-invariant, so the DENSE VALUES it produces "
+        "are byte-identical -- but `_respec` re-sparsifies, so a bypassed "
+        "shuffle stores only the originally-stored entries where the real one "
+        "stores every context. That `nnz` difference is what makes the "
+        "single-definition rule falsifiable here rather than merely "
+        "load-bearing-in-principle",
+        "test_the_shuffles_store_every_context_so_a_grid_bypass_cannot_hide",
         [
             (
                 '    dense = _control_grid(t, "shuffle_space")',
@@ -293,7 +334,7 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
     (
         "C10",
         "`shuffle_time` bypasses `_control_grid` -- the time mirror of C9",
-        "test_a_column_count_that_disagrees_with_the_cell_axis_is_rejected",
+        "test_the_shuffles_store_every_context_so_a_grid_bypass_cannot_hide",
         [
             (
                 '    dense = _control_grid(t, "shuffle_time")',
@@ -717,6 +758,160 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
             (
                 '    "shuffle_time": shuffle_time,',
                 '    "shuffle_time": shuffle_space,',
+            )
+        ],
+    ),
+    # ---- C1 (the FINDING, not the mutant id): a control of a control -------
+    (
+        "C39",
+        "the CONTROL-OF-A-CONTROL guard removed, so `uniform_prior(uniform_"
+        "prior(t))` and all fifteen other compositions are accepted and "
+        "RELABELLED with the outer variant. Every composition is "
+        "mass-preserving, finite, in range, right-shaped and right-axed -- a "
+        "`shuffle_space`-of-`uniform` is simply `uniform` again -- so the "
+        "results table gains a row that claims to be a first-order spatial "
+        "null and nothing downstream can contradict it, because the only "
+        "evidence was the variant string this module overwrote",
+        "test_a_control_of_a_control_is_refused",
+        [('    if t.spec.variant != "full":', "    if False:")],
+    ),
+    (
+        "C40",
+        "the control-of-a-control guard INVERTED, so the FULL prior is the one "
+        "input refused and every control raises on the only tensor it is "
+        "defined for -- the mirror of C39, and the same shape of defect as the "
+        "dense-grid refusal C3 re-introduces: a guard that takes the paper's "
+        "credibility section down before it computes anything",
+        "test_the_full_prior_itself_is_not_refused",
+        [('    if t.spec.variant != "full":', '    if t.spec.variant == "full":')],
+    ),
+    (
+        "C41",
+        "the control-of-a-control message reports the OUTER control's name in "
+        "place of the variant it actually received, so a caller holding four "
+        "saved artifacts is told which function raised and not which file they "
+        "passed in -- and the failure mode this guard exists for is precisely "
+        "a loop that lost track of which artifact it was holding",
+        "test_the_control_of_a_control_message_names_the_variant_it_received",
+        [
+            (
+                "            f\"already the {t.spec.variant!r} control: a control of a control \"",
+                "            f\"already the {where!r} control: a control of a control \"",
+            )
+        ],
+    ),
+    # ---- I1/I2: the two holes the previous revision's 3-cell axis opened ---
+    (
+        "C42",
+        "`shuffle_space` becomes a NO-OP, labelled by the multiset test that "
+        "USED TO SURVIVE it. On the previous 3-cell axis that test's seed drew "
+        "the identity permutation, so it compared an array to itself and this "
+        "exact mutation passed it. The fixture is now five cells with an "
+        "asserted non-identity seed and an explicit \"the array changed\" "
+        "assertion, so the tautology is closed at the cause",
+        "test_shuffle_space_preserves_the_value_multiset",
+        [
+            (
+                "    blocks = blocks[:, np.random.default_rng(seed).permutation(n_cells), :]",
+                "    blocks = blocks[:, np.arange(n_cells), :]",
+            )
+        ],
+    ),
+    (
+        "C43",
+        "`shuffle_space` becomes a NO-OP, labelled by the total-mass test that "
+        "also used to survive it -- the second of the two seed-1 tautologies, "
+        "and a separate mutant because each must kill this mutation on its own "
+        "rather than leaning on a neighbour in the same file",
+        "test_shuffle_space_preserves_total_mass",
+        [
+            (
+                "    blocks = blocks[:, np.random.default_rng(seed).permutation(n_cells), :]",
+                "    blocks = blocks[:, np.arange(n_cells), :]",
+            )
+        ],
+    ),
+    (
+        "C44",
+        "`shuffle_space` SCATTERS where it should gather: the cell axis indexed "
+        "by the INVERSE permutation (`np.argsort`). Both directions are "
+        "statistically valid shuffles, so this is not wrong in itself -- but "
+        "it means the implementation is not the construction the tests claim, "
+        "and on the previous 3-cell axis the only test that recomputes the "
+        "permutation was seeded with an INVOLUTION, on which gather and "
+        "scatter are the same array. This mutant SURVIVED all 78 tests. The "
+        "five-cell axis, the asserted not-its-own-inverse precondition and the "
+        "mirror assertion against `argsort` close it",
+        "test_shuffle_space_relocates_whole_cells_not_individual_values",
+        [
+            (
+                "    blocks = blocks[:, np.random.default_rng(seed).permutation(n_cells), :]",
+                "    blocks = blocks[:, np.argsort(np.random.default_rng(seed).permutation(n_cells)), :]",
+            )
+        ],
+    ),
+    (
+        "C45",
+        "`shuffle_time` scatters where it should gather -- the time mirror of "
+        "C44. The 52-element week axis never had the space axis's involution "
+        "problem, but the axis length was the only thing standing between this "
+        "mutant and survival, and an axis length is not an assertion",
+        "test_shuffle_time_permutes_week_slots_with_one_shared_permutation",
+        [
+            (
+                "    blocks = blocks[:, :, np.random.default_rng(seed).permutation(WEEKS_PER_YEAR)]",
+                "    blocks = blocks[:, :, np.argsort(np.random.default_rng(seed).permutation(WEEKS_PER_YEAR))]",
+            )
+        ],
+    ),
+    (
+        "C46",
+        "`shuffle_time` becomes a NO-OP, labelled by the multiset test -- the "
+        "time twin of C42. The week axis was never the one with the identity "
+        "seed, which is exactly why its precondition needed asserting rather "
+        "than inferring",
+        "test_shuffle_time_preserves_the_value_multiset",
+        [
+            (
+                "    blocks = blocks[:, :, np.random.default_rng(seed).permutation(WEEKS_PER_YEAR)]",
+                "    blocks = blocks[:, :, np.arange(WEEKS_PER_YEAR)]",
+            )
+        ],
+    ),
+    # ---- I4: marginal's CONTRAST, the only signal it exists to carry -------
+    (
+        "C47",
+        "`marginal_prior` SHRINKS each species' mean halfway toward the global "
+        "mean -- the shape of a plausible \"stabilise a sparse estimate\" "
+        "improvement. TOTAL mass is preserved EXACTLY (the rows are all the "
+        "same length, so the average of the shrunk means is the global mean), "
+        "the control still varies across species, every value is finite and in "
+        "range -- and the 4:1 label-frequency ratio the control exists to "
+        "carry is reported as 1.86:1. Without a contrast measurement against a "
+        "KNOWN ratio, the only tests that could see this compare against "
+        "`dense.mean(axis=1)` recomputed from the same grid",
+        "test_marginal_reproduces_a_known_species_mass_ratio_on_a_sparse_prior",
+        [
+            (
+                "    per_species = dense.mean(axis=1, keepdims=True)",
+                "    per_species = 0.5 * dense.mean(axis=1, keepdims=True) + 0.5 * dense.mean()",
+            )
+        ],
+    ),
+    (
+        "C48",
+        "`marginal_prior` AMPLIFIES the contrast instead, squaring each "
+        "species' mean and rescaling so total mass is preserved exactly. The "
+        "opposite sign of C47 and a separate mutant because a test that "
+        "catches a squeezed ratio need not catch a manufactured one -- and a "
+        "control reporting MORE label frequency than the data holds makes a "
+        "real gain look like it failed the marginal null",
+        "test_marginal_reproduces_a_known_species_mass_ratio_on_a_sparse_prior",
+        [
+            (
+                "    per_species = dense.mean(axis=1, keepdims=True)",
+                "    _m = dense.mean(axis=1, keepdims=True)\n"
+                "    per_species = _m**2 * (_m.sum() / (_m**2).sum())",
             )
         ],
     ),

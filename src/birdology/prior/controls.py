@@ -86,12 +86,46 @@ not a flat 1e-06.
 What including the floor DOES do is spread the full prior's whole mass over
 every context, which puts the uniform constant at roughly ``nnz/size`` of the
 observed mean. That is not dilution -- it is the correct scale, because the
-FULL PRIOR also answers ~98% of its contexts with the floor. Control and
-prior are then one object measured two ways, which is the entirety of T9-R2.
+FULL PRIOR also answers ~98% of its contexts with the floor.
 
 Averaging over the stored entries only would build a control at ~52x the mass
 of the prior it is the null for, and the sweep would report that scale gap as
 a spatiotemporal effect. That is the defect, not the fix.
+
+ARITHMETIC MASS IS MATCHED; LOG-SPACE LOCATION IS NOT, AND CANNOT BE
+---------------------------------------------------------------------
+An earlier revision of this docstring claimed control and prior were "one
+object measured two ways". That is FALSE, and measurably so. On the sparse
+fixture in ``tests/prior/test_controls.py`` (10 stored contexts of 520,
+1.92% fill):
+
+    mean log, full prior : -13.595   (geometric mean 1.25e-06)
+    mean log, ``uniform``:  -5.652   (geometric mean 3.51e-03)
+    offset               :   7.943 nats per context
+
+and the sign of that offset is STRUCTURAL rather than incidental: among all
+fills with the same arithmetic total, the CONSTANT one maximises the
+geometric mean (AM-GM, with equality only when the prior is already
+constant). So ``uniform`` is the mass-preserving control sitting furthest
+ABOVE the full prior in log space, and no mass-preserving control can match
+both the arithmetic total and the log-space location of a floor-dominated
+grid. The two are different functionals of the same mass and a 98%-floor grid
+separates them by construction.
+
+Arithmetic mass is still the right thing to match, because that is what the
+sweep reads: fusion is multiplicative, and a control at a different
+arithmetic scale turns the headline comparison into a scale difference
+(T9-R2). The trade-off is stated here rather than resolved, because it cannot
+be resolved.
+
+The consequence to carry downstream: a fusion mode that consumes ``log
+prior`` ADDITIVELY sees a near-constant offset (~7.9 nats on this fixture,
+larger the sparser the grid) between every control and the full prior. Any
+decision threshold, calibration fit or tuned mixing weight learnt against one
+must be refit against the other; a threshold transplanted from the full prior
+to a control -- or a mixing weight tuned on the full prior and reused -- is
+reading that offset as evidence. The arithmetic comparison the sweep reports
+is unaffected.
 
 So the paper's null hypothesis is: *the released prior's total mass,
 redistributed with no context information at all* (``uniform``), or *with
@@ -165,10 +199,37 @@ def _control_grid(t: PriorTensor, where: str) -> np.ndarray:
     out of ``_respec`` as ``PriorTensor``'s own dataclass message, which names
     a different contract and points the caller at the wrong layer.
 
+    A CONTROL OF A CONTROL IS REFUSED
+    ---------------------------------
+    The consumed contract is a ``PriorTensor`` whose ``spec.variant`` is
+    ``"full"``. Every control is defined as a reduction OF THE FULL PRIOR, and
+    each is a fixed point or a near-fixed point of the others: ``uniform`` of
+    ``uniform`` is ``uniform``, ``marginal`` of ``uniform`` is ``uniform``, and
+    a shuffle of ``uniform`` is ``uniform`` again. Every one of them preserves
+    mass, stays finite, stays in range, has the right shape and the right axes
+    -- and ``_respec`` then RELABELS the output with the outer variant, so a
+    second-order ``shuffle_space``-of-``uniform`` lands in the results table
+    under a label that claims it is a first-order spatial null. Nothing
+    downstream can detect that: the only evidence is the variant string this
+    module just overwrote.
+
+    A sweep loop that accumulated variants, or a rerun over a directory of
+    saved priors that globbed the controls it wrote on the previous pass,
+    produces exactly this. So it raises, naming the variant it received.
+
     The dense-grid and stored-zero clauses this guard used to carry are gone;
     the module docstring says why, and the mutation table keeps a regression
     mutant for each so neither can return unnoticed.
     """
+    if t.spec.variant != "full":
+        raise ValueError(
+            f"the {where} control requires the FULL prior, but this tensor is "
+            f"already the {t.spec.variant!r} control: a control of a control "
+            "is meaningless -- every control is a reduction of the full prior, "
+            "the reductions are fixed points of one another (a shuffle of "
+            "uniform is uniform again), and the output would be RELABELLED "
+            f"{where!r} and read as a first-order null"
+        )
     n_cols = t.values.get_shape()[1]
     expected_cols = len(t.cells) * WEEKS_PER_YEAR
     if n_cols != expected_cols:
@@ -193,6 +254,33 @@ def _respec(t: PriorTensor, variant: str, values: np.ndarray) -> PriorTensor:
 
     ``gbif_doi`` is carried too: a released control artifact has to be
     traceable to the same download as the full prior it is the control for.
+
+    EVERY CONTROL IS DENSE, SO ITS ``fill`` IS 1.0 BY CONSTRUCTION
+    --------------------------------------------------------------
+    All four controls are built from ``t.dense()``, in which every context on
+    the axes carries a value (most of them ``FLOOR``), and none of them can
+    produce a zero from a positive grid -- a constant, a per-species constant
+    and two permutations all map positive to positive. So the re-sparsified
+    matrix stores ``dense_capacity`` entries, and each control's sidecar
+    publishes ``nnz == dense_capacity`` -- a fill of 1.000 -- where the full
+    prior it controls publishes, on the test fixture, 10 of 520 (0.019).
+
+    That number is NOT comparable with the full prior's and must not be read
+    as the control being better covered: it is a property of the construction,
+    and the two ``fill`` values answer different questions (the prior's is
+    "what fraction was observed", the control's is "what fraction is stored",
+    which for a control is always all of it).
+
+    The storage consequence, beside the peak-memory one the mutation harness
+    records: a control is not a sparse artifact. At national figures each
+    control is ~750 MB of float64 values plus ~375 MB of int32 CSR indices ON
+    DISK, times four, to encode a matrix with a handful of distinct values --
+    ONE for ``uniform``, at most ``n_species`` for ``marginal``, and the full
+    prior's own multiset for the two shuffles. The released bundle is therefore
+    dominated by the controls rather than by the prior, and a consumer sizing
+    a download from the full prior's ``fill`` will be wrong by ~52x per control
+    at 2% fill. Compression recovers much of it for ``uniform`` and
+    ``marginal`` and almost none of it for the shuffles.
     """
     return PriorTensor(
         spec=PriorSpec(t.spec.resolution, t.spec.source, variant),
@@ -242,6 +330,42 @@ def marginal_prior(t: PriorTensor) -> PriorTensor:
     that species' original mass on the floored grid, so this control preserves
     per-species mass and therefore total mass too. A sum or a median would not,
     and neither would a mean over that species' stored entries only.
+
+    ITS CONTRAST DECAYS WITH FILL, AND THAT IS A PROPERTY OF THE CONSTRUCTION
+    -------------------------------------------------------------------------
+    The signal this control exists to carry is the RATIO between species. The
+    floor is a common ADDITIVE baseline in every row, so with fill ``f``,
+    observed value scale ``v`` and a true observed-mass ratio ``r``, the ratio
+    this control actually emits is
+
+        (f*v + (1-f)*FLOOR) / (f*v/r + (1-f)*FLOOR)  ->  1 as f*v -> FLOOR
+
+    Measured (``FLOOR`` = 1e-06, r = 4):
+
+        f=1.92e-02, v=1e-01 -> 3.994   <-- the sparse test fixture
+        f=1.00e-03, v=1e-01 -> 3.885
+        f=1.00e-04, v=1e-01 -> 3.143
+        f=1.00e-04, v=1e-02 -> 1.600
+        f=1.00e-05, v=1e-03 -> 1.007   <-- signal gone
+
+    This is NOT a shared limitation of prior and control. It is asymmetric,
+    and that asymmetry is why it matters: the FULL prior's label signal is
+    concentrated in the ``f`` share of contexts it actually observed and is
+    undiluted there, while ``marginal`` smears each species' mass across 100%
+    of contexts, where the floor is most of the baseline. The floor dilutes the
+    control's contrast without diluting the prior's. At sufficient sparsity
+    ``marginal`` converges toward ``uniform``, stops carrying label frequency
+    at all, and a gain then "survives the marginal control" trivially -- which
+    is precisely the reviewer question the paper claims to answer.
+
+    ``uniform`` is far more robust by comparison: at f=1e-03, v=1e-01 it still
+    sits 101x above ``FLOOR``, and only collapses toward the floor around
+    f<=1e-04 with v<=1e-02.
+
+    ``test_marginal_reproduces_a_known_species_mass_ratio_on_a_sparse_prior``
+    pins the ratio on the fixture; the build script must report the observed
+    contrast on the real artifact, because these numbers are a function of the
+    artifact's own ``f`` and ``v`` and no fixture can stand in for them.
     """
     dense = _control_grid(t, "marginal")
     per_species = dense.mean(axis=1, keepdims=True)
