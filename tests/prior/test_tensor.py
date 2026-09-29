@@ -7,6 +7,7 @@ matched on wording specific to THAT check rather than on a bare word another
 layer could also produce.
 """
 import json
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -1130,6 +1131,73 @@ def test_load_reads_the_SIDECAR_from_the_normalised_path_not_the_raw_one(tmp_pat
     assert load_prior(tmp_path / "p.dat").cells == ["cell-a"]
 
 
+def test_a_sidecar_declaring_a_different_axis_LENGTH_than_the_matrix_is_rejected(
+    tmp_path,
+):
+    """M3: the I4 decoy varies the axis VALUES but not its declared LENGTH.
+
+    `test_load_reads_the_SIDECAR_from_the_normalised_path_not_the_raw_one`
+    plants a decoy whose cell axis is `["decoy-cell"]` -- a DIFFERENT cell, but
+    still exactly one of them. So the decoy's DECLARED DIMENSIONS match the
+    matrix's, and a reader that took the grid's shape from the sidecar rather
+    than from the matrix bytes passes it. That is a real reader shape: the
+    sidecar publishes `species_keys`, `cells` and `weeks_per_year`, from which
+    `len(species_keys) x len(cells) * weeks_per_year` is the obvious way to
+    size the grid, and this document tells third parties to do exactly that.
+
+    This decoy therefore differs in LENGTH: two cells declared against a matrix
+    that encodes one cell's 52 columns. The two halves are then not descriptions
+    of the same artifact and `PriorTensor` must refuse them. A reader that
+    instead RESHAPED the matrix to the declared dimensions would pad it with a
+    silent second cell-block of implicit zeros -- which this boundary reads as
+    the floor -- and hand back a plausible prior over a cell the data never had.
+
+    The decoy is planted at the NORMALISED sidecar location, not at the raw
+    one, precisely because the mutant it exists to kill only bites when the
+    shape-mismatched sidecar is the one actually read.
+    """
+    real = _saveable([(1, "cell-a", 46, 0.25)])
+    path = save_prior(real, tmp_path / "p.npz")
+    sidecar = path.with_suffix(".json")
+    meta = json.loads(sidecar.read_text(encoding="utf-8"))
+
+    meta["cells"] = ["cell-a", "cell-b"]
+    sidecar.write_text(json.dumps(meta), encoding="utf-8")
+
+    # Preconditions: nnz still agrees and the stride is untouched, so neither
+    # of those guards is what fires -- only the declared-vs-encoded SHAPE.
+    assert meta["nnz"] == real.values.nnz
+    assert meta["weeks_per_year"] == WEEKS_PER_YEAR
+    assert real.values.get_shape()[1] == 1 * WEEKS_PER_YEAR
+    assert len(meta["cells"]) * WEEKS_PER_YEAR != real.values.get_shape()[1]
+
+    with pytest.raises(ValueError, match=r"cells x \d+ weeks needs"):
+        load_prior(path)
+
+
+def test_a_sidecar_declaring_a_different_SPECIES_axis_length_is_rejected(tmp_path):
+    """The row half of the same hole; its own test because one cannot see the other.
+
+    A matrix can have the right width and the wrong height. A reader sizing the
+    grid from the sidecar pads a second species row of implicit zeros, which
+    this boundary reads as the floor, and every lookup of that invented species
+    is answered with a plausible prior.
+    """
+    real = _saveable([(1, "cell-a", 46, 0.25)])
+    path = save_prior(real, tmp_path / "p.npz")
+    sidecar = path.with_suffix(".json")
+    meta = json.loads(sidecar.read_text(encoding="utf-8"))
+
+    meta["species_keys"] = [1, 2]
+    sidecar.write_text(json.dumps(meta), encoding="utf-8")
+
+    assert meta["nnz"] == real.values.nnz  # precondition: the nnz guard is silent
+    assert len(meta["species_keys"]) != real.values.get_shape()[0]
+
+    with pytest.raises(ValueError, match="species keys"):
+        load_prior(path)
+
+
 def test_two_names_differing_only_after_a_dot_produce_two_distinct_artifacts(tmp_path):
     """`with_suffix` TRUNCATES at the last dot -- measured silent DATA LOSS.
 
@@ -1301,3 +1369,131 @@ def test_an_independent_reader_recovers_the_floor_from_the_sidecar(tmp_path):
     reference = load_prior(npz).dense()
     assert grid.shape == reference.shape
     assert grid.ravel().tolist() == pytest.approx(reference.ravel().tolist())
+
+
+# --------------------------------------------------------------------------
+# I5: the RELEASED DOCUMENTATION, executed against a freshly saved artifact
+#
+# `docs/prior-artifact-format.md` is aimed at someone who has downloaded the
+# files and is not reading this package. Prose that contradicts the code six
+# months from now is worse than no prose at all, so the load-bearing facts in
+# it are not trusted: the sidecar example is parsed and its KEYS compared with
+# a real sidecar, the published constants are compared with the constants, and
+# the decoding recipe is EXECUTED and required to reproduce `dense()` and
+# `lookup()` exactly.
+# --------------------------------------------------------------------------
+ARTIFACT_DOC = Path(__file__).parent.parent.parent / "docs" / "prior-artifact-format.md"
+
+
+def _fenced_blocks(text, language):
+    """Every ```<language> fenced block in a markdown document, in order."""
+    return re.findall(
+        rf"^```{language}\n(.*?)^```", text, flags=re.DOTALL | re.MULTILINE
+    )
+
+
+def test_the_artifact_documentation_matches_a_freshly_saved_artifact(tmp_path):
+    """The released documentation, checked against the artifact it describes.
+
+    Every claim exercised here is one a third party would act on with their own
+    tooling and could not detect being wrong: the sidecar's FIELD NAMES, the
+    `.npz` MEMBER NAMES, the literal value of the floor, the licence terms, and
+    the decoding recipe itself. If `save_prior` renames a field or the floor
+    moves, this fails rather than the document quietly becoming a lie.
+    """
+    doc = ARTIFACT_DOC.read_text(encoding="utf-8")
+
+    rows = [
+        (1, "841f059ffffffff", 46, 0.25),
+        (2, "841f05bffffffff", 3, 0.5),
+        (1, "841f05bffffffff", WEEKS_PER_YEAR, 0.125),
+    ]
+    t = _saveable(rows)
+    npz = save_prior(t, tmp_path / "prior_res4_dof_full.npz")
+    sidecar = npz.with_suffix(".json")
+    meta = json.loads(sidecar.read_text(encoding="utf-8"))
+
+    # -- the sidecar example documents exactly the fields that are written --
+    example = json.loads(_fenced_blocks(doc, "json")[0])
+    assert sorted(example) == sorted(meta), (
+        "the documented sidecar example and the real sidecar have different "
+        "fields; a third party is being told about a field that does not "
+        "exist, or not told about one that does"
+    )
+    assert sorted(example["spec"]) == sorted(meta["spec"])
+
+    # -- and the constants it publishes are the constants --
+    assert example["missing_value"] == FLOOR
+    assert example["weeks_per_year"] == WEEKS_PER_YEAR
+    assert example["licence"] == LICENCE
+    assert example["licence_url"] == LICENCE_URL
+    # The floor's literal value must appear in the PROSE too, not only in the
+    # example: the one sentence a third party has to read is "unstored means
+    # this number".
+    assert repr(FLOOR) in doc
+    assert LICENCE in doc and LICENCE_URL in doc
+
+    # -- the `.npz` member names the document lists are the ones written --
+    documented_members = re.search(r"<!-- npz-members: (.*?) -->", doc).group(1).split()
+    with np.load(npz) as z:
+        assert sorted(z.files) == sorted(documented_members)
+
+    # -- the decoding recipe, EXECUTED --
+    recipe = {}
+    exec(_fenced_blocks(doc, "python")[0], recipe)  # noqa: S102 - the doc IS the test
+    doc_meta, grid = recipe["load_dense"](npz, sidecar)
+    assert doc_meta == meta
+
+    reference = load_prior(npz).dense()
+    assert grid.shape == reference.shape
+    assert grid.ravel().tolist() == pytest.approx(reference.ravel().tolist())
+
+    # A STORED context: the recipe's lookup agrees with ours.
+    for key, cell, week, p in rows:
+        assert recipe["lookup"](doc_meta, grid, key, cell, week) == pytest.approx(p)
+        assert recipe["lookup"](doc_meta, grid, key, cell, week) == pytest.approx(
+            t.lookup(key, cell, week)
+        )
+
+    # An UNSTORED context on both axes: the whole point of the document. A
+    # reader following it must reach the FLOOR here, not 0.0.
+    assert t.values[0, _column_index(0, 7)] == 0.0  # precondition: nothing stored
+    assert recipe["lookup"](doc_meta, grid, 1, "841f059ffffffff", 7) == pytest.approx(
+        FLOOR
+    )
+    assert recipe["lookup"](doc_meta, grid, 1, "841f059ffffffff", 7) != 0.0
+    assert recipe["lookup"](doc_meta, grid, 1, "841f059ffffffff", 7) == pytest.approx(
+        t.lookup(1, "841f059ffffffff", 7)
+    )
+
+    # And an off-axis key is an ERROR in the recipe too, not a floor: the
+    # document tells third parties to raise, so the code it ships must.
+    with pytest.raises(ValueError, match="species axis"):
+        recipe["lookup"](doc_meta, grid, 999, "841f059ffffffff", 7)
+    with pytest.raises(ValueError, match="cell axis"):
+        recipe["lookup"](doc_meta, grid, 1, "not-a-cell", 7)
+
+
+def test_the_documented_fill_arithmetic_is_the_one_the_sidecar_publishes(tmp_path):
+    """`nnz / dense_capacity` is how the document says to recover coverage.
+
+    `lookup` is total over the axis cross-product, so it can never report
+    absence; the document directs readers to the stored coordinates and to this
+    ratio instead. Both halves of it must therefore describe the real matrix.
+    """
+    doc = ARTIFACT_DOC.read_text(encoding="utf-8")
+    assert "fill = nnz / dense_capacity" in doc
+
+    t = _saveable([(1, "cell-a", 46, 0.25), (2, "cell-b", 3, 0.5)])
+    npz = save_prior(t, tmp_path / "p.npz")
+    meta = json.loads(npz.with_suffix(".json").read_text(encoding="utf-8"))
+
+    with np.load(npz) as z:
+        stored = len(z["data"])
+        capacity = int(z["shape"][0]) * int(z["shape"][1])
+
+    assert meta["nnz"] == stored
+    assert meta["dense_capacity"] == capacity
+    assert meta["nnz"] / meta["dense_capacity"] == pytest.approx(
+        t.values.nnz / t.dense_capacity
+    )

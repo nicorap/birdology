@@ -26,6 +26,13 @@ the release citable: the matrix alone cannot say which species a row is, which
 grid it was cut on, what an absent entry means, or under what terms it may be
 redistributed.
 
+`docs/prior-artifact-format.md` is the SAME format written for someone who has
+downloaded the files and is not reading this module: the layout, the field
+meanings, the floor convention below, a numpy-only decoding recipe and the
+CC BY 4.0 / GBIF-DOI terms. It ships with the release, and
+`test_the_artifact_documentation_matches_a_freshly_saved_artifact` runs its
+recipe against a freshly saved artifact so it cannot rot away from this code.
+
 A MISSING CONTEXT READS THE FLOOR, AND THAT IS NOT IMPUTATION
 -------------------------------------------------------------
 A `(species, cell, week)` context whose species IS on the species axis and
@@ -282,6 +289,13 @@ def _validate_p(values: np.ndarray) -> None:
             "would be stored as an explicit sparse entry and read back as a "
             "probability"
         )
+    # THIS CLAUSE IS A PRECONDITION OF `PriorTensor.lookup` (and of `vector`
+    # and `dense`, which read through the same `_floor_missing`). Those readers
+    # substitute the floor for any value that reads as 0.0, and that is only
+    # observationally identical to "was never stored" BECAUSE this clause makes
+    # a stored zero impossible. Relax it -- to `< 0.0`, or away entirely -- and
+    # the released artifact starts round-tripping real stored zeros as 1e-06,
+    # with no error at either site. The two are coupled; change neither alone.
     if np.any(values <= 0.0):
         raise ValueError(
             "prior table column 'p' contains values at or below 0.0; the "
@@ -405,9 +419,23 @@ class PriorTensor:
         key. For a context that is ON both axes but has no stored value,
         returns `backoff.FLOOR` -- the value the backoff defines for "no
         evidence" -- never a hard 0.0. See the module docstring.
+
+        BECAUSE OF THAT, THIS METHOD NEVER REPORTS ABSENCE: it is TOTAL over
+        the axis cross-product and answers every context the axes span, so a
+        returned `FLOOR` cannot be distinguished from a stored one and
+        `lookup` can never tell you whether a triple was OBSERVED. Anything
+        needing coverage, support size, sparsity or a denominator must go
+        through the stored keys instead -- the matrix's own coordinates, or
+        `values.nnz` against `dense_capacity` in aggregate.
         """
         col = self._column(cell, week)
         row = self._row(species_key)
+        # PRECONDITION, enforced in `_validate_p`, NOT here: a stored `p` at or
+        # below 0.0 is refused at write time, so "reads as 0.0" and "was never
+        # stored" are the same set and substituting the floor below is
+        # observationally identical to answering an unstored context. Weaken
+        # `_validate_p`'s `<= 0.0` clause and this line silently starts
+        # round-tripping a real stored zero as 1e-06, with nothing raised.
         return float(_floor_missing(np.float64(self.values[row, col])))
 
     def vector(self, cell: str, week: int | float) -> np.ndarray:

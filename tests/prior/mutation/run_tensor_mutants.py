@@ -57,6 +57,8 @@ clause, and each statement gets its own mutant:
 * `isfinite` / `<= 0.0` / `> 1.0` on `p`        -> T8, T9, T10 (per clause)
 * the schema loop's missing / dtype / null arms -> T14, T15, T16
 * the two axis-vs-matrix shape checks           -> T21, T22
+* a sidecar whose DECLARED axis length differs from the one the matrix
+  encodes                                       -> T71, T72 (per axis)
 * the unknown-cell and unknown-species guards   -> T49, T50 (per axis)
 * `load_prior`'s MATRIX read and its SIDECAR read -> T36a, T36b (per read)
 
@@ -114,6 +116,17 @@ it is
   download this tensor was actually built from -- is a pipeline-level property
   no test in this file can check: `gbif_doi` is a free string the caller sets,
   and the guard tests emptiness, not well-formedness.
+* THE RELEASED DOCUMENTATION BEYOND ITS LOAD-BEARING FACTS.
+  `docs/prior-artifact-format.md` is checked by
+  `test_the_artifact_documentation_matches_a_freshly_saved_artifact`, which
+  parses its sidecar example, compares the FIELD SET with a real sidecar,
+  compares the published constants with `FLOOR`/`LICENCE`/`WEEKS_PER_YEAR`, and
+  EXECUTES its numpy-only decoding recipe against a freshly saved artifact,
+  requiring it to reproduce `dense()` and `lookup()` (including the floor for
+  an unstored context). T73 is the rot mutant: a sidecar field the document
+  does not mention. What is NOT covered is the document's PROSE -- an
+  explanation can be misleading while every fact in it is true, and no test can
+  see that.
 * JSON ENCODING EDGE CASES. The sidecar is written with the default encoder.
   A cell string containing an unusual codepoint round-trips through JSON, but
   nothing here exercises non-ASCII cells, because H3 cells are hexadecimal.
@@ -1217,6 +1230,79 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
             (
                 "    return col // WEEKS_PER_YEAR",
                 "    return col // 53",
+            )
+        ],
+    ),
+    # ---- M3: the DECLARED dimensions vs the ENCODED ones ------------------
+    #
+    # The I4 sidecar decoy differs in axis VALUES but not in axis LENGTH, so a
+    # reader that sized the grid from the sidecar's declared dimensions while
+    # decoding the matrix bytes passed it. These two mutants ARE that reader:
+    # `load_prior` reshapes the loaded matrix onto the axis lengths the sidecar
+    # declares, so the shape guards in `__post_init__` can never disagree with
+    # it and a sidecar paired with a matrix of another shape is silently
+    # accepted -- padded with implicit zeros, which this boundary then reads as
+    # the FLOOR, yielding a plausible prior over contexts the data never had.
+    # One mutant per axis: a matrix can have the right width and the wrong
+    # height, so neither reshape can detect the other's loss.
+    (
+        "T71",
+        "`load_prior` takes the COLUMN count from the SIDECAR's declared cell "
+        "axis rather than from the matrix, reshaping the loaded matrix onto it. "
+        "A sidecar declaring two cells against a one-cell matrix then loads "
+        "without complaint, padded with a whole cell-block of implicit zeros "
+        "that reads as the floor -- a fabricated cell answering plausible "
+        "probabilities. The shape guard cannot fire because the mutant makes "
+        "the matrix agree with the axes by construction",
+        "test_a_sidecar_declaring_a_different_axis_LENGTH_than_the_matrix_is_rejected",
+        [
+            (
+                "    matrix = sparse.load_npz(npz).tocsr()",
+                "    matrix = sparse.load_npz(npz).tocsr()\n"
+                "    matrix.resize(\n"
+                "        matrix.get_shape()[0],\n"
+                '        len(meta["cells"]) * int(meta["weeks_per_year"]),\n'
+                "    )",
+            )
+        ],
+    ),
+    (
+        "T72",
+        "the ROW half of T71: `load_prior` takes the row count from the "
+        "SIDECAR's declared species axis and reshapes onto it, so a sidecar "
+        "listing a species the matrix has no row for loads silently and every "
+        "lookup of that invented species is answered with a floored -- and "
+        "entirely fabricated -- prior. Separate mutant because a matrix can "
+        "have the right width and the wrong height",
+        "test_a_sidecar_declaring_a_different_SPECIES_axis_length_is_rejected",
+        [
+            (
+                "    matrix = sparse.load_npz(npz).tocsr()",
+                "    matrix = sparse.load_npz(npz).tocsr()\n"
+                "    matrix.resize(\n"
+                '        len(meta["species_keys"]),\n'
+                "        matrix.get_shape()[1],\n"
+                "    )",
+            )
+        ],
+    ),
+    # ---- I5: the RELEASED DOCUMENTATION is executed, not trusted ----------
+    (
+        "T73",
+        "a NEW field added to the sidecar that `docs/prior-artifact-format.md` "
+        "does not document. Nothing round-trips differently, every existing "
+        "sidecar test still passes -- they assert the fields they care about, "
+        "never the field SET -- and the released artifact quietly grows a "
+        "field its own release documentation never mentions. This is "
+        "documentation rot in the direction it actually happens (the code "
+        "moves, the prose does not), and only a test that reads the document "
+        "against a real artifact can see it",
+        "test_the_artifact_documentation_matches_a_freshly_saved_artifact",
+        [
+            (
+                '        "nnz": int(tensor.values.nnz),',
+                '        "row_axis": "species_keys",\n'
+                '        "nnz": int(tensor.values.nnz),',
             )
         ],
     ),
