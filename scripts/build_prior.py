@@ -312,6 +312,26 @@ def estimate_over_full_grid(
     return pa.concat_tables(pieces)
 
 
+def species_axis(counts: pa.Table) -> list[int]:
+    """The SORTED species axis for the grid.
+
+    Sorted, and a named function rather than an inline set comprehension,
+    because the sort is load-bearing in a way that leaves no trace in the
+    artifact: `to_tensor` sorts the tensor's own axis, so an unsorted list
+    changes no stored value. What it changes is which species fall in which
+    `--species-chunk`, and a set's iteration order varies with the hash seed
+    and insertion history -- so the artifact would be reproducible only
+    within one interpreter run. A released dataset has to be reproducible
+    across them.
+    """
+    return sorted({int(k) for k in counts.column("species_key").to_pylist()})
+
+
+def cell_axis(counts: pa.Table) -> list[str]:
+    """The SORTED cell axis for the grid. Sorted for the same reason."""
+    return sorted({str(c) for c in counts.column("cell").to_pylist()})
+
+
 def build_from_archive(
     zip_path: Path,
     *,
@@ -359,8 +379,8 @@ def build_from_archive(
 
     counts = aggregate_counts(table)
     ratios = target_group_ratios(counts)
-    species = sorted({int(k) for k in counts.column("species_key").to_pylist()})
-    cells = sorted({str(c) for c in counts.column("cell").to_pylist()})
+    species = species_axis(counts)
+    cells = cell_axis(counts)
     log.info(
         "resolution %d: %d occurrences, %d species, %d cells -> %d grid "
         "contexts over %d weeks",

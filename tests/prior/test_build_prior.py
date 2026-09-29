@@ -31,8 +31,17 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "scripts"))
 
 from birdology.prior.backoff import FLOOR
-from birdology.prior.indexing import WEEKS_PER_YEAR
-from birdology.prior.leakage import GUARD_MARKER_KEY, XENO_CANTO_PUBLISHER_KEYS
+from birdology.prior.indexing import (
+    WEEKS_PER_YEAR,
+    aggregate_counts,
+    assign_cells,
+)
+from birdology.prior.leakage import (
+    GUARD_MARKER_KEY,
+    XENO_CANTO_PUBLISHER_KEYS,
+    mark_guards_applied,
+)
+from birdology.prior.occurrences import read_occurrences
 from birdology.prior.tensor import LICENCE, load_prior
 
 import build_prior
@@ -68,6 +77,26 @@ OBSERVED_WEEKS = (2, 24, 46)
 
 SPECIES = (1001, 1002)
 
+#: A THIRD species, present in exactly ONE (cell, week). It exists to make
+#: the fixture SPARSE in the species direction, and that is load-bearing
+#: rather than decoration.
+#:
+#: Measured: with every species present in every cell-week, restricting each
+#: backoff chunk's ratio table to its own species changes NOTHING -- the
+#: parent denominators are sums of `total` over cell-weeks, and every chunk
+#: sees the same cell-week key set, so the filtered and unfiltered tables
+#: give bit-identical output (max |diff| = 0). A chunk-scoping defect is
+#: therefore INVISIBLE on a dense fixture. Add one species that occupies a
+#: single cell-week and the same defect moves its value by 0.071: its chunk
+#: now sees one cell-week's worth of effort instead of the archive's.
+#:
+#: Real occurrence data is overwhelmingly of this shape -- most species are
+#: in a handful of cells -- so the dense fixture was the unrepresentative one.
+SPARSE_SPECIES = 1003
+SPARSE_WEEK_INDEX = 0
+SPARSE_POINT_INDEX = 0
+ALL_SPECIES = (*SPECIES, SPARSE_SPECIES)
+
 #: Records per (species, cell, week), indexed by week position. The two
 #: species are deliberately UNBALANCED and the balance CHANGES from week to
 #: week. An equal split would make every ratio exactly 0.5 at every level of
@@ -96,21 +125,32 @@ def _zip(tmp_path, rows, name="occ.zip"):
 
 
 def _archive(tmp_path, extra_rows=()):
-    """Two species x four cells x three weeks, with a WEEK-VARYING balance.
+    """Two dense species + one SPARSE one, over four cells and three weeks.
 
     The per-week species balance is what makes the hierarchy observable: with
     a constant balance every level of the backoff collapses to the same
     number and an estimated context is numerically indistinguishable from a
     copied cell profile.
+
+    `SPARSE_SPECIES` occupies exactly one (cell, week). See its comment: a
+    fixture in which every species is present in every cell-week makes a
+    whole class of chunk-scoping defects numerically invisible, because the
+    hierarchy's parent denominators depend on the cell-week key set rather
+    than on which species are present.
     """
     rows = []
     i = 0
     for wi, week_date in enumerate(DATES):
-        for lat, lon in POINTS:
+        for pi, (lat, lon) in enumerate(POINTS):
             for sk in SPECIES:
                 for _ in range(COUNTS_BY_WEEK[wi][sk]):
                     i += 1
                     rows.append(_row(i, sk, lat + i * 1e-7, lon, week_date))
+            if wi == SPARSE_WEEK_INDEX and pi == SPARSE_POINT_INDEX:
+                i += 1
+                rows.append(
+                    _row(i, SPARSE_SPECIES, lat + i * 1e-7, lon, week_date)
+                )
     rows.extend(extra_rows)
     return _zip(tmp_path, rows)
 
@@ -142,7 +182,7 @@ def test_full_prior_has_probabilities_for_seen_species(tmp_path):
     paths = _build(tmp_path)
     full = next(p for p in paths if load_prior(p).spec.variant == "full")
     t = load_prior(full)
-    assert set(t.species_keys.tolist()) == set(SPECIES)
+    assert set(t.species_keys.tolist()) == set(ALL_SPECIES)
     assert t.values.max() > 0.0
 
 
@@ -241,7 +281,7 @@ def test_every_context_of_the_grid_is_stored_not_merely_reachable(tmp_path):
     paths = _build(tmp_path)
     t = load_prior(next(p for p in paths if load_prior(p).spec.variant == "full"))
     assert t.values.nnz == t.dense_capacity
-    assert t.dense_capacity == len(SPECIES) * len(t.cells) * WEEKS_PER_YEAR
+    assert t.dense_capacity == len(ALL_SPECIES) * len(t.cells) * WEEKS_PER_YEAR
 
 
 def test_an_observed_week_and_an_unobserved_week_carry_DIFFERENT_values(tmp_path):
@@ -260,6 +300,37 @@ def test_an_observed_week_and_an_unobserved_week_carry_DIFFERENT_values(tmp_path
     assert observed > unobserved
 
 
+def test_the_fixture_is_sparse_in_species_not_just_in_time(tmp_path):
+    """PRECONDITION of `test_species_chunking_is_bit_exact`, asserted directly.
+
+    Not a proxy: it reads the built prior and checks that `SPARSE_SPECIES`
+    really does occupy ONE (cell, week) in the archive while the dense
+    species occupy all of them. If that ever stops holding, chunk-scoping
+    mutants go silently equivalent -- measured, not hypothesised -- and the
+    bit-exactness test would keep passing while proving nothing.
+    """
+    paths = _build(tmp_path)
+    t = load_prior(next(p for p in paths if load_prior(p).spec.variant == "full"))
+    assert set(t.species_keys.tolist()) == set(ALL_SPECIES)
+
+    # In the RATIO table the sparse species has exactly one row; the dense
+    # ones have one per (cell, week) they were observed in.
+    table = assign_cells(read_occurrences(_archive(tmp_path)), 4)
+    counts = aggregate_counts(mark_guards_applied(table))
+    rows = counts.to_pylist()
+    occupancy = {}
+    for row in rows:
+        occupancy.setdefault(row["species_key"], set()).add(
+            (row["cell"], row["week"])
+        )
+    assert len(occupancy[SPARSE_SPECIES]) == 1, (
+        "the sparse species must occupy exactly one cell-week, or the "
+        "chunk-scoping mutants become equivalent"
+    )
+    for sk in SPECIES:
+        assert len(occupancy[sk]) == len(POINTS) * len(DATES)
+
+
 def test_species_chunking_is_bit_exact(tmp_path):
     """Chunking bounds memory; it must not change a single value.
 
@@ -269,6 +340,12 @@ def test_species_chunking_is_bit_exact(tmp_path):
     kernel never blends across species. Asserted as EXACT equality rather
     than `approx`, because an approximation here would mean the claim is
     false and the artifact depends on an arbitrary batch size.
+
+    Requires a fixture that is SPARSE in the species direction --
+    `test_the_fixture_is_sparse_in_species_not_just_in_time` pins that. On a
+    dense fixture a chunk that scopes the ratio table to its own species is
+    bit-identical to one that does not (measured), so this test would pass on
+    the very defect it exists to catch.
     """
     paths_chunked = _build(
         tmp_path, species_chunk=1, out_dir=tmp_path / "chunked"
@@ -282,6 +359,43 @@ def test_species_chunking_is_bit_exact(tmp_path):
     assert a.cells == b.cells
     assert a.species_keys.tolist() == b.species_keys.tolist()
     assert np.array_equal(a.dense(), b.dense())
+
+
+def test_chunk_boundaries_are_deterministic_across_runs(tmp_path):
+    """The species axis handed to the backoff is SORTED, not set-ordered.
+
+    `to_tensor` sorts the tensor's own axis, so an unsorted species list
+    changes no stored value and no end-to-end comparison can see it. What it
+    changes is which species land in which CHUNK -- and a set's iteration
+    order depends on the hash seed and on insertion history. The artifact
+    would then be reproducible only within a single interpreter run, which is
+    not reproducibility at all for a released dataset.
+
+    Asserted on the function that derives the axis rather than on the tensor,
+    because the tensor is precisely where the evidence is destroyed.
+    """
+    table = assign_cells(read_occurrences(_archive(tmp_path)), 4)
+    counts = aggregate_counts(mark_guards_applied(table))
+    species = build_prior.species_axis(counts)
+    assert species == sorted(species)
+    assert species == sorted(set(ALL_SPECIES))
+    # Repeated derivation is identical, which a set comprehension would not
+    # guarantee across processes.
+    assert species == build_prior.species_axis(counts)
+
+
+def test_the_cell_axis_is_sorted_too(tmp_path):
+    """Its own test: two axes, two functions, two independent regressions.
+
+    A sorted species axis and a set-ordered cell axis is still not
+    reproducible across processes, and the cell axis is the one that reaches
+    thousands of entries at national scale.
+    """
+    table = assign_cells(read_occurrences(_archive(tmp_path)), 4)
+    counts = aggregate_counts(mark_guards_applied(table))
+    cells = build_prior.cell_axis(counts)
+    assert cells == sorted(cells)
+    assert len(cells) == len(POINTS)
 
 
 def test_a_species_chunk_below_one_is_rejected(tmp_path):
@@ -363,6 +477,37 @@ def test_the_full_week_grid_is_honoured_even_where_nothing_was_observed():
 # --------------------------------------------------------------------------
 # Provenance and licence.
 # --------------------------------------------------------------------------
+
+
+def test_the_week_axis_follows_WEEKS_PER_YEAR_not_a_literal_52(monkeypatch):
+    """The week stride has ONE definition, in `indexing`.
+
+    `WEEKS_PER_YEAR` is 52 today, so a hard-coded 52 produces identical
+    numbers and NO value-based test can see the difference. The property is
+    about provenance rather than value: the grid the build packs and the
+    stride the tensor indexes by must be the same symbol, so that changing
+    one changes both. A literal here would leave the build packing a 52-week
+    grid into a tensor indexed by something else -- columns silently off by
+    a whole year's worth of stride, with every value present and plausible.
+
+    Checked by REBINDING the symbol the script resolves at call time. That is
+    the only way to make today's coincidence stop being a coincidence.
+    """
+    monkeypatch.setattr(build_prior, "WEEKS_PER_YEAR", 8)
+    cell = "8a1fb46622dffff"
+    ratios = pa.table(
+        {
+            "species_key": pa.array([1], pa.int64()),
+            "cell": pa.array([cell], pa.string()),
+            "week": pa.array([5], pa.int8()),
+            "n": pa.array([1], pa.int64()),
+            "total": pa.array([1], pa.int64()),
+        }
+    )
+    out = estimate_over_full_grid(ratios, [1], [cell])
+    assert sorted(r["week"] for r in out.to_pylist()) == list(range(1, 9)), (
+        "the week grid did not follow WEEKS_PER_YEAR, so it is a literal"
+    )
 
 
 def test_an_empty_doi_refuses_to_write_anything(tmp_path):
@@ -717,9 +862,45 @@ def test_a_split_missing_a_column_is_rejected(tmp_path):
 
 
 def test_a_split_with_an_unparseable_week_is_rejected(tmp_path):
+    """A week that is not an integer at all."""
     path = _split_csv(tmp_path, [(55.0, 12.0, "week-two", "obs")])
     with pytest.raises(ValueError, match="unparseable week"):
         load_test_split(path)
+
+
+def test_a_FRACTIONAL_week_is_rejected_rather_than_truncated(tmp_path):
+    """Its OWN test, because it is a different disjunct from `week-two`.
+
+    `week-two` fails `int()` AND `int(float())` alike, so it cannot tell a
+    strict coercion from a truncating one. `24.7` distinguishes them: `int()`
+    raises, `int(float("24.7"))` silently yields 24.
+
+    Truncation is the dangerous branch. A fractional week means the split
+    carries a day-of-year, a fractional epoch, or a units bug -- and a
+    truncated one bans the WRONG (cell, week): occurrences that never leaked
+    are deleted from the prior while the ones that did leak stay in it. Both
+    halves silent, and the artifact still builds.
+    """
+    path = _split_csv(tmp_path, [(55.0, 12.0, "24.7", "obs")])
+    with pytest.raises(ValueError, match="unparseable week"):
+        load_test_split(path)
+    # The truncating alternative WOULD have accepted it, which is what makes
+    # this fixture discriminating rather than a duplicate of the one above.
+    assert int(float("24.7")) == 24
+
+
+def test_a_week_outside_1_to_WEEKS_PER_YEAR_is_rejected(tmp_path):
+    """Week 0 and week 53 are integers, and both are outside the grid.
+
+    Rejected by `TestRecording`, not by `load_test_split` -- the split loader
+    parses, the dataclass validates the range -- so this asserts the
+    composition rather than either half, which is what the build actually
+    relies on.
+    """
+    for bad in (0, WEEKS_PER_YEAR + 1):
+        split = load_test_split(_split_csv(tmp_path, [(55.0, 12.0, bad, "obs")]))
+        with pytest.raises(ValueError, match="week"):
+            recordings_at_resolution(split, 4)
 
 
 def test_a_split_with_unparseable_coordinates_is_rejected(tmp_path):
@@ -791,7 +972,7 @@ def test_a_xeno_canto_record_never_reaches_the_prior(tmp_path):
     paths = _build(tmp_path, archive=archive)
     t = load_prior(next(p for p in paths if "full" in p.name))
     assert 7777 not in t.species_keys.tolist()
-    assert set(t.species_keys.tolist()) == set(SPECIES)
+    assert set(t.species_keys.tolist()) == set(ALL_SPECIES)
 
 
 # --------------------------------------------------------------------------

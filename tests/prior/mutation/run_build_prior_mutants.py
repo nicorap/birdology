@@ -107,12 +107,23 @@ REPO = Path(__file__).resolve().parents[3]
 TARGET = Path("scripts/build_prior.py")
 TESTS = "tests/prior/test_build_prior.py"
 
-# (id, description, killer_test, [(old, new), ...])
+# (id, description, killer_test, [(old, new), ...], optional target path)
 #
 # `killer_test` is the test whose failure DEMONSTRATES the mutant is caught.
 # It is verified at runtime: a mutant that fails only other tests is reported
 # MISLABELLED rather than counted as a kill.
-MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
+#
+# The optional FIFTH element names the file the edit applies to; it defaults
+# to `TARGET`. Almost every mutant edits the build script. One (B3b) edits the
+# TEST file instead, to prove that a FIXTURE property is load-bearing: B3's
+# chunk-scoping edit is EQUIVALENT on a fixture where every species occupies
+# every cell-week, so the fixture's sparsity is part of what makes the suite
+# able to catch B3 at all. A fixture weakness is a coverage defect exactly as
+# a missing assertion is, and this is the only way to score one.
+Mutant = tuple[str, str, str, list[tuple[str, str]]] | tuple[
+    str, str, str, list[tuple[str, str]], Path
+]
+MUTANTS: list[Mutant] = [
     # ---- T10-R1: the full 52-week grid, passed explicitly ----------------
     (
         "B1",
@@ -135,7 +146,7 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         "the form a 'documented window' would take if it were ever adopted "
         "WITHOUT being stated in the sidecar. T10-R1 permits a window only if "
         "the artifact declares it, so an undeclared one must die",
-        "test_the_full_prior_spans_every_week_of_the_year",
+        "test_every_context_of_the_grid_is_stored_not_merely_reachable",
         [
             (
                 "    weeks = list(range(1, WEEKS_PER_YEAR + 1))",
@@ -146,19 +157,17 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
     (
         "B1c",
         "`WEEKS_PER_YEAR` replaced by a hard-coded 52 in the week grid. The "
-        "NUMBER is identical today, so no value changes and no end-to-end "
-        "test can see it -- which is why the killer is the function-level "
-        "grid test and why this mutant exists at all: the plan's rule is that "
-        "the week stride has ONE definition, in `indexing`, so that a change "
-        "to it propagates everywhere rather than leaving the build script "
-        "silently packing a different grid from the one the tensor indexes",
-        "test_the_full_week_grid_is_honoured_even_where_nothing_was_observed",
+        "NUMBER is identical today, so no value changes and NO value-based "
+        "test can see it -- which is why the killer rebinds the symbol rather "
+        "than comparing numbers. The plan's rule is that the week stride has "
+        "ONE definition, in `indexing`, so a change to it propagates rather "
+        "than leaving the build packing a 52-week grid into a tensor indexed "
+        "by a different stride",
+        "test_the_week_axis_follows_WEEKS_PER_YEAR_not_a_literal_52",
         [
             (
                 "    weeks = list(range(1, WEEKS_PER_YEAR + 1))",
-                "    weeks = list(range(1, 52 + 1))\n"
-                "    if WEEKS_PER_YEAR != 52:\n"
-                "        weeks = list(range(1, 53))",
+                "    weeks = list(range(1, 52 + 1))",
             )
         ],
     ),
@@ -202,6 +211,25 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
                 "                ordered[start : start + species_chunk],",
             )
         ],
+    ),
+    (
+        "B3b",
+        "the SPARSE species removed from the fixture -- a mutation of the TEST "
+        "rather than the target, applied here so the harness records why the "
+        "fixture is shaped as it is. Measured: with every species present in "
+        "every cell-week, B3's chunk-scoping edit changes nothing at all "
+        "(max |diff| = 0), because the hierarchy's parent denominators sum "
+        "`total` over cell-weeks and every chunk then sees the same key set. "
+        "With one species in one cell-week the same edit moves its value by "
+        "0.071. The fixture's sparsity is what makes B3 non-equivalent",
+        "test_the_fixture_is_sparse_in_species_not_just_in_time",
+        [
+            (
+                "            if wi == SPARSE_WEEK_INDEX and pi == SPARSE_POINT_INDEX:",
+                "            if True:",
+            )
+        ],
+        Path(TESTS),
     ),
     (
         "B4",
@@ -523,7 +551,7 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         "resolution of a sweep fails on the first's warning. A cross-artifact "
         "contamination that only appears when more than one build runs in one "
         "process -- which is exactly what a `--resolutions 3 4 5` sweep does",
-        "test_a_sweep_with_a_split_succeeds_at_every_resolution",
+        "test_a_split_that_DOES_match_removes_rows_and_builds",
         [
             (
                 "        logging.getLogger(\"birdology.prior.leakage\").removeHandler(detector)",
@@ -570,7 +598,7 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         "TRUNCATED to a neighbouring week instead of being rejected. The "
         "guard then bans the WRONG cell-week: real occurrences are deleted "
         "and the leaking ones survive, both silently",
-        "test_a_split_with_an_unparseable_week_is_rejected",
+        "test_a_FRACTIONAL_week_is_rejected_rather_than_truncated",
         [
             (
                 '                week = int(str(row["week"]).strip())',
@@ -634,11 +662,27 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         "BOUNDARIES become nondeterministic run to run. Bit-exactness across "
         "chunk sizes is what makes chunking legitimate, so a mutant that "
         "makes chunking order-dependent must die",
-        "test_species_chunking_is_bit_exact",
+        "test_chunk_boundaries_are_deterministic_across_runs",
         [
             (
-                '    species = sorted({int(k) for k in counts.column("species_key").to_pylist()})',
-                '    species = list({int(k) for k in counts.column("species_key").to_pylist()})[::-1]',
+                '    return sorted({int(k) for k in counts.column("species_key").to_pylist()})',
+                '    return list({int(k) for k in counts.column("species_key").to_pylist()})[::-1]',
+            )
+        ],
+    ),
+    (
+        "B43",
+        "the CELL axis unsorted, by the same edit on `cell_axis`. Its own "
+        "mutant because the two axes are derived by two functions and a fix "
+        "to one does not touch the other: a build with a sorted species axis "
+        "and a set-ordered cell axis is still not reproducible across "
+        "processes, and the cell axis is the one that grows to thousands of "
+        "entries at national scale",
+        "test_the_cell_axis_is_sorted_too",
+        [
+            (
+                '    return sorted({str(c) for c in counts.column("cell").to_pylist()})',
+                '    return list({str(c) for c in counts.column("cell").to_pylist()})[::-1]',
             )
         ],
     ),
@@ -656,14 +700,15 @@ def _git(*args: str) -> str:
     ).stdout
 
 
-def _require_clean() -> None:
+def _require_clean(paths: set[Path]) -> None:
+    tracked = {str(p) for p in paths}
     dirty = [
         line
         for line in _git("status", "--porcelain").splitlines()
-        if line[3:].strip() == str(TARGET)
+        if line[3:].strip() in tracked
     ]
     if dirty:
-        sys.exit(f"refusing to run: {TARGET} is dirty ({dirty!r}); commit or restore it")
+        sys.exit(f"refusing to run: {dirty!r} is dirty; commit or restore it")
 
 
 def _run_tests() -> tuple[int, str, set[str]]:
@@ -702,10 +747,10 @@ _CRASH_TYPES = (
 )
 
 
-def _crash_in_target(out: str) -> str | None:
+def _crash_in_target(out: str, target: Path) -> str | None:
     """The crash type, if the output shows one raised FROM THE TARGET MODULE.
 
-    Scoped to the target file on purpose. A mutant is entitled to make a TEST
+    Scoped to the mutated file on purpose. A mutant is entitled to make a TEST
     raise `AttributeError` -- for instance one that removes a function a test
     calls, where that IS the behaviour under test. What is never legitimate is
     the mutated module failing to load or to resolve its own names, and that is
@@ -713,12 +758,12 @@ def _crash_in_target(out: str) -> str | None:
     """
     for crash in _CRASH_TYPES:
         # pytest's one-line traceback summary: "<path>:<line>: <ErrorType>".
-        if re.search(rf"^{re.escape(str(TARGET))}:\d+: {crash}$", out, re.MULTILINE):
+        if re.search(rf"^{re.escape(str(target))}:\d+: {crash}$", out, re.MULTILINE):
             return crash
         # A module that does not even import reports the error without a
         # "path:line:" prefix of its own, but names the file in the frame.
         if re.search(
-            rf'File "[^"]*{re.escape(TARGET.name)}".*\n(?:.*\n)??\s*{crash}:',
+            rf'File "[^"]*{re.escape(target.name)}".*\n(?:.*\n)??\s*{crash}:',
             out,
         ):
             return crash
@@ -745,15 +790,24 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    source = (REPO / TARGET).read_text()
+    # Every file any mutant touches, read ONCE up front. The restore check
+    # compares against these bytes, so a mutant can never be left behind.
+    targets = {m[4] if len(m) > 4 else TARGET for m in MUTANTS}
+    sources = {path: (REPO / path).read_text() for path in targets}
     test_source = (REPO / TESTS).read_text()
     selected = [m for m in MUTANTS if args.only is None or m[0] in args.only]
 
     if args.verify_labels:
         bad = []
-        for mid, description, killer, edits in selected:
+        for mutant in selected:
+            mid, description, killer, edits = mutant[:4]
+            target = mutant[4] if len(mutant) > 4 else TARGET
+            source = sources[target]
             mutated = _apply(source, edits)
-            print(f"\n{'=' * 72}\n{mid}: {description}\n  killer: {killer}\n{'=' * 72}")
+            print(
+                f"\n{'=' * 72}\n{mid} [{target}]: {description}\n"
+                f"  killer: {killer}\n{'=' * 72}"
+            )
             if mutated is None:
                 print("  !! NOT APPLICABLE: a pattern does not occur exactly once")
                 bad.append(mid)
@@ -775,7 +829,7 @@ def main() -> int:
         print(f"\nunapplicable/mislabelled: {bad or 'none'}")
         return 1 if bad else 0
 
-    _require_clean()
+    _require_clean(targets)
 
     _clear_pycache()
     baseline, out, _ = _run_tests()
@@ -790,7 +844,11 @@ def main() -> int:
     mislabelled: list[str] = []
     crashed: list[str] = []
 
-    for mid, description, killer, edits in selected:
+    for mutant in selected:
+        mid, description, killer, edits = mutant[:4]
+        target = mutant[4] if len(mutant) > 4 else TARGET
+        source = sources[target]
+
         if f"def {killer}(" not in test_source:
             print(f"{mid}: MISLABELLED — killer test {killer!r} does not exist")
             rows.append((mid, description, "MISLABELLED"))
@@ -805,16 +863,16 @@ def main() -> int:
             not_applied.append(mid)
             continue
 
-        (REPO / TARGET).write_text(mutated)
+        (REPO / target).write_text(mutated)
         _clear_pycache()
         try:
             failures, out, failed_names = _run_tests()
         finally:
-            _git("checkout", "--", str(TARGET))
+            _git("checkout", "--", str(target))
             _clear_pycache()
-            assert (REPO / TARGET).read_text() == source, "restore failed"
+            assert (REPO / target).read_text() == source, "restore failed"
 
-        crash = _crash_in_target(out)
+        crash = _crash_in_target(out, target)
         if crash is not None:
             # NOT a kill, whatever the failure count says. The edit broke the
             # module instead of changing its behaviour, so it exercises no
@@ -837,7 +895,7 @@ def main() -> int:
         print(f"{mid}: {verdict:>10}  {description[:70]}")
         rows.append((mid, description, verdict))
 
-    _require_clean()
+    _require_clean(targets)
     _clear_pycache()
     final, out, _ = _run_tests()
     _clear_pycache()
