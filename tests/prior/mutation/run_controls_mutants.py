@@ -750,7 +750,7 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         "reviewer is guaranteed to demand is never run by a sweep that "
         "iterates `CONTROLS`. The function still exists and still passes its "
         "own tests",
-        "test_controls_registry_covers_all_four",
+        "test_controls_registry_covers_all_five",
         [
             (
                 '    "marginal": marginal_prior,\n',
