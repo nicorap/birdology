@@ -1629,7 +1629,7 @@ Create `tests/prior/test_tensor.py`:
 > This is correct behaviour for this stage — it cannot invent a probability for a
 > grid point it was never handed — but it means **the caller must supply a dense
 > grid over all 52 weeks**. State it in the module docstring. Task 10 carries the
-> matching obligation (T10-R1); the two must be read together.
+> matching obligation (T10-R1, rewritten after the T8-R5 reversal); read both.
 
 ```python
 """Sparse prior tensor, round-tripped through disk."""
@@ -2188,20 +2188,43 @@ The marginal-frequency control is the one a reviewer will demand."
 > of its own obligations, and the mechanism the acceptance criterion recommends does
 > not work as described. All verified by execution.**
 >
-> **T10-R1 — `build_from_archive` must pass the full 52-week grid to
-> `hierarchical_estimate`, and the observed cells explicitly.** The code below calls
-> `hierarchical_estimate(ratios, species)` with no `weeks=`. The backoff's documented
-> default is "the observed axes", so on the plan's own end-to-end fixture the grid
-> comes out as **3 weeks, not 52** (measured: weeks [2, 24, 46], 6 rows instead of
-> 104). Every unobserved week then never reaches `to_tensor`, becomes a **structural
-> zero** in the CSR matrix, and `lookup` returns a hard `0.0` for it — not the floor
-> (see T8-R5). That is precisely the "prior vetoes a correct detection" outcome the
-> floor exists to prevent, arriving by a different route, and it is silent: the
-> artifact is well-formed, every stored value is right, and only the absent columns
-> are wrong. On the real data nearly every cell-week is unobserved, so this is the
-> normal case, not an edge case. Pass `weeks=list(range(1, WEEKS_PER_YEAR + 1))` and
-> `cells=<the observed cells>`, and assert in the test that the full prior's tensor
-> has exactly `n_cells * 52` columns with no structural zero among them.
+> **T10-R1 — `build_from_archive` must pass the observed cells AND the full 52-week
+> grid to `hierarchical_estimate` explicitly. The REASON changed on 2026-09-29; the
+> instruction did not.** The code below calls `hierarchical_estimate(ratios, species)`
+> with no `weeks=`. The backoff's documented default is "the observed axes", so on the
+> plan's own end-to-end fixture the grid comes out as **3 weeks, not 52** (measured:
+> weeks [2, 24, 46], 6 rows instead of 104).
+>
+> **What this used to mean, and no longer does.** Under the original T8-R5 an absent
+> context was a structural zero and `lookup` returned a hard `0.0`, so a collapsed grid
+> silently vetoed correct detections. **T8-R5 was REVERSED** (see the ledger): an
+> unstored context on both axes now returns `backoff.FLOOR`, and there are no structural
+> zeros anywhere. The veto is gone, and the old justification for this ruling with it.
+> Do not repeat the structural-zero argument — it describes code that no longer exists.
+>
+> **Why the instruction still stands.** A week the backoff never saw reads as a bare
+> `FLOOR`. A week the backoff *did* see, but with no occurrences, gets a **shrunk
+> estimate** — the cell's annual profile pulled toward the species' global profile,
+> which is the entire point of the hierarchy. Those are different numbers, and the
+> second is the one the paper claims to publish. Omitting `weeks=` silently downgrades
+> ~98% of the artifact from "estimated" to "no evidence", and the failure is invisible:
+> every stored value is right, the artifact is well-formed, and only its coverage is
+> impoverished. So pass `weeks=list(range(1, WEEKS_PER_YEAR + 1))` and
+> `cells=<the observed cells>`.
+>
+> **The cost, which is now real and must be measured, not assumed.** Because
+> `_validate_p` forbids `p <= 0`, every estimated context is an explicit nonzero. A full
+> 52-week grid over the observed cells therefore materialises `n_species * n_cells * 52`
+> stored entries. At Danish national scale (~600 species, ~3000 cells) that is 9.36e7
+> entries, ~1.1 GB of CSR — and Task 9's controls call `t.dense()`, which materialises
+> ~750 MB per control on top. **Measure peak RSS on the real build before assuming this
+> fits.** If it does not, the honest resolutions are (a) build per-species or per-cell
+> in chunks, or (b) restrict the week grid to a documented window, stated in the sidecar
+> — NOT to silently fall back to the observed axes, which reintroduces the defect this
+> ruling exists to prevent. Assert in the test that the full prior's tensor has exactly
+> `n_cells * 52` columns, and that a context in an unobserved week reads a value
+> **strictly greater than `FLOOR`** (i.e. genuinely estimated, not defaulted) — that is
+> the assertion the old structural-zero check should become.
 >
 > **T10-R2 — Arrow schema metadata does NOT survive `group_by().aggregate()`, so the
 > acceptance criterion's "have `aggregate_counts` propagate it" cannot mean "it is
