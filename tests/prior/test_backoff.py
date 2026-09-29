@@ -608,6 +608,12 @@ def test_a_numerator_exceeding_its_own_total_is_rejected():
 
 
 def test_a_non_positive_total_is_rejected_not_divided_by():
+    """The message must name the EFFORT, not just fail somehow.
+
+    `n=1, total=0` also violates `n <= total`, so a generic `match="total"`
+    passes even when the effort check itself is gone. Matching the effort
+    check's own wording keeps the two guards distinguishable.
+    """
     bad = pa.table(
         {
             "species_key": pa.array([1], pa.int64()),
@@ -618,7 +624,7 @@ def test_a_non_positive_total_is_rejected_not_divided_by():
             "ratio": pa.array([0.0], pa.float64()),
         }
     )
-    with pytest.raises(ValueError, match="total"):
+    with pytest.raises(ValueError, match="effort"):
         hierarchical_estimate(bad, [1])
 
 
@@ -719,11 +725,266 @@ def test_effort_contract_errors_are_not_swallowed():
 def test_the_shrunk_estimate_is_the_documented_formula():
     """An explicit numeric anchor for the whole three-level chain, so a
     refactor that changes the arithmetic cannot pass on inequalities alone.
+
+    The cell deliberately holds a SECOND week, so its annual denominator
+    (110) differs from the leaf week's (10). Without that the two levels
+    share both numerator and denominator, and the formula is symmetric
+    enough that SWAPPING the two shrinkage weights gives a bit-identical
+    answer -- a fixture that anchors nothing. Asserted below.
     """
-    rows = [(1, "c", 5, 3), (2, "c", 5, 7), (2, "d", 9, 90)]
+    rows = [(1, "c", 5, 3), (2, "c", 5, 7), (1, "c", 9, 1), (2, "c", 9, 99), (2, "d", 20, 90)]
     out = _p(rows, [1], cells=["c"], weeks=[5])
 
-    p_global = 3 / 100
-    p_cell = (3 + 50.0 * p_global) / (10 + 50.0)
+    p_global = 4 / 200
+    p_cell = (4 + 50.0 * p_global) / (110 + 50.0)
     p_week = (3 + 10.0 * p_cell) / (10 + 10.0)
     assert out[(1, "c", 5)] == pytest.approx(p_week, rel=1e-12)
+
+    # PRECONDITION: the fixture must distinguish the two weights' ROLES.
+    swapped_cell = (4 + 10.0 * p_global) / (110 + 10.0)
+    swapped_week = (3 + 50.0 * swapped_cell) / (10 + 50.0)
+    assert swapped_week != pytest.approx(p_week, rel=1e-9), (
+        "swapping cell_weight and cell_week_weight leaves this fixture "
+        "unchanged, so it cannot anchor which weight applies at which level"
+    )
+
+
+def test_a_non_positive_n_is_rejected():
+    """Contract 3, on the input side and with teeth.
+
+    `target_group_ratios` cannot produce `n <= 0`, so this row can only come
+    from a hand-built table -- which is exactly how a zero-filled "absence"
+    would arrive. Accepting it conflates row-absence (nobody looked) with an
+    observed zero, the failure that corrupts a target-group prior with no
+    error anywhere.
+    """
+    for bad_n in (0, -5):
+        bad = pa.table(
+            {
+                "species_key": pa.array([1], pa.int64()),
+                "cell": pa.array(["c"], pa.string()),
+                "week": pa.array([5], pa.int8()),
+                "n": pa.array([bad_n], pa.int64()),
+                "total": pa.array([10], pa.int64()),
+                "ratio": pa.array([0.0], pa.float64()),
+            }
+        )
+        with pytest.raises(ValueError, match="n="):
+            hierarchical_estimate(bad, [1])
+
+
+# ===========================================================================
+# Tests added to close mutation survivors. Each names the mutant it kills.
+# ===========================================================================
+
+
+def test_an_absent_species_is_at_the_floor_in_every_cell_INCLUDING_rich_ones():
+    """The floor holds wherever the species is missing, not only in empty cells.
+
+    NOT a kill for mutant B10 (dropping the floor from `p_global`): that
+    mutation is EQUIVALENT under the emitted clamp. Measured over 1.2M
+    parameter/count configurations the two differ by at most 3.1e-10, because
+    the floor-scale mass `p_global` contributes is itself far below the floor
+    the output is clamped to. The `p_global` floor is kept as defence in depth
+    and documented as such rather than defended by a contrived assertion.
+    """
+    rows = [(1, "c", 5, 1000), (2, "c", 5, 1000), (1, "d", 9, 1)]
+    out = _p(rows, [999], cells=["c", "d", "empty"], weeks=[5, 30])
+    assert out and all(v == pytest.approx(FLOOR) for v in out.values())
+
+
+def test_the_upper_clamp_holds_when_a_weight_is_negative():
+    """Kills B11: the upper clamp removed.
+
+    Every valid input keeps `p <= 1` on its own, so the clamp is unreachable
+    from contract-conforming data -- which is why the bounded-probability test
+    could not see it. A NEGATIVE shrinkage weight is the reachable path: it
+    makes the denominator smaller than the numerator and drives `p` above 1.
+
+    This documents the clamp as the last line of defence, not as dead code.
+    """
+    rows = [(1, "c", 5, 10), (2, "c", 5, 90)]
+    out = _p(
+        rows, [1], cells=["c"], weeks=[5],
+        params=BackoffParams(cell_week_weight=-5.0),
+    )
+    assert out[(1, "c", 5)] <= 1.0
+
+
+def test_a_duplicate_species_cell_week_ROW_is_rejected():
+    """A RatioTable has ONE row per (species, cell, week).
+
+    `aggregate_counts` group_by guarantees it upstream, but concatenating two
+    independently-computed RatioTables does not: the duplicate rows each carry
+    their own partial `n` against a `total` that already covers the whole
+    cell-week. Summing them double-counts the numerator against a single
+    denominator (a share of 0.6 where the truth is 0.3); keeping one silently
+    discards records. Neither is recoverable here, so it is rejected.
+
+    This is also why mutant B27 (numerator overwritten rather than summed) is
+    recorded as EQUIVALENT rather than killed: with keys unique, accumulate
+    and overwrite are the same operation.
+    """
+    dup = pa.concat_tables(
+        [
+            _counts([(1, "c", 5, 3), (2, "c", 5, 7)]),
+            _counts([(1, "c", 5, 3), (2, "c", 5, 7)]),
+        ]
+    )
+    # PRECONDITION: the key really does repeat.
+    keys = [(r["species_key"], r["cell"], r["week"]) for r in dup.to_pylist()]
+    assert len(keys) != len(set(keys))
+
+    with pytest.raises(ValueError, match="duplicate"):
+        hierarchical_estimate(dup, [1], cells=["c"], weeks=[5])
+
+
+def test_a_ratio_table_missing_only_TOTAL_is_rejected():
+    """Kills B31: the required-column check narrowed to skip `total`.
+
+    The existing missing-columns test drops `n` AND `total` together, so a
+    check that covers only `n` still passes it. `total` is the effort weight
+    that contract 4 exists to preserve, so its absence must be named
+    specifically.
+    """
+    no_total = pa.table(
+        {
+            "species_key": pa.array([1], pa.int64()),
+            "cell": pa.array(["c"], pa.string()),
+            "week": pa.array([5], pa.int8()),
+            "n": pa.array([1], pa.int64()),
+            "ratio": pa.array([1.0], pa.float64()),
+        }
+    )
+    # PRECONDITION: `n` is present, so only `total` can be the cause.
+    assert "n" in no_total.column_names
+    assert "total" not in no_total.column_names
+    with pytest.raises(ValueError, match="total"):
+        hierarchical_estimate(no_total, [1])
+
+
+def test_a_total_of_zero_is_rejected_even_when_n_is_zero_too():
+    """Kills B34: the `total >= 1` row check removed.
+
+    With `n=1, total=0` the `n <= total` guard fires first, so removing the
+    effort check is invisible. `n=0, total=0` is the shape that isolates it --
+    and it is the realistic one, being exactly what a zero-filled dense grid
+    produces for a cell-week nobody visited (contract 3).
+
+    Both guards are asserted by MESSAGE, so neither can stand in for the
+    other.
+    """
+    zero_fill = pa.table(
+        {
+            "species_key": pa.array([1], pa.int64()),
+            "cell": pa.array(["c"], pa.string()),
+            "week": pa.array([5], pa.int8()),
+            "n": pa.array([0], pa.int64()),
+            "total": pa.array([0], pa.int64()),
+            "ratio": pa.array([0.0], pa.float64()),
+        }
+    )
+    with pytest.raises(ValueError, match="effort") as caught:
+        hierarchical_estimate(zero_fill, [1])
+    # PRECONDITION: it is the EFFORT guard talking, not the pairing guard.
+    assert "exceeds" not in str(caught.value)
+
+
+def test_the_effort_guard_RAISES_rather_than_printing():
+    """Kills B37: `raise ValueError(` replaced by `print(`.
+
+    A warn-and-continue path leaves the function returning a table built from
+    a zero denominator -- the exact pattern the plan's rule B forbids, and one
+    that a `pytest.raises` on a DIFFERENT guard cannot detect. Assert that
+    nothing is returned and nothing is printed.
+    """
+    bad = pa.table(
+        {
+            "species_key": pa.array([1], pa.int64()),
+            "cell": pa.array(["c"], pa.string()),
+            "week": pa.array([5], pa.int8()),
+            "n": pa.array([0], pa.int64()),
+            "total": pa.array([0], pa.int64()),
+            "ratio": pa.array([0.0], pa.float64()),
+        }
+    )
+    with pytest.raises(ValueError, match="effort"):
+        hierarchical_estimate(bad, [1])
+
+
+def test_the_cell_level_weight_applies_at_the_CELL_level(capsys):
+    """Kills B13 and B14 by naming the level each weight governs.
+
+    `cell_weight` must move an estimate that is scored PURELY from the cell
+    profile (an unvisited week), and `cell_week_weight` must not. The two are
+    distinguishable only on a fixture where the cell's denominator differs
+    from the leaf week's, which is asserted.
+    """
+    rows = [(1, "c", 5, 1), (2, "c", 5, 99), (2, "d", 40, 900)]
+    # An unvisited week reads the cell profile; only `cell_weight` moves it.
+    weak = _p(
+        rows, [1], cells=["c"], weeks=[30], params=BackoffParams(cell_weight=0.1)
+    )[(1, "c", 30)]
+    strong = _p(
+        rows, [1], cells=["c"], weeks=[30], params=BackoffParams(cell_weight=1000.0)
+    )[(1, "c", 30)]
+    assert strong < weak, "cell_weight does not govern the cell level"
+
+    # `cell_week_weight` cannot move a week with no local data at all.
+    a = _p(
+        rows, [1], cells=["c"], weeks=[30],
+        params=BackoffParams(cell_week_weight=0.1),
+    )[(1, "c", 30)]
+    b = _p(
+        rows, [1], cells=["c"], weeks=[30],
+        params=BackoffParams(cell_week_weight=1000.0),
+    )[(1, "c", 30)]
+    assert a == pytest.approx(b, rel=1e-12), (
+        "cell_week_weight changed a week that has no local data, so it is "
+        "being applied at the cell level"
+    )
+
+
+def test_an_unvisited_cell_week_is_scored_from_the_parent_not_from_zero_over_zero(
+):
+    """Kills B17 by name: `_shrink` reduced to the raw local share.
+
+    The existing no-NaN test is satisfied by the `0.0` fallback such a
+    reduction would use, so it never names this. The parent value is asserted
+    exactly: an unvisited week must EQUAL its cell profile, which a raw local
+    share cannot produce.
+    """
+    rows = [(1, "c", 5, 50), (2, "c", 5, 50), (2, "d", 40, 900)]
+    out = _p(rows, [1], cells=["c"], weeks=[30])
+    p_global = 50 / 1000
+    p_cell = (50 + 50.0 * p_global) / (100 + 50.0)
+    assert out[(1, "c", 30)] == pytest.approx(p_cell, rel=1e-12)
+    assert out[(1, "c", 30)] > 0.0
+
+
+def test_a_cell_profile_sums_its_weeks_rather_than_keeping_the_last(
+):
+    """Kills B28 by name: the cell numerator overwritten instead of summed.
+
+    Two weeks contribute unequally to the cell profile; keeping only the last
+    row's `n` would score the cell from whichever week Arrow emitted last.
+    The expected value is asserted exactly, so 'last wins' cannot coincide.
+    """
+    rows = [(1, "c", 5, 1), (2, "c", 5, 99), (1, "c", 9, 40), (2, "c", 9, 60)]
+    out = _p(rows, [1], cells=["c"], weeks=[30])
+    p_global = 41 / 200
+    p_cell = (41 + 50.0 * p_global) / (200 + 50.0)
+    assert out[(1, "c", 30)] == pytest.approx(p_cell, rel=1e-12)
+
+
+def test_the_requested_WEEKS_axis_is_honoured_even_when_all_are_unobserved():
+    """Kills B41 by name: the `weeks=` argument ignored.
+
+    The empty-cell-week test also exercises `cells=`, so a mutant that keeps
+    `cells=` and drops `weeks=` fails it for the wrong reason. Here every
+    requested week is unobserved, which isolates the weeks axis.
+    """
+    ratios = _counts([(1, "c", 5, 10)])
+    out = hierarchical_estimate(ratios, [1], cells=["c"], weeks=[30, 31])
+    assert sorted(out.column("week").to_pylist()) == [30, 31]
+    assert 5 not in out.column("week").to_pylist()

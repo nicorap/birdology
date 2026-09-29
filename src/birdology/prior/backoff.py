@@ -227,9 +227,17 @@ def hierarchical_estimate(
             )
         cell_week_total[key] = total
 
-        cell_week_species[(sk, cell, week)] = (
-            cell_week_species.get((sk, cell, week), 0.0) + n
-        )
+        row_key = (sk, cell, week)
+        if row_key in cell_week_species:
+            raise ValueError(
+                f"RatioTable has a duplicate row for {row_key!r}; a RatioTable "
+                "holds one row per (species, cell, week). Duplicates arrive by "
+                "concatenating two independently-computed tables, where each "
+                "copy's partial `n` is paired with a `total` that already "
+                "covers the whole cell-week -- summing them double-counts the "
+                "numerator and keeping one discards records"
+            )
+        cell_week_species[row_key] = float(n)
         cell_species[(sk, cell)] = cell_species.get((sk, cell), 0.0) + n
         global_species[sk] = global_species.get(sk, 0.0) + n
 
