@@ -21,10 +21,42 @@ defect this plan has found most often.
 
 Beside the `.npz` sits a JSON sidecar carrying the spec, the species and cell
 axes, the value a missing context takes, the fill (`nnz` against the dense
-capacity), the GBIF download DOI and the licence. The sidecar is what makes
-the release citable: the matrix alone cannot say which species a row is, which
-grid it was cut on, what an absent entry means, or under what terms it may be
+capacity), the SHRINKAGE AND SMOOTHING PARAMETERS, the GBIF download DOI and
+the licence. The sidecar is what makes the release citable: the matrix alone
+cannot say which species a row is, which grid it was cut on, what an absent
+entry means, how hard it was smoothed, or under what terms it may be
 redistributed.
+
+THE ARTIFACT RECORDS ITS OWN SMOOTHING (I2)
+-------------------------------------------
+`backoff_params` and `smoothing_params` are in the sidecar because THE
+CONSTANTS DECIDE THE EFFECT SIZE. Measured through `build_from_archive` on a
+149 795-record synthetic archive with a known seasonal signal, the fraction of
+true weekly amplitude that survives into the artifact falls 0.462 -> 0.317 ->
+0.161 -> 0.073 across H3 resolutions 3/4/5/6 at the defaults -- and rises to
+0.826 at `cell_week_weight=0.5` on the same res-4 data. A consumer holding a
+res-5 `.npz` and no record of the shrinkage cannot tell an artifact that
+retains a sixth of the real seasonal amplitude from one that retains all of
+it, because both are well-formed, in range, and correct in phase. The numbers
+are in `BackoffParams` and `SmoothingParams`.
+
+BOTH ARE `None`-ABLE AND NEITHER IS DEFAULTED ON READ
+-----------------------------------------------------
+A hand-built `PriorTensor` legitimately has no parameters to declare -- it did
+not come out of the backoff. So the fields are `None` by default and the
+sidecar carries an explicit JSON `null` for them, which says "this artifact
+does not record its shrinkage".
+
+`load_prior` distinguishes that from a sidecar in which the KEY IS ABSENT,
+which it REFUSES. The two are different claims: `null` is an artifact stating
+it has no record, an absent key is a sidecar that cannot be asked. Defaulting
+an absent key to `None` would silently convert every sidecar written by a
+different or older writer into an artifact claiming to have made the
+declaration -- the silent repair at a boundary this module forbids everywhere
+else. A recorded params object whose FIELDS do not match this build's
+dataclass is refused for the same reason: a missing `cell_week_weight` cannot
+be filled in from the current default, because the current default is exactly
+the thing the record exists to make non-default-able.
 
 `docs/prior-artifact-format.md` is the SAME format written for someone who has
 downloaded the files and is not reading this module: the layout, the field
@@ -88,17 +120,33 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field
+from dataclasses import fields as dc_fields
 from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
 from scipy import sparse
 
-from .backoff import FLOOR
+from .backoff import FLOOR, BackoffParams
 from .indexing import WEEKS_PER_YEAR
+from .smoothing import SmoothingParams
 
 LICENCE = "CC BY 4.0"
 LICENCE_URL = "https://creativecommons.org/licenses/by/4.0/"
+
+#: The sidecar keys recording how the artifact was shrunk and smoothed, each
+#: paired with the dataclass whose fields it must carry EXACTLY.
+#:
+#: Derived from the dataclasses with `dataclasses.fields`, never spelled as a
+#: literal tuple of names. A hand-written list drifts the moment a parameter is
+#: added: the new field would be written by `save_prior` (which uses `asdict`)
+#: and then rejected by `load_prior` as unknown, or -- worse, if the list were
+#: used for writing too -- silently dropped from every artifact while the
+#: sidecar still looked complete.
+_PARAM_TYPES = {
+    "backoff_params": BackoffParams,
+    "smoothing_params": SmoothingParams,
+}
 
 _REQUIRED_TYPES = {
     "species_key": pa.int64(),
@@ -328,6 +376,15 @@ class PriorTensor:
     cells: list[str]
     values: sparse.csr_matrix
     gbif_doi: str = ""
+    #: How this artifact was shrunk and smoothed, or `None` for a tensor that
+    #: did not come out of the backoff (a hand-built one, or a control, which
+    #: inherits whatever the full prior declared). I2: without these an
+    #: artifact cannot say what fraction of the real seasonal amplitude it
+    #: retains, and that fraction is set by the constants rather than by the
+    #: data. NOT defaulted to `BackoffParams()`: a tensor that never ran the
+    #: backoff would then publish a claim about parameters it never used.
+    backoff_params: BackoffParams | None = None
+    smoothing_params: SmoothingParams | None = None
     _species_index: dict[int, int] = field(default_factory=dict, repr=False)
     _cell_index: dict[str, int] = field(default_factory=dict, repr=False)
 
@@ -463,8 +520,22 @@ class PriorTensor:
         return _floor_missing(np.asarray(self.values.toarray(), dtype=np.float64))
 
 
-def to_tensor(table: pa.Table, spec: PriorSpec) -> PriorTensor:
-    """Pack a smoothed estimate table into a sparse tensor."""
+def to_tensor(
+    table: pa.Table,
+    spec: PriorSpec,
+    *,
+    backoff_params: BackoffParams | None = None,
+    smoothing_params: SmoothingParams | None = None,
+) -> PriorTensor:
+    """Pack a smoothed estimate table into a sparse tensor.
+
+    `backoff_params` / `smoothing_params` are the constants the table upstream
+    was produced with, carried into the artifact so it can say how hard it was
+    shrunk (I2). They are NOT inferred and NOT defaulted: this function cannot
+    see what produced its input, and a `BackoffParams()` default would make
+    every artifact publish today's constants as the ones it was built with
+    even when it was built with others.
+    """
     _validate_table(table)
 
     species = _single_array(table.column("species_key")).to_numpy(zero_copy_only=False)
@@ -506,6 +577,8 @@ def to_tensor(table: pa.Table, spec: PriorSpec) -> PriorTensor:
         species_keys=np.asarray(species_keys, dtype=np.int64),
         cells=cells,
         values=matrix,
+        backoff_params=backoff_params,
+        smoothing_params=smoothing_params,
     )
 
 
@@ -572,6 +645,76 @@ def _sidecar_path(npz: Path) -> Path:
     return npz.with_suffix(".json")
 
 
+def _params_payload(params) -> dict | None:
+    """A params dataclass as JSON, or `None` when the artifact declares none.
+
+    `asdict` rather than a hand-written dict literal, for the reason in
+    `_PARAM_TYPES`: a parameter added to `BackoffParams` must reach the sidecar
+    without an edit here, or the artifact would keep publishing a complete-
+    looking record of a strictly smaller set of constants than it was built
+    with -- which is the I2 defect again, one field deep.
+    """
+    return None if params is None else asdict(params)
+
+
+def _params_from_sidecar(meta: dict, key: str):
+    """Read one params object back. ABSENT KEY and `null` are DIFFERENT.
+
+    `null` is an artifact SAYING it has no record of its shrinkage -- legal,
+    and what a hand-built tensor writes. An ABSENT key is a sidecar that never
+    made the declaration at all, and it is REFUSED rather than read as `None`:
+    treating the two alike would silently promote every foreign or older
+    sidecar into an artifact claiming to have declared something, and the whole
+    point of I2 is that a consumer must be able to tell.
+
+    A record whose FIELDS disagree with this build's dataclass is refused for
+    the same reason. Filling a missing `cell_week_weight` from the current
+    default would publish today's constant as the one the artifact was built
+    with, which is precisely the number the record exists to pin down. An
+    unknown extra field is refused too: it means the artifact was written by a
+    build whose parameter set this one does not understand, and quietly
+    dropping it would read a richer record as a poorer one.
+    """
+    if key not in meta:
+        raise ValueError(
+            f"sidecar has no {key!r} field at all; this is not the same as a "
+            f"{key!r} of null, which is an artifact stating it has no record "
+            "of its own shrinkage. An absent key is a sidecar that never made "
+            "the declaration, and reading it as null would silently promote "
+            "every foreign or older artifact into one claiming it did. The "
+            "shrinkage and smoothing constants set how much of the real "
+            "seasonal amplitude an artifact retains, so an artifact that "
+            "cannot be asked about them cannot be interpreted"
+        )
+    recorded = meta[key]
+    if recorded is None:
+        return None
+    cls = _PARAM_TYPES[key]
+    expected = {f.name for f in dc_fields(cls)}
+    if not isinstance(recorded, dict):
+        raise ValueError(
+            f"sidecar field {key!r} is {type(recorded).__name__}, not a JSON "
+            f"object or null; it records the {cls.__name__} the artifact was "
+            "built with, one field per parameter"
+        )
+    got = set(recorded)
+    if got != expected:
+        missing = sorted(expected - got)
+        unknown = sorted(got - expected)
+        raise ValueError(
+            f"sidecar field {key!r} records {sorted(got)!r} but this build's "
+            f"{cls.__name__} has {sorted(expected)!r} (missing {missing!r}, "
+            f"unknown {unknown!r}); refusing to fill a missing parameter from "
+            "the current default and refusing to drop an unknown one. The "
+            "current default is exactly the value this record exists to pin "
+            "down -- an artifact would otherwise publish today's constant as "
+            "the one it was built with -- and an unknown field means a build "
+            "whose parameter set this one does not implement, which would be "
+            "read as a poorer record than it is"
+        )
+    return cls(**recorded)
+
+
 def save_prior(tensor: PriorTensor, path: Path) -> Path:
     """Write the matrix and its citable sidecar; return the `.npz` written."""
     # `.strip()` is load-bearing, not tidying. `--gbif-doi '   '` from an unset
@@ -612,6 +755,13 @@ def save_prior(tensor: PriorTensor, path: Path) -> Path:
         "dense_capacity": int(tensor.dense_capacity),
         "licence": LICENCE,
         "licence_url": LICENCE_URL,
+        # HOW THIS ARTIFACT WAS SHRUNK AND SMOOTHED (I2). Explicit `null` when
+        # the tensor declares none, never omitted: `load_prior` refuses an
+        # absent key, so writing the key unconditionally is what keeps "no
+        # record" a statement the artifact makes rather than one a reader
+        # infers.
+        "backoff_params": _params_payload(tensor.backoff_params),
+        "smoothing_params": _params_payload(tensor.smoothing_params),
         "gbif_doi": tensor.gbif_doi,
         "attribution": (
             f"Derived from GBIF occurrence download {tensor.gbif_doi}. "
@@ -654,4 +804,8 @@ def load_prior(path: Path) -> PriorTensor:
         cells=list(meta["cells"]),
         values=matrix,
         gbif_doi=meta.get("gbif_doi", ""),
+        # `_params_from_sidecar`, not `meta.get(...)`: an ABSENT key is
+        # refused rather than read as "no record". See its docstring.
+        backoff_params=_params_from_sidecar(meta, "backoff_params"),
+        smoothing_params=_params_from_sidecar(meta, "smoothing_params"),
     )

@@ -134,7 +134,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 import pyarrow as pa
 
-from birdology.prior.backoff import hierarchical_estimate
+from birdology.prior.backoff import BackoffParams, hierarchical_estimate
 from birdology.prior.controls import CONTROLS
 from birdology.prior.effort import target_group_ratios
 from birdology.prior.indexing import WEEKS_PER_YEAR, aggregate_counts, assign_cells
@@ -143,7 +143,7 @@ from birdology.prior.leakage import (
     apply_leakage_guards,
 )
 from birdology.prior.occurrences import read_occurrences
-from birdology.prior.smoothing import smooth
+from birdology.prior.smoothing import SmoothingParams, smooth
 from birdology.prior.tensor import PriorSpec, save_prior, to_tensor
 
 log = logging.getLogger("birdology.prior.build")
@@ -420,6 +420,8 @@ def estimate_over_full_grid(
     cells: Sequence[str],
     *,
     species_chunk: int = DEFAULT_SPECIES_CHUNK,
+    backoff_params: BackoffParams = BackoffParams(),
+    smoothing_params: SmoothingParams = SmoothingParams(),
 ) -> pa.Table:
     """The backoff over the FULL (species x cells x 52) grid, in species chunks.
 
@@ -453,9 +455,11 @@ def estimate_over_full_grid(
             hierarchical_estimate(
                 ratios,
                 ordered[start : start + species_chunk],
+                backoff_params,
                 cells=list(cells),
                 weeks=weeks,
-            )
+            ),
+            smoothing_params,
         )
         for start in range(0, len(ordered), species_chunk)
     ]
@@ -463,9 +467,14 @@ def estimate_over_full_grid(
         # No species at all. `pa.concat_tables([])` cannot infer a schema, so
         # the empty grid is produced through the same call the loop would have
         # made -- one definition of the output schema, rather than a
-        # hand-written empty table that could drift from it.
+        # hand-written empty table that could drift from it. The SAME params
+        # are passed here, so the empty path cannot silently use the defaults
+        # while the populated one uses the caller's.
         return smooth(
-            hierarchical_estimate(ratios, [], cells=list(cells), weeks=weeks)
+            hierarchical_estimate(
+                ratios, [], backoff_params, cells=list(cells), weeks=weeks
+            ),
+            smoothing_params,
         )
     return pa.concat_tables(pieces)
 
@@ -851,6 +860,8 @@ def build_from_archive(
     gbif_doi: str,
     species_chunk: int = DEFAULT_SPECIES_CHUNK,
     min_split_match_rate: float = DEFAULT_MIN_SPLIT_MATCH_RATE,
+    backoff_params: BackoffParams = BackoffParams(),
+    smoothing_params: SmoothingParams = SmoothingParams(),
 ) -> list[Path]:
     """Archive -> full prior + every registered control. Returns written paths.
 
@@ -981,11 +992,26 @@ def build_from_archive(
     )
 
     estimates = estimate_over_full_grid(
-        ratios, species, cells, species_chunk=species_chunk
+        ratios,
+        species,
+        cells,
+        species_chunk=species_chunk,
+        backoff_params=backoff_params,
+        smoothing_params=smoothing_params,
     )
 
     spec = PriorSpec(resolution=resolution, source=source, variant="full")
-    full = to_tensor(estimates, spec)
+    # The params reach the ARTIFACT, not just the computation (I2). They are
+    # passed to `to_tensor` rather than set on the tensor afterwards so there
+    # is no window in which a full prior exists with no record of how it was
+    # shrunk -- and so the ONE object handed to `hierarchical_estimate` is the
+    # one that lands in the sidecar.
+    full = to_tensor(
+        estimates,
+        spec,
+        backoff_params=backoff_params,
+        smoothing_params=smoothing_params,
+    )
     full.gbif_doi = gbif_doi
 
     written: list[Path] = []
@@ -1004,6 +1030,19 @@ def build_from_archive(
         # so a regression in `_respec` fails the build rather than releasing
         # an unattributed artifact.
         control.gbif_doi = gbif_doi
+        # NOT belt and braces: `_respec` carries `gbif_doi` and does NOT carry
+        # the params, so these two lines are the ONLY thing putting them on a
+        # control artifact. Stated rather than claimed redundant, because a
+        # comment asserting a redundancy that is not there is what gets the
+        # line it defends deleted.
+        #
+        # They describe the BUILD -- the shrinkage that produced the full prior
+        # this control is the null for -- not the control's own (destroyed)
+        # structure. That is the reading that makes them useful: a control and
+        # the prior it is compared against must be known to have come from the
+        # same constants, or the comparison measures the constants.
+        control.backoff_params = backoff_params
+        control.smoothing_params = smoothing_params
         written.append(save_prior(control, out_dir / f"{stem}_{name}.npz"))
 
     # LAST, after every artifact of this resolution. See `write_manifest`.

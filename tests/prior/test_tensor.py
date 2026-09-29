@@ -19,7 +19,10 @@ from scipy import sparse
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 
-from birdology.prior.backoff import FLOOR
+from dataclasses import fields as dc_fields
+
+from birdology.prior.backoff import FLOOR, BackoffParams
+from birdology.prior.smoothing import SmoothingParams
 from birdology.prior.indexing import WEEKS_PER_YEAR
 from birdology.prior.tensor import (
     LICENCE,
@@ -1539,4 +1542,269 @@ def test_the_documented_fill_arithmetic_is_the_one_the_sidecar_publishes(tmp_pat
     assert meta["dense_capacity"] == capacity
     assert meta["nnz"] / meta["dense_capacity"] == pytest.approx(
         t.values.nnz / t.dense_capacity
+    )
+
+
+# --------------------------------------------------------------------------
+# I2: the artifact records the shrinkage and smoothing that produced it.
+#
+# The constants set how much of the real seasonal amplitude an artifact keeps
+# (0.80 / 0.68 / 0.43 / 0.30 at H3 res 3/4/5/6, measured through
+# `build_from_archive` -- see `BackoffParams` and
+# `tests/prior/test_amplitude_retention.py`). Without them in the sidecar a
+# consumer of a res-5 `.npz` cannot learn which of those numbers applies.
+# --------------------------------------------------------------------------
+
+
+def test_the_params_ROUND_TRIP_through_the_sidecar(tmp_path):
+    """Written, read back, EQUAL -- for non-default values.
+
+    Deliberately NOT the defaults. A `load_prior` that ignored the sidecar and
+    constructed `BackoffParams()` would pass on default values while lying
+    about every swept artifact, which is the one a reader most needs to
+    interpret. The asserted values are also checked to DIFFER from the
+    defaults, so the test cannot be satisfied by a hardcoded constructor.
+    """
+    backoff = BackoffParams(cell_week_weight=3.5, cell_weight=17.0, floor=FLOOR)
+    smoothing = SmoothingParams(space_weight=0.8, time_weight=0.05)
+    assert backoff != BackoffParams(), "the fixture must not be the defaults"
+    assert smoothing != SmoothingParams(), "the fixture must not be the defaults"
+
+    t = to_tensor(
+        _table([(1, "cell-a", 46, 0.25)]),
+        SPEC,
+        backoff_params=backoff,
+        smoothing_params=smoothing,
+    )
+    t.gbif_doi = DOI
+    npz = save_prior(t, tmp_path / "p.npz")
+
+    meta = json.loads(npz.with_suffix(".json").read_text(encoding="utf-8"))
+    assert meta["backoff_params"] == {
+        "cell_week_weight": 3.5,
+        "cell_weight": 17.0,
+        "floor": FLOOR,
+    }
+    assert meta["smoothing_params"] == {"space_weight": 0.8, "time_weight": 0.05}
+
+    back = load_prior(npz)
+    assert back.backoff_params == backoff
+    assert back.smoothing_params == smoothing
+
+
+def test_a_tensor_that_declares_no_params_writes_an_explicit_null(tmp_path):
+    """`None` is a STATEMENT ("no record"), written as JSON null, never omitted.
+
+    A hand-built tensor did not come out of the backoff and has nothing to
+    declare. That has to be expressible, because the alternative -- defaulting
+    to `BackoffParams()` -- would make it publish constants it never used.
+
+    The key is still WRITTEN. `load_prior` refuses an absent key, so omitting
+    it for a `None` would make this artifact unreadable by its own reader.
+    """
+    t = _saveable([(1, "cell-a", 46, 0.25)])
+    assert t.backoff_params is None and t.smoothing_params is None
+    npz = save_prior(t, tmp_path / "p.npz")
+
+    meta = json.loads(npz.with_suffix(".json").read_text(encoding="utf-8"))
+    assert "backoff_params" in meta and meta["backoff_params"] is None
+    assert "smoothing_params" in meta and meta["smoothing_params"] is None
+
+    back = load_prior(npz)
+    assert back.backoff_params is None
+    assert back.smoothing_params is None
+
+
+@pytest.mark.parametrize("key", ["backoff_params", "smoothing_params"])
+def test_a_sidecar_MISSING_a_params_key_is_REFUSED_not_defaulted(tmp_path, key):
+    """An ABSENT key is not a `null`. No silent repair at the boundary.
+
+    `null` is an artifact stating it has no record of its shrinkage; an absent
+    key is a sidecar that never made the declaration. Reading the second as the
+    first would silently promote every foreign or older sidecar into one
+    claiming to have declared something -- and the entire point of recording
+    the constants is that a consumer can tell.
+
+    Both keys are checked, because a guard written for one of them would leave
+    the other defaulting with nothing to notice.
+    """
+    t = _saveable([(1, "cell-a", 46, 0.25)])
+    npz = save_prior(t, tmp_path / "p.npz")
+    sidecar = npz.with_suffix(".json")
+
+    meta = json.loads(sidecar.read_text(encoding="utf-8"))
+    del meta[key]
+    sidecar.write_text(json.dumps(meta), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=f"sidecar has no {key!r} field at all"):
+        load_prior(npz)
+
+
+@pytest.mark.parametrize("key", ["backoff_params", "smoothing_params"])
+def test_a_params_record_MISSING_A_FIELD_is_REFUSED_not_completed(tmp_path, key):
+    """A partial record cannot be finished from the current defaults.
+
+    Filling a missing `cell_week_weight` from `BackoffParams()` would publish
+    TODAY's constant as the one the artifact was built with -- which is exactly
+    the value the record exists to pin down. The repair would be invisible and
+    would make every such artifact claim the default.
+    """
+    backoff = BackoffParams(cell_week_weight=3.5)
+    smoothing = SmoothingParams(space_weight=0.8)
+    t = to_tensor(
+        _table([(1, "cell-a", 46, 0.25)]),
+        SPEC,
+        backoff_params=backoff,
+        smoothing_params=smoothing,
+    )
+    t.gbif_doi = DOI
+    npz = save_prior(t, tmp_path / "p.npz")
+    sidecar = npz.with_suffix(".json")
+
+    meta = json.loads(sidecar.read_text(encoding="utf-8"))
+    dropped = sorted(meta[key])[0]
+    del meta[key][dropped]
+    sidecar.write_text(json.dumps(meta), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="refusing to fill a missing parameter") as e:
+        load_prior(npz)
+    # The message must name WHICH parameter went missing and must NOT claim an
+    # unknown one: one shared guard serves both directions, so the fixture that
+    # exercises this direction has to prove the message describes it.
+    assert f"missing ['{dropped}']" in str(e.value)
+    assert "unknown []" in str(e.value)
+
+
+@pytest.mark.parametrize("key", ["backoff_params", "smoothing_params"])
+def test_a_params_record_with_an_UNKNOWN_FIELD_is_REFUSED_not_ignored(tmp_path, key):
+    """An extra field means a richer parameter set this build cannot honour.
+
+    Dropping it silently would read an artifact built with a parameter this
+    code does not implement as one built without it -- a strictly wrong
+    description of the file, with nothing raised.
+    """
+    t = to_tensor(
+        _table([(1, "cell-a", 46, 0.25)]),
+        SPEC,
+        backoff_params=BackoffParams(),
+        smoothing_params=SmoothingParams(),
+    )
+    t.gbif_doi = DOI
+    npz = save_prior(t, tmp_path / "p.npz")
+    sidecar = npz.with_suffix(".json")
+
+    meta = json.loads(sidecar.read_text(encoding="utf-8"))
+    meta[key]["a_parameter_from_the_future"] = 1.0
+    sidecar.write_text(json.dumps(meta), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="refusing to drop an unknown one") as e:
+        load_prior(npz)
+    assert "unknown ['a_parameter_from_the_future']" in str(e.value)
+    assert "missing []" in str(e.value)
+
+
+@pytest.mark.parametrize("key", ["backoff_params", "smoothing_params"])
+def test_a_params_record_that_is_not_an_object_is_REFUSED(tmp_path, key):
+    """A scalar or a list where an object belongs is refused by NAME.
+
+    Distinct from the field-mismatch message on purpose: `set("10.0")` would
+    otherwise reach the field comparison and report a nonsense field list,
+    sending whoever reads it to look for the wrong problem.
+    """
+    t = to_tensor(
+        _table([(1, "cell-a", 46, 0.25)]),
+        SPEC,
+        backoff_params=BackoffParams(),
+        smoothing_params=SmoothingParams(),
+    )
+    t.gbif_doi = DOI
+    npz = save_prior(t, tmp_path / "p.npz")
+    sidecar = npz.with_suffix(".json")
+
+    meta = json.loads(sidecar.read_text(encoding="utf-8"))
+    meta[key] = 10.0
+    sidecar.write_text(json.dumps(meta), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="not a JSON object or null"):
+        load_prior(npz)
+
+
+def test_the_sidecar_params_keys_are_DERIVED_from_the_dataclasses(tmp_path):
+    """Every field of each params dataclass reaches the sidecar. No hand list.
+
+    A hardcoded field list drifts the moment a parameter is added: the new
+    constant would be used by the build and absent from every artifact's
+    record, so a released prior would publish a complete-looking account of a
+    strictly smaller set of constants than produced it -- the I2 defect again,
+    one field deep. Asserted against `dataclasses.fields`, not against a
+    literal tuple, so the check itself cannot go stale.
+    """
+    t = to_tensor(
+        _table([(1, "cell-a", 46, 0.25)]),
+        SPEC,
+        backoff_params=BackoffParams(),
+        smoothing_params=SmoothingParams(),
+    )
+    t.gbif_doi = DOI
+    npz = save_prior(t, tmp_path / "p.npz")
+    meta = json.loads(npz.with_suffix(".json").read_text(encoding="utf-8"))
+
+    for key, cls in (
+        ("backoff_params", BackoffParams),
+        ("smoothing_params", SmoothingParams),
+    ):
+        expected = {f.name for f in dc_fields(cls)}
+        assert expected, f"{cls.__name__} has no fields, so this pins nothing"
+        assert set(meta[key]) == expected, (
+            f"the sidecar's {key!r} carries {sorted(meta[key])!r} but "
+            f"{cls.__name__} has {sorted(expected)!r}; a constant used by the "
+            "build is missing from the artifact's own record of it"
+        )
+
+
+def test_the_documented_PARAMS_fields_match_a_real_sidecar(tmp_path):
+    """Section 2b of the release doc, checked against a written artifact.
+
+    The doc tells a third party which keys to expect inside `backoff_params`
+    and `smoothing_params` and what the shipped values are. Both claims are
+    executed here against a real `save_prior` output, because that section is
+    the one telling a reader their res-5 artifact keeps under half the real
+    seasonal amplitude -- and this document has already once described a regime
+    the pipeline cannot produce.
+    """
+    doc = ARTIFACT_DOC.read_text(encoding="utf-8")
+
+    t = to_tensor(
+        _table([(1, "cell-a", 46, 0.25)]),
+        SPEC,
+        backoff_params=BackoffParams(),
+        smoothing_params=SmoothingParams(),
+    )
+    t.gbif_doi = DOI
+    npz = save_prior(t, tmp_path / "p.npz")
+    meta = json.loads(npz.with_suffix(".json").read_text(encoding="utf-8"))
+
+    # The §2 example block is the field-level contract; it must carry both
+    # keys with the SAME inner fields the writer produces.
+    example = json.loads(_fenced_blocks(doc, "json")[0])
+    for key in ("backoff_params", "smoothing_params"):
+        assert key in example, f"the documented sidecar example omits {key!r}"
+        assert sorted(example[key]) == sorted(meta[key]), (
+            f"the documented {key!r} lists {sorted(example[key])!r} but a real "
+            f"sidecar carries {sorted(meta[key])!r}"
+        )
+        assert example[key] == meta[key], (
+            f"the documented {key!r} VALUES are not the shipped defaults; a "
+            "reader would calibrate against constants no artifact was built "
+            "with"
+        )
+
+    # The prose must name the mechanism, not just the keys: the one thing a
+    # reader has to understand is that a weight is a pseudo-count in records.
+    assert "pseudo-count" in doc
+    # ...and the resolution at which the decay matters must be stated with its
+    # measured retention, so the table cannot drift away from the code's.
+    assert "0.426" in doc, (
+        "the documented res-5 seasonal retention is missing; section 2b's "
+        "table is what a consumer calibrates against"
     )

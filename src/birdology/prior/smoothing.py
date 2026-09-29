@@ -98,7 +98,53 @@ _REQUIRED_TYPES = {
 
 @dataclass(frozen=True)
 class SmoothingParams:
-    """Neighbour weights, relative to the cell's own value of 1.0."""
+    """Neighbour weights, relative to the cell's own value of 1.0.
+
+    UNTUNED, LIKE THE BACKOFF'S -- BUT MEASURABLY THE SMALLER EFFECT (I2)
+    ---------------------------------------------------------------------
+    `space_weight = 0.3` and `time_weight = 0.3` were chosen by judgement and
+    never swept. Read `BackoffParams`' docstring first: it carries the full
+    retention table and the argument that the paper must sweep these
+    constants. This one records what THESE two are worth, which is much less
+    than the shrinkage -- and that is a measurement, not a defence.
+
+    A weight is relative to the cell's own value of 1.0, so `0.3` means each of
+    the six hex neighbours (and each of the two adjacent weeks) counts for
+    three tenths of a vote against the cell's own one. At `space_weight = 0.3`
+    a cell with six present neighbours has 6 * 0.3 = 1.8 of foreign weight
+    against its own 1.0, so a majority of the output value is already its
+    neighbours'.
+
+    MEASURED, at H3 resolution 5 on a 167 879-record `build_from_archive` build
+    with a known signal (fraction of the true weekly / across-cell CV that
+    reaches the `.npz`; the other three constants at their defaults):
+
+        space_weight   0.0     0.3(default)   1.0
+        seasonal       0.506   0.426          0.423
+        spatial        0.917   0.887          0.881
+
+        time_weight    0.0     0.3(default)   1.0
+        seasonal       0.466   0.426          0.413
+        spatial        0.892   0.887          0.898
+
+    Three things follow, all of which contradict what one would guess:
+
+    1. `space_weight` COSTS SEASONAL AMPLITUDE (0.506 -> 0.426) more than it
+       costs spatial contrast (0.917 -> 0.887). Blurring a thin cell-week
+       across its neighbours is another way of averaging away a weekly peak.
+    2. Neither weight is where the amplitude goes. `cell_week_weight` moves
+       seasonal retention from 1.094 to 0.134 over its swept range; these two
+       move it by ~0.08 and ~0.05.
+    3. Both response curves are FLAT above the default -- 0.3 and 1.0 are
+       nearly the same artifact -- because a cell's six neighbours in a clumped
+       observer field mostly resemble it. Almost all of the smoothing these
+       constants do is done by the first 0.3.
+
+    `0.0` is a legitimate value for either and is not a special case: the
+    short-circuits in `smooth` make it skip the term, which is a cost guard
+    rather than a semantic one. `save_prior` writes this object into every
+    sidecar, so an artifact says which row of the table above applies to it.
+    """
 
     space_weight: float = 0.3
     time_weight: float = 0.3

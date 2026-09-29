@@ -18,6 +18,7 @@ from a hardcoded cluster path.
 """
 import builtins
 import json
+import re
 import logging
 import shutil
 import sys
@@ -32,7 +33,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "scripts"))
 
-from birdology.prior.backoff import FLOOR
+from birdology.prior.backoff import FLOOR, BackoffParams
 from birdology.prior.controls import CONTROLS
 from birdology.prior.indexing import (
     WEEKS_PER_YEAR,
@@ -45,11 +46,14 @@ from birdology.prior.leakage import (
     mark_guards_applied,
 )
 from birdology.prior.occurrences import read_occurrences
+from birdology.prior.smoothing import SmoothingParams
 from birdology.prior.tensor import LICENCE, load_prior
 
 import build_prior
 from build_prior import (
+    MANIFEST_VERSION,
     ZeroMatchGuardError,
+    check_manifest,
     build_from_archive,
     estimate_over_full_grid,
     load_test_split,
@@ -2675,3 +2679,167 @@ def test_the_build_script_does_not_import_the_download_client():
     body = source.split('"""', 2)[2]
     for forbidden in ("gbif_download", "requests", "urllib", "http"):
         assert forbidden not in body, f"build_prior.py must not reference {forbidden}"
+
+# --------------------------------------------------------------------------
+# I2: the build's shrinkage and smoothing constants reach every artifact, and
+# the release documentation describes both them and the manifest truthfully.
+# --------------------------------------------------------------------------
+
+ARTIFACT_DOC = Path(__file__).parent.parent.parent / "docs" / "prior-artifact-format.md"
+
+
+def _fenced(doc: str, language: str) -> list[str]:
+    return re.findall(rf"```{language}\n(.*?)```", doc, re.DOTALL)
+
+
+def test_the_build_records_its_params_in_EVERY_artifact_including_controls(tmp_path):
+    """I2: the full prior AND every control publish the build's constants.
+
+    `controls._respec` carries `gbif_doi` and does NOT carry the params, so
+    `build_from_archive`'s two assignments are the only thing putting them on a
+    control. Asserted through `load_prior` on each written `.npz`, so a
+    regression in either the assignment or the sidecar write fails here.
+
+    A control's params describe the BUILD it is the null for, not the control's
+    own destroyed structure: a control and the prior it is compared against
+    must be known to come from the same constants, or the comparison measures
+    the constants rather than the context.
+    """
+    paths = _build(tmp_path)
+    assert len(paths) == EXPECTED_ARTIFACTS
+    for p in paths:
+        t = load_prior(p)
+        assert t.backoff_params == BackoffParams(), (p.name, t.backoff_params)
+        assert t.smoothing_params == SmoothingParams(), (p.name, t.smoothing_params)
+
+
+def test_a_NON_DEFAULT_build_records_the_params_it_actually_used(tmp_path):
+    """The sidecar records what the build USED, not what the module defaults to.
+
+    Every other test in this file builds at the defaults, so a `save_prior`
+    that hardcoded `BackoffParams()` would pass all of them while lying about
+    the one artifact whose parameters a reader most needs: a swept one. The
+    values are asserted to DIFFER from the defaults, so this cannot be
+    satisfied by a constant.
+    """
+    backoff = BackoffParams(cell_week_weight=1.25, cell_weight=6.0)
+    smoothing = SmoothingParams(space_weight=0.7, time_weight=0.0)
+    assert backoff != BackoffParams() and smoothing != SmoothingParams()
+
+    paths = _build(
+        tmp_path, backoff_params=backoff, smoothing_params=smoothing
+    )
+    for p in paths:
+        t = load_prior(p)
+        assert t.backoff_params == backoff, p.name
+        assert t.smoothing_params == smoothing, p.name
+
+
+def test_the_build_params_actually_CHANGE_the_values_not_just_the_sidecar(tmp_path):
+    """The recorded params are the ones the pipeline computed with.
+
+    A build that wrote the caller's params into the sidecar while computing
+    with the defaults would satisfy every assertion above and publish a
+    correct-looking artifact describing a different computation -- the worst
+    shape this finding can take, because the record would then be actively
+    misleading rather than absent.
+
+    `cell_week_weight` 0.5 against 50.0 is a hundredfold difference in the
+    pseudo-count, so the stored values must differ substantially. Asserted on
+    the MATRIX, read back from disk.
+    """
+    archive = _archive(tmp_path)
+    light = _build(
+        tmp_path,
+        archive=archive,
+        out_dir=tmp_path / "light",
+        backoff_params=BackoffParams(cell_week_weight=0.5),
+    )
+    heavy = _build(
+        tmp_path,
+        archive=archive,
+        out_dir=tmp_path / "heavy",
+        backoff_params=BackoffParams(cell_week_weight=50.0),
+    )
+    a = load_prior(next(p for p in light if p.name.endswith("_full.npz")))
+    b = load_prior(next(p for p in heavy if p.name.endswith("_full.npz")))
+
+    assert a.species_keys.tolist() == b.species_keys.tolist()
+    assert a.cells == b.cells
+    spread = float(np.abs(a.dense() - b.dense()).max())
+    assert spread > 1e-3, (
+        f"a 100x change in `cell_week_weight` moved the largest stored value "
+        f"by only {spread:.3e}. The params reach the sidecar but apparently "
+        "not the computation, so every artifact would publish a faithful "
+        "record of constants it was not built with"
+    )
+
+
+def test_the_documented_MANIFEST_shape_matches_a_real_one(tmp_path):
+    """Section 2c of the release doc, executed against a written manifest.
+
+    The manifest is what tells a third party their artifact set is complete,
+    and the doc is the only description of it they have. Field names, the
+    filename pattern and the artifacts[] entry shape are all checked against a
+    manifest `build_from_archive` actually wrote -- not a hand-built example --
+    because this document has already once described a regime the pipeline
+    cannot produce.
+    """
+    doc = ARTIFACT_DOC.read_text(encoding="utf-8")
+    paths = _build(tmp_path, resolution=4, source="dof")
+    out_dir = paths[0].parent
+    real = json.loads(
+        (out_dir / "prior_dof_r4_manifest.json").read_text(encoding="utf-8")
+    )
+
+    # The documented FILENAME PATTERN produces the file that exists.
+    assert "prior_{source}_r{resolution}_manifest.json" in doc
+    assert (out_dir / "prior_dof_r4_manifest.json").exists()
+
+    # The documented EXAMPLE has the same top-level fields as a real manifest.
+    example = next(
+        json.loads(b) for b in _fenced(doc, "json") if "manifest_version" in b
+    )
+    assert sorted(example) == sorted(real), (
+        f"the documented manifest lists {sorted(example)!r} but a real one "
+        f"carries {sorted(real)!r}"
+    )
+    assert example["manifest_version"] == real["manifest_version"] == MANIFEST_VERSION
+
+    # ...and the same ENTRY shape, which is what a consumer iterates.
+    assert {k for e in example["artifacts"] for k in e} == {
+        k for e in real["artifacts"] for k in e
+    } == {"npz", "sidecar"}
+
+    # The documented entry count is DERIVED, so a control added to the registry
+    # cannot leave the doc claiming a smaller set. Checked against the registry
+    # rather than against a literal.
+    assert real["artifact_count"] == len(real["artifacts"]) == EXPECTED_ARTIFACTS
+
+    # The RULE the whole section exists for must be stated, in the words a
+    # reader acts on: absence means incomplete.
+    assert "not a complete artifact set" in doc
+    assert "verify the names, not this number" in doc
+
+
+def test_the_documented_manifest_rule_is_the_one_check_manifest_ENFORCES(tmp_path):
+    """The doc says "refuse a set with no manifest"; the reader must do that.
+
+    Documentation that describes a stricter rule than the code implements is
+    the same defect class as documentation describing a regime the pipeline
+    cannot produce -- a third party writes the strict check, ours does not, and
+    the disagreement surfaces as their tooling rejecting our releases or ours
+    accepting a truncated set. So the rule is asserted against `check_manifest`
+    on a real directory, not just found in the prose.
+    """
+    paths = _build(tmp_path, resolution=4, source="dof")
+    out_dir = paths[0].parent
+
+    # A complete set verifies, and names every artifact rather than counting.
+    verified = check_manifest(out_dir, "dof", 4)
+    assert sorted(p.name for p in verified) == sorted(p.name for p in paths)
+
+    # Remove the manifest: the doc says refuse, so the reader refuses.
+    (out_dir / "prior_dof_r4_manifest.json").unlink()
+    with pytest.raises(ValueError, match="not a complete release"):
+        check_manifest(out_dir, "dof", 4)

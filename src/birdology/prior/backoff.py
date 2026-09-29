@@ -135,7 +135,84 @@ _REQUIRED_TYPES = {
 
 @dataclass(frozen=True)
 class BackoffParams:
-    """Shrinkage strengths. Higher = pull harder toward the coarser level."""
+    """Shrinkage strengths. Higher = pull harder toward the coarser level.
+
+    THE DEFAULTS ARE UNTUNED, AND THEY SET THE PAPER'S EFFECT SIZE (I2)
+    -------------------------------------------------------------------
+    `cell_week_weight = 10.0` and `cell_weight = 50.0` were chosen by
+    judgement, not fitted. They have never been swept against a held-out
+    criterion, and no experiment in this repository justifies these values over
+    any other. This docstring exists to say so plainly rather than to defend
+    them: THE PAPER MUST SWEEP THEM, and must report which value it swept to,
+    because the number it reports as the spatiotemporal effect is substantially
+    a function of this constant.
+
+    WHAT THE UNITS ARE. `_shrink` computes
+    `(local_num + weight * coarse_p) / (local_den + weight)`, so a weight is a
+    PSEUDO-COUNT IN RECORDS: `cell_week_weight = 10` means the cell's annual
+    profile is worth 10 records of local evidence. That is the whole mechanism.
+    A cell-week holding fewer than 10 records is therefore decided more by its
+    parent than by itself.
+
+    WHY THAT BITES. Measured with `read_occurrences` + `aggregate_counts` on a
+    167 879-record synthetic archive over 1500 Danish sites, the median
+    cell-week holds 102 / 31 / 6 / 2 records at H3 resolutions 3 / 4 / 5 / 6,
+    with 19% / 23% / 74% / 97% of cell-weeks below the 10 pseudo-counts. The
+    published sweep goes to resolution 5, where three cell-weeks in four are
+    outvoted by their parent.
+
+    MEASURED AMPLITUDE RETENTION -- ALL FROM `build_from_archive` OUTPUT
+    --------------------------------------------------------------------
+    Fraction of a KNOWN seasonal signal (weekly CV against the generating
+    truth's) and of a KNOWN spatial signal (across-cell CV) that reaches the
+    `.npz`, on that 167 879-record build:
+
+        resolution   cells   median effort   seasonal   spatial
+        ----------   -----   -------------   --------   -------
+        3               21             102      0.798     0.898
+        4               98              31      0.679     0.947
+        5              461               6      0.426     0.887
+        6             1171               2      0.298     0.811
+
+    SEASONAL AMPLITUDE DECAYS MONOTONICALLY; SPATIAL CONTRAST DOES NOT. Phase
+    is not the problem -- the recovered peak week is right throughout -- it is
+    amplitude. A res-5 artifact carries under half the real seasonal swing.
+
+    The asymmetry is structural, not a fixture accident. `cell_weight` divides
+    a sum over all 52 of a cell's weeks, so its 50 pseudo-counts meet a
+    denominator ~52x larger than the one `cell_week_weight`'s 10 meet; the
+    default sits on the FLAT part of its own response curve while
+    `cell_week_weight`'s default sits on the STEEP part of its. Swept directly
+    at resolution 5 on the same archive:
+
+        cell_week_weight   0.5     2.0     10.0(default)   50.0
+        seasonal           1.094   0.841   0.426           0.134
+        spatial            1.003   0.952   0.887           0.854
+
+        cell_weight        5.0     50.0(default)   500.0
+        seasonal           0.445   0.426           0.419
+        spatial            0.987   0.887           0.610
+
+    So `cell_week_weight` is the constant that decides the SEASONAL effect
+    size, and `cell_weight` decides the SPATIAL one -- but only well above its
+    current value. Both act almost exclusively on their own axis.
+
+    A retention above 1.0 at `cell_week_weight = 0.5` is not a better artifact:
+    with almost no shrinkage a 3-record cell-week reports its own sampling
+    noise as signal. The choice is a bias/variance trade-off, which is exactly
+    why it needs a sweep against a downstream criterion rather than a default.
+
+    `tests/prior/test_amplitude_retention.py` pins FLOORS under these numbers
+    on a smaller fixture so a future edit to the constants cannot flatten the
+    artifact silently, and `save_prior` writes this object into every sidecar
+    so a consumer of a res-5 `.npz` can look up which row of the table applies.
+
+    `floor` is a different kind of constant and is NOT untuned in the same
+    sense: it is the smallest probability the artifact may carry, and its role
+    (never veto a correct detection with a hard zero) and its stated limitation
+    (above a global denominator of 1/floor the absence distinction collapses)
+    are argued in the module docstring.
+    """
 
     cell_week_weight: float = 10.0
     cell_weight: float = 50.0

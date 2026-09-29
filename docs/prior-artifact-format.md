@@ -6,10 +6,14 @@ decode it with their own tooling. Everything below was derived by reading
 `src/birdology/prior/tensor.py` and inspecting an artifact it actually wrote.
 
 If you read nothing else, read
-[**A missing entry is NOT zero**](#a-missing-entry-is-not-zero) and
-[**What is actually shipped**](#what-is-actually-shipped). The first is the
-decoding convention; the second is the fact that every artifact released here
-satisfies it trivially, because it stores every context it spans.
+[**A missing entry is NOT zero**](#a-missing-entry-is-not-zero),
+[**What is actually shipped**](#what-is-actually-shipped) and
+[**How hard the artifact was smoothed**](#2b-how-hard-the-artifact-was-smoothed--and-why-it-matters-to-you).
+The first is the decoding convention; the second is the fact that every
+artifact released here satisfies it trivially, because it stores every context
+it spans; the third is the one that changes what the numbers *mean* — at H3
+resolution 5 an artifact retains under half of the real seasonal amplitude, and
+the constants that decide that are published in the sidecar.
 
 ---
 
@@ -80,6 +84,15 @@ species and two cells:
   "dense_capacity": 208,
   "licence": "CC BY 4.0",
   "licence_url": "https://creativecommons.org/licenses/by/4.0/",
+  "backoff_params": {
+    "cell_week_weight": 10.0,
+    "cell_weight": 50.0,
+    "floor": 1e-06
+  },
+  "smoothing_params": {
+    "space_weight": 0.3,
+    "time_weight": 0.3
+  },
   "gbif_doi": "10.15468/dl.abc123",
   "attribution": "Derived from GBIF occurrence download 10.15468/dl.abc123. Released under CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/); cite that DOI and this licence when redistributing or building on this artifact."
 }
@@ -98,6 +111,8 @@ species and two cells:
 | `dense_capacity` | `len(species_keys) * len(cells) * weeks_per_year` — how many contexts the axes span, stored or not. `nnz / dense_capacity` is the artifact's fill |
 | `licence` | `CC BY 4.0` |
 | `licence_url` | the licence deed |
+| `backoff_params` | **how hard this artifact was shrunk** — a JSON object, or `null`. See section 2b |
+| `smoothing_params` | **how hard this artifact was smoothed** — a JSON object, or `null`. See section 2b |
 | `gbif_doi` | the GBIF occurrence-download DOI this prior was derived from |
 | `attribution` | a ready-made attribution string naming both the DOI and the licence |
 
@@ -150,6 +165,147 @@ compatibility, so a future genuinely-sparse release decodes under a stated
 convention rather than a guessed one; and because the reader in this repository
 accepts **hand-built sparse tensors** that a third party may assemble, for which
 the rule in section 3 is load-bearing.
+
+---
+
+## 2b. How hard the artifact was smoothed — and why it matters to you
+
+**`backoff_params` and `smoothing_params` record the constants that produced
+this artifact. They are not tuning trivia: they decide how much of the real
+seasonal signal the values you are reading still contain.**
+
+```json
+"backoff_params":   {"cell_week_weight": 10.0, "cell_weight": 50.0, "floor": 1e-06},
+"smoothing_params": {"space_weight": 0.3, "time_weight": 0.3}
+```
+
+Both fields are **always present**. Either may be `null`, which means *this
+artifact does not record how it was built* — a hand-assembled tensor, not
+something `scripts/build_prior.py` wrote. Every artifact from the build script
+carries objects, never `null`. A sidecar in which the **key is missing
+entirely** is a different thing again and this repository's reader **refuses**
+it, rather than reading it as `null`: an absent key is a file that cannot be
+asked, and treating it as an artifact that answered "no record" would be a
+guess dressed as a fact. If you write your own decoder, do the same.
+
+### What the numbers mean
+
+The prior is built by shrinking each `(species, cell, week)` estimate toward
+the coarser levels above it. A weight is a **pseudo-count measured in
+records**: `cell_week_weight = 10` means the cell's annual profile is worth ten
+records of local evidence, so **a cell-week with fewer than ten records is
+decided more by its parent than by itself**. `space_weight` / `time_weight` are
+neighbour weights relative to a cell's own value of 1.0.
+
+### Measured consequence
+
+Fraction of a known seasonal signal, and of a known spatial signal, that
+survives into the `.npz`. Built through `scripts/build_prior.py` on a
+167 879-record synthetic archive over 1500 Danish sites with a generating
+intensity we control, so "how much survived" is a measurement rather than an
+estimate:
+
+| resolution | cells | median records per cell-week | seasonal amplitude retained | spatial contrast retained |
+|---|---|---|---|---|
+| 3 | 21 | 102 | 0.798 | 0.898 |
+| 4 | 98 | 31 | 0.679 | 0.947 |
+| 5 | 461 | 6 | 0.426 | 0.887 |
+| 6 | 1171 | 2 | 0.298 | 0.811 |
+
+Read this before you use a fine-resolution artifact for anything that depends
+on the *size* of a seasonal swing:
+
+1. **Seasonal amplitude decays with resolution; spatial contrast does not.** A
+   res-5 artifact carries under half of the real seasonal swing, and a res-6
+   one under a third. Spatial contrast stays near 0.9 throughout.
+2. **The phase is not affected.** The week a species peaks in is recovered
+   correctly at every resolution. It is the *depth* of the seasonal trough that
+   is flattened, not its position. If your use is "when does this species
+   peak?", the flattening does not concern you; if it is "how much more likely
+   is this species in June than in January?", it does, and the answer you read
+   off the artifact is a lower bound.
+3. **The constants, not the data, set this.** On the same records at
+   `cell_week_weight = 0.5` the res-5 seasonal retention is 1.09 rather than
+   0.43, and at 50.0 it is 0.13. `cell_weight` 5 / 50 / 500 moves the *spatial*
+   retention 0.987 / 0.887 / 0.610.
+4. **They are untuned, and this release says so.** No sweep in this project
+   justifies 10 / 50 / 0.3 / 0.3 over other values. Higher values are not
+   simply worse: with almost no shrinkage a three-record cell-week reports its
+   own sampling noise as signal. It is a bias/variance trade-off that has not
+   been resolved against a downstream criterion.
+
+Two artifacts that differ only in these fields are genuinely different
+datasets. Compare `backoff_params` before comparing values across releases.
+
+---
+
+## 2c. The per-resolution manifest — its absence means the set is incomplete
+
+Beside each resolution's artifacts, `scripts/build_prior.py` writes one more
+file:
+
+```text
+prior_{source}_r{resolution}_manifest.json
+```
+
+for example `prior_dof_r4_manifest.json`. A real one:
+
+```json
+{
+  "manifest_version": 1,
+  "source": "dof",
+  "resolution": 3,
+  "stem": "prior_dof_r3",
+  "gbif_doi": "10.15468/dl.abc123",
+  "artifact_count": 6,
+  "artifacts": [
+    {"npz": "prior_dof_r3_full.npz",          "sidecar": "prior_dof_r3_full.json"},
+    {"npz": "prior_dof_r3_uniform.npz",       "sidecar": "prior_dof_r3_uniform.json"},
+    {"npz": "prior_dof_r3_marginal.npz",      "sidecar": "prior_dof_r3_marginal.json"},
+    {"npz": "prior_dof_r3_shuffle_space.npz", "sidecar": "prior_dof_r3_shuffle_space.json"},
+    {"npz": "prior_dof_r3_shuffle_time.npz",  "sidecar": "prior_dof_r3_shuffle_time.json"},
+    {"npz": "prior_dof_r3_separable.npz",     "sidecar": "prior_dof_r3_separable.json"}
+  ]
+}
+```
+
+| field | meaning |
+|---|---|
+| `manifest_version` | schema version of this file. Currently `1`. A reader that does not know the version must **refuse** the file, not half-read it |
+| `source` | matches the artifacts' `spec.source` |
+| `resolution` | matches the artifacts' `spec.resolution` |
+| `stem` | the filename prefix every artifact of this resolution shares |
+| `gbif_doi` | the same DOI every sidecar in the set carries |
+| `artifact_count` | how many entries `artifacts` has. Informational — **verify the names, not this number**; any six files would satisfy a count, including six copies of the full prior |
+| `artifacts` | one entry per artifact, each naming its `npz` and its `sidecar`, both as bare filenames in the same directory |
+
+### The rule
+
+**A resolution with no manifest is not a complete artifact set. Refuse it.**
+
+The manifest is written **last**, after every `.npz` and `.json` of that
+resolution, and any stale one is deleted **first**. So its presence is the
+completion record and its absence is exactly the state a build that died
+part-way leaves behind.
+
+That state is the reason this file exists, and it is genuinely undetectable
+without it: a build that failed during the third control leaves
+`prior_dof_r4_{full,uniform,marginal}.{npz,json}` — six files, each one
+individually valid, correctly packed and correctly provenanced, with nothing
+recording that two controls never landed. Globbing the directory cannot tell
+that from a complete release.
+
+**What the manifest does not do:** it does not clean up. A failed build still
+leaves its partial artifacts on disk, and a consumer who never checks the
+manifest is exactly as misled as before. What changed is that the truncation is
+now detectable mechanically, without knowing how many controls there are
+supposed to be.
+
+To check a set: read the manifest, refuse if it is absent, refuse if
+`manifest_version` is not one you know, confirm `source` and `resolution` match
+what you asked for, and confirm every `npz` **and** every `sidecar` it names
+exists in the directory. An `.npz` whose sidecar never landed is a truncated
+*artifact*, and the same mid-resolution failure produces it.
 
 ---
 
@@ -354,12 +510,17 @@ so `fill` does not distinguish them either.
 
 ---
 
-*This file is kept honest by two tests. Field names, constants and the decoding
-recipe are executed against a freshly saved artifact by
+*This file is kept honest by four tests. Field names, constants and the
+decoding recipe are executed against a freshly saved artifact by
 `tests/prior/test_tensor.py::test_the_artifact_documentation_matches_a_freshly_saved_artifact`.
 The fill regime section 2a asserts is pinned against an artifact built through
 `build_from_archive` — a real pipeline output, not a hand-built fixture — by
 `tests/prior/test_controls.py::test_the_documented_fill_regime_holds_on_a_PIPELINE_artifact`.
 That second test exists because an earlier revision of this document claimed the
 released grid was ~2% full, which was measured on a hand-built sparse fixture
-and is false of everything the pipeline writes.*
+and is false of everything the pipeline writes. Section 2b's retention claims
+are pinned by `tests/prior/test_amplitude_retention.py`, which generates a known
+seasonal and spatial signal, builds it through the CLI's own entry point and
+asserts floors under the retained fraction at every default resolution. Section
+2c's manifest shape and its named-artifacts rule are pinned by
+`tests/prior/test_build_prior.py::test_the_documented_MANIFEST_shape_matches_a_real_one`.*
