@@ -403,3 +403,58 @@ def test_latin1_byte_does_not_corrupt_following_rows(tmp_path):
     table = read_occurrences(zip_path)
     assert table.num_rows == 2
     assert table.column("recorded_by")[1].as_py() == "Ole Ratzer"
+
+
+# --- No silent repair at the boundary (I1) ----------------------------------
+# This module is the pipeline's only ingestion point, so every coercion it
+# performs is invisible from here on. The rule is reject, never repair — and
+# the two repairs most likely to be added as a "kindness" are pinned below.
+
+
+def test_a_float_shaped_species_key_is_DROPPED_not_truncated(tmp_path):
+    """`2492576.0` is not a GBIF species key and must not become one.
+
+    `int("2492576.0")` raises, so the row is dropped today. A well-meaning
+    `int(float(raw))` would accept it — and would also silently accept
+    `2492576.9`, inventing a key that identifies a different taxon. There is
+    no way to see that downstream: the resulting table is well-formed and the
+    species is simply wrong.
+    """
+    table = read_occurrences(
+        _archive(tmp_path, [GOOD, _field(GOOD, "speciesKey", "2492576.0")])
+    )
+    assert table.num_rows == 1
+    assert table.column("species_key").to_pylist() == [2492576]
+
+
+def test_an_unusable_row_is_DROPPED_not_kept_with_a_sentinel(tmp_path):
+    """A dropped row must leave no trace, not a placeholder key.
+
+    Substituting a sentinel (`-1`, `0`) for an unparseable `speciesKey` keeps
+    the row count stable and the schema valid, and manufactures a species that
+    then accumulates a target-group share of its own across every cell-week in
+    the archive. The row-count-only drop tests cannot distinguish this from a
+    real drop, so the surviving KEYS are asserted here.
+    """
+    table = read_occurrences(_archive(tmp_path, [GOOD, NO_SPECIES, NO_COORD, NO_DATE]))
+    assert table.num_rows == 1
+    keys = table.column("species_key").to_pylist()
+    assert keys == [2492576]
+    assert -1 not in keys and 0 not in keys
+
+
+def test_the_dropped_row_TOTAL_counts_every_row_read(tmp_path, caplog):
+    """The INFO line is the only record of how much of an archive was used.
+
+    `kept K of N` is the operator's sole signal that a schema change upstream
+    has started discarding most of the download, so `N` must count rows READ,
+    not rows kept: a total incremented after the filters would report
+    `kept 1 of 1` for an archive whose three other rows vanished.
+    """
+    rows = [GOOD, NO_SPECIES, NO_COORD, NO_DATE]
+    with caplog.at_level(logging.INFO, logger="birdology.prior.occurrences"):
+        read_occurrences(_archive(tmp_path, rows))
+    message = "\n".join(r.getMessage() for r in caplog.records)
+    assert "kept 1 of 4 rows" in message
+    assert "dropped 3" in message
+

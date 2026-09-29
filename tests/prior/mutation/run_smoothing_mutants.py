@@ -112,17 +112,52 @@ it is
   the dense column, and no test bounds that against the 40 MB / dense-grid
   budget beyond the existing `test_a_dense_grid_...` passing with it in place.
 """
+# ---------------------------------------------------------------------------
+# TEST SCOPE (final-gate finding I1)
+# ---------------------------------------------------------------------------
+# Every mutant is confronted with the WHOLE `tests/prior` directory, not just
+# this module's own test file. Before the change each harness set `TESTS` to
+# one file, so any contract whose violation is observable only in a DOWNSTREAM
+# CONSUMER was invisible -- proved on `indexing.py`, where making the guard
+# marker re-stamp unconditional passed all 21 of `test_indexing.py` and was
+# killed only by `test_effort.py`.
+#
+# Measured cost per mutant (wall clock, `uv run pytest -q`, includes uv
+# startup): one file 0.19-0.70s, whole directory 1.27s for 730 tests. The
+# directory is chosen over a derived per-target consumer set because the
+# difference is under a second per mutant and a hand-maintained consumer list
+# is a guess that rots. The consumer graph WAS derived (`grep` of every
+# `from birdology.prior...` and `from .` import under src/, scripts/ and
+# tests/prior) and is recorded below for what the widening buys, not as a
+# filter:
+#
+#   indexing   -> backoff, controls, smoothing, tensor, effort(runtime),
+#                 leakage(tests), build_prior      [WEEKS_PER_YEAR + the marker
+#                                                   re-stamp + aggregate_counts]
+#   leakage    -> indexing, effort, build_prior
+#   backoff    -> tensor (FLOOR), build_prior
+#   tensor     -> controls, build_prior
+#   effort     -> backoff(tests), build_prior
+#   smoothing  -> build_prior
+#   controls   -> build_prior
+#   occurrences-> indexing(tests), build_prior
+#
+# `TESTS` below is now this module's OWN test file and is NOT the scope: the
+# runner uses it only to report which mutants are pinned ONLY from outside it.
+# `--tests tests/prior/test_x.py` reproduces the old narrow behaviour, and
+# exists so the cost of the widening can be re-measured.
+# ---------------------------------------------------------------------------
+
 from __future__ import annotations
 
-import argparse
-import difflib
-import re
-import shutil
-import subprocess
 import sys
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import _harness  # noqa: E402  -- sibling module; this file runs as a script
+
+REPO = _harness.REPO
 TARGET = Path("src/birdology/prior/smoothing.py")
 TESTS = "tests/prior/test_smoothing.py"
 
@@ -845,166 +880,13 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
 ]
 
 
-def _clear_pycache() -> None:
-    for d in REPO.rglob("__pycache__"):
-        shutil.rmtree(d, ignore_errors=True)
-
-
-def _git(*args: str) -> str:
-    return subprocess.run(
-        ["git", *args], cwd=REPO, capture_output=True, text=True, check=True
-    ).stdout
-
-
-def _require_clean() -> None:
-    dirty = [
-        line
-        for line in _git("status", "--porcelain").splitlines()
-        if line[3:].strip() == str(TARGET)
-    ]
-    if dirty:
-        sys.exit(f"refusing to run: {TARGET} is dirty ({dirty!r}); commit or restore it")
-
-
-def _run_tests() -> tuple[int, str, set[str]]:
-    """Return (failure count, output, names of failing tests)."""
-    proc = subprocess.run(
-        ["uv", "run", "pytest", TESTS, "-q", "--no-header", "-p", "no:cacheprovider"],
-        cwd=REPO,
-        capture_output=True,
-        text=True,
-    )
-    out = proc.stdout + proc.stderr
-    failed = set(re.findall(r"^(?:FAILED|ERROR) \S+::(\w+)", out, re.MULTILINE))
-    match = re.search(r"(\d+) failed", out)
-    if match:
-        return int(match.group(1)), out, failed
-    # A collection error or an uncaught crash reports no "N failed" line but is
-    # still a kill; treat any non-zero exit as at least one failure so that a
-    # broken run can never be scored as a survivor.
-    return (0 if proc.returncode == 0 else 1), out, failed
-
-
-def _apply(source: str, edits: list[tuple[str, str]]) -> str | None:
-    mutated = source
-    for old, new in edits:
-        if mutated.count(old) != 1:
-            return None
-        mutated = mutated.replace(old, new)
-    return mutated
-
-
 def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--only", nargs="*", default=None, help="mutant ids to run")
-    parser.add_argument(
-        "--verify-labels",
-        action="store_true",
-        help="print the diff each mutant applies and exit, so every LABEL can "
-        "be read against its actual EDIT rather than trusted",
+    return _harness.main(
+        target=TARGET,
+        mutants=MUTANTS,
+        own_tests=TESTS,
+        allow_unnamed=False,
     )
-    args = parser.parse_args()
-
-    source = (REPO / TARGET).read_text()
-    test_source = (REPO / TESTS).read_text()
-    selected = [m for m in MUTANTS if args.only is None or m[0] in args.only]
-
-    if args.verify_labels:
-        bad = []
-        for mid, description, killer, edits in selected:
-            mutated = _apply(source, edits)
-            print(f"\n{'=' * 72}\n{mid}: {description}\n  killer: {killer}\n{'=' * 72}")
-            if mutated is None:
-                print("  !! NOT APPLICABLE: a pattern does not occur exactly once")
-                bad.append(mid)
-                continue
-            if f"def {killer}(" not in test_source:
-                print(f"  !! killer test {killer!r} does not exist in {TESTS}")
-                bad.append(mid)
-            print(
-                "".join(
-                    difflib.unified_diff(
-                        source.splitlines(keepends=True),
-                        mutated.splitlines(keepends=True),
-                        "original",
-                        mid,
-                        n=1,
-                    )
-                )
-            )
-        print(f"\nunapplicable/mislabelled: {bad or 'none'}")
-        return 1 if bad else 0
-
-    _require_clean()
-
-    _clear_pycache()
-    baseline, out, _ = _run_tests()
-    _clear_pycache()
-    if baseline:
-        sys.exit(f"refusing to run: baseline is not green ({baseline} failed)\n{out}")
-    print(f"baseline: green ({out.strip().splitlines()[-1]})\n")
-
-    rows: list[tuple[str, str, str]] = []
-    survivors: list[str] = []
-    not_applied: list[str] = []
-    mislabelled: list[str] = []
-
-    for mid, description, killer, edits in selected:
-        if f"def {killer}(" not in test_source:
-            print(f"{mid}: MISLABELLED — killer test {killer!r} does not exist")
-            rows.append((mid, description, "MISLABELLED"))
-            mislabelled.append(mid)
-            continue
-
-        mutated = _apply(source, edits)
-        if mutated is None:
-            counts = [source.count(old) for old, _ in edits]
-            print(f"{mid}: NOT APPLIED — pattern occurrence counts {counts}")
-            rows.append((mid, description, "NOT APPLIED"))
-            not_applied.append(mid)
-            continue
-
-        (REPO / TARGET).write_text(mutated)
-        _clear_pycache()
-        try:
-            failures, out, failed_names = _run_tests()
-        finally:
-            _git("checkout", "--", str(TARGET))
-            _clear_pycache()
-            assert (REPO / TARGET).read_text() == source, "restore failed"
-
-        if not failures:
-            verdict = "SURVIVED"
-            survivors.append(mid)
-        elif killer not in failed_names:
-            # The mutant died, but not to the test this row CLAIMS covers it.
-            # That is the "label does not match the coverage" failure mode from
-            # earlier in this plan, and it must not read as a kill.
-            verdict = f"MISLABELLED ({failures} failed, not {killer})"
-            mislabelled.append(mid)
-        else:
-            verdict = str(failures)
-        print(f"{mid}: {verdict:>10}  {description[:70]}")
-        rows.append((mid, description, verdict))
-
-    _require_clean()
-    _clear_pycache()
-    final, out, _ = _run_tests()
-    _clear_pycache()
-    print(f"\nrestored run: {'GREEN' if not final else f'{final} FAILED'}")
-
-    print("\n| # | Mutation | Killed by | Tests killed |")
-    print("|---|---|---|---|")
-    by_id = {m[0]: m[2] for m in MUTANTS}
-    for mid, description, verdict in rows:
-        print(f"| {mid} | {description} | `{by_id[mid]}` | {verdict} |")
-    print(f"\nSurvivors: {survivors or 'none'}")
-    # NOT-APPLIED and MISLABELLED are FAILURES, not neutral rows. A pattern
-    # that has gone stale after a refactor tests nothing, and a mutant killed
-    # only by an unrelated test credits coverage that does not exist.
-    print(f"NOT APPLIED: {not_applied or 'none'}")
-    print(f"MISLABELLED: {mislabelled or 'none'}")
-    return 1 if survivors or not_applied or mislabelled or final else 0
 
 
 if __name__ == "__main__":

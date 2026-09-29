@@ -266,3 +266,78 @@ def test_aggregate_counts_n_is_int64():
     assert counts.schema.field("n").type == pa.int64()
     assert counts.schema.field("species_key").type == pa.int64()
     assert counts.schema.field("week").type == pa.int8()
+
+
+# --- Cross-module contracts this module OWNS (I1) ----------------------------
+# `indexing.py` had no mutation harness until finding I1, and the three
+# contracts below are the ones other modules depend on without being able to
+# check. They are pinned HERE, at the producer, so the harness can name a
+# killer inside this file rather than relying on a downstream file happening
+# to notice.
+
+
+def test_cell_column_is_string_not_large_string():
+    """`tensor.py` and `leakage.py` key on `cell` by pyarrow type.
+
+    `pa.large_string()` holds the same bytes and compares equal element-wise,
+    so every value-based assertion in the repository passes under it while
+    `table.schema == other.schema` comparisons and `pc.is_in` value sets
+    silently stop matching. Nothing downstream re-derives the type, so this is
+    the only place it can be pinned.
+    """
+    t = _table([(1, "A", 55.6, 12.5, date(2025, 3, 3), "p", "o")])
+    out = assign_cells(t, resolution=4)
+    assert out.schema.field("cell").type == pa.string()
+    assert out.schema.field("cell").type != pa.large_string()
+    assert aggregate_counts(out).schema.field("cell").type == pa.string()
+
+
+def test_aggregate_counts_emits_ONE_row_per_species_cell_week():
+    """Row uniqueness is a contract `backoff.py` REFUSES to re-derive.
+
+    `backoff.hierarchical_estimate` rejects a duplicate (species, cell, week)
+    row rather than accumulating it (mutants B27/B27b), and its docstring says
+    the `aggregate_counts` group_by guarantees uniqueness upstream. Two records
+    of the same species, cell and week differing ONLY in provenance must
+    therefore collapse to one row with n=2 — provenance is projected away
+    BEFORE the group_by, and if it were not, the leaf grouping would be finer
+    than the key backoff validates against and every duplicate would arrive at
+    backoff as a rejected table.
+    """
+    t = _table(
+        [
+            (1, "A", 55.6867, 12.5700, date(2025, 11, 14), "pub-a", "Ole"),
+            (1, "A", 55.6867, 12.5700, date(2025, 11, 14), "pub-b", "Jens"),
+        ]
+    )
+    counts = aggregate_counts(assign_cells(t, resolution=4)).to_pylist()
+    assert len(counts) == 1
+    assert counts[0]["n"] == 2
+    keys = [(r["species_key"], r["cell"], r["week"]) for r in counts]
+    assert len(set(keys)) == len(keys)
+
+
+def test_week_and_cell_are_aligned_to_their_OWN_row():
+    """The two derived columns are built as list comprehensions over separate
+    column reads, so a reversal, an off-by-one or a re-sort in either one
+    misaligns every record without changing the SET of cells or weeks — and a
+    test that only checks sets, or that uses one row, cannot see it.
+
+    Both pairings are asserted against a fixture where the two rows differ in
+    species, in place and in week, so no permutation of either list is the
+    identity.
+    """
+    cph, syd = (55.6867, 12.5700), (-33.8688, 151.2093)
+    t = _table(
+        [
+            (1, "A", cph[0], cph[1], date(2025, 11, 14), "p", "o"),  # week 46
+            (2, "B", syd[0], syd[1], date(2025, 3, 3), "p", "o"),  # week 10
+        ]
+    )
+    out = assign_cells(t, resolution=4).to_pylist()
+    by_species = {row["species_key"]: row for row in out}
+    assert by_species[1]["week"] == 46
+    assert by_species[2]["week"] == 10
+    assert by_species[1]["cell"] == h3.latlng_to_cell(*cph, 4)
+    assert by_species[2]["cell"] == h3.latlng_to_cell(*syd, 4)
+

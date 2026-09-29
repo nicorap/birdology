@@ -77,16 +77,52 @@ layer. Where a disjunct is genuinely unreachable in isolation, say so in the
 label with the reason rather than inventing a contrived assertion: an
 honestly-recorded equivalent mutant is a real result, a fabricated kill is not.
 """
+# ---------------------------------------------------------------------------
+# TEST SCOPE (final-gate finding I1)
+# ---------------------------------------------------------------------------
+# Every mutant is confronted with the WHOLE `tests/prior` directory, not just
+# this module's own test file. Before the change each harness set `TESTS` to
+# one file, so any contract whose violation is observable only in a DOWNSTREAM
+# CONSUMER was invisible -- proved on `indexing.py`, where making the guard
+# marker re-stamp unconditional passed all 21 of `test_indexing.py` and was
+# killed only by `test_effort.py`.
+#
+# Measured cost per mutant (wall clock, `uv run pytest -q`, includes uv
+# startup): one file 0.19-0.70s, whole directory 1.27s for 730 tests. The
+# directory is chosen over a derived per-target consumer set because the
+# difference is under a second per mutant and a hand-maintained consumer list
+# is a guess that rots. The consumer graph WAS derived (`grep` of every
+# `from birdology.prior...` and `from .` import under src/, scripts/ and
+# tests/prior) and is recorded below for what the widening buys, not as a
+# filter:
+#
+#   indexing   -> backoff, controls, smoothing, tensor, effort(runtime),
+#                 leakage(tests), build_prior      [WEEKS_PER_YEAR + the marker
+#                                                   re-stamp + aggregate_counts]
+#   leakage    -> indexing, effort, build_prior
+#   backoff    -> tensor (FLOOR), build_prior
+#   tensor     -> controls, build_prior
+#   effort     -> backoff(tests), build_prior
+#   smoothing  -> build_prior
+#   controls   -> build_prior
+#   occurrences-> indexing(tests), build_prior
+#
+# `TESTS` below is now this module's OWN test file and is NOT the scope: the
+# runner uses it only to report which mutants are pinned ONLY from outside it.
+# `--tests tests/prior/test_x.py` reproduces the old narrow behaviour, and
+# exists so the cost of the widening can be re-measured.
+# ---------------------------------------------------------------------------
+
 from __future__ import annotations
 
-import argparse
-import re
-import shutil
-import subprocess
 import sys
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import _harness  # noqa: E402  -- sibling module; this file runs as a script
+
+REPO = _harness.REPO
 TARGET = Path("src/birdology/prior/effort.py")
 TESTS = "tests/prior/test_effort.py"
 
@@ -919,110 +955,13 @@ MUTANTS: list[tuple[str, str, list[tuple[str, str]]]] = [
 ]
 
 
-def _clear_pycache() -> None:
-    for d in REPO.rglob("__pycache__"):
-        shutil.rmtree(d, ignore_errors=True)
-
-
-def _git(*args: str) -> str:
-    return subprocess.run(
-        ["git", *args], cwd=REPO, capture_output=True, text=True, check=True
-    ).stdout
-
-
-def _require_clean() -> None:
-    dirty = [
-        line
-        for line in _git("status", "--porcelain").splitlines()
-        if line[3:].strip() == str(TARGET)
-    ]
-    if dirty:
-        sys.exit(f"refusing to run: {TARGET} is dirty ({dirty!r}); commit or restore it")
-
-
-def _run_tests() -> tuple[int, str]:
-    proc = subprocess.run(
-        ["uv", "run", "pytest", TESTS, "-q", "--no-header", "-p", "no:cacheprovider"],
-        cwd=REPO,
-        capture_output=True,
-        text=True,
-    )
-    out = proc.stdout + proc.stderr
-    match = re.search(r"(\d+) failed", out)
-    if match:
-        return int(match.group(1)), out
-    # A collection error or an uncaught crash reports no "N failed" line but is
-    # still a kill; treat any non-zero exit as at least one failure so that a
-    # broken run can never be scored as a survivor.
-    return (0 if proc.returncode == 0 else 1), out
-
-
 def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--only", nargs="*", default=None, help="mutant ids to run")
-    args = parser.parse_args()
-
-    _require_clean()
-    source = (REPO / TARGET).read_text()
-
-    _clear_pycache()
-    baseline, out = _run_tests()
-    _clear_pycache()
-    if baseline:
-        sys.exit(f"refusing to run: baseline is not green ({baseline} failed)\n{out}")
-    print(f"baseline: green ({out.strip().splitlines()[-1]})\n")
-
-    selected = [m for m in MUTANTS if args.only is None or m[0] in args.only]
-    rows: list[tuple[str, str, str]] = []
-    survivors: list[str] = []
-    not_applied: list[str] = []
-
-    for mid, description, edits in selected:
-        mutated = source
-        applied = True
-        for old, new in edits:
-            count = mutated.count(old)
-            if count != 1:
-                print(f"{mid}: NOT APPLIED — pattern occurs {count}x: {old[:60]!r}")
-                applied = False
-                break
-            mutated = mutated.replace(old, new)
-        if not applied:
-            rows.append((mid, description, "NOT APPLIED"))
-            not_applied.append(mid)
-            continue
-
-        (REPO / TARGET).write_text(mutated)
-        _clear_pycache()
-        try:
-            failures, out = _run_tests()
-        finally:
-            _git("checkout", "--", str(TARGET))
-            _clear_pycache()
-            assert (REPO / TARGET).read_text() == source, "restore failed"
-
-        verdict = str(failures) if failures else "SURVIVED"
-        if not failures:
-            survivors.append(mid)
-        print(f"{mid}: {verdict:>10}  {description}")
-        rows.append((mid, description, verdict))
-
-    _require_clean()
-    _clear_pycache()
-    final, out = _run_tests()
-    _clear_pycache()
-    print(f"\nrestored run: {'GREEN' if not final else f'{final} FAILED'}")
-
-    print("\n| # | Mutation | Tests killed |")
-    print("|---|---|---|")
-    for mid, description, verdict in rows:
-        print(f"| {mid} | {description} | {verdict} |")
-    print(f"\nSurvivors: {survivors or 'none'}")
-    # NOT-APPLIED is a FAILURE, not a neutral row (round-1 finding F7). A
-    # pattern that has gone stale after a refactor tests nothing, and under a
-    # "Survivors: none" banner it reads as coverage it never provided.
-    print(f"NOT APPLIED: {not_applied or 'none'}")
-    return 1 if survivors or not_applied or final else 0
+    return _harness.main(
+        target=TARGET,
+        mutants=MUTANTS,
+        own_tests=TESTS,
+        allow_unnamed=True,
+    )
 
 
 if __name__ == "__main__":
