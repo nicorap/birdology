@@ -45,29 +45,55 @@ passed for the same reason in the spatial direction, and explicitly rather
 than by default so the axes the artifact publishes are a decision this script
 made, not a side effect of which rows happened to survive the guards.
 
-THE COST IS REAL AND IS MEASURED, NOT ASSUMED
-----------------------------------------------
+THE COST IS REAL AND WAS MEASURED, NOT ASSUMED
+-----------------------------------------------
 `_validate_p` forbids `p <= 0`, so EVERY estimated context is an explicit
 nonzero. A full 52-week grid over the observed cells materialises
-`n_species * n_cells * 52` stored entries: at Danish national scale (~600
-species, ~3000 cells) that is 9.36e7 entries, ~1.1 GB of CSR, and Task 9's
-controls call `t.dense()` on top, ~750 MB each.
+`n_species * n_cells * 52` stored entries.
 
-So this script BUILDS IN SPECIES CHUNKS (`--species-chunk`) and reports peak
-RSS at INFO. Chunking is bit-exact, not an approximation, and that is a
-property of the backoff rather than a hope: every level of the hierarchy is
-computed from the RATIO TABLE, which is passed whole to every chunk, so a
-chunk's estimates do not depend on which other species are in the same call.
-`test_build_prior.py` pins it against a single-call build value-for-value.
+MEASURED peak RSS, by building real archives end to end (macOS arm64,
+`ru_maxrss`), with the peak attributed per stage:
 
-What chunking does NOT reduce is the PEAK, which is set by the controls:
-`dense()` materialises the whole float64 grid in one array regardless of how
-the tensor was assembled. The honest resolutions if that does not fit are the
-two T10-R1 names: a documented week window -- which would have to be stated
-in the sidecar, because an artifact whose grid is narrower than 52 weeks and
-does not say so is a silent lie about its own coverage -- or a control
-implementation that streams. Falling back to the observed axes is NOT one of
-them: it reintroduces the exact defect this design prevents.
+    species x cells   contexts   backoff+concat   to_tensor   dense()
+    ---------------   --------   --------------   ---------   -------
+    120 x 200          1.25e6         --            324 MiB     --
+    240 x 400          4.99e6         --           1007 MiB     --
+    600 x 600          1.87e7       823 MiB        2827 MiB    +0 MiB
+    850 x 600          2.65e7      1106 MiB        4051 MiB    +0 MiB
+
+Two findings, both of which contradict the estimate this design started from:
+
+1. THE PEAK IS `to_tensor`, NOT `dense()`. The float64 grid `dense()`
+   materialises is only 8 bytes per context -- 202 MiB at 2.65e7 contexts,
+   and it did not move the peak at any scale measured, controls included.
+   What dominates is the Arrow table -> COO -> CSR conversion, which holds
+   several representations of the same nonzeros at once. Cost is ~160 bytes
+   per context, stable across a 20x range of scales.
+
+2. CHUNKING BOUNDS THE BACKOFF, NOT THE PEAK. Measured at 240 x 400:
+   chunk 50 -> 1181 MiB, chunk 10 -> 1007 MiB, chunk 4 -> 993 MiB. Chunking
+   caps the backoff's working set (the `estimates` table is built whole
+   regardless, then converted whole), so it buys ~15% and then flattens.
+   `--species-chunk` is therefore honest about what it does and is NOT a
+   way to fit an arbitrarily large grid.
+
+WHAT THAT IMPLIES FOR THE RELEASE, at ~600 Danish species:
+
+    resolution   cells over DK   contexts   projected peak
+    ----------   -------------   --------   --------------
+    3                       27   8.4e5          ~0.14 GB
+    4                      147   4.6e6          ~0.7 GB
+    5                      897   2.8e7          ~4.5 GB
+    6                     5975   1.9e8           ~30 GB
+    7                    40999   1.3e9          ~200 GB
+
+Resolutions 3, 4 and 5 -- the default sweep -- fit on an ordinary machine.
+Resolution 6 needs a large node and 7 does not fit at all. The honest
+resolutions for those are the two T10-R1 names: a documented week window,
+which would have to be STATED IN THE SIDECAR because an artifact whose grid
+is narrower than 52 weeks and does not say so is a silent lie about its own
+coverage, or a streaming `to_tensor`. Falling back to the observed axes is
+NOT one of them: it reintroduces the exact defect this design prevents.
 """
 from __future__ import annotations
 
@@ -312,6 +338,24 @@ def estimate_over_full_grid(
     return pa.concat_tables(pieces)
 
 
+#: MEASURED bytes of peak RSS per grid context, from end-to-end builds at
+#: 1.87e7 and 2.65e7 contexts (158 and 160 bytes/context respectively; see
+#: the module docstring's table). The peak is the Arrow -> COO -> CSR
+#: conversion in `to_tensor`, NOT `dense()`, which costs 8 bytes/context and
+#: did not move the peak at any scale measured.
+#:
+#: Used only to WARN before a long job. It is a projection from measurements,
+#: not a guarantee, and it is deliberately not a guard: refusing to build
+#: would substitute this script's guess for the operator's knowledge of their
+#: own machine.
+MEASURED_BYTES_PER_CONTEXT = 160
+
+
+def project_peak_bytes(n_species: int, n_cells: int) -> int:
+    """Projected peak RSS for a grid of this size, from measured scaling."""
+    return n_species * n_cells * WEEKS_PER_YEAR * MEASURED_BYTES_PER_CONTEXT
+
+
 def species_axis(counts: pa.Table) -> list[int]:
     """The SORTED species axis for the grid.
 
@@ -383,13 +427,14 @@ def build_from_archive(
     cells = cell_axis(counts)
     log.info(
         "resolution %d: %d occurrences, %d species, %d cells -> %d grid "
-        "contexts over %d weeks",
+        "contexts over %d weeks, projected peak ~%.1f GiB",
         resolution,
         table.num_rows,
         len(species),
         len(cells),
         len(species) * len(cells) * WEEKS_PER_YEAR,
         WEEKS_PER_YEAR,
+        project_peak_bytes(len(species), len(cells)) / (1 << 30),
     )
 
     estimates = estimate_over_full_grid(

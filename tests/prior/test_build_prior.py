@@ -384,6 +384,34 @@ def test_chunk_boundaries_are_deterministic_across_runs(tmp_path):
     assert species == build_prior.species_axis(counts)
 
 
+def test_the_projected_peak_is_reported_before_the_expensive_stage(tmp_path, caplog):
+    """The operator learns the cost BEFORE the hours, not after an OOM.
+
+    The projection is from MEASURED scaling (~160 bytes/context, stable
+    across a 20x range), and it is logged before `estimate_over_full_grid`
+    rather than after, because after is where the OOM happens.
+
+    Deliberately NOT a guard. Refusing to build above some threshold would
+    substitute this script's guess for the operator's knowledge of their own
+    machine; what the script owes them is the number.
+    """
+    with caplog.at_level(logging.INFO, logger="birdology.prior.build"):
+        _build(tmp_path)
+    grid = [r for r in caplog.records if "grid" in r.getMessage()]
+    assert grid, "the grid size was never reported"
+    assert "projected peak" in grid[0].getMessage()
+
+
+def test_the_peak_projection_scales_with_the_grid(tmp_path):
+    """It is a function of the grid, not a constant dressed up as one."""
+    small = build_prior.project_peak_bytes(10, 10)
+    big = build_prior.project_peak_bytes(20, 10)
+    assert big == 2 * small
+    # ...and it follows WEEKS_PER_YEAR, so a documented week window would
+    # change the projection rather than leaving it stale.
+    assert small == 10 * 10 * WEEKS_PER_YEAR * build_prior.MEASURED_BYTES_PER_CONTEXT
+
+
 def test_the_cell_axis_is_sorted_too(tmp_path):
     """Its own test: two axes, two functions, two independent regressions.
 

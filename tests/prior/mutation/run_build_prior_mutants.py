@@ -67,13 +67,16 @@ it is
   exist. The `weeks=` half is genuinely different: B1 dies twice over.
   This asymmetry is real and is reported as such rather than papered over
   with a mutant that would have had to be labelled dishonestly.
-* SCALE. The largest fixture is 2 species x 4 cells x 52 weeks = 416
+* SCALE. The largest fixture is 3 species x 4 cells x 52 weeks = 624
   contexts. Nothing here would catch a defect that appears only at national
-  scale -- and the memory behaviour of the full grid is exactly such a
-  property. It is MEASURED in the task report (peak RSS against species and
-  cell count, with the dominant term identified) rather than asserted by a
-  test, because a peak-RSS assertion on a 416-context fixture would pin
-  nothing and a national-scale one would take minutes per run.
+  scale. The memory behaviour of the full grid is such a property and was
+  MEASURED separately (end-to-end builds up to 2.65e7 contexts; see the
+  build script's docstring table) rather than asserted by a test, because a
+  peak-RSS assertion on a 624-context fixture would pin nothing and a
+  national-scale one would take minutes per run. B16/B17 pin that the
+  measured scaling is SURFACED to the operator and varies with the grid;
+  they do NOT pin that 160 bytes/context is still the right constant, which
+  would drift silently if `to_tensor`'s representation changed.
 * THAT THE DOI IS THE RIGHT ONE. B10/B11 prove the DOI the caller supplied
   reaches every artifact. That it NAMES the GBIF download this archive
   actually came from is not checkable by any test: `--gbif-doi` is a free
@@ -335,6 +338,43 @@ MUTANTS: list[Mutant] = [
                 '            full, Path("/scratch/priors") / f"{stem}_full.npz"\n'
                 "        )\n"
                 "    )",
+            )
+        ],
+    ),
+    (
+        "B16",
+        "the peak-memory projection REMOVED from the pre-build log line. The "
+        "grid size is still reported, so a check that something was logged "
+        "passes -- what is lost is the only warning an operator gets before "
+        "committing hours to a build that will OOM. T10-R1's memory "
+        "obligation is that the cost is measured and SURFACED, not that it "
+        "was measured once by the author",
+        "test_the_projected_peak_is_reported_before_the_expensive_stage",
+        [
+            (
+                '        "contexts over %d weeks, projected peak ~%.1f GiB",',
+                '        "contexts over %d weeks",',
+            ),
+            (
+                "        WEEKS_PER_YEAR,\n"
+                "        project_peak_bytes(len(species), len(cells)) / (1 << 30),\n"
+                "    )",
+                "        WEEKS_PER_YEAR,\n    )",
+            ),
+        ],
+    ),
+    (
+        "B17",
+        "the projection made a CONSTANT rather than a function of the grid, so "
+        "every resolution of a sweep reports the same number. It still looks "
+        "like a measurement and still appears in the log, which is what makes "
+        "it worse than no projection at all: an operator who trusts it sizes "
+        "a res-6 job from a res-3 figure",
+        "test_the_peak_projection_scales_with_the_grid",
+        [
+            (
+                "    return n_species * n_cells * WEEKS_PER_YEAR * MEASURED_BYTES_PER_CONTEXT",
+                "    return 512 * (1 << 20)",
             )
         ],
     ),
