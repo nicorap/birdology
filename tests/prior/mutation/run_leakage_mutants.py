@@ -143,9 +143,8 @@ MUTANTS: list[tuple[str, str, list[tuple[str, str]]]] = [
         "contributor normalisation dropped on the OCCURRENCE side only",
         [
             (
-                "        or (normalise_cell(cell), normalise_week(week), normalise_contributor(name))\n"
-                "        not in banned",
-                "        or (normalise_cell(cell), normalise_week(week), name) not in banned",
+                "        key = (normalise_cell(cell), normalise_week(week), who)",
+                "        key = (normalise_cell(cell), normalise_week(week), name)",
             )
         ],
     ),
@@ -163,16 +162,24 @@ MUTANTS: list[tuple[str, str, list[tuple[str, str]]]] = [
     (
         "M12",
         "layer 1: blank test recording NOT skipped (mass-deletion path)",
-        [("        if who is None:", "        if False:")],
+        [
+            (
+                "        if who is None:\n"
+                "            # Unreachable via TestRecording.__post_init__; belt-and-braces for",
+                "        if False:\n"
+                "            # Unreachable via TestRecording.__post_init__; belt-and-braces for",
+            )
+        ],
     ),
     (
         "M13",
         "layer 2: null recorded_by rows treated as matchable",
         [
             (
-                "        normalise_contributor(name) is None\n"
-                "        or (normalise_cell(cell), normalise_week(week), normalise_contributor(name))",
-                "        (normalise_cell(cell), normalise_week(week), normalise_contributor(name))",
+                "        if who is None:\n"
+                "            # Layer 2 of the blank-contributor defence: ALWAYS kept, and the",
+                "        if False:\n"
+                "            # Layer 2 of the blank-contributor defence: ALWAYS kept, and the",
             )
         ],
     ),
@@ -182,12 +189,16 @@ MUTANTS: list[tuple[str, str, list[tuple[str, str]]]] = [
         "clause (the exact reviewer mutation that survived in round 1)",
         [
             (
-                "    keep = keep_mask(cells, weeks, who_raw, banned)",
+                "    keep, matched = _mask_and_matched_keys(cells, weeks, who_raw, banned)",
                 "    keep = [\n"
                 "        (normalise_cell(c), normalise_week(w), normalise_contributor(n))\n"
                 "        not in banned\n"
                 "        for c, w, n in zip(cells, weeks, who_raw)\n"
-                "    ]",
+                "    ]\n"
+                "    matched = {\n"
+                "        (normalise_cell(c), normalise_week(w), normalise_contributor(n))\n"
+                "        for c, w, n in zip(cells, weeks, who_raw)\n"
+                "    } & banned",
             )
         ],
     ),
@@ -221,8 +232,8 @@ MUTANTS: list[tuple[str, str, list[tuple[str, str]]]] = [
                 '        banned.add(("", normalise_week(recording.week), who))',
             ),
             (
-                "        or (normalise_cell(cell), normalise_week(week), normalise_contributor(name))",
-                '        or ("", normalise_week(week), normalise_contributor(name))',
+                "        key = (normalise_cell(cell), normalise_week(week), who)",
+                '        key = ("", normalise_week(week), who)',
             ),
         ],
     ),
@@ -235,8 +246,8 @@ MUTANTS: list[tuple[str, str, list[tuple[str, str]]]] = [
                 "        banned.add((cell, 0, who))",
             ),
             (
-                "        or (normalise_cell(cell), normalise_week(week), normalise_contributor(name))",
-                "        or (normalise_cell(cell), 0, normalise_contributor(name))",
+                "        key = (normalise_cell(cell), normalise_week(week), who)",
+                "        key = (normalise_cell(cell), 0, who)",
             ),
         ],
     ),
@@ -249,8 +260,8 @@ MUTANTS: list[tuple[str, str, list[tuple[str, str]]]] = [
                 '        banned.add((cell, normalise_week(recording.week), ""))',
             ),
             (
-                "        or (normalise_cell(cell), normalise_week(week), normalise_contributor(name))",
-                '        or (normalise_cell(cell), normalise_week(week), "")',
+                "        key = (normalise_cell(cell), normalise_week(week), who)",
+                '        key = (normalise_cell(cell), normalise_week(week), "")',
             ),
         ],
     ),
@@ -280,10 +291,15 @@ MUTANTS: list[tuple[str, str, list[tuple[str, str]]]] = [
         "apply_leakage_guards skips the contributor guard",
         [
             (
-                "    kept, contributor_removed, banned_count = _drop_test_contributor_cells(\n"
-                "        after_xc, test_recordings\n"
+                "    kept, contributor_removed, banned_count, matched_count = (\n"
+                "        _drop_test_contributor_cells(after_xc, test_recordings)\n"
                 "    )",
-                "    kept, contributor_removed, banned_count = after_xc, 0, 0",
+                "    kept, contributor_removed, banned_count, matched_count = (\n"
+                "        after_xc,\n"
+                "        0,\n"
+                "        0,\n"
+                "        0,\n"
+                "    )",
             )
         ],
     ),
@@ -302,10 +318,8 @@ MUTANTS: list[tuple[str, str, list[tuple[str, str]]]] = [
         "keep_mask ignores `banned` entirely (all-True)",
         [
             (
-                "        normalise_contributor(name) is None\n"
-                "        or (normalise_cell(cell), normalise_week(week), normalise_contributor(name))\n"
-                "        not in banned",
-                "        True",
+                "        if key in banned:",
+                "        if False:",
             )
         ],
     ),
@@ -314,8 +328,8 @@ MUTANTS: list[tuple[str, str, list[tuple[str, str]]]] = [
         "drop_test_contributor_cells bypasses keep_mask (keeps everything)",
         [
             (
-                "    keep = keep_mask(cells, weeks, who_raw, banned)",
-                "    keep = [True] * len(cells)",
+                "    keep, matched = _mask_and_matched_keys(cells, weeks, who_raw, banned)",
+                "    keep, matched = [True] * len(cells), set(banned)",
             )
         ],
     ),
@@ -335,8 +349,8 @@ MUTANTS: list[tuple[str, str, list[tuple[str, str]]]] = [
         "F1: cell NOT normalised on the occurrence side (keep_mask)",
         [
             (
-                "        or (normalise_cell(cell), normalise_week(week), normalise_contributor(name))",
-                "        or (cell, normalise_week(week), normalise_contributor(name))",
+                "        key = (normalise_cell(cell), normalise_week(week), who)",
+                "        key = (cell, normalise_week(week), who)",
             )
         ],
     ),
