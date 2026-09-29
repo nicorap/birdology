@@ -259,8 +259,9 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         "T9",
         "the NON-POSITIVITY clause removed, so a `p` of exactly 0.0 -- an "
         "upstream contract breach, since the backoff clamps into "
-        "[1e-06, 1.0] -- is stored as a structural zero indistinguishable "
-        "from a context missing from the tensor entirely",
+        "[1e-06, 1.0] -- is stored as an explicit zero, which `_floor_missing` "
+        "reads exactly as it reads a context that was never stored: the real "
+        "zero is silently reinterpreted as \"nobody looked\"",
         "test_a_zero_p_is_rejected_not_silently_skipped",
         [
             (
@@ -311,8 +312,9 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         "T13",
         "the brief's original `if r['p'] == 0.0: continue` restored in spirit: "
         "non-positive rows are DROPPED instead of raising. Nothing errors, "
-        "the tensor is one entry smaller, and the dropped context becomes a "
-        "structural zero -- the silent failure T8-R4 forbids",
+        "the tensor is one entry smaller, and the dropped context now reads "
+        "the FLOOR -- so an upstream stage that emitted a real zero has it "
+        "silently converted into \"nobody looked\", the failure T8-R4 forbids",
         "test_a_zero_p_is_rejected_not_silently_skipped",
         [
             (
