@@ -543,7 +543,11 @@ def test_the_sbatch_header_documents_the_log_dir_precreation():
 
 def _sbatch_guard_block():
     lines = _sbatch_text().splitlines()
-    start = next(i for i, ln in enumerate(lines) if ln.startswith("mapfile"))
+    # The shard listing is now an if/else on $SPLIT (split-specific shard
+    # globs, measured on WEKA); the guard block starts at that branch.
+    start = next(
+        i for i, ln in enumerate(lines) if ln.startswith('if [ -n "$SPLIT" ]')
+    )
     stop = next(
         i
         for i, ln in enumerate(lines)
@@ -577,7 +581,10 @@ def _run_guard_block(tmp_path, n_shards, *, task_max):
     corpus.mkdir(exist_ok=True)
     for i in range(n_shards):
         (corpus / f"XCM_shard_{i:04d}.tar.gz").write_bytes(b"")
-    script = f'set -euo pipefail\nCORPUS="{corpus}"\n' + _sbatch_guard_block()
+    script = (
+        f'set -euo pipefail\nCORPUS="{corpus}"\nCONFIG="XCM"\nSPLIT=""\n'
+        + _sbatch_guard_block()
+    )
     return subprocess.run(
         [_modern_bash(), "-c", script],
         capture_output=True,

@@ -38,13 +38,23 @@
 # already complete unless --force is passed.
 set -euo pipefail
 
-CONFIG=${1:?usage: sbatch ... phase_a_embed.sbatch CONFIG RESOLUTION}
+CONFIG=${1:?usage: sbatch ... phase_a_embed.sbatch CONFIG RESOLUTION [SPLIT] [ENCODER]}
 RESOLUTION=${2:-4}
+# SPLIT: for configs shipping several metadata parquets (HSN: train/test/test_5s).
+# It is part of the manifest artifact name and of OUT, matching the driver.
+SPLIT=${3:-}
+# ENCODER: melsummary until Task 6 wires perch/birdnet (which raise loudly).
+ENCODER=${4:-melsummary}
 
+SUFFIX=${SPLIT:+_${SPLIT}}
 CORPUS=/mnt/weka/ML/birdset/${CONFIG}/${CONFIG}
-OUT=/mnt/weka/ML/phase_a/embeddings/${CONFIG}
-MANIFEST=/mnt/weka/ML/phase_a/${CONFIG}_r${RESOLUTION}_manifest.parquet
+OUT=/mnt/weka/ML/phase_a/embeddings/${CONFIG}${SUFFIX}
+MANIFEST=/mnt/weka/ML/phase_a/${CONFIG}${SUFFIX}_r${RESOLUTION}_manifest.parquet
 SIF=/shared/apps/ML/containers/pytorch.sif
+# The SIF does NOT carry this repo (verified on the fleet, 2026-09-30): the
+# code must be bind-mounted in and put on PYTHONPATH, and $HOME redirected --
+# jobs run with an unreadable $HOME, and python's site machinery touches it.
+REPO=/shared/apps/ML/birdology
 
 # Fail loudly rather than writing to a local directory of the same name.
 mountpoint -q /mnt/weka || { echo "FATAL: /mnt/weka is not a mountpoint on $(hostname -s)"; exit 2; }
@@ -52,7 +62,16 @@ mountpoint -q /mnt/weka || { echo "FATAL: /mnt/weka is not a mountpoint on $(hos
 
 mkdir -p "$OUT" /mnt/weka/ML/phase_a/logs
 
-mapfile -t SHARDS < <(ls "$CORPUS"/*.tar.gz | sort)
+if [ -n "$SPLIT" ]; then
+    # Split-sharded configs name shards WITHOUT the split's underscores:
+    # metadata is HSN_metadata_test_5s.parquet but shards are
+    # HSN_test5s_shard_*.tar.gz (measured on WEKA, 2026-09-30 -- BirdSet's own
+    # inconsistency). tr -d '_' maps test_5s->test5s, train->train, test->test.
+    SHARD_TAG=$(echo "$SPLIT" | tr -d '_')
+    mapfile -t SHARDS < <(ls "$CORPUS/${CONFIG}_${SHARD_TAG}_shard_"*.tar.gz | sort)
+else
+    mapfile -t SHARDS < <(ls "$CORPUS"/*.tar.gz | sort)
+fi
 N=${#SHARDS[@]}
 [ "$N" -gt 0 ] || { echo "FATAL: no shards under $CORPUS"; exit 2; }
 
@@ -70,6 +89,8 @@ SHARD=${SHARDS[$IDX]}
 
 echo "host=$(hostname -s) task=$IDX/$N shard=$(basename "$SHARD")"
 
-apptainer exec --nv --bind /mnt/weka:/mnt/weka "$SIF" \
+apptainer exec --nv --bind /mnt/weka:/mnt/weka,"$REPO":/opt/birdology "$SIF" \
+    env HOME=/tmp PYTHONPATH=/opt/birdology/src \
     python3 -m birdology.phase_a.embed_cli \
-        --shard "$SHARD" --manifest "$MANIFEST" --out "$OUT"
+        --shard "$SHARD" --manifest "$MANIFEST" --out "$OUT" \
+        --encoder "$ENCODER"
