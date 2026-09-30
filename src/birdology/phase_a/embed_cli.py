@@ -38,19 +38,35 @@ log = logging.getLogger("phase_a.embed")
 
 
 def slice_manifest_to_shard(manifest: pa.Table, members: set[str]) -> pa.Table:
-    """The manifest rows whose filepath is a member of THIS shard.
+    """The manifest rows whose filepath matches a member of THIS shard.
 
     `embed_shard` and `shard_is_complete` iterate their manifest row-by-row
     via `to_pylist()`. XCL's manifest is ~500k rows; filtering columnar-side
     first (a pyarrow compute `is_in` — cheap) keeps the per-shard Python cost
     at the shard's ~5k rows instead of the whole corpus.
+
+    Matches by exact path OR basename: XCM shards 0001-0126 store members
+    under full manifest-equal paths, shards 0127/0158-0182 store bare
+    basenames (measured on WEKA 2026-09-30 — BirdSet's packaging is
+    inconsistent across shards of the same config). The slice must be a
+    SUPERSET of what `_resolve_members` will match, never narrower, or the
+    resolver downstream sees an artificially empty manifest.
     """
-    return manifest.filter(
+    member_basenames = {m.rsplit("/", 1)[-1] for m in members}
+    basenames = pc.replace_substring_regex(
+        manifest.column("filepath"), pattern=r"^.*/", replacement=""
+    )
+    keep = pc.or_(
         pc.is_in(
             manifest.column("filepath"),
             value_set=pa.array(sorted(members), pa.string()),
-        )
+        ),
+        pc.is_in(
+            basenames,
+            value_set=pa.array(sorted(member_basenames), pa.string()),
+        ),
     )
+    return manifest.filter(keep)
 
 
 def main(argv: list[str] | None = None) -> int:

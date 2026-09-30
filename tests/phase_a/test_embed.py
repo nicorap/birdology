@@ -224,9 +224,10 @@ def test_a_CORRUPT_failures_json_means_incomplete_not_complete_or_crash(tmp_path
 
 
 def test_ZERO_manifest_shard_overlap_raises_instead_of_blessing_no_op(tmp_path):
-    """F3: `./a/XC1.ogg` vs `a/XC1.ogg` is one prefix change away from
-    embedding zero rows fleet-wide at exit 0. Zero overlap must be LOUD."""
-    p = _shard(tmp_path, [("./a/XC1.ogg", _ogg_bytes()), ("./a/XC2.ogg", _ogg_bytes())])
+    """F3: zero overlap must be LOUD. (A bare `./` prefix difference is now
+    RESOLVED by the basename fallback -- measured real in XCM -- so this
+    fixture uses names that differ even by basename.)"""
+    p = _shard(tmp_path, [("./a/XC7.ogg", _ogg_bytes()), ("./a/XC8.ogg", _ogg_bytes())])
     with pytest.raises(ValueError, match="ZERO overlap"):
         embed_shard(
             p, _manifest(["a/XC1.ogg", "a/XC2.ogg"]), _encoder(),
@@ -335,3 +336,66 @@ def test_stereo_audio_is_mixed_down_to_mono_before_the_encoder(tmp_path):
     assert res.embedded == 1
     assert len(seen) == 1
     assert seen[0].ndim == 1
+
+
+def test_a_BARE_BASENAME_shard_is_resolved_against_full_manifest_paths(tmp_path):
+    """Measured on WEKA 2026-09-30: XCM shards 0127 and 0158-0182 store bare
+    basenames (XC111167.ogg) while the manifest carries full paths
+    (data/xeno-canto/.../XC111167.ogg). BirdSet's packaging is inconsistent
+    ACROSS SHARDS OF THE SAME CONFIG; 26 real shards failed on it."""
+    p = _shard(tmp_path, [("XC1.ogg", _ogg_bytes()), ("XC2.ogg", _ogg_bytes())])
+    out = tmp_path / "emb"
+    manifest = _manifest(["data/xc/parus_major/XC1.ogg", "data/xc/parus_major/XC2.ogg"])
+    res = embed_shard(p, manifest, _encoder(), out_dir=out)
+    assert res.embedded == 2
+    # The parquet must store the CANONICAL manifest path -- Phase B's join key.
+    written = pq.read_table(out / "shard_0001.parquet")
+    assert sorted(written.column("filepath").to_pylist()) == [
+        "data/xc/parus_major/XC1.ogg",
+        "data/xc/parus_major/XC2.ogg",
+    ]
+    assert shard_is_complete(p, manifest, out)
+
+
+def test_an_AMBIGUOUS_basename_is_left_unresolved_not_guessed(tmp_path):
+    """Two manifest rows sharing one basename: a wrong join is worse than a
+    dropped file, so the bare member matches NEITHER -- and with nothing
+    resolvable in the whole shard, the zero-overlap guard fires loudly."""
+    p = _shard(tmp_path, [("XC1.ogg", _ogg_bytes())])
+    manifest = _manifest(["site_a/XC1.ogg", "site_b/XC1.ogg"])
+    with pytest.raises(ValueError, match="ZERO overlap"):
+        embed_shard(p, manifest, _encoder(), out_dir=tmp_path / "emb")
+
+    # With a resolvable sibling present, the ambiguous member is dropped
+    # SILENTLY-BY-DESIGN (not guessed, not fatal) and the rest proceeds.
+    second = tmp_path / "second"
+    second.mkdir()
+    p2 = _shard(
+        second,
+        [("XC1.ogg", _ogg_bytes()), ("data/xc/parus_major/XC2.ogg", _ogg_bytes())],
+    )
+    manifest2 = _manifest(
+        ["site_a/XC1.ogg", "site_b/XC1.ogg", "data/xc/parus_major/XC2.ogg"]
+    )
+    res = embed_shard(p2, manifest2, _encoder(), out_dir=tmp_path / "emb2")
+    assert res.embedded == 1
+    assert res.expected == 1
+
+
+def test_a_FAILED_bare_member_is_recorded_under_the_canonical_path(tmp_path):
+    p = _shard(tmp_path, [("XC1.ogg", b"not audio")])
+    out = tmp_path / "emb"
+    manifest = _manifest(["data/xc/parus_major/XC1.ogg"])
+    res = embed_shard(p, manifest, _encoder(), out_dir=out)
+    assert "data/xc/parus_major/XC1.ogg" in res.failed
+    # Completion accounting is in manifest-path space, so the failure must be too.
+    assert shard_is_complete(p, manifest, out)
+
+
+def test_zero_overlap_still_raises_when_even_basenames_differ(tmp_path):
+    """The mismatch guard survives the resolver: members that match nothing
+    (not even by basename) are still a systematic key mismatch."""
+    p = _shard(tmp_path, [("XC999.ogg", _ogg_bytes())])
+    manifest = _manifest(["data/xc/parus_major/XC1.ogg"])
+    with pytest.raises(ValueError, match="ZERO overlap"):
+        embed_shard(p, manifest, _encoder(), out_dir=tmp_path / "emb")

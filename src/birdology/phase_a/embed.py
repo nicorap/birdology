@@ -94,6 +94,42 @@ def _out_paths(shard: Path, out_dir: Path) -> tuple[Path, Path]:
     return out_dir / f"{stem}.parquet", out_dir / f"{stem}.failures.json"
 
 
+def _resolve_members(
+    member_names: list[str], manifest_paths: set[str]
+) -> dict[str, str]:
+    """Map tar member name -> canonical MANIFEST filepath.
+
+    Measured on WEKA (2026-09-30): XCM shards 0001-0126 store members under
+    full paths (`data/xeno-canto/.../XC654011.ogg`) that equal the manifest's
+    `filepath` column, but shards 0127 and 0158-0182 store BARE basenames
+    (`XC111167.ogg`) -- BirdSet's own packaging is inconsistent across shards.
+    Exact match is tried first; a basename fallback covers the bare shards.
+    The fallback is safe for this corpus because XC ids are globally unique:
+    verified 85,885 manifest rows -> 85,885 distinct basenames, 0 collisions.
+    An ambiguous basename (two manifest rows sharing it) is left UNRESOLVED
+    rather than guessed -- a wrong join is worse than a dropped file.
+
+    The canonical key matters: the output parquet stores the MANIFEST path,
+    never the member name, so Phase B joins one key space regardless of which
+    shard convention held.
+    """
+    by_basename: dict[str, str | None] = {}
+    for p in manifest_paths:
+        b = p.rsplit("/", 1)[-1]
+        # Second sighting poisons the entry: ambiguous basenames stay unmapped.
+        by_basename[b] = None if b in by_basename else p
+
+    out: dict[str, str] = {}
+    for name in member_names:
+        if name in manifest_paths:
+            out[name] = name
+            continue
+        hit = by_basename.get(name.rsplit("/", 1)[-1])
+        if hit is not None:
+            out[name] = hit
+    return out
+
+
 def embed_shard(
     shard: Path,
     manifest: pa.Table,
@@ -118,12 +154,13 @@ def embed_shard(
     }
 
     member_names = _audio_member_names(shard)
-    expected = set(wanted) & set(member_names)
-    if wanted and member_names and not expected:
+    resolved = _resolve_members(member_names, set(wanted))
+    if wanted and member_names and not resolved:
         raise ValueError(
             f"shard {shard.name}: ZERO overlap between manifest filepaths and "
-            f"tar member names -- systematic key mismatch, refusing to bless "
-            f"an empty shard. sample members: {member_names[:3]}; "
+            f"tar member names (exact AND basename) -- systematic key "
+            f"mismatch, refusing to bless an empty shard. "
+            f"sample members: {member_names[:3]}; "
             f"sample manifest paths: {sorted(wanted)[:3]}"
         )
 
@@ -131,9 +168,10 @@ def embed_shard(
     failed: dict[str, str] = {}
 
     for name, payload in iter_shard_audio(shard):
-        context = wanted.get(name)
-        if context is None:
+        canonical = resolved.get(name)
+        if canonical is None:
             continue
+        context = wanted[canonical]
         try:
             samples, sr = sf.read(io.BytesIO(payload), dtype="float32", always_2d=False)
             if getattr(samples, "ndim", 1) > 1:
@@ -145,12 +183,14 @@ def embed_shard(
                 raise ValueError("decoded to 0 samples (truncated file?)")
             vector = np.asarray(encoder(samples, sr), dtype=np.float32)
         except Exception as exc:  # one bad file must not lose the shard
-            failed[name] = f"{type(exc).__name__}: {exc}"
+            # Keyed by the CANONICAL manifest path: completion compares
+            # done against expected in manifest-path space.
+            failed[canonical] = f"{type(exc).__name__}: {exc}"
             log.warning("shard %s: %s failed: %s", shard.name, name, exc)
             continue
         rows.append(
             {
-                "filepath": name,
+                "filepath": canonical,
                 "cell": context["cell"],
                 "week": context["week"],
                 "ebird_code": context["ebird_code"],
@@ -180,7 +220,7 @@ def embed_shard(
     return ShardResult(
         shard=shard.name,
         embedded=len(rows),
-        expected=len(expected),
+        expected=len(resolved),
         failed=failed,
     )
 
@@ -220,7 +260,10 @@ def shard_is_complete(shard: Path, manifest: pa.Table, out_dir: Path) -> bool:
             # An unreadable failures sidecar means the outputs cannot be
             # trusted as a pair; re-run the shard.
             return False
-    expected = set(manifest.column("filepath").to_pylist()) & set(
-        _audio_member_names(shard)
-    )
+    manifest_paths = set(manifest.column("filepath").to_pylist())
+    resolved = _resolve_members(_audio_member_names(shard), manifest_paths)
+    # Expected in CANONICAL manifest-path space, matching what embed_shard
+    # writes -- member names and manifest paths may differ per shard
+    # convention (full-path vs bare-basename shards, both real in XCM).
+    expected = set(resolved.values())
     return done >= expected
