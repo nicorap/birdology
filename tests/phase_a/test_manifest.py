@@ -184,3 +184,60 @@ def test_distinct_weeks_travels_in_the_metadata():
     out, _ = build_manifest(_focal(rows), dates=dates, resolution=4, split="train")
     meta = {k.decode(): v.decode() for k, v in (out.schema.metadata or {}).items()}
     assert meta["distinct_weeks"] == "3"
+
+
+def test_the_split_column_carries_the_GIVEN_split_not_a_default():
+    """Kills review mutant M7 (split hardcoded to 'train').
+
+    Phase B SELECTS rows by split; a manifest whose every row says 'train'
+    would silently feed eval recordings into training-side lookups.
+    """
+    t = pa.table(
+        {
+            "filepath": pa.array(["HSN_001_20150708_061805.ogg"], pa.string()),
+            "lat": pa.array([37.0], pa.float64()),
+            "long": pa.array([-118.5], pa.float64()),
+            "ebird_code": pa.array(["whcspa"], pa.string()),
+        }
+    )
+    out, _ = build_manifest(t, dates=None, resolution=4, split="test_5s")
+    assert out.to_pylist()[0]["split"] == "test_5s"
+
+
+def test_resolution_is_HONOURED_exact_cell_at_a_nondefault_resolution():
+    """Kills review mutant M8 (resolution hardcoded to 4).
+
+    test_finer_resolution_splits_cells uses >=, which equal cell-sets satisfy,
+    and the exact-cell test runs at the default resolution -- so a mutant
+    ignoring the parameter passed every test. Assert the exact r6 cell.
+    """
+    import h3
+
+    t = _focal([("a.ogg", 55.6867, 12.57, "gretit", 1)])
+    out, _ = build_manifest(t, dates={1: date(2021, 1, 4)}, resolution=6, split="train")
+    assert out.to_pylist()[0]["cell"] == h3.latlng_to_cell(55.6867, 12.57, 6)
+    assert out.to_pylist()[0]["cell"] != h3.latlng_to_cell(55.6867, 12.57, 4)
+
+
+def test_a_SINGLE_null_coordinate_is_counted_as_NO_COORDINATES_not_BAD_CELL():
+    """Pins the drop ATTRIBUTION for a half-null row (review mutant M6).
+
+    lat present, lon null must count as NO_COORDINATES. Under the or->and
+    mutant the row still dropped -- but via float(None) TypeError into
+    BAD_CELL, so the coverage report would blame the wrong cause.
+    """
+    t = pa.table(
+        {
+            "filepath": pa.array(["a.ogg"], pa.string()),
+            "lat": pa.array([55.0], pa.float64()),
+            "long": pa.array([None], pa.float64()),
+            "ebird_code": pa.array(["gretit"], pa.string()),
+            "id": pa.array([1], pa.int64()),
+        }
+    )
+    out, drops = build_manifest(
+        t, dates={1: date(2021, 1, 4)}, resolution=4, split="train"
+    )
+    assert out.num_rows == 0
+    assert drops[DropReason.NO_COORDINATES] == 1
+    assert DropReason.BAD_CELL not in drops
