@@ -60,6 +60,7 @@ prior: ## Build occurrence priors + every registered control (ARCHIVE=path SOURC
 
 .PHONY: phase-a-manifest
 phase-a-manifest: ## Build the Phase A context manifest (CONFIG=XCM RESOLUTION=4)
+	mkdir -p /mnt/weka/ML/phase_a/logs
 	uv run python scripts/phase_a_manifest.py \
 		--corpus /mnt/weka/ML/birdset --config $(CONFIG) \
 		--resolution $(or $(RESOLUTION),4) \

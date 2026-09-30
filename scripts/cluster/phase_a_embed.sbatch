@@ -12,6 +12,11 @@
 #
 #   sbatch --array=0-181 scripts/cluster/phase_a_embed.sbatch XCM 4
 #
+# FIRST SUBMISSION on a fresh tree: run `mkdir -p /mnt/weka/ML/phase_a/logs`
+# beforehand (`make phase-a-manifest` does it) -- Slurm opens the
+# #SBATCH --output path BEFORE this script runs, so the in-job mkdir below
+# is too late for the very first array.
+#
 # THREE things here are silent failures if omitted, all measured:
 #   --gres=gpu:1            without it, torch.cuda.is_available() is False
 #                           INSIDE the container even with --nv
@@ -52,6 +57,14 @@ N=${#SHARDS[@]}
 [ "$N" -gt 0 ] || { echo "FATAL: no shards under $CORPUS"; exit 2; }
 
 IDX=${SLURM_ARRAY_TASK_ID:-0}
+# Exactly one task (0) checks the operator-supplied --array range against the
+# real shard count: an under-provisioned array (200 shards, --array=0-181)
+# leaves shards 182+ silently un-embedded. WARN, do not fail -- a deliberate
+# partial run (re-submitting a range) is legitimate; task 0's log is the signal.
+ARRAY_TASKS=$(( ${SLURM_ARRAY_TASK_MAX:-0} + 1 ))
+if [ "$IDX" -eq 0 ] && [ "$ARRAY_TASKS" -lt "$N" ]; then
+    echo "WARNING: array covers $ARRAY_TASKS of $N shards -- shards $ARRAY_TASKS..$((N-1)) will NOT be embedded"
+fi
 [ "$IDX" -lt "$N" ] || { echo "task $IDX >= $N shards, nothing to do"; exit 0; }
 SHARD=${SHARDS[$IDX]}
 

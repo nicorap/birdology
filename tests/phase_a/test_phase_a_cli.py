@@ -6,6 +6,8 @@ its own namespace, so patching the source module would miss it.
 """
 import io
 import logging
+import os
+import subprocess
 import sys
 import tarfile
 from datetime import date
@@ -185,6 +187,30 @@ def test_resume_does_NOT_refetch_already_done_species(tmp_path):
     second.assert_not_called()
     assert dates == {1: date(2021, 6, 1)}
     assert failed == 0
+
+
+def test_a_TORN_progress_file_warns_and_restarts_from_scratch(tmp_path, caplog):
+    """A half-written JSON (filesystem-level corruption — _save_progress is
+    atomic) must never crash the driver or silently skip species: warn naming
+    the file, discard it, re-fetch everything. Kills narrowing the except
+    clause in _load_progress (Task 4 M8/M9 precedent: correct-but-untested
+    defensive branches need the killing test)."""
+    progress = tmp_path / "progress.json"
+    progress.write_bytes(b'{"parus major": {"1": "2021-')  # torn mid-write
+    fetch = MagicMock(return_value={1: date(2021, 6, 1)})
+    with caplog.at_level(logging.WARNING, logger="phase_a"):
+        with patch("phase_a_manifest.fetch_species_dates", fetch):
+            dates, failed = date_focal_species(
+                [("parus", "major")], key="k", progress_path=progress
+            )
+    assert fetch.call_count == 1  # torn progress discarded -> full re-fetch
+    assert dates == {1: date(2021, 6, 1)}
+    assert failed == 0
+    assert any(
+        str(progress) in r.getMessage() and "unreadable" in r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING
+    )
 
 
 def test_resume_fetches_only_the_missing_species(tmp_path):
@@ -407,6 +433,13 @@ def test_embed_cli_raises_on_ZERO_manifest_overlap(tmp_path):
 
 
 # ── the sbatch script ───────────────────────────────────────────────────────
+#
+# LESSON (this repo's 5th and 6th instance of the defect): asserting a token
+# `in script` is satisfiable by the very COMMENTS that explain why the token
+# matters — removing `--nv` from the active apptainer line, or deleting the
+# whole mountpoint guard, left every sbatch test green. Every assertion below
+# is therefore anchored to a syntactic CATEGORY of line: #SBATCH directives,
+# active (bash-executed) lines, or header comments — never the whole file.
 
 
 def _sbatch_text():
@@ -416,12 +449,40 @@ def _sbatch_text():
     ).read_text()
 
 
-def test_the_sbatch_script_binds_weka_and_requests_a_gpu():
-    """Both are silent failures: no bind = empty dir, no gres = CUDA False."""
-    script = _sbatch_text()
-    assert "--bind /mnt/weka:/mnt/weka" in script
-    assert "--nv" in script
-    assert "--gres=gpu:" in script
+def _sbatch_directive_lines(text):
+    """#SBATCH lines — comments to bash, directives to Slurm."""
+    return [ln for ln in text.splitlines() if ln.lstrip().startswith("#SBATCH")]
+
+
+def _active_lines(text):
+    """Lines bash actually executes: non-empty, not comments (which includes
+    the #SBATCH directives — those are their own category above)."""
+    return [
+        ln
+        for ln in text.splitlines()
+        if ln.strip() and not ln.lstrip().startswith("#")
+    ]
+
+
+def test_the_sbatch_script_requests_a_gpu_in_a_directive():
+    """No --gres = torch.cuda.is_available() False INSIDE the container even
+    with --nv (measured). Must be a real #SBATCH directive, not the comment
+    explaining it."""
+    assert any(
+        "--gres=gpu:" in ln for ln in _sbatch_directive_lines(_sbatch_text())
+    )
+
+
+def test_the_active_apptainer_line_passes_nv_and_the_weka_bind():
+    """Both are silent failures: no bind = empty dir, no --nv = no CUDA
+    driver. Both flags must sit on the ACTIVE line that invokes apptainer —
+    the header comments naming them do not count."""
+    apptainer = [
+        ln for ln in _active_lines(_sbatch_text()) if "apptainer" in ln
+    ]
+    assert len(apptainer) == 1
+    assert "--nv" in apptainer[0]
+    assert "--bind /mnt/weka:/mnt/weka" in apptainer[0]
 
 
 def test_the_sbatch_script_is_fleet_wide():
@@ -431,5 +492,123 @@ def test_the_sbatch_script_is_fleet_wide():
 
 def test_the_sbatch_script_fails_if_weka_is_not_mounted():
     """20 nodes mount independently; one silently losing the mount fabricates
-    an empty corpus on that node only."""
-    assert "mountpoint" in _sbatch_text()
+    an empty corpus on that node only. The guard must be an ACTIVE line — a
+    comment about the guard satisfied the old whole-file grep."""
+    assert any(
+        "mountpoint -q /mnt/weka" in ln for ln in _active_lines(_sbatch_text())
+    )
+
+
+# ── Slurm log-dir ordering (I2) ─────────────────────────────────────────────
+# Slurm opens the #SBATCH --output path BEFORE the job runs, so the in-job
+# mkdir is too late on the first-ever submission. The Makefile manifest target
+# (which runs on a WEKA-mounted node before any array) pre-creates it, and the
+# sbatch header must tell the operator.
+
+
+def _makefile_recipe(target):
+    """Active (non-comment) recipe lines of one Makefile target."""
+    lines = (Path(__file__).parent.parent.parent / "Makefile").read_text().splitlines()
+    start = next(i for i, ln in enumerate(lines) if ln.startswith(f"{target}:"))
+    recipe = []
+    for ln in lines[start + 1:]:
+        if not ln.startswith("\t"):
+            break
+        recipe.append(ln.strip())
+    return [ln for ln in recipe if not ln.startswith("#") and not ln.startswith("@#")]
+
+
+def test_the_manifest_make_target_precreates_the_slurm_log_dir():
+    assert any(
+        "mkdir -p /mnt/weka/ML/phase_a/logs" in ln
+        for ln in _makefile_recipe("phase-a-manifest")
+    )
+
+
+def test_the_sbatch_header_documents_the_log_dir_precreation():
+    header = [
+        ln
+        for ln in _sbatch_text().splitlines()
+        if ln.startswith("#") and not ln.startswith("#SBATCH")
+    ]
+    assert any("mkdir -p /mnt/weka/ML/phase_a/logs" in ln for ln in header)
+
+
+# ── array-range coverage and the zero-shard guard (I3 / P1) ─────────────────
+# The block from shard discovery through the index guard is extracted from
+# the COMMITTED script and run under bash, so the tests exercise the real
+# lines: deleting the warning block or the zero-shard exit-2 guard from the
+# script must fail these.
+
+
+def _sbatch_guard_block():
+    lines = _sbatch_text().splitlines()
+    start = next(i for i, ln in enumerate(lines) if ln.startswith("mapfile"))
+    stop = next(
+        i
+        for i, ln in enumerate(lines)
+        if "nothing to do" in ln and not ln.lstrip().startswith("#")
+    )
+    return "\n".join(lines[start : stop + 1])
+
+
+def _modern_bash():
+    """A bash >= 4 (mapfile). macOS /bin/bash is 3.2; the cluster and CI run
+    4+. Skip (loudly) rather than fake the guard when none is available."""
+    candidates = ["bash"] + [
+        p for p in ("/opt/homebrew/bin/bash", "/usr/local/bin/bash", "/bin/bash")
+        if Path(p).exists()
+    ]
+    for bash in candidates:
+        try:
+            r = subprocess.run(
+                [bash, "-c", "echo ${BASH_VERSINFO[0]}"],
+                capture_output=True, text=True,
+            )
+            if r.returncode == 0 and int(r.stdout.strip()) >= 4:
+                return bash
+        except (OSError, ValueError):
+            continue
+    pytest.skip("no bash >= 4 available for the sbatch guard-block tests")
+
+
+def _run_guard_block(tmp_path, n_shards, *, task_max):
+    corpus = tmp_path / "corpus"
+    corpus.mkdir(exist_ok=True)
+    for i in range(n_shards):
+        (corpus / f"XCM_shard_{i:04d}.tar.gz").write_bytes(b"")
+    script = f'set -euo pipefail\nCORPUS="{corpus}"\n' + _sbatch_guard_block()
+    return subprocess.run(
+        [_modern_bash(), "-c", script],
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "SLURM_ARRAY_TASK_ID": "0",
+            "SLURM_ARRAY_TASK_MAX": str(task_max),
+        },
+    )
+
+
+def test_an_UNDERPROVISIONED_array_warns_loudly_in_task_0(tmp_path):
+    """200 shards, --array=0-181: shards 182+ would silently never embed —
+    the warning in task 0's log is the only signal (never a nonzero exit:
+    a deliberate partial re-run of a range is legitimate)."""
+    r = _run_guard_block(tmp_path, 200, task_max=181)
+    assert r.returncode == 0
+    assert "WARNING: array covers 182 of 200 shards" in r.stdout
+    assert "182..199 will NOT be embedded" in r.stdout
+
+
+def test_a_fully_provisioned_array_does_not_warn(tmp_path):
+    r = _run_guard_block(tmp_path, 200, task_max=199)
+    assert r.returncode == 0
+    assert "WARNING" not in r.stdout
+
+
+def test_zero_shards_is_a_FATAL_exit_2_not_a_silent_success(tmp_path):
+    """Without the guard, an empty corpus (e.g. a bad CONFIG) yields
+    'nothing to do' exit 0 on every task — a fully green, fully empty run."""
+    r = _run_guard_block(tmp_path, 0, task_max=0)
+    assert r.returncode == 2
+    assert "no shards" in r.stdout
