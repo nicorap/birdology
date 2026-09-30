@@ -27,3 +27,7 @@ output/.birdology*_oxi/
 # SDD process artifacts
 .superpowers/
 .worktrees/
+
+# Xeno-Canto API v3 personal key (per-account, required on every API call).
+# Never commit: the key identifies the account and XC rate-limits by it.
+.XCkey
