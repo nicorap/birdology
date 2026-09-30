@@ -344,7 +344,7 @@ def test_embed_cli_slices_the_manifest_to_the_shards_members(tmp_path):
     manifest = _write_manifest(tmp_path, ["in_shard.wav", "other_shard.wav"])
     seen = {}
 
-    def fake_embed(shard_path, manifest_table, encoder, *, out_dir):
+    def fake_embed(shard_path, manifest_table, encoder, *, out_dir, with_logits=False):
         seen["filepaths"] = manifest_table.column("filepath").to_pylist()
         return ShardResult(shard=shard_path.name, embedded=1, expected=1)
 
