@@ -1055,35 +1055,310 @@ def test_a_wrong_input_dtype_is_not_silently_CAST_to_the_required_schema():
         hierarchical_estimate(wrong, [1])
 
 
-def test_the_upper_clamp_holds_when_a_weight_is_negative():
-    """Kills B11: the upper clamp removed.
+def test_a_negative_weight_is_REJECTED_rather_than_silently_clamped():
+    """The negative-weight path that used to be merely BOUNDED is now closed.
 
-    No contract-conforming input can push `p` above 1 on its own: with
-    `n <= total`, a coarse value in [0, 1] and a positive weight, the
-    shrinkage is a weighted average of two quantities that are both <= 1. That
-    is precisely why the bounded-probability test cannot see this clamp, and
-    why leaving it untested would have recorded coverage that does not exist.
+    This test replaces `test_the_upper_clamp_holds_when_a_weight_is_negative`
+    and the replacement is deliberate rather than incidental, so the history
+    is recorded here: the old test passed a `cell_week_weight` of -5.0 and
+    asserted that the output clamp bounded the damage at 1.0. That fixture
+    really did drive the unclamped value to 1.75 (the arithmetic is
+    reproduced below and still asserted), and the clamp really did bound it
+    -- but a caller who asks for a negative pseudo-count is asking for the
+    coarser level's evidence to be SUBTRACTED, and an artifact of clamped
+    1.0s is exactly the plausible-looking constant this round exists to stop.
 
-    A NEGATIVE weight is the reachable path -- a caller error rather than a
-    data error, but one whose damage the clamp is there to bound. The fixture
-    is built so the mutation is definitely visible: species 1 is the whole of
-    its cell-week (n == total == 10) while a second cell keeps the global
-    profile below 1, which makes the unclamped value 1.75.
+    The consequence for the mutation harness is recorded there: with negative
+    weights rejected, no validated input can reach the upper clamp, so B11
+    (the clamp removed) is retired as EQUIVALENT with a reachability
+    argument rather than a survivor.
     """
-    rows = [(1, "c", 5, 10), (2, "d", 9, 90)]
-    params = BackoffParams(cell_week_weight=-5.0)
-    out = _p(rows, [1], cells=["c"], weeks=[5], params=params)
-
-    # PRECONDITION: without the clamp this fixture really does exceed 1.0.
     p_global = 10 / 100
     p_cell = (10 + 50.0 * p_global) / (10 + 50.0)
     unclamped = (10 + -5.0 * p_cell) / (10 + -5.0)
     assert unclamped > 1.0, (
-        "the fixture no longer drives p above 1, so it cannot demonstrate the "
-        "clamp and the clamp's coverage would be imaginary"
+        "the fixture no longer drives p above 1, so it no longer demonstrates "
+        "what the rejection is protecting against"
     )
 
-    assert out[(1, "c", 5)] == 1.0
+    rows = [(1, "c", 5, 10), (2, "d", 9, 90)]
+    with pytest.raises(ValueError, match="negative"):
+        _p(
+            rows, [1], cells=["c"], weeks=[5],
+            params=BackoffParams(cell_week_weight=-5.0),
+        )
+
+
+# ===========================================================================
+# THE PARAMETER CONTRACT (round 10 / brief A).
+#
+# `SmoothingParams` was validated and `BackoffParams` was not. Measured at
+# HEAD edd0723: `cell_weight=0.0`, `cell_weight=-1.0`, `floor=0.0`,
+# `floor=-1.0` and `floor=2.0` all returned a plausible table with NOTHING
+# raised, and `floor=2.0` made every value exactly 1.0. Two values raised at
+# all, both a bare ZeroDivisionError from inside `_shrink`.
+#
+# Each test below asserts on the MESSAGE, not on a bare `ValueError`: a
+# `ValueError` from this module could come from any of the two dozen table
+# checks above, so matching the type alone would let a test pass while the
+# parameter guard did not exist.
+# ===========================================================================
+
+
+_PARAM_ROWS = [(1, "c", 5, 10), (2, "c", 5, 90)]
+
+
+def _with(**kwargs):
+    """Run the module's normal path with one parameter overridden."""
+    return _p(_PARAM_ROWS, [1, 2], cells=["c"], weeks=[5], params=BackoffParams(**kwargs))
+
+
+# ---- the two weights: finiteness, then range, checked separately ----------
+
+
+def test_a_non_finite_shrinkage_weight_is_rejected():
+    """nan and inf, for BOTH weights.
+
+    Separate from the range test because `nan` fails every comparison:
+    `nan < 0.0` is False, so an ordering check alone passes a nan straight
+    through to the arithmetic, where it makes every emitted probability nan
+    with no error. `smoothing.py` splits these two clauses for exactly this
+    reason and the same reasoning applies here.
+    """
+    for field in ("cell_week_weight", "cell_weight"):
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with pytest.raises(ValueError, match="not finite"):
+                _with(**{field: bad})
+
+
+def test_a_nan_weight_really_would_poison_every_value_without_the_guard():
+    """The harm the finiteness clause prevents, demonstrated not asserted.
+
+    A nan weight does not raise anywhere in the arithmetic: it propagates
+    through `_shrink` into every emitted `p`, and `min(max(nan, floor), 1.0)`
+    returns nan rather than the floor, so the artifact is silently all-nan.
+    """
+    nan = float("nan")
+    p_cell = (10 + nan * 0.1) / (100 + nan)
+    poisoned = min(max(p_cell, FLOOR), 1.0)
+    assert poisoned != poisoned, (
+        "a nan weight no longer produces nan, so the finiteness clause is "
+        "guarding against something that cannot happen"
+    )
+
+
+def test_a_negative_shrinkage_weight_is_rejected():
+    """A pseudo-count below zero SUBTRACTS the coarser level's evidence.
+
+    Both fields, and at values that behaved DIFFERENTLY at HEAD: -1.0 and
+    -3.0 returned a plausible table with no error at all, while -4.0 raised a
+    bare ZeroDivisionError purely because that fixture's denominator was 4.
+    The guard must not depend on which of those a caller happens to hit.
+    """
+    for field in ("cell_week_weight", "cell_weight"):
+        for bad in (-1.0, -3.0, -4.0, -1e-12):
+            with pytest.raises(ValueError, match="negative"):
+                _with(**{field: bad})
+
+
+def test_the_weight_guard_covers_BOTH_weights_not_only_the_first():
+    """A guard that loops over one field is a guard over half the contract.
+
+    Asserted as a pair so a mutant that drops `cell_weight` from the loop is
+    caught by name: the two fields are checked with the same bad value, and
+    the messages must name the field that was actually wrong.
+    """
+    with pytest.raises(ValueError, match="cell_week_weight=-1.0"):
+        _with(cell_week_weight=-1.0)
+    with pytest.raises(ValueError, match="cell_weight=-1.0"):
+        _with(cell_weight=-1.0)
+
+
+# ---- zero shrinkage is ACCEPTED, and the empty level it implies is defined -
+
+
+def test_a_zero_shrinkage_weight_is_ACCEPTED():
+    """`0.0` means "no shrinkage at this level", which a sweep may ask for.
+
+    The published sweep already goes down to `cell_week_weight = 0.5`; zero
+    is the limit of that direction, and a guard that rejected it would be
+    narrower than the sweep it exists to protect. It is accepted for both
+    fields, together and separately.
+    """
+    for params in (
+        BackoffParams(cell_week_weight=0.0),
+        BackoffParams(cell_weight=0.0),
+        BackoffParams(cell_week_weight=0.0, cell_weight=0.0),
+    ):
+        out = _p(_PARAM_ROWS, [1], cells=["c"], weeks=[5], params=params)
+        assert all(v == v for v in out.values())
+
+
+def test_zero_shrinkage_on_an_EMPTY_cell_week_returns_the_PARENT_not_zero():
+    """The 0/0 that zero shrinkage used to hit is DEFINED, not repaired.
+
+    With `cell_week_weight = 0.0` and a cell-week nobody visited, `_shrink`
+    is handed `local_den = 0` and `weight = 0`: at HEAD that was a bare
+    `ZeroDivisionError`. A level with no records carries no information, so
+    the answer is the COARSER level's value -- the same limit the expression
+    has as `local_den -> 0` for any positive weight.
+
+    THE FIXTURE IS BUILT SO THE FLOOR CANNOT SPOOF IT. If the empty case
+    returned `0.0` instead, the output clamp `min(max(p, floor), 1.0)` would
+    silently raise it to `floor` and an assertion like `> 0` would still
+    pass. The cell profile here is 0.1, five orders of magnitude above the
+    default floor, and it is asserted EXACTLY.
+    """
+    out = _p(
+        _PARAM_ROWS, [1], cells=["c"], weeks=[40],
+        params=BackoffParams(cell_week_weight=0.0),
+    )
+    p_global = 10 / 100
+    p_cell = (10 + 50.0 * p_global) / (100 + 50.0)
+    assert p_cell > 1000 * FLOOR, (
+        "the parent value is too near the floor to distinguish it from a "
+        "zero that the output clamp lifted"
+    )
+    assert out[(1, "c", 40)] == pytest.approx(p_cell, rel=1e-12)
+
+
+def test_zero_shrinkage_on_an_EMPTY_CELL_returns_the_GLOBAL_profile():
+    """The same 0/0, one level up: a requested cell with no records at all."""
+    out = _p(
+        _PARAM_ROWS, [1], cells=["empty"], weeks=[5],
+        params=BackoffParams(cell_weight=0.0, cell_week_weight=0.0),
+    )
+    p_global = 10 / 100
+    assert p_global > 1000 * FLOOR
+    assert out[(1, "empty", 5)] == pytest.approx(p_global, rel=1e-12)
+
+
+# ---- the floor is a probability, strictly inside (0, 1) -------------------
+
+
+def test_a_non_finite_floor_is_rejected():
+    """A nan floor is a SILENT NO-OP, which is why finiteness is its own check.
+
+    `max(p, nan)` returns `p` and `min(p, 1.0)` leaves it, so a nan floor
+    does not poison anything and does not raise -- the floor the module
+    guarantees simply stops existing. An ordering check cannot see it.
+    """
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError, match=r"floor=.* is not finite"):
+            _with(floor=bad)
+
+
+def test_a_nan_floor_really_would_silently_disable_the_floor():
+    """The harm the floor's finiteness clause prevents, demonstrated."""
+    nan = float("nan")
+    assert min(max(0.0, nan), 1.0) == 0.0, (
+        "a nan floor no longer passes a hard zero through, so the floor's "
+        "finiteness clause is guarding against something that cannot happen"
+    )
+
+
+def test_a_floor_of_zero_is_rejected():
+    """`0.0` re-admits the hard zero the module's docstring exists to forbid."""
+    with pytest.raises(ValueError, match="re-admits the hard zero"):
+        _with(floor=0.0)
+
+
+def test_a_negative_floor_is_rejected():
+    with pytest.raises(ValueError, match="re-admits the hard zero"):
+        _with(floor=-1.0)
+
+
+def test_a_floor_of_one_is_rejected():
+    """Exactly 1.0 IS a probability and still flattens the artifact.
+
+    `min(max(p, 1.0), 1.0)` is the constant 1.0, so a floor of certainty
+    produces the identical information-free artifact that `floor=2.0` does.
+    Admitting it because it happens to lie in [0, 1] would leave the
+    documented harm reachable through the boundary.
+    """
+    with pytest.raises(ValueError, match="flattens the whole artifact"):
+        _with(floor=1.0)
+
+
+def test_a_floor_above_one_is_rejected():
+    """The reproduced defect: `floor=2.0` made every value exactly 1.0."""
+    with pytest.raises(ValueError, match="flattens the whole artifact"):
+        _with(floor=2.0)
+
+
+def test_a_floor_of_two_really_would_flatten_every_value():
+    """The harm, demonstrated on the emitted expression rather than claimed."""
+    assert {min(max(p, 2.0), 1.0) for p in (1e-9, 0.3, 0.5, 1.0)} == {1.0}
+
+
+# ---- the accepted domain: the guard must not be too strict to sweep with ---
+
+
+def test_the_swept_parameter_values_are_all_ACCEPTED():
+    """The sweep is a real use and the guard must not break it.
+
+    These are the values the retention table in `BackoffParams`' docstring
+    was measured at, plus the floor's two documented regimes. A guard that
+    rejected any of them would make the paper's sweep unbuildable, which is
+    a worse failure than the one it is fixing.
+    """
+    accepted = [
+        BackoffParams(cell_week_weight=0.5),
+        BackoffParams(cell_week_weight=2.0),
+        BackoffParams(cell_week_weight=10.0),
+        BackoffParams(cell_week_weight=50.0),
+        BackoffParams(cell_weight=5.0),
+        BackoffParams(cell_weight=50.0),
+        BackoffParams(cell_weight=500.0),
+        BackoffParams(floor=1e-6),
+        BackoffParams(floor=1e-3),
+        BackoffParams(floor=0.5),
+        # The open boundaries themselves, from both sides.
+        BackoffParams(cell_week_weight=0.0, cell_weight=0.0),
+        BackoffParams(floor=5e-324),
+        BackoffParams(floor=1.0 - 1e-16),
+    ]
+    for params in accepted:
+        out = _p(_PARAM_ROWS, [1, 2], cells=["c"], weeks=[5], params=params)
+        assert out, params
+
+
+def test_the_defaults_are_unchanged_and_accepted():
+    """This round adds a guard; it does not retune the artifact."""
+    assert BackoffParams().cell_week_weight == 10.0
+    assert BackoffParams().cell_weight == 50.0
+    assert BackoffParams().floor == FLOOR == 1e-6
+    _p(_PARAM_ROWS, [1, 2], cells=["c"], weeks=[5], params=BackoffParams())
+
+
+def test_a_rejected_parameter_is_never_repaired_into_a_default():
+    """No clamp, no cast, no substitution: the call must not succeed at all.
+
+    A silent repair is the worst available outcome here, because
+    `save_prior` writes the params object into the sidecar: the artifact
+    would carry an honest record of constants the build did not use.
+    """
+    for params in (
+        BackoffParams(floor=2.0),
+        BackoffParams(floor=0.0),
+        BackoffParams(cell_weight=-1.0),
+        BackoffParams(cell_week_weight=float("nan")),
+    ):
+        with pytest.raises(ValueError):
+            _p(_PARAM_ROWS, [1], cells=["c"], weeks=[5], params=params)
+
+
+def test_the_parameter_guard_runs_before_any_estimate_is_produced():
+    """Rejected on an EMPTY table too: it is validation, not a side effect.
+
+    An empty table takes the short path through the row loop and emits the
+    floor everywhere, so a guard that only fired once some arithmetic went
+    wrong would miss it entirely.
+    """
+    with pytest.raises(ValueError, match="flattens the whole artifact"):
+        hierarchical_estimate(
+            _counts([]), [1], BackoffParams(floor=2.0), cells=["c"], weeks=[5]
+        )
 
 
 def test_a_duplicate_species_cell_week_ROW_is_rejected():
@@ -1264,3 +1539,150 @@ def test_the_requested_WEEKS_axis_is_honoured_even_when_all_are_unobserved():
     out = hierarchical_estimate(ratios, [1], cells=["c"], weeks=[30, 31])
     assert sorted(out.column("week").to_pylist()) == [30, 31]
     assert 5 not in out.column("week").to_pylist()
+
+
+# ===========================================================================
+# THE END-TO-END ASSERTION (round 10 / brief A, item 4).
+#
+# A unit test on `BackoffParams` does NOT prove the CLI is protected:
+# `build_from_archive` constructs its own params object and hands it to
+# `estimate_over_full_grid`, which hands it to `hierarchical_estimate`. A
+# guard placed anywhere short of that last call would leave the reproduced
+# defect live through the only path that writes artifacts.
+#
+# The reproduced defect, at HEAD edd0723, res 3, 300 records, 3 species:
+# `BackoffParams(floor=2.0)` wrote SIX valid, fully provenanced `.npz` files
+# -- DOI, manifest, licence, an honest sidecar record of the parameters -- in
+# which every value was exactly 1.0. So the assertion is not merely that an
+# exception is raised: it is that NOTHING WAS WRITTEN.
+#
+# No network: the archive is a local zip built here by `zipfile.writestr`,
+# exactly as `test_build_prior.py` does it. `build_from_archive` does not
+# import a download client.
+# ===========================================================================
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent / "scripts"))
+
+_E2E_HEADER = "\t".join(
+    ["gbifID", "datasetKey", "publishingOrgKey", "speciesKey", "species",
+     "decimalLatitude", "decimalLongitude", "eventDate", "recordedBy"]
+)
+
+#: Four well-separated Danish points and three dates in distinct ISO weeks,
+#: so the build has a real grid rather than one cell-week.
+_E2E_POINTS = [(55.6867, 12.5700), (55.9000, 12.5000), (56.1629, 10.2039)]
+_E2E_DATES = ("2025-01-07", "2025-06-10", "2025-11-14")
+_E2E_SPECIES = (1001, 1002, 1003)
+
+
+def _e2e_archive(tmp_path):
+    import zipfile
+
+    rows = []
+    i = 0
+    for date in _E2E_DATES:
+        for lat, lon in _E2E_POINTS:
+            for sk in _E2E_SPECIES:
+                for _ in range(4):
+                    i += 1
+                    rows.append(
+                        "\t".join(
+                            [str(i), "ds", "pub", str(sk), f"sp{sk}",
+                             str(lat + i * 1e-7), str(lon), date, "obs"]
+                        )
+                    )
+    zip_path = tmp_path / "occ.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("occurrence.txt", "\n".join([_E2E_HEADER, *rows]) + "\n")
+    return zip_path
+
+
+def _e2e_build(tmp_path, out, **kwargs):
+    from build_prior import build_from_archive
+
+    return build_from_archive(
+        _e2e_archive(tmp_path),
+        resolution=3,
+        source="dof",
+        test_recordings=[],
+        out_dir=out,
+        gbif_doi="10.15468/dl.test",
+        **kwargs,
+    )
+
+
+def test_the_end_to_end_BUILD_writes_a_real_artifact_set_on_good_params():
+    """The control: this fixture DOES build, so the refusals below mean something.
+
+    Without it a refusal test could pass because the fixture never reaches
+    the backoff at all -- the "coverage that does not exist" failure the
+    mutation harness's header warns about, arriving through the fixture
+    rather than through a label.
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        out = tmp_path / "priors"
+        paths = _e2e_build(tmp_path, out)
+        assert len(paths) >= 2, paths
+        assert sorted(out.glob("*.npz")) == sorted(paths)
+
+        # AND the artifact is not already the constant the defect produces,
+        # so `distinct == 1` below really is the defect's signature.
+        from birdology.prior.tensor import load_prior
+
+        values = load_prior(paths[0]).values.data
+        assert len(set(values.tolist())) > 1, (
+            "the good build already produces a constant, so a flattened "
+            "artifact would be indistinguishable from a correct one"
+        )
+
+
+def test_a_FLATTENING_floor_cannot_produce_artifacts_through_the_CLI():
+    """The reproduced defect, closed end to end: NOTHING is written.
+
+    `floor=2.0` wrote six fully provenanced artifacts of constant 1.0 at
+    HEAD. `build_from_archive` has no try/except anywhere on this path, so
+    the guard's `ValueError` must reach the caller and the output directory
+    must be left with no `.npz` in it -- a partial release under a
+    normal-looking filename is the failure the refusal exists to prevent.
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        out = tmp_path / "priors"
+        with pytest.raises(ValueError, match="flattens the whole artifact"):
+            _e2e_build(tmp_path, out, backoff_params=BackoffParams(floor=2.0))
+        assert not out.exists() or not list(out.glob("*.npz")), (
+            "the build refused but still left artifacts on disk"
+        )
+        assert not out.exists() or not list(out.glob("*.json")), (
+            "the build refused but still left a sidecar or a manifest on disk"
+        )
+
+
+def test_every_rejected_parameter_is_rejected_through_the_CLI_too():
+    """One bad value per field, through the real build path.
+
+    `build_from_archive` constructs its own params object and passes it down
+    two call layers; a guard that unit tests reach but the CLI does not
+    would leave every one of these live in the only path that writes
+    artifacts.
+    """
+    import tempfile
+
+    for params in (
+        BackoffParams(floor=0.0),
+        BackoffParams(floor=float("nan")),
+        BackoffParams(cell_weight=-1.0),
+        BackoffParams(cell_week_weight=-1.0),
+        BackoffParams(cell_week_weight=float("inf")),
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            out = tmp_path / "priors"
+            with pytest.raises(ValueError):
+                _e2e_build(tmp_path, out, backoff_params=params)
+            assert not out.exists() or not list(out.glob("*.npz")), params

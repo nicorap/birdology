@@ -106,6 +106,25 @@ It is passed through byte-for-byte: no local casefolding, no parent-cell
 derivation. Two differently-cased spellings are two different cells here, which
 is what makes a redundant second normalisation visible instead of a no-op.
 
+THE PARAMETERS ARE PART OF THE CONTRACT, NOT JUST THE DATA
+----------------------------------------------------------
+`BackoffParams` is validated at the point `hierarchical_estimate` accepts it,
+for the same reason the table is: a bad constant here does not crash, it
+writes a plausible artifact. Measured at this module's HEAD before the guard
+existed: `floor = 2.0` produced six fully provenanced `.npz` files -- DOI,
+manifest, licence, an honest sidecar record of the parameters -- in which
+EVERY value was exactly 1.0, and nothing anywhere raised. `cell_weight = -1.0`
+and `floor = -1.0` likewise returned a plausible table. Only two of the
+reachable bad values raised at all, and both raised a bare
+`ZeroDivisionError` from inside `_shrink` rather than anything naming a
+parameter.
+
+These constants are SWEPT -- they are how the paper reports its effect size
+(see `BackoffParams`) -- so a sweep is the normal way a wrong value arrives,
+and a sweep that walks off the end of a valid range must stop rather than
+publish. Nothing is clamped, cast or defaulted: see `_validate_params` for
+each bound and the argument for it.
+
 ERROR CONTRACT
 --------------
 Every contract violation raises `ValueError`. There is no try/except: an
@@ -117,6 +136,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from math import isfinite
 
 import pyarrow as pa
 
@@ -220,8 +240,117 @@ class BackoffParams:
 
 
 def _shrink(local_num: float, local_den: float, coarse_p: float, weight: float) -> float:
-    """Posterior mean with a `weight`-strength pseudo-count at `coarse_p`."""
-    return (local_num + weight * coarse_p) / (local_den + weight)
+    """Posterior mean with a `weight`-strength pseudo-count at `coarse_p`.
+
+    THE EMPTY LEVEL AT `weight == 0.0` IS DEFINED, NOT A 0/0
+    -------------------------------------------------------
+    `weight = 0.0` means "no shrinkage": trust the local share alone. That is
+    a coherent thing for a sweep to ask for -- the published sweep already
+    goes down to 0.5 and `cell_week_weight = 0.0` is the limit of that
+    direction -- so it is ACCEPTED by `_validate_params` rather than rejected.
+    Accepting it obliges this function to say what the answer is when there is
+    no local evidence either: with `local_den == 0` the expression is 0/0 and
+    raised a bare `ZeroDivisionError` naming neither the parameter nor the
+    cell-week.
+
+    A level with no records carries no information, so the answer is the
+    COARSER level's value -- which is also the limit of this expression as
+    `local_den -> 0` for any `weight > 0`, so the definition is continuous
+    with the rest of the surface rather than a special case bolted on. It is
+    NOT `0.0`: a hard zero is the one value this module's whole docstring
+    exists to forbid.
+    """
+    denominator = local_den + weight
+    if denominator == 0.0:
+        return coarse_p
+    return (local_num + weight * coarse_p) / denominator
+
+
+def _validate_params(params: BackoffParams) -> None:
+    """Reject a `BackoffParams` that would silently corrupt the artifact.
+
+    THE STYLE IS `smoothing.py::_validate_params`: name the parameter, its
+    value, and the concrete harm. Nothing is clamped, cast or defaulted --
+    substituting a default for a rejected value would publish an artifact
+    whose sidecar faithfully records constants the build did not use.
+
+    FINITENESS IS CHECKED SEPARATELY FROM RANGE, and the two do not subsume
+    each other. `nan` fails EVERY comparison, so `nan < 0.0` is False and a
+    range check alone passes a nan straight through; a range check is
+    likewise the only thing that sees `-1.0`. The harm is different too: a
+    nan weight makes every emitted `p` nan, while a nan `floor` is a silent
+    NO-OP, because `max(p, nan)` returns `p` and `min(p, 1.0)` leaves it --
+    the floor the module guarantees simply stops existing, with no error and
+    no nan to notice.
+
+    WHY EACH BOUND, since these constants are swept and a guard that is too
+    strict breaks the sweep that produces the paper's number:
+
+    * The two weights are PSEUDO-COUNTS IN RECORDS (see `BackoffParams`).
+      NEGATIVE is rejected: a negative pseudo-count is not weak shrinkage, it
+      is evidence SUBTRACTED -- it can push `p` above 1.0 (the output clamp
+      exists only to bound that damage) and it can drive `local_den + weight`
+      through zero, where the result flips sign discontinuously or divides by
+      zero. Measured at HEAD: `cell_week_weight = -1.0` and `-3.0` returned a
+      plausible table with no error at all, and `-4.0` raised
+      `ZeroDivisionError` only because that fixture's denominator happened to
+      be 4.
+    * ZERO is ACCEPTED for both weights: it means "no shrinkage at this
+      level", the sweep's endpoint, and `_shrink` now defines the empty case
+      it used to divide by zero on. The alternative -- rejecting it -- would
+      make the guard narrower than the sweep it is supposed to protect.
+    * `floor` is a PROBABILITY and a strictly positive one. `0.0` re-admits
+      the hard zero this module exists to forbid, letting the prior veto a
+      correct detection outright. `>= 1.0` flattens the artifact to a
+      constant: every value becomes exactly 1.0 through
+      `min(max(p, floor), 1.0)`, which at HEAD wrote six valid, fully
+      provenanced artifacts carrying no information whatsoever. 1.0 is
+      rejected with the same clause and for the same reason as 2.0 -- a
+      floor of "certainty" produces the identical constant artifact, and
+      admitting it because it happens to BE a probability would leave the
+      documented harm reachable.
+    """
+    for name, value in (
+        ("cell_week_weight", params.cell_week_weight),
+        ("cell_weight", params.cell_weight),
+    ):
+        if not isfinite(value):
+            raise ValueError(
+                f"{name}={value!r} is not finite; a shrinkage weight is a "
+                "pseudo-count in records, and a nan or inf one makes every "
+                "emitted probability nan or degenerate rather than raising"
+            )
+        if value < 0.0:
+            raise ValueError(
+                f"{name}={value!r} is negative; a shrinkage weight is a "
+                "pseudo-count in records, so a negative one SUBTRACTS the "
+                "coarser level's evidence -- it can push `p` above 1.0 and "
+                "can drive the denominator through zero, and at some values "
+                "it simply returns a plausible table with no error"
+            )
+    if not isfinite(params.floor):
+        raise ValueError(
+            f"floor={params.floor!r} is not finite; `floor` is applied as "
+            "`min(max(p, floor), 1.0)`, and a nan floor is a SILENT NO-OP "
+            "(nan loses every comparison) that removes the floor the module "
+            "guarantees, while an inf one flattens every value to 1.0"
+        )
+    if params.floor <= 0.0:
+        raise ValueError(
+            f"floor={params.floor!r} is not positive; `floor` is the smallest "
+            "probability the artifact may carry, and a floor of zero or less "
+            "re-admits the hard zero this module exists to forbid -- an "
+            "unobserved cell-week would be recorded as certain absence and "
+            "could veto a correct detection outright"
+        )
+    if params.floor >= 1.0:
+        raise ValueError(
+            f"floor={params.floor!r} is not below 1.0; `floor` is a "
+            "probability, and any floor at or above certainty flattens the "
+            "whole artifact to the constant 1.0 through "
+            "`min(max(p, floor), 1.0)` -- a valid, fully provenanced `.npz` "
+            "carrying no information at all"
+        )
 
 
 def _validate_table(ratios: pa.Table) -> None:
@@ -284,6 +413,7 @@ def hierarchical_estimate(
 ) -> pa.Table:
     """Estimate P(species | cell, week) over the full requested grid."""
     _validate_table(ratios)
+    _validate_params(params)
     _validate_grid_axis(list(species_keys), "species_key")
     if cells is not None:
         _validate_grid_axis(list(cells), "cell")

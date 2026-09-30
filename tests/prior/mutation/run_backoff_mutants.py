@@ -88,6 +88,29 @@ is
   pinned individually (B12/B13/B14), but a mutant that swapped the two
   DEFAULTS and simultaneously swapped the two call sites would be a pure
   relabelling and is not tested.
+* THE PARAMETER CONTRACT'S *VALUES*. B49-B58b (round 10) pin that each bound
+  of `_validate_params` is load-bearing -- one mutant per clause, in both the
+  too-loose and (where meaningful) the too-strict direction. They do NOT pin
+  that the bounds are the RIGHT ones. Specifically, nothing here would catch:
+  - a floor of 0.9 being accepted. It is a probability, it is inside the
+    guard, and it produces an artifact that is 1.0 almost everywhere. The
+    guard rejects only the degenerate endpoint, not "absurdly high but
+    legal", because no principled threshold exists between them and an
+    invented one would break a sweep;
+  - a weight of 1e9, which shrinks every cell-week to its global profile and
+    produces a spatially and seasonally flat artifact with no error. Same
+    reason: there is no bound short of `inf` that is not a guess;
+  - the sidecar recording DIFFERENT params from the ones the build used
+    while both are individually valid. That is `tensor.py`'s contract and is
+    mutated in `run_tensor_mutants.py`, not here;
+  - a caller mutating a `BackoffParams` between validation and use. The
+    dataclass is frozen, which makes this hard rather than impossible
+    (`object.__setattr__`), and no mutant models it.
+* THE CLI SEAM, beyond one call. B49's killer is the end-to-end test, so the
+  guard is proved to be reachable from `build_from_archive`. Nothing here
+  proves the OTHER entry points a future round might add are covered: the
+  guard lives in `hierarchical_estimate`, and a new caller that reimplements
+  the backoff rather than calling it would bypass it silently.
 """
 # ---------------------------------------------------------------------------
 # TEST SCOPE (final-gate finding I1)
@@ -316,17 +339,290 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
             )
         ],
     ),
+    # B11 RETIRED as EQUIVALENT, with a REACHABILITY PROOF rather than a
+    # sampled statistic (see this file's header on B10 for why the
+    # distinction matters).
+    #
+    # B11 removed the UPPER CLAMP in `min(max(p, params.floor), 1.0)`. Its
+    # killer test drove `p` to 1.75 by passing `cell_week_weight = -5.0`,
+    # i.e. the mutated branch was live ONLY under a negative shrinkage
+    # weight. Round 10 REJECTS negative weights at the entry point, so that
+    # input can no longer reach the arithmetic and the mutant became
+    # unkillable by construction.
+    #
+    # THE CONDITION UNDER WHICH THE MUTATION CHANGES BEHAVIOUR is `p > 1.0`
+    # at the emit site. No validated input can satisfy it:
+    #
+    #   * `_validate_table` enforces `1 <= n <= total` per row and
+    #     `sum(n) <= total` per cell-week, so every ratio of sums in the
+    #     chain is <= 1;
+    #   * `_validate_params` enforces `floor` strictly inside (0, 1), so
+    #     `p_global = max(raw_share, floor)` is <= 1;
+    #   * `_validate_params` enforces both weights finite and >= 0, so each
+    #     `_shrink` is a convex combination of two quantities that are both
+    #     <= 1 (or, on an empty level, the coarse value itself) and is
+    #     therefore <= 1.
+    #
+    # Hence `max(p, floor) <= 1.0` for every accepted input and the clamp is
+    # a no-op. It is KEPT in the source as a bound on any future path that
+    # reintroduces an unbounded weight; it is not mutated, because a mutant
+    # no input can distinguish is a survivor that means nothing.
+    #
+    # The test that made B11 live is now
+    # `test_a_negative_weight_is_REJECTED_rather_than_silently_clamped`,
+    # which pins the rejection AND re-asserts the 1.75 arithmetic, so the
+    # premise of this equivalence argument fails loudly if the rejection is
+    # ever relaxed.
+    # ---- THE PARAMETER CONTRACT (round 10 / brief A) -----------------------
+    #
+    # ONE MUTANT PER VALIDATION CLAUSE. A single mutant deleting the whole
+    # guard proves only that the guard exists, not that each bound is
+    # load-bearing -- and each bound here closes a DIFFERENT reproduced
+    # silent failure (see the module docstring's measurements at HEAD
+    # edd0723).
+    #
+    # Each clause is mutated in both directions where both are meaningful:
+    # REMOVED (the bad value is re-admitted) and TIGHTENED (a swept value
+    # that must work is rejected). The second direction matters because
+    # these constants are swept to produce the paper's effect size, so a
+    # guard that is too strict is a defect of the same family as one that is
+    # too loose -- it just fails the build instead of the artifact.
     (
-        "B11",
-        "the upper clamp removed, so a NEGATIVE shrinkage weight (a caller "
-        "error, not a data error -- no contract-conforming table can do it, "
-        "since n <= total makes every level a weighted average of values <= 1) "
-        "emits p > 1.0 instead of being bounded",
-        "test_the_upper_clamp_holds_when_a_weight_is_negative",
+        "B49",
+        "`_validate_params` never called, so the whole parameter contract "
+        "disappears: floor=2.0 again writes a fully provenanced artifact in "
+        "which every value is exactly 1.0. Killed BY THE END-TO-END TEST on "
+        "purpose -- a unit test on `BackoffParams` does not prove the CLI is "
+        "protected, since `build_from_archive` builds its own params object "
+        "and passes it down two call layers",
+        "test_a_FLATTENING_floor_cannot_produce_artifacts_through_the_CLI",
         [
             (
-                "                out_p.append(min(max(p, params.floor), 1.0))",
-                "                out_p.append(max(p, params.floor))",
+                "    _validate_params(params)",
+                "    pass  # _validate_params(params)",
+            )
+        ],
+    ),
+    (
+        "B49b",
+        "the parameter guard made CONDITIONAL on the table having rows, so an "
+        "empty RatioTable is scored with any parameters at all -- the path "
+        "that emits the floor everywhere and touches none of the arithmetic "
+        "a lazier guard would have waited for",
+        "test_the_parameter_guard_runs_before_any_estimate_is_produced",
+        [
+            (
+                "    _validate_params(params)",
+                "    if ratios.num_rows:\n        _validate_params(params)",
+            )
+        ],
+    ),
+    (
+        "B50",
+        "the WEIGHTS' FINITENESS clause removed. `nan` fails every comparison, "
+        "so the range clause below cannot see it: a nan weight is accepted "
+        "and every emitted probability becomes nan with no error. Separate "
+        "mutant from B51 because neither clause can detect the other's loss",
+        "test_a_non_finite_shrinkage_weight_is_rejected",
+        [
+            (
+                "        if not isfinite(value):",
+                "        if False:",
+            )
+        ],
+    ),
+    (
+        "B51",
+        "the WEIGHTS' NON-NEGATIVITY clause removed, so a negative "
+        "pseudo-count SUBTRACTS the coarser level's evidence. At HEAD "
+        "cell_week_weight=-1.0 and -3.0 returned a plausible table with no "
+        "error at all. Separate mutant from B50: a finiteness test passes on "
+        "-1.0 and a range test passes on nan",
+        "test_a_negative_shrinkage_weight_is_rejected",
+        [
+            (
+                "        if value < 0.0:",
+                "        if False:",
+            )
+        ],
+    ),
+    (
+        "B51b",
+        "the weights' range clause TIGHTENED to reject 0.0, which is the "
+        "sweep's endpoint (`cell_week_weight = 0` means no shrinkage) and a "
+        "documented accepted value. The guard would then be narrower than "
+        "the sweep it exists to protect",
+        "test_a_zero_shrinkage_weight_is_ACCEPTED",
+        [
+            (
+                "        if value < 0.0:",
+                "        if value <= 0.0:",
+            )
+        ],
+    ),
+    (
+        "B52",
+        "the weight guard applied to `cell_week_weight` ONLY, so a nan or "
+        "negative `cell_weight` slips through the per-field loop -- the "
+        "parameter-plumbing form of the defect, invisible to any test that "
+        "only ever passes a bad cell_week_weight",
+        "test_the_weight_guard_covers_BOTH_weights_not_only_the_first",
+        [
+            (
+                '        ("cell_week_weight", params.cell_week_weight),\n'
+                '        ("cell_weight", params.cell_weight),',
+                '        ("cell_week_weight", params.cell_week_weight),',
+            )
+        ],
+    ),
+    (
+        "B53",
+        "the FLOOR'S FINITENESS clause removed. A nan floor is a SILENT "
+        "NO-OP rather than a poison -- `max(p, nan)` returns `p` -- so the "
+        "floor the module guarantees simply stops existing, with no error "
+        "and no nan anywhere to notice. The range clauses cannot see it",
+        "test_a_non_finite_floor_is_rejected",
+        [
+            (
+                "    if not isfinite(params.floor):",
+                "    if False:",
+            )
+        ],
+    ),
+    (
+        "B54",
+        "the FLOOR > 0 clause removed, re-admitting the hard zero the "
+        "module's entire docstring exists to forbid: an unobserved cell-week "
+        "would be recorded as certain absence and could veto a correct "
+        "detection outright",
+        "test_a_floor_of_zero_is_rejected",
+        [
+            (
+                "    if params.floor <= 0.0:",
+                "    if False:",
+            )
+        ],
+    ),
+    (
+        "B54b",
+        "the FLOOR > 0 clause weakened from `<=` to `<`, admitting EXACTLY "
+        "0.0 while still rejecting -1.0. The boundary is the whole point: "
+        "0.0 is the hard zero, and a guard that rejects only negative floors "
+        "leaves the documented harm reachable",
+        "test_a_floor_of_zero_is_rejected",
+        [
+            (
+                "    if params.floor <= 0.0:",
+                "    if params.floor < 0.0:",
+            )
+        ],
+    ),
+    (
+        "B55",
+        "the FLOOR < 1 clause removed. This is the reproduced end-to-end "
+        "defect: floor=2.0 wrote six valid, fully provenanced artifacts -- "
+        "DOI, manifest, licence, honest sidecar -- in which every value was "
+        "exactly 1.0, with nothing raised anywhere in the pipeline",
+        "test_a_floor_above_one_is_rejected",
+        [
+            (
+                "    if params.floor >= 1.0:",
+                "    if False:",
+            )
+        ],
+    ),
+    (
+        "B55b",
+        "the FLOOR < 1 clause weakened from `>=` to `>`, admitting EXACTLY "
+        "1.0 -- which IS a probability and still flattens the artifact to "
+        "the same constant, since `min(max(p, 1.0), 1.0)` is 1.0 for every "
+        "p. The boundary admits the identical information-free artifact",
+        "test_a_floor_of_one_is_rejected",
+        [
+            (
+                "    if params.floor >= 1.0:",
+                "    if params.floor > 1.0:",
+            )
+        ],
+    ),
+    (
+        "B55c",
+        "the FLOOR < 1 clause TIGHTENED to reject any floor at or above 0.5, "
+        "which is a legitimate probability and a buildable configuration. "
+        "The over-strict direction of the same bound: it fails the build "
+        "rather than the artifact, and no test of a REJECTION can see it",
+        "test_the_swept_parameter_values_are_all_ACCEPTED",
+        [
+            (
+                "    if params.floor >= 1.0:",
+                "    if params.floor >= 0.5:",
+            )
+        ],
+    ),
+    (
+        "B56",
+        "the parameter guard WARNS instead of raising (the warn-and-continue "
+        "pattern the plan's rule B forbids), so the flattening floor is "
+        "announced on stdout and then used anyway",
+        "test_a_floor_above_one_is_rejected",
+        [
+            (
+                "    if params.floor >= 1.0:\n        raise ValueError(",
+                "    if params.floor >= 1.0:\n        print(",
+            )
+        ],
+    ),
+    (
+        "B57",
+        "the parameter guard CLAMPS instead of raising -- the silent-repair "
+        "form, and the dangerous one: the build succeeds with a floor the "
+        "caller never asked for, while `save_prior` writes the ORIGINAL "
+        "params object into the sidecar. The artifact would carry an honest "
+        "record of constants the build did not use",
+        "test_a_rejected_parameter_is_never_repaired_into_a_default",
+        [
+            (
+                "    if not isfinite(params.floor):",
+                "    params = BackoffParams(\n"
+                "        cell_week_weight=max(params.cell_week_weight, 0.0),\n"
+                "        cell_weight=max(params.cell_weight, 0.0),\n"
+                "        floor=min(max(params.floor, FLOOR), 1.0 - 1e-12),\n"
+                "    )\n"
+                "    if not isfinite(params.floor):",
+            )
+        ],
+    ),
+    (
+        "B58",
+        "the EMPTY-LEVEL definition in `_shrink` returns 0.0 instead of the "
+        "coarse value, so zero shrinkage on an unvisited cell-week reports a "
+        "hard zero. The output clamp then lifts it to `floor`, which is why "
+        "an assertion like `p > 0` cannot see this and the killer test "
+        "asserts the PARENT value exactly on a fixture whose parent is five "
+        "orders of magnitude above the floor",
+        "test_zero_shrinkage_on_an_EMPTY_cell_week_returns_the_PARENT_not_zero",
+        [
+            (
+                "    if denominator == 0.0:\n        return coarse_p",
+                "    if denominator == 0.0:\n        return 0.0",
+            )
+        ],
+    ),
+    (
+        "B58b",
+        "the empty-level guard removed entirely, restoring the bare "
+        "`ZeroDivisionError` that `cell_week_weight = 0.0` on an unvisited "
+        "cell-week raised at HEAD -- an error naming neither the parameter "
+        "nor the cell-week, from a configuration the sweep is entitled to ask "
+        "for",
+        "test_zero_shrinkage_on_an_EMPTY_cell_week_returns_the_PARENT_not_zero",
+        [
+            (
+                "    denominator = local_den + weight\n"
+                "    if denominator == 0.0:\n"
+                "        return coarse_p\n"
+                "    return (local_num + weight * coarse_p) / denominator",
+                "    return (local_num + weight * coarse_p) / (local_den + weight)",
             )
         ],
     ),
@@ -389,8 +685,8 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         "test_two_identical_ratios_with_different_effort_get_different_estimates",
         [
             (
-                "    return (local_num + weight * coarse_p) / (local_den + weight)",
-                "    return (local_num + weight * coarse_p) / (local_num + weight)",
+                "    denominator = local_den + weight",
+                "    denominator = local_num + weight",
             )
         ],
     ),
@@ -402,8 +698,8 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         "test_a_single_record_cell_week_cannot_reach_certainty",
         [
             (
-                "    return (local_num + weight * coarse_p) / (local_den + weight)",
-                "    return (local_num + weight * coarse_p) / (local_den + 0.0000001)",
+                "    denominator = local_den + weight",
+                "    denominator = local_den + 0.0000001",
             )
         ],
     ),
@@ -414,7 +710,10 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         "test_an_unvisited_cell_week_is_scored_from_the_parent_not_from_zero_over_zero",
         [
             (
-                "    return (local_num + weight * coarse_p) / (local_den + weight)",
+                "    denominator = local_den + weight\n"
+                "    if denominator == 0.0:\n"
+                "        return coarse_p\n"
+                "    return (local_num + weight * coarse_p) / denominator",
                 "    return local_num / local_den if local_den else 0.0",
             )
         ],
@@ -426,7 +725,10 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         "test_dense_cell_week_dominated_by_local_estimate",
         [
             (
-                "    return (local_num + weight * coarse_p) / (local_den + weight)",
+                "    denominator = local_den + weight\n"
+                "    if denominator == 0.0:\n"
+                "        return coarse_p\n"
+                "    return (local_num + weight * coarse_p) / denominator",
                 "    return coarse_p",
             )
         ],
