@@ -14,7 +14,7 @@
 
 - **Every job that reads the corpus must pass `--bind /mnt/weka:/mnt/weka` to `apptainer`.** Measured: without it the container sees an EMPTY `/mnt/weka`, not an error. A shard loop would report "0 files" and exit 0.
 - **Every job that uses a GPU must pass `--nv` to `apptainer` AND `--gres=gpu:N` to Slurm.** Measured: with `--gres=gpu:1` and `--nv`, `torch.cuda.is_available()` is True and the device is `NVIDIA H100 80GB HBM3`. Without `--gres`, CUDA is False inside the container even with `--nv`.
-- **WEKA is on dgx171 ONLY today** (verified node by node across 21 up nodes). Every job in this plan must pin `--nodelist=dgx171` until the mount is fleet-wide, and must fail loudly if `/mnt/weka` is not a mountpoint rather than writing to a local path of the same name.
+- **WEKA is fleet-wide as of 2026-09-30** (verified: all 20 schedulable nodes report `mountpoint -q /mnt/weka` OK, 1.0 PB; dgx169/177/179/182 down). No node pin is needed. Every job must still fail loudly if `/mnt/weka` is not a mountpoint rather than writing to a local path of the same name — a node that loses the mount would otherwise fabricate an empty corpus.
 - Jobs run as `uid=1000(nvidia)`; the login user is `uid=1000(ubuntu)` group `hpcbuild`. `$HOME` is unreadable in a job and Slurm chdirs to `/tmp`. **`HF_HOME` and `HOME` must both be redirected** or `huggingface_hub` dies on `~/.cache/huggingface/token`.
 - **A directory created on `/shared/apps` as `ubuntu` is not necessarily usable by a job.** Measured: `/shared/apps/ML/secrets` created as `ubuntu` did not exist from inside a job; `mkdir` from inside the job as `nvidia` succeeded. Create job-facing directories from inside a job.
 - The XC v3 key lives in `/shared/apps/ML/secrets/xc_key` mode 600, created from inside a job. **Never** hardcoded, never logged, never in a filename, never in a command line (use a file read, not an argv or env value that `ps` can show).
@@ -1316,7 +1316,7 @@ def test_the_sbatch_script_binds_weka_and_requests_a_gpu():
     assert "--bind /mnt/weka:/mnt/weka" in script
     assert "--nv" in script
     assert "--gres=gpu:" in script
-    assert "--nodelist=dgx171" in script
+    # No nodelist assertion: WEKA is fleet-wide (verified 2026-09-30).
 
 
 def test_the_sbatch_script_fails_if_weka_is_not_mounted():
@@ -1605,7 +1605,6 @@ Create `scripts/cluster/phase_a_embed.sbatch`:
 #!/usr/bin/env bash
 #SBATCH --job-name=phase-a-embed
 #SBATCH --partition=gpu
-#SBATCH --nodelist=dgx171
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
@@ -1623,8 +1622,9 @@ Create `scripts/cluster/phase_a_embed.sbatch`:
 #   --nv                    without it, the container has no CUDA driver
 #   --bind /mnt/weka        without it, /mnt/weka is an EMPTY DIRECTORY in the
 #                           container -- the shard loop finds 0 files, exit 0
-# WEKA is on dgx171 only today, hence --nodelist. Remove it when the mount is
-# fleet-wide, not before.
+# WEKA is fleet-wide (verified across all 20 schedulable nodes, 2026-09-30),
+# so the array spreads over the whole fleet; the mountpoint guard below still
+# protects against any node that silently loses the mount.
 set -euo pipefail
 
 CONFIG=${1:?usage: sbatch ... phase_a_embed.sbatch CONFIG RESOLUTION}
