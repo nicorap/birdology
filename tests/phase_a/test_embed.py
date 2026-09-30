@@ -13,6 +13,7 @@ import soundfile as sf
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 
 from birdology.phase_a.embed import (
+    EMBEDDING_SCHEMA,
     ShardResult,
     embed_shard,
     iter_shard_audio,
@@ -141,14 +142,148 @@ def test_shard_is_complete_requires_a_MATCHING_ROW_COUNT(tmp_path):
     """Review Focus 5: a preempted task must not look finished."""
     p = _shard(tmp_path, [("a/XC1.ogg", _ogg_bytes()), ("a/XC2.ogg", _ogg_bytes())])
     out = tmp_path / "emb"
-    assert not shard_is_complete(p, out)
+    full = _manifest(["a/XC1.ogg", "a/XC2.ogg"])
+    assert not shard_is_complete(p, full, out)
 
-    # A partial write: one row where the shard holds two audio members.
+    # A partial write: one row where the manifest expects two.
     embed_shard(p, _manifest(["a/XC1.ogg"]), _encoder(), out_dir=out)
-    assert not shard_is_complete(p, out)
+    assert not shard_is_complete(p, full, out)
 
-    embed_shard(p, _manifest(["a/XC1.ogg", "a/XC2.ogg"]), _encoder(), out_dir=out)
-    assert shard_is_complete(p, out)
+    embed_shard(p, full, _encoder(), out_dir=out)
+    assert shard_is_complete(p, full, out)
+
+
+def test_a_manifest_EXCLUDED_member_does_not_block_completion(tmp_path):
+    """Task 3's manifest drops ~2% of recordings by design; a shard whose
+    manifest-listed members are all done must be COMPLETE even though the
+    tar holds members the manifest never asked for."""
+    p = _shard(tmp_path, [("a/XC1.ogg", _ogg_bytes()), ("a/XC9.ogg", _ogg_bytes())])
+    out = tmp_path / "emb"
+    m = _manifest(["a/XC1.ogg"])
+    res = embed_shard(p, m, _encoder(), out_dir=out)
+    assert res.embedded == 1
+    assert res.expected == 1
+    assert shard_is_complete(p, m, out)
+
+
+def test_completion_is_SET_BASED_not_count_arithmetic(tmp_path):
+    """F2, measured: a crash between the two writes leaves a parquet holding
+    {XC1, XC2} and a STALE failures json holding {XC2} -- 3 accountings for
+    2 names, with XC3 lost. Count arithmetic (2 + 1 >= 3) blesses it."""
+    p = _shard(
+        tmp_path,
+        [
+            ("a/XC1.ogg", _ogg_bytes()),
+            ("a/XC2.ogg", _ogg_bytes()),
+            ("a/XC3.ogg", _ogg_bytes()),
+        ],
+    )
+    m = _manifest(["a/XC1.ogg", "a/XC2.ogg", "a/XC3.ogg"])
+    out = tmp_path / "emb"
+    out.mkdir()
+    rows = [
+        {
+            "filepath": n,
+            "cell": "c",
+            "week": 1,
+            "ebird_code": "gretit",
+            "split": "train",
+            "embedding": [0.0] * 8,
+        }
+        for n in ("a/XC1.ogg", "a/XC2.ogg")
+    ]
+    pq.write_table(
+        pa.Table.from_pylist(rows, schema=EMBEDDING_SCHEMA),
+        out / "shard_0001.parquet",
+    )
+    (out / "shard_0001.failures.json").write_text('{"a/XC2.ogg": "stale"}')
+    assert not shard_is_complete(p, m, out)
+
+
+def test_a_CORRUPT_parquet_means_incomplete_not_complete_or_crash(tmp_path):
+    """F5/M9: a torn parquet (preemption mid-write) must read as incomplete."""
+    p = _shard(tmp_path, [("a/XC1.ogg", _ogg_bytes())])
+    out = tmp_path / "emb"
+    m = _manifest(["a/XC1.ogg"])
+    embed_shard(p, m, _encoder(), out_dir=out)
+    assert shard_is_complete(p, m, out)
+    (out / "shard_0001.parquet").write_bytes(b"\x00garbage not a parquet\x00")
+    assert shard_is_complete(p, m, out) is False
+
+
+def test_a_CORRUPT_failures_json_means_incomplete_not_complete_or_crash(tmp_path):
+    """F5/M8: an unreadable failures sidecar makes the output pair
+    untrustworthy, even when the parquet alone covers everything."""
+    p = _shard(tmp_path, [("a/XC1.ogg", _ogg_bytes())])
+    out = tmp_path / "emb"
+    m = _manifest(["a/XC1.ogg"])
+    embed_shard(p, m, _encoder(), out_dir=out)
+    assert shard_is_complete(p, m, out)
+    (out / "shard_0001.failures.json").write_bytes(b"{not json![")
+    assert shard_is_complete(p, m, out) is False
+
+
+def test_ZERO_manifest_shard_overlap_raises_instead_of_blessing_no_op(tmp_path):
+    """F3: `./a/XC1.ogg` vs `a/XC1.ogg` is one prefix change away from
+    embedding zero rows fleet-wide at exit 0. Zero overlap must be LOUD."""
+    p = _shard(tmp_path, [("./a/XC1.ogg", _ogg_bytes()), ("./a/XC2.ogg", _ogg_bytes())])
+    with pytest.raises(ValueError, match="ZERO overlap"):
+        embed_shard(
+            p, _manifest(["a/XC1.ogg", "a/XC2.ogg"]), _encoder(),
+            out_dir=tmp_path / "emb",
+        )
+    # And no output was blessed.
+    assert not (tmp_path / "emb" / "shard_0001.parquet").exists()
+
+
+def test_a_TRUNCATED_ogg_that_decodes_to_zero_samples_is_a_failure(tmp_path):
+    """F1, measured: a valid-header OGG cut at 60% returns 0 samples from
+    sf.read WITHOUT raising; embedding it writes a garbage row."""
+    whole = _ogg_bytes(seconds=2.0)
+    truncated = whole[: int(len(whole) * 0.6)]
+    # Precondition of the probe: the truncation is the silent kind.
+    s, _ = sf.read(io.BytesIO(truncated), dtype="float32", always_2d=False)
+    assert s.size == 0
+    p = _shard(tmp_path, [("a/XC1.ogg", _ogg_bytes()), ("a/XC2.ogg", truncated)])
+    out = tmp_path / "emb"
+    res = embed_shard(
+        p, _manifest(["a/XC1.ogg", "a/XC2.ogg"]), _encoder(), out_dir=out
+    )
+    assert res.embedded == 1
+    assert "a/XC2.ogg" in res.failed
+    assert "0 samples" in res.failed["a/XC2.ogg"]
+    written = pq.read_table(out / "shard_0001.parquet")
+    assert written.column("filepath").to_pylist() == ["a/XC1.ogg"]
+
+
+def test_a_crash_during_the_parquet_write_leaves_NO_torn_final_file(
+    tmp_path, monkeypatch
+):
+    """F2: writes must be atomic. Simulate preemption mid-`write_table`:
+    with tmp+os.replace the destination path never exists; a non-atomic
+    write leaves a torn file at the final path that a reader half-trusts."""
+    import birdology.phase_a.embed as embed_mod
+
+    def torn_write(table, where, *args, **kwargs):
+        Path(where).write_bytes(b"half a parquet")
+        raise RuntimeError("preempted mid-write")
+
+    monkeypatch.setattr(embed_mod.pq, "write_table", torn_write)
+    p = _shard(tmp_path, [("a/XC1.ogg", _ogg_bytes())])
+    out = tmp_path / "emb"
+    with pytest.raises(RuntimeError, match="preempted"):
+        embed_shard(p, _manifest(["a/XC1.ogg"]), _encoder(), out_dir=out)
+    assert not (out / "shard_0001.parquet").exists()
+    # Failures json is written FIRST, so it survived the crash -- and the
+    # missing parquet (the completion witness) makes the shard re-run.
+    assert (out / "shard_0001.failures.json").exists()
+
+
+def test_no_tmp_files_survive_a_successful_run(tmp_path):
+    p = _shard(tmp_path, [("a/XC1.ogg", _ogg_bytes())])
+    out = tmp_path / "emb"
+    embed_shard(p, _manifest(["a/XC1.ogg"]), _encoder(), out_dir=out)
+    assert not list(out.glob("*.tmp"))
 
 
 def test_embedding_width_is_preserved(tmp_path):
