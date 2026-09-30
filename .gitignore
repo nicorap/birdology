@@ -31,3 +31,8 @@ output/.birdology*_oxi/
 # Xeno-Canto API v3 personal key (per-account, required on every API call).
 # Never commit: the key identifies the account and XC rate-limits by it.
 .XCkey
+
+# Editor swap/backup files. A .XCkey.swp holds the key in plaintext.
+*.swp
+*.swo
+*~
