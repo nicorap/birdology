@@ -58,26 +58,22 @@ def _mean_log_mel(samples: np.ndarray, sr: int, n_mels: int = 64) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 
-def _frame_for_perch(samples: np.ndarray, sr: int) -> np.ndarray:
-    """Frame a mono recording into normalized (n_windows, 160000) float32.
+def _batch_for_perch(samples: np.ndarray, sr: int) -> np.ndarray:
+    """Validate and shape a mono recording into hoplite's (1, n_samples) batch.
 
-    Mirrors perch-hoplite's semantics exactly (frame_audio + normalize_audio):
-    - sr must be 32 kHz. Our corpus is native 32 kHz; silently accepting
-      another rate would embed garbage that no downstream check could catch.
-    - Recordings shorter than one window are zero-CENTER-padded to 5 s
-      (librosa.util.pad_center, including its odd-amount left/right split).
-    - Longer recordings are framed at hop 5 s and any trailing remainder
-      < 5 s is DROPPED (librosa.util.frame with window == hop == 160000,
-      exactly what hoplite does). Zero-padding the remainder instead is
-      actively harmful here: normalization runs AFTER framing, so the
-      mean-subtract turns the pad's zeros into a DC plateau and the
-      peak-normalize scales that plateau to full amplitude — a mostly
-      synthetic constant window that mean-pooling then averages into the
-      recording embedding at weight 1/n_windows. Dropping < 5 s of tail
-      audio is the cited hoplite behavior and what the golden-reference
-      gate (≤ 1e-5 vs hoplite's own embed()) requires.
-    - Each window is then mean-subtracted and peak-normalized to 0.25
-      (all-zero windows are left as zeros — no division by zero).
+    DELIBERATELY NO framing and NO normalization here. The real
+    `batch_embed` frames (window 5 s, hop 5 s, trailing remainder dropped,
+    short input padded) and normalizes (mean-subtract, peak 0.25) INTERNALLY
+    — measured by reading its source on the fleet (2026-09-30). Our first
+    implementation reproduced those stages faithfully (librosa-oracle
+    byte-identical) and STILL failed the golden gate at ~1.2e-4: hoplite
+    re-normalized our already-normalized windows, and in float32 the
+    re-computed mean is not exactly 0 nor the peak exactly 0.25, so the
+    inputs drifted ~1e-7 and the network amplified it. Equality with the
+    reference comes from SHARING its code path, not imitating it.
+
+    sr must be 32 kHz: the corpus is native 32 kHz, and silently accepting
+    another rate would embed garbage no downstream check could catch.
     """
     if sr != PERCH_SR:
         raise ValueError(
@@ -85,49 +81,39 @@ def _frame_for_perch(samples: np.ndarray, sr: int) -> np.ndarray:
             "32 kHz and resampling here would silently change the embeddings"
         )
     x = np.asarray(samples, dtype=np.float32).reshape(-1)
-    frame, hop = PERCH_WINDOW_SAMPLES, PERCH_HOP_SAMPLES
-    if x.size < frame:
-        pad = frame - x.size
-        left = pad // 2
-        x = np.pad(x, (left, pad - left))
-        n_windows = 1
-    else:
-        # hoplite / librosa.util.frame semantics: only FULL windows; the
-        # trailing remainder (< 5 s) is dropped, never padded (see docstring).
-        n_windows = 1 + (x.size - frame) // hop
-    windows = np.stack([x[i * hop : i * hop + frame] for i in range(n_windows)])
-    # Per-window normalization (perch-hoplite normalize_audio semantics).
-    windows = windows - windows.mean(axis=1, keepdims=True)
-    peaks = np.max(np.abs(windows), axis=1, keepdims=True)
-    safe_peaks = np.where(peaks > 0, peaks, 1.0)
-    windows = windows * (PERCH_TARGET_PEAK / safe_peaks)
-    return windows.astype(np.float32)
+    if x.size == 0:
+        raise ValueError("empty audio cannot be embedded")
+    return x[None, :]
 
 
 def _pool_perch_outputs(embeddings_array: np.ndarray) -> np.ndarray:
-    """Adapt hoplite batch_embed output to (n_windows, 1536) float32.
+    """Pool hoplite batch_embed output for ONE recording to (1536,) float32.
 
     MEASURED on the fleet (2026-09-30, perch_v2 GPU SavedModel via
-    perch-hoplite 1.0.4): `batch_embed([n, 160000])` returns
-    **(n, 1, 1, 1536)** — batch, time, channel, features — and `embed(7 s)`
-    returns (1, 1, 1536), confirming one window per 5 s with the trailing
-    remainder dropped. Each input here is exactly one 5 s window, so every
-    middle axis must be singleton; squeeze them to (batch, 1536).
-    Already-flat (batch, 1536) passes through unchanged. A NON-singleton
-    middle axis raises loudly: reshaping it away would silently interleave
-    values from different windows into every embedding.
+    perch-hoplite 1.0.4): `batch_embed([1, n_samples])` returns
+    **(1, n_windows, 1, 1536)** — batch, time, channel, features — where
+    n_windows is hoplite's OWN framing of the recording (7 s → 1, 10 s → 2).
+    We pass exactly one recording per call, so batch must be 1 and channel
+    singleton; the recording-level embedding is the MEAN over the time axis
+    (the Perch paper's own recipe, §2.5.1 — identical to
+    pooled_embeddings(time_pooling='mean', channel_pooling='mean')).
+    A 2-D (n_windows, 1536) input is accepted for mocked tests. Anything
+    else raises loudly rather than silently mixing recordings.
 
     Pure numpy so contract tests can pin the axis logic without TensorFlow.
     """
     emb = np.asarray(embeddings_array, dtype=np.float32)
     if emb.ndim == 2:
-        return emb
-    if emb.ndim >= 3 and all(s == 1 for s in emb.shape[1:-1]):
-        return emb.reshape(emb.shape[0], emb.shape[-1])
+        return emb.mean(axis=0).astype(np.float32)
+    if emb.ndim == 4 and emb.shape[0] == 1 and emb.shape[2] == 1:
+        return emb[0, :, 0, :].mean(axis=0).astype(np.float32)
+    if emb.ndim == 3 and emb.shape[1] == 1:
+        # embed()-style (n_windows, 1, 1536)
+        return emb[:, 0, :].mean(axis=0).astype(np.float32)
     raise ValueError(
         f"unexpected perch embeddings shape {emb.shape}; expected "
-        "(batch, 1536) with only singleton middle axes — a non-singleton "
-        "time axis means the model saw inputs longer than one 5 s window"
+        "(1, n_windows, 1, 1536) from batch_embed of ONE recording — "
+        "a batch > 1 here would silently mix recordings"
     )
 
 
@@ -148,8 +134,9 @@ def _load_perch_model() -> Callable[[np.ndarray], Mapping[str, np.ndarray]]:
         ) from exc
     loaded = model_configs.load_model_by_name("perch_v2")
 
-    def infer(windows: np.ndarray) -> Mapping[str, np.ndarray]:
-        return {"embedding": _pool_perch_outputs(loaded.batch_embed(windows).embeddings)}
+    def infer(batch: np.ndarray) -> Mapping[str, np.ndarray]:
+        # batch is (1, n_samples) RAW audio; hoplite frames and normalizes.
+        return {"embedding": _pool_perch_outputs(loaded.batch_embed(batch).embeddings)}
 
     return infer
 
@@ -160,18 +147,23 @@ def make_perch_encoder(
     """Build the Perch 2.0 encoder.
 
     `model` is injectable for contract tests: a callable taking a
-    (n_windows, 160000) float32 batch and returning a mapping with
-    'embedding' of shape (n_windows, 1536). Default None lazy-loads the real
-    SavedModel (ImportError when the runtime is absent).
+    (1, n_samples) float32 RAW-audio batch (framing and normalization happen
+    INSIDE hoplite's batch_embed — see _batch_for_perch for why imitating
+    them fails the golden gate) and returning a mapping with 'embedding'
+    of shape (1536,) pooled, or (n_windows, 1536) from a mock. Default None
+    lazy-loads the real SavedModel (ImportError when the runtime is absent).
     """
     if model is None:
         model = _load_perch_model()
 
     def encode(samples: np.ndarray, sr: int) -> np.ndarray:
-        windows = _frame_for_perch(samples, sr)
-        emb = np.asarray(model(windows)["embedding"], dtype=np.float32)
-        # Recording-level embedding: MEAN over windows (Perch paper §2.5.1).
-        return emb.mean(axis=0).astype(np.float32)
+        batch = _batch_for_perch(samples, sr)
+        # model returns the ALREADY-POOLED (1536,) recording embedding (or a
+        # (n,1536) window matrix from a mock, which _pool… mean-pools).
+        emb = np.asarray(model(batch)["embedding"], dtype=np.float32)
+        if emb.ndim == 2:
+            emb = emb.mean(axis=0)
+        return emb.astype(np.float32)
 
     return encode
 
