@@ -16,16 +16,23 @@ Cited facts (2026-09-30 reconnaissance, docs/superpowers/plans/
   serving returns 1536-d per window; recording-level = MEAN over windows
   (the paper's own recipe, §2.5.1).
 - BirdNET V2.4: the `birdnet` pip package resamples internally (scipy FFT),
-  so we pass OUR sr through; `encode_arrays` returns embeddings
+  so we pass OUR sr through; session `run_arrays` returns embeddings
   (1, n_segments, 1024) plus a boolean mask of the same shape; a segment is
   VALID when ~mask.any(axis=-1) (True marks PADDING — numpy MaskedArray
   convention, measured); recording-level = MEAN over valid segments.
   n_workers MUST be 1 under Slurm (the package spawns per-core workers
-  otherwise).
+  otherwise). Sessions, not one-shots: encode_arrays/predict_arrays spawn
+  and tear down birdnet's producer/worker processes on EVERY call —
+  MEASURED 12.14 s/call of pure spawn overhead, projecting to 81 hours for
+  the 12 000-recording HSN pilot (which timed out at 45 min with zero
+  output). encode_session/predict_session amortize the spawn: measured
+  steady state 0.005 s/rec (encode) and 0.335 s/rec (predict).
 """
 from __future__ import annotations
 
+import atexit
 from collections.abc import Callable, Mapping
+from typing import Any
 
 import numpy as np
 
@@ -333,33 +340,111 @@ def _load_birdnet_model():
     return birdnet.load("acoustic", "2.4", "pb")
 
 
+class _BirdnetSession:
+    """A lazily-opened, process-lifetime birdnet session with retry-once.
+
+    WHY SESSIONS: birdnet 1.1.1's encode_arrays/predict_arrays one-shots
+    spawn and tear down the package's producer/worker processes on EVERY
+    call — MEASURED 12.14 s/call of pure spawn overhead on the fleet
+    (2026-09-30), projecting to 81 hours for the 12 000-recording HSN pilot,
+    which timed out at 45 min with zero output. encode_session /
+    predict_session amortize the spawn across calls: measured steady state
+    0.005 s/rec (encode) and 0.335 s/rec (predict). run_arrays returns the
+    SAME result shapes as the one-shots (verified live: (24, 2, 1024)
+    embeddings; (24, 2, 6522) probs with top_k=None).
+
+    LIFECYCLE: a session owns child processes, so it is opened LAZILY on
+    the first run_arrays (a merely-constructed encoder spawns nothing),
+    cached for the life of this object, registered with atexit so an
+    unclosed session still ends its children at interpreter exit, and
+    closed idempotently (double-end guarded by nulling the reference before
+    calling .end()).
+
+    RETRY: a worker that dies mid-session surfaces as an exception from
+    run_arrays, never a hang. On failure the session is closed and
+    re-opened ONCE and the same recording retried — transient worker death
+    recovers; a second failure re-raises (systematic breakage must stop the
+    shard, not loop).
+    """
+
+    def __init__(self, open_session: "Callable[[], Any]"):
+        self._open_session = open_session
+        self._session: Any = None
+        self._atexit_registered = False
+
+    def _open(self):
+        if self._session is None:
+            self._session = self._open_session()
+            if not self._atexit_registered:
+                # Register once per wrapper, not per re-open: atexit holds a
+                # reference forever and close() is idempotent anyway.
+                atexit.register(self.close)
+                self._atexit_registered = True
+        return self._session
+
+    def run_arrays(self, inputs):
+        session = self._open()
+        try:
+            return session.run_arrays(inputs)
+        except Exception:
+            # Transient worker death: close, re-open ONCE, retry this
+            # recording. The second failure re-raises (chained onto the
+            # first) — systematic breakage, not a flaky worker.
+            self.close()
+            session = self._open()
+            try:
+                return session.run_arrays(inputs)
+            except Exception:
+                self.close()
+                raise
+
+    def close(self) -> None:
+        """End the session's child processes. Idempotent (double-end safe)."""
+        session, self._session = self._session, None
+        if session is not None:
+            session.end()
+
+
 def make_birdnet_encoder(model=None, device: str = "GPU") -> Encoder:
-    """Build the BirdNET V2.4 encoder.
+    """Build the BirdNET V2.4 encoder over a process-lifetime encode session.
 
     `model` is injectable for contract tests: an object whose
-    `encode_arrays([(samples, sr)], n_workers=1, device=...)` returns a
-    result with `.embeddings` (1, n_segments, 1024) and boolean
-    `.embeddings_masked` of the same shape. Default None lazy-loads the
-    real model.
+    `encode_session(n_workers=1, batch_size=1, device=...)` returns a
+    session whose `run_arrays([(samples, sr)])` returns a result with
+    `.embeddings` (1, n_segments, 1024) and boolean `.embeddings_masked`
+    of the same shape — the same shapes as the old encode_arrays one-shot
+    (verified on the fleet). Default None lazy-loads the real model.
 
-    `device` is forwarded EXPLICITLY to every encode_arrays call: the pb
-    backend selects its device at ENCODE time, not at load time, and the
-    package default is not ours to trust — leaving it implicit could run
-    the whole 182-shard array on CPU of an H100 node, ~6x slower with
-    correct numbers, which no golden gate would catch. Default 'GPU'
-    because the fleet runs GPU nodes; CPU callers pass 'CPU' explicitly.
+    The session is opened LAZILY on the first call and reused for every
+    subsequent call: the one-shot encode_arrays spawns and tears down
+    birdnet's worker processes per call (measured 12.14 s/call — 81 h
+    projected for the HSN pilot), while the session's steady state is
+    0.005 s/rec. The returned callable exposes `close()` so embed_cli can
+    end the child processes deterministically after the shard loop; an
+    atexit hook covers the non-deterministic path.
+
+    `device` is forwarded EXPLICITLY at session open: the pb backend
+    selects its device at session time, and the package default is not
+    ours to trust — leaving it implicit could run the whole 182-shard
+    array on CPU of an H100 node, ~6x slower with correct numbers, which
+    no golden gate would catch. Default 'GPU' because the fleet runs GPU
+    nodes; CPU callers pass 'CPU' explicitly.
 
     We pass OUR sr straight through — the package resamples internally
     (scipy FFT). n_workers is pinned to 1: under Slurm the package would
-    otherwise spawn one worker per core of the whole node.
+    otherwise spawn one worker per core of the whole node. batch_size=1:
+    embed.py feeds one recording per call.
     """
     if model is None:
         model = _load_birdnet_model()
+    session = _BirdnetSession(
+        lambda: model.encode_session(n_workers=1, batch_size=1, device=device)
+    )
 
     def encode(samples: np.ndarray, sr: int) -> np.ndarray:
         x = np.asarray(samples, dtype=np.float32).reshape(-1)
         try:
-            result = model.encode_arrays([(x, sr)], n_workers=1, device=device)
+            result = session.run_arrays([(x, sr)])
         except Exception as exc:
             if device != "GPU":
                 raise
@@ -368,7 +453,7 @@ def make_birdnet_encoder(model=None, device: str = "GPU") -> Encoder:
             # the fleet surface here, so name them instead of re-raising a
             # bare assertion from a subprocess:
             raise RuntimeError(
-                "birdnet encode_arrays failed with device='GPU'. Two known "
+                "birdnet encode session failed with device='GPU'. Two known "
                 "causes on the fleet: (1) TF sees ZERO GPUs inside the "
                 "container — check the job ran with --nv and --gres=gpu:1 "
                 "and that tf.sif has the nvidia cuda wheels installed "
@@ -382,6 +467,7 @@ def make_birdnet_encoder(model=None, device: str = "GPU") -> Encoder:
         mask = np.asarray(result.embeddings_masked)[0]
         return _masked_mean(emb, mask)
 
+    encode.close = session.close  # type: ignore[attr-defined]
     return encode
 
 
@@ -482,20 +568,23 @@ def _dense_birdnet_scores(
 def make_birdnet_encoder_with_logits(model=None, device: str = "GPU") -> EncoderWithLogits:
     """Build the BirdNET V2.4 encoder that also returns max-pooled scores.
 
-    `encode_arrays` does NOT return scores, so the posterior comes from
-    `predict_arrays`. MEASURED (birdnet 1.1.1, pb backend, fleet
-    2026-09-30) — replacing this wrapper's earlier mock-pinned
-    `.predictions` contract, which DOES NOT EXIST on the real package:
+    The encode session does NOT return scores, so the posterior comes from
+    a SECOND process-lifetime session opened via `predict_session`.
+    MEASURED (birdnet 1.1.1, pb backend, fleet 2026-09-30):
 
-        predict_arrays(inp, /, *, top_k=5, n_workers=None, batch_size=1,
-                       device='CPU', apply_sigmoid=True,
-                       sigmoid_sensitivity=1.0,
-                       default_confidence_threshold=0.1,
-                       apply_softmax=False, ...)
+        predict_session(*, top_k=5, apply_sigmoid=True,
+                        sigmoid_sensitivity=1.0,
+                        default_confidence_threshold=0.1,
+                        apply_softmax=False, n_workers=None, batch_size=1,
+                        device='CPU', ...) -> AcousticPredictionSession
 
-    returning a result with `.species_probs` (n_inputs, n_segments, k)
-    float32, `.species_ids` (same shape) uint16, and `.species_list` /
-    `.n_species` (6522). Called here with:
+    whose `run_arrays([(samples, sr)])` returns a result with
+    `.species_probs` (n_inputs, n_segments, k) float32, `.species_ids`
+    (same shape) uint16, and `.species_list` / `.n_species` (6522) — the
+    SAME shapes as the old predict_arrays one-shot (verified live:
+    (24, 2, 6522) with top_k=None). The one-shot spawned worker processes
+    per call (measured 12.14 s/call; 81 h projected for the HSN pilot);
+    the session's steady state is 0.335 s/rec. Session kwargs:
 
     - top_k=None — MEASURED to return the FULL n_species-wide vector
       (species_probs (1, 3, 6522)); the default top_k=5 TRUNCATES, and
@@ -503,15 +592,16 @@ def make_birdnet_encoder_with_logits(model=None, device: str = "GPU") -> Encoder
     - apply_sigmoid=True — BirdNET's head emits per-class sigmoid
       PROBABILITIES in [0, 1], NOT raw logits. The column concept is
       'scores': the cache stores what the official tooling emits.
-    - default_confidence_threshold=None — asking for NO thresholding.
-      LOUD CAVEAT: None was probed only against the mock, not the real
-      call; birdnet 1.1.1's signature defaults it to 0.1 (float). If the
-      real package rejects None, the Task 6.4 pilot fails RIGHT HERE with
-      birdnet's own TypeError/ValueError — adapt the wrapper then; do NOT
-      pre-emptively pass a magic float that silently zeroes sub-threshold
-      scores.
-    - n_workers=1 (Slurm: never one worker per core), device forwarded
-      exactly like encode_arrays.
+    - default_confidence_threshold=None — NO thresholding. VERIFIED live
+      on the fleet (2026-09-30): the real package accepts None.
+    - n_workers=1 (Slurm: never one worker per core), batch_size=1
+      (embed.py feeds one recording per call), device forwarded exactly
+      like the encode session.
+
+    Both sessions are opened LAZILY on first use, cached, and covered by
+    atexit; the returned callable exposes `close()` that ends BOTH (a
+    close that ends only one leaks the other's worker processes for the
+    life of the Slurm task).
 
     Pooling is MAX over segments (BirdSet's convention) on the DENSE
     class-aligned scores; _dense_birdnet_scores verifies species_ids are
@@ -522,32 +612,37 @@ def make_birdnet_encoder_with_logits(model=None, device: str = "GPU") -> Encoder
     if model is None:
         model = _load_birdnet_model()
     embed_only = make_birdnet_encoder(model=model, device=device)
+    predict_session = _BirdnetSession(
+        lambda: model.predict_session(
+            top_k=None,
+            apply_sigmoid=True,
+            default_confidence_threshold=None,
+            n_workers=1,
+            batch_size=1,
+            device=device,
+        )
+    )
 
     def encode2(samples: np.ndarray, sr: int) -> tuple[np.ndarray, np.ndarray]:
         emb = embed_only(samples, sr)
-        if not hasattr(model, "predict_arrays"):
+        if not hasattr(model, "predict_session"):
             raise NotImplementedError(
                 "birdnet scores require the model to expose "
-                "predict_arrays(inp, /, *, top_k=None, apply_sigmoid=True, "
-                "n_workers=1, device=...) returning a result with "
+                "predict_session(*, top_k=None, apply_sigmoid=True, "
+                "default_confidence_threshold=None, n_workers=1, "
+                "batch_size=1, device=...) returning a session whose "
+                "run_arrays([(samples, sr)]) result carries "
                 ".species_probs and .species_ids of shape "
                 "(1, n_segments, k) plus .n_species; this birdnet build "
                 f"does not have it (model type: {type(model).__name__})."
             )
         x = np.asarray(samples, dtype=np.float32).reshape(-1)
-        result = model.predict_arrays(
-            [(x, sr)],
-            top_k=None,
-            apply_sigmoid=True,
-            default_confidence_threshold=None,
-            n_workers=1,
-            device=device,
-        )
+        result = predict_session.run_arrays([(x, sr)])
         species_probs = getattr(result, "species_probs", None)
         species_ids = getattr(result, "species_ids", None)
         if species_probs is None or species_ids is None:
             raise NotImplementedError(
-                "birdnet predict_arrays returned an object without "
+                "birdnet predict session returned an object without "
                 ".species_probs/.species_ids "
                 f"(got {type(result).__name__}); the wrapper needs the "
                 "measured 1.1.1 pb result shape (1, n_segments, k) — "
@@ -558,7 +653,7 @@ def make_birdnet_encoder_with_logits(model=None, device: str = "GPU") -> Encoder
             species_list = getattr(result, "species_list", None)
             if species_list is None:
                 raise NotImplementedError(
-                    "birdnet predict_arrays result exposes neither "
+                    "birdnet predict session result exposes neither "
                     ".n_species nor .species_list; without the class count "
                     "the k<n_species truncation guard cannot run — "
                     "re-measure the API, do NOT pool unguarded."
@@ -570,12 +665,19 @@ def make_birdnet_encoder_with_logits(model=None, device: str = "GPU") -> Encoder
             raise ValueError(
                 f"unexpected birdnet species_probs/species_ids shapes "
                 f"{probs.shape}/{ids.shape}; expected matching "
-                "(1, n_segments, k) from predict_arrays of ONE recording — "
-                "refusing to guess axes on a surprise shape"
+                "(1, n_segments, k) from the predict session of ONE "
+                "recording — refusing to guess axes on a surprise shape"
             )
         dense = _dense_birdnet_scores(probs[0], ids[0], int(n_species))
         return emb, _max_pool_birdnet_logits(dense)
 
+    def close() -> None:
+        # BOTH sessions: closing only the encode side would leak the
+        # predict session's worker processes (and vice versa).
+        embed_only.close()  # type: ignore[attr-defined]
+        predict_session.close()
+
+    encode2.close = close  # type: ignore[attr-defined]
     return encode2
 
 

@@ -123,13 +123,21 @@ def main(argv: list[str] | None = None) -> int:
         encoder = load_encoder_with_logits(args.encoder)
     else:
         encoder = load_encoder(args.encoder)
-    result = embed_shard(
-        args.shard,
-        shard_manifest,
-        encoder,
-        out_dir=args.out,
-        with_logits=args.with_logits,
-    )
+    try:
+        result = embed_shard(
+            args.shard,
+            shard_manifest,
+            encoder,
+            out_dir=args.out,
+            with_logits=args.with_logits,
+        )
+    finally:
+        # The birdnet encoder holds process-lifetime sessions that own
+        # child worker processes; close them deterministically after the
+        # shard loop instead of leaning on atexit. melsummary/perch
+        # callables have no close() — hence the hasattr guard.
+        if hasattr(encoder, "close"):
+            encoder.close()  # type: ignore[union-attr]
 
     log.info(
         "%s: embedded=%d/expected=%d failed=%d schema=%s",

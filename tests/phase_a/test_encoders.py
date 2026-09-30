@@ -190,51 +190,154 @@ def test_masked_mean_all_padding_raises():
         _masked_mean(emb, mask)
 
 
+class _FakeEncodeSession:
+    """Mock of birdnet's AcousticEncodingSession: run_arrays + end."""
+
+    def __init__(self, result_fn):
+        self._result_fn = result_fn
+        self.run_inputs: list = []
+        self.ended = 0
+
+    def run_arrays(self, inputs):
+        self.run_inputs.append(inputs)
+        return self._result_fn(inputs)
+
+    def end(self):
+        self.ended += 1
+
+
+class _SessionFakeModel:
+    """Mock birdnet model exposing the MEASURED encode_session API (fleet,
+    2026-09-30): keyword-only knobs, returns a session whose run_arrays
+    carries the same .embeddings/.embeddings_masked shapes as the old
+    one-shot. Keyword-only so a positional or dropped forward fails loudly."""
+
+    def __init__(self, result_fn=None):
+        if result_fn is None:
+            def result_fn(inputs):
+                emb = np.ones((1, 1, 4), dtype=np.float32)
+                mask = np.zeros((1, 1, 4), dtype=bool)  # False = valid
+                return SimpleNamespace(embeddings=emb, embeddings_masked=mask)
+        self._result_fn = result_fn
+        self.session_kwargs: list[dict] = []
+        self.sessions: list[_FakeEncodeSession] = []
+
+    def encode_session(self, *, n_workers, batch_size, device):
+        self.session_kwargs.append(
+            dict(n_workers=n_workers, batch_size=batch_size, device=device)
+        )
+        session = _FakeEncodeSession(self._result_fn)
+        self.sessions.append(session)
+        return session
+
+
 def test_birdnet_encoder_passes_sr_through_and_pins_workers():
-    calls = {}
+    def result_fn(inputs):
+        emb = np.array([[[1.0, 3.0], [5.0, 7.0], [999.0, 999.0]]], dtype=np.float32)
+        mask = np.array([[[False, False], [False, False], [True, True]]])
+        return SimpleNamespace(embeddings=emb, embeddings_masked=mask)
 
-    class FakeModel:
-        def encode_arrays(self, arrays, n_workers, device):
-            calls["arrays"] = arrays
-            calls["n_workers"] = n_workers
-            calls["device"] = device
-            emb = np.array([[[1.0, 3.0], [5.0, 7.0], [999.0, 999.0]]], dtype=np.float32)
-            mask = np.array([[[False, False], [False, False], [True, True]]])
-            return SimpleNamespace(embeddings=emb, embeddings_masked=mask)
-
-    encoder = make_birdnet_encoder(model=FakeModel())
+    model = _SessionFakeModel(result_fn)
+    encoder = make_birdnet_encoder(model=model)
     samples = np.ones(32000, dtype=np.float32)
     vec = encoder(samples, 32000)
-    assert calls["n_workers"] == 1
-    (passed_samples, passed_sr) = calls["arrays"][0]
+    assert model.session_kwargs == [dict(n_workers=1, batch_size=1, device="GPU")]
+    (passed_samples, passed_sr) = model.sessions[0].run_inputs[0][0]
     assert passed_sr == 32000  # OUR sr goes through; the package resamples
     assert passed_samples.dtype == np.float32
     np.testing.assert_allclose(vec, np.array([3.0, 5.0], dtype=np.float32))
     assert vec.dtype == np.float32
 
 
+def test_birdnet_encoder_opens_the_session_lazily_and_ONCE():
+    """THE per-call spawn bug this task kills: the one-shot API spawned and
+    tore down birdnet's worker processes on EVERY call (measured 12.14
+    s/call — 81 h projected for the HSN pilot). The session must be opened
+    lazily (constructing the encoder spawns nothing) and exactly ONCE
+    across calls."""
+    model = _SessionFakeModel()
+    encoder = make_birdnet_encoder(model=model)
+    assert model.sessions == []  # lazy: nothing spawned before the first call
+    encoder(np.zeros(32000, dtype=np.float32), 32000)
+    encoder(np.ones(32000, dtype=np.float32), 32000)
+    assert len(model.sessions) == 1  # ONE session across both calls
+    assert len(model.sessions[0].run_inputs) == 2
+
+
+def test_birdnet_encoder_close_ends_the_session_idempotently():
+    model = _SessionFakeModel()
+    encoder = make_birdnet_encoder(model=model)
+    assert hasattr(encoder, "close")
+    encoder.close()  # close before any call: nothing opened, nothing to end
+    assert model.sessions == []
+    encoder(np.zeros(32000, dtype=np.float32), 32000)
+    encoder.close()
+    encoder.close()  # double-close must not double-end
+    assert model.sessions[0].ended == 1
+
+
+def test_birdnet_encoder_retries_ONCE_after_a_worker_death():
+    """A transient worker death mid-session: close, re-open ONCE, retry the
+    recording. The first session is ended (its children reaped) and the
+    second serves the retry."""
+    attempts = []
+
+    def result_fn(inputs):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise RuntimeError("worker died")
+        emb = np.ones((1, 1, 4), dtype=np.float32)
+        mask = np.zeros((1, 1, 4), dtype=bool)
+        return SimpleNamespace(embeddings=emb, embeddings_masked=mask)
+
+    model = _SessionFakeModel(result_fn)
+    encoder = make_birdnet_encoder(model=model, device="CPU")
+    vec = encoder(np.zeros(32000, dtype=np.float32), 32000)
+    assert vec.shape == (4,)
+    assert len(model.sessions) == 2  # re-opened exactly once
+    assert model.sessions[0].ended == 1  # the dead session was closed
+    # The reopened session is REUSED by the next call — no third open.
+    encoder(np.zeros(32000, dtype=np.float32), 32000)
+    assert len(model.sessions) == 2
+
+
+def test_birdnet_encoder_raises_after_the_second_failure_not_forever():
+    """Systematic breakage must STOP, not loop: a run_arrays that keeps
+    failing gets exactly TWO attempts (original + one retry) and then the
+    exception propagates. The mock SUCCEEDS on the third attempt, so a
+    retry-forever mutation returns a result instead of raising — and this
+    test fails instead of hanging."""
+    attempts = []
+
+    def result_fn(inputs):
+        attempts.append(1)
+        if len(attempts) <= 3:
+            raise RuntimeError("systematically broken")
+        emb = np.ones((1, 1, 4), dtype=np.float32)
+        mask = np.zeros((1, 1, 4), dtype=bool)
+        return SimpleNamespace(embeddings=emb, embeddings_masked=mask)
+
+    model = _SessionFakeModel(result_fn)
+    encoder = make_birdnet_encoder(model=model, device="CPU")
+    with pytest.raises(RuntimeError, match="systematically broken"):
+        encoder(np.zeros(32000, dtype=np.float32), 32000)
+    assert len(attempts) == 2  # original + ONE retry, never a third
+    assert all(s.ended == 1 for s in model.sessions)  # nothing left running
+
+
 def test_birdnet_encoder_forwards_device_explicitly():
-    """device is chosen at ENCODE time; the wrapper must forward it every call.
+    """device is chosen at session-open time; the wrapper must forward it.
 
     Default 'GPU' (the fleet runs GPU nodes); an explicit 'CPU' must also
-    reach encode_arrays. A keyword-only fake makes a positional or dropped
-    forward fail loudly.
+    reach encode_session. The keyword-only mock makes a positional or
+    dropped forward fail loudly.
     """
-    seen = []
-
-    class FakeModel:
-        def encode_arrays(self, arrays, *, n_workers, device):
-            seen.append(device)
-            emb = np.ones((1, 1, 4), dtype=np.float32)
-            mask = np.zeros((1, 1, 4), dtype=bool)  # False = valid (measured)
-            return SimpleNamespace(embeddings=emb, embeddings_masked=mask)
-
-    fake = FakeModel()
+    fake = _SessionFakeModel()
     make_birdnet_encoder(model=fake)(np.zeros(32000, dtype=np.float32), 32000)
     make_birdnet_encoder(model=fake, device="CPU")(
         np.zeros(32000, dtype=np.float32), 32000
     )
-    assert seen == ["GPU", "CPU"]
+    assert [kw["device"] for kw in fake.session_kwargs] == ["GPU", "CPU"]
 
 
 def test_birdnet_gpu_failure_reraises_with_both_known_causes():
@@ -245,14 +348,14 @@ def test_birdnet_gpu_failure_reraises_with_both_known_causes():
     sees zero GPUs (tf.sif missing nvidia wheels / no --nv) or more than
     one (CUDA_VISIBLE_DEVICES unrestricted). The bare worker assertion is
     undebuggable from a Slurm log; the wrapper must re-raise with both
-    causes and their remedies.
+    causes and their remedies — after the retry-once path has been
+    exhausted (an always-failing session fails both attempts).
     """
 
-    class ExplodingModel:
-        def encode_arrays(self, arrays, n_workers, device):
-            raise AssertionError("len(gpus) == 1")
+    def exploding(inputs):
+        raise AssertionError("len(gpus) == 1")
 
-    encoder = make_birdnet_encoder(model=ExplodingModel())
+    encoder = make_birdnet_encoder(model=_SessionFakeModel(exploding))
     with pytest.raises(RuntimeError) as excinfo:
         encoder(np.zeros(32000, dtype=np.float32), 32000)
     msg = str(excinfo.value)
@@ -265,11 +368,10 @@ def test_birdnet_gpu_failure_reraises_with_both_known_causes():
 def test_birdnet_cpu_failure_is_not_rewritten_as_gpu_diagnostic():
     """device='CPU' failures re-raise untouched — the GPU causes don't apply."""
 
-    class ExplodingModel:
-        def encode_arrays(self, arrays, n_workers, device):
-            raise ValueError("bad audio")
+    def exploding(inputs):
+        raise ValueError("bad audio")
 
-    encoder = make_birdnet_encoder(model=ExplodingModel(), device="CPU")
+    encoder = make_birdnet_encoder(model=_SessionFakeModel(exploding), device="CPU")
     with pytest.raises(ValueError, match="bad audio"):
         encoder(np.zeros(32000, dtype=np.float32), 32000)
 
@@ -315,14 +417,13 @@ def test_factories_return_callables_with_mocked_runtime():
     )
     assert callable(perch)
 
-    class FakeModel:
-        def encode_arrays(self, arrays, n_workers, device):
-            return SimpleNamespace(
-                embeddings=np.ones((1, 1, 1024), dtype=np.float32),
-                embeddings_masked=np.zeros((1, 1, 1024), dtype=bool),
-            )
+    def result_fn(inputs):
+        return SimpleNamespace(
+            embeddings=np.ones((1, 1, 1024), dtype=np.float32),
+            embeddings_masked=np.zeros((1, 1, 1024), dtype=bool),
+        )
 
-    birdnet = make_birdnet_encoder(model=FakeModel())
+    birdnet = make_birdnet_encoder(model=_SessionFakeModel(result_fn))
     assert callable(birdnet)
     assert birdnet(np.zeros(48000, dtype=np.float32), 32000).shape == (1024,)
 

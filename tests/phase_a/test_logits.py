@@ -239,14 +239,33 @@ def test_perch_encoder_with_logits_rejects_non_32khz():
         encoder2(np.zeros(1000, dtype=np.float32), 44100)
 
 
+class _FakeSession:
+    """Mock of a birdnet session: run_arrays + end, result from a callable."""
+
+    def __init__(self, result_fn):
+        self._result_fn = result_fn
+        self.run_inputs: list = []
+        self.ended = 0
+
+    def run_arrays(self, inputs):
+        self.run_inputs.append(inputs)
+        return self._result_fn(inputs)
+
+    def end(self):
+        self.ended += 1
+
+
 class _MeasuredBirdnetModel:
-    """Mock pinned to birdnet 1.1.1's MEASURED predict_arrays API (fleet,
-    2026-09-30): POSITIONAL-ONLY inp, KEYWORD-ONLY knobs, and a
-    top_k-HONOURING result — a wrapper that drops top_k=None receives the
-    default-5 confidence-sorted TRUNCATED result, exactly like the real
-    package, and the k < n_species guard must refuse it. The old
-    `.predictions` attribute does not exist here because it does not exist
-    on the real package either.
+    """Mock pinned to birdnet 1.1.1's MEASURED session API (fleet,
+    2026-09-30): `encode_session`/`predict_session` take KEYWORD-ONLY knobs
+    and return sessions whose `run_arrays` carries the SAME result shapes
+    as the retired one-shots (verified live). The predict session HONOURS
+    the top_k captured at session open — a wrapper that drops top_k=None
+    gets the default-5 confidence-sorted TRUNCATED result, exactly like the
+    real package, and the k < n_species guard must refuse it. The old
+    one-shot encode_arrays/predict_arrays methods are deliberately ABSENT:
+    they cost a measured 12.14 s of process spawn per call and the wrapper
+    must not fall back to them.
     """
 
     def __init__(self, ids=None, probs=None):
@@ -254,16 +273,34 @@ class _MeasuredBirdnetModel:
         self._ids = _BN_IDENTITY_IDS if ids is None else ids
         self._probs = _BN_DENSE_PROBS if probs is None else probs
         self.calls: dict = {}
+        self.encode_sessions: list[_FakeSession] = []
+        self.predict_sessions: list[_FakeSession] = []
 
-    def encode_arrays(self, arrays, n_workers, device):
-        emb = np.array([[[1.0, 3.0], [5.0, 7.0]]], dtype=np.float32)
-        mask = np.zeros((1, 2, 2), dtype=bool)
-        return SimpleNamespace(embeddings=emb, embeddings_masked=mask)
+    def encode_session(self, *, n_workers, batch_size, device):
+        def result_fn(inputs):
+            emb = np.array([[[1.0, 3.0], [5.0, 7.0]]], dtype=np.float32)
+            mask = np.zeros((1, 2, 2), dtype=bool)
+            return SimpleNamespace(embeddings=emb, embeddings_masked=mask)
 
-    def predict_arrays(
+        session = _FakeSession(result_fn)
+        self.encode_sessions.append(session)
+        return session
+
+    def _predict_result(self, inputs, top_k):
+        probs, ids = self._probs, self._ids
+        if top_k is not None:
+            order = np.argsort(-probs, axis=1)[:, :top_k]
+            probs = np.take_along_axis(probs, order, axis=1)
+            ids = np.take_along_axis(ids.astype(np.int64), order, axis=1)
+        return SimpleNamespace(
+            species_probs=np.asarray(probs, dtype=np.float32)[None],
+            species_ids=np.asarray(ids, dtype=np.uint16)[None],
+            species_list=[f"sp{i}" for i in range(_BN_N_SPECIES)],
+            n_species=_BN_N_SPECIES,
+        )
+
+    def predict_session(
         self,
-        inp,
-        /,
         *,
         top_k=5,
         n_workers=None,
@@ -277,44 +314,111 @@ class _MeasuredBirdnetModel:
         self.calls.update(
             top_k=top_k,
             n_workers=n_workers,
+            batch_size=batch_size,
             device=device,
             apply_sigmoid=apply_sigmoid,
             default_confidence_threshold=default_confidence_threshold,
-            sr=inp[0][1],
         )
-        probs, ids = self._probs, self._ids
-        if top_k is not None:
-            order = np.argsort(-probs, axis=1)[:, :top_k]
-            probs = np.take_along_axis(probs, order, axis=1)
-            ids = np.take_along_axis(ids.astype(np.int64), order, axis=1)
-        return SimpleNamespace(
-            species_probs=np.asarray(probs, dtype=np.float32)[None],
-            species_ids=np.asarray(ids, dtype=np.uint16)[None],
-            species_list=[f"sp{i}" for i in range(_BN_N_SPECIES)],
-            n_species=_BN_N_SPECIES,
-        )
+
+        def result_fn(inputs):
+            self.calls["sr"] = inputs[0][1]
+            return self._predict_result(inputs, top_k)
+
+        session = _FakeSession(result_fn)
+        self.predict_sessions.append(session)
+        return session
 
 
 def test_birdnet_encoder_with_logits_dense_identity_ids():
-    """The MEASURED happy path: top_k=None yields the full dense matrix with
-    identity ids; recording-level scores are the per-class MAX. A wrapper
-    that leaves top_k at the default 5 gets a truncated result from this
-    honouring mock and the guard fails the test."""
+    """The MEASURED happy path: a top_k=None session yields the full dense
+    matrix with identity ids; recording-level scores are the per-class MAX.
+    A wrapper that leaves top_k at the default 5 gets a truncated result
+    from this honouring mock and the guard fails the test."""
     model = _MeasuredBirdnetModel()
     encoder2 = make_birdnet_encoder_with_logits(model=model)
     emb, scores = encoder2(np.ones(32000, dtype=np.float32), 32000)
     np.testing.assert_allclose(emb, np.array([3.0, 5.0], dtype=np.float32))
     np.testing.assert_allclose(scores, _BN_DENSE_MAX)
     assert scores.dtype == np.float32
-    # The measured call contract, knob by knob:
+    # The measured session-open contract, knob by knob:
     assert model.calls["top_k"] is None  # full 6522-wide vector, no truncation
     assert model.calls["apply_sigmoid"] is True  # probabilities, like the tooling
     assert model.calls["default_confidence_threshold"] is None  # no zeroing
     assert model.calls["n_workers"] == 1  # Slurm: never one worker per core
+    assert model.calls["batch_size"] == 1  # embed.py feeds one recording/call
     assert model.calls["device"] == "GPU"
     assert model.calls["sr"] == 32000  # OUR sr; the package resamples internally
     # Max, not mean — BirdSet's convention; the fixture makes them differ.
     assert not np.allclose(scores, _BN_DENSE_PROBS.mean(axis=0))
+
+
+def test_birdnet_encoder_with_logits_opens_each_session_ONCE():
+    """The per-call spawn bug this task kills (measured 12.14 s/call — 81 h
+    projected for the HSN pilot): across TWO encoder calls, exactly ONE
+    encode session and ONE predict session are opened, lazily (nothing
+    before the first call)."""
+    model = _MeasuredBirdnetModel()
+    encoder2 = make_birdnet_encoder_with_logits(model=model)
+    assert model.encode_sessions == [] and model.predict_sessions == []
+    encoder2(np.ones(32000, dtype=np.float32), 32000)
+    encoder2(np.ones(32000, dtype=np.float32), 32000)
+    assert len(model.encode_sessions) == 1
+    assert len(model.predict_sessions) == 1
+    assert len(model.encode_sessions[0].run_inputs) == 2
+    assert len(model.predict_sessions[0].run_inputs) == 2
+
+
+def test_birdnet_encoder_with_logits_close_ends_BOTH_sessions():
+    """close() must end BOTH the encode and the predict session — ending
+    only one leaks the other's worker processes for the life of the Slurm
+    task. Idempotent: a second close must not double-end."""
+    model = _MeasuredBirdnetModel()
+    encoder2 = make_birdnet_encoder_with_logits(model=model)
+    encoder2(np.ones(32000, dtype=np.float32), 32000)
+    encoder2.close()
+    assert model.encode_sessions[0].ended == 1
+    assert model.predict_sessions[0].ended == 1
+    encoder2.close()
+    assert model.encode_sessions[0].ended == 1
+    assert model.predict_sessions[0].ended == 1
+
+
+def test_birdnet_encoder_with_logits_retries_predict_once_then_raises():
+    """Retry-once on the predict session too: a transient failure re-opens
+    the session and retries the recording; persistent failure raises after
+    the SECOND attempt (the mock would succeed on the third, so a
+    retry-forever mutation returns instead of raising and fails here)."""
+    attempts = []
+
+    class FlakyPredictModel(_MeasuredBirdnetModel):
+        def _predict_result(self, inputs, top_k):
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise RuntimeError("worker died")
+            return super()._predict_result(inputs, top_k)
+
+    model = FlakyPredictModel()
+    encoder2 = make_birdnet_encoder_with_logits(model=model, device="CPU")
+    _, scores = encoder2(np.ones(32000, dtype=np.float32), 32000)
+    np.testing.assert_allclose(scores, _BN_DENSE_MAX)
+    assert len(model.predict_sessions) == 2  # re-opened exactly once
+    assert model.predict_sessions[0].ended == 1
+
+    attempts2 = []
+
+    class BrokenPredictModel(_MeasuredBirdnetModel):
+        def _predict_result(self, inputs, top_k):
+            attempts2.append(1)
+            if len(attempts2) <= 3:
+                raise RuntimeError("systematically broken")
+            return super()._predict_result(inputs, top_k)
+
+    encoder2b = make_birdnet_encoder_with_logits(
+        model=BrokenPredictModel(), device="CPU"
+    )
+    with pytest.raises(RuntimeError, match="systematically broken"):
+        encoder2b(np.ones(32000, dtype=np.float32), 32000)
+    assert len(attempts2) == 2  # original + ONE retry, never a third
 
 
 def test_birdnet_encoder_with_logits_scatters_permuted_ids():
@@ -329,14 +433,14 @@ def test_birdnet_encoder_with_logits_scatters_permuted_ids():
 
 
 def test_birdnet_encoder_refuses_a_stuck_truncated_result():
-    """A model that IGNORES top_k and returns the default-5 truncation no
-    matter what (k=5 < n_species=7) must be refused — pooling it would write
-    the silently-wrong cache this guard exists for."""
+    """A model whose predict session IGNORES top_k and serves the default-5
+    truncation no matter what (k=5 < n_species=7) must be refused — pooling
+    it would write the silently-wrong cache this guard exists for."""
 
     class StuckTopKModel(_MeasuredBirdnetModel):
-        def predict_arrays(self, inp, /, **kwargs):
+        def predict_session(self, **kwargs):
             kwargs["top_k"] = 5  # the package default, immovably
-            return super().predict_arrays(inp, **kwargs)
+            return super().predict_session(**kwargs)
 
     encoder2 = make_birdnet_encoder_with_logits(model=StuckTopKModel())
     with pytest.raises(ValueError, match="top_k"):
@@ -344,18 +448,21 @@ def test_birdnet_encoder_refuses_a_stuck_truncated_result():
 
 
 def test_birdnet_with_logits_without_predict_api_raises_naming_it():
-    """A birdnet build without predict_arrays must fail NAMING the API it
+    """A birdnet build without predict_session must fail NAMING the API it
     needs — never guess a call signature."""
 
     class EncodeOnlyModel:
-        def encode_arrays(self, arrays, n_workers, device):
-            return SimpleNamespace(
-                embeddings=np.ones((1, 1, 4), dtype=np.float32),
-                embeddings_masked=np.zeros((1, 1, 4), dtype=bool),
-            )
+        def encode_session(self, *, n_workers, batch_size, device):
+            def result_fn(inputs):
+                return SimpleNamespace(
+                    embeddings=np.ones((1, 1, 4), dtype=np.float32),
+                    embeddings_masked=np.zeros((1, 1, 4), dtype=bool),
+                )
+
+            return _FakeSession(result_fn)
 
     encoder2 = make_birdnet_encoder_with_logits(model=EncodeOnlyModel())
-    with pytest.raises(NotImplementedError, match="predict_arrays"):
+    with pytest.raises(NotImplementedError, match="predict_session"):
         encoder2(np.zeros(32000, dtype=np.float32), 32000)
 
 
@@ -365,7 +472,7 @@ def test_birdnet_with_logits_result_without_species_probs_raises():
     refused loudly, not silently adapted."""
 
     class OldHypothesisModel(_MeasuredBirdnetModel):
-        def predict_arrays(self, inp, /, **kwargs):
+        def _predict_result(self, inputs, top_k):
             return SimpleNamespace(predictions=np.ones((1, 1, 3)))
 
     encoder2 = make_birdnet_encoder_with_logits(model=OldHypothesisModel())
@@ -383,7 +490,7 @@ def test_birdnet_with_logits_surprise_shapes_raise():
             self.probs_shape = probs_shape
             self.ids_shape = ids_shape
 
-        def predict_arrays(self, inp, /, **kwargs):
+        def _predict_result(self, inputs, top_k):
             return SimpleNamespace(
                 species_probs=np.ones(self.probs_shape, dtype=np.float32),
                 species_ids=np.zeros(self.ids_shape, dtype=np.uint16),
