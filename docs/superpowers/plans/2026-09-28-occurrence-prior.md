@@ -728,6 +728,22 @@ Week 53 folds into 52 so the circular kernel never sees a short week."
 
 **Interfaces:**
 - Consumes: the celled `pa.Table` from `assign_cells`.
+
+> **CORRECTED 2026-09-29 — normalise EVERY key component on BOTH sides.**
+> An earlier draft of this plan required both-sides normalisation only for the
+> contributor name. That was too narrow. A leakage-guard key is a tuple, and any
+> un-normalised component silently disables the whole guard. Verified on a real res-4
+> table where the guard should have removed the row: an UPPERCASED cell kept it, a
+> whitespace-padded cell kept it, and a res-5 cell kept it — no exception, no log line,
+> leak survives. `h3.get_resolution` accepts an uppercased cell, so validity checks do
+> not catch it.
+> Rules for any guard in this plan:
+>   1. Normalise every string key component on both sides (contributor AND cell).
+>   2. Raise on a cross-resolution cell mismatch — never warn. It is never intentional
+>      and the consequence is total silent leakage. The guard function holds both the
+>      table and the recordings, so it is the only place the invariant can be checked.
+>   3. WARN when a non-empty banned set removes ZERO rows. That one line is the shared
+>      observable symptom of every silent under-match mode.
 - Produces:
   - `XENO_CANTO_PUBLISHER_KEYS: frozenset[str]`
   - `TestRecording` dataclass: `cell: str`, `week: int`, `recorded_by: str`.
@@ -871,9 +887,14 @@ from dataclasses import dataclass
 import pyarrow as pa
 import pyarrow.compute as pc
 
-# Xeno-Canto Foundation for Nature Sounds, publishing organisation on GBIF.
+# Xeno-canto Foundation for Nature Sounds, publishing organisation on GBIF.
+# CORRECTED 2026-09-29: this plan originally named e2e717bf-551a-4917-bdc9-4fa0f342c530,
+# which api.gbif.org/v1/organization resolves to the CORNELL LAB OF ORNITHOLOGY (the eBird
+# publisher). Using it would have leaked every Xeno-Canto occurrence into the prior AND
+# deleted the entire eBird population — both failure modes at once. Verified against the
+# live API: the key below is "Xeno-canto Foundation for Nature Sounds".
 XENO_CANTO_PUBLISHER_KEYS = frozenset(
-    {"e2e717bf-551a-4917-bdc9-4fa0f342c530"}
+    {"1f00d75c-f6fc-4224-a595-975e82d7689c"}
 )
 
 
@@ -934,8 +955,12 @@ curl -s "https://api.gbif.org/v1/dataset/search?q=xeno-canto&limit=5" \
   | python3 -c "import json,sys; d=json.load(sys.stdin); [print(r['publishingOrganizationKey'], r['title']) for r in d['results']]"
 ```
 
-If the key differs from `e2e717bf-551a-4917-bdc9-4fa0f342c530`, update
-`XENO_CANTO_PUBLISHER_KEYS` and re-run the tests.
+Expected: `1f00d75c-f6fc-4224-a595-975e82d7689c` for all five Xeno-canto datasets.
+If the key differs, update `XENO_CANTO_PUBLISHER_KEYS` and re-run the tests.
+
+DO NOT use `e2e717bf-551a-4917-bdc9-4fa0f342c530` — an earlier draft of this plan named it
+as Xeno-Canto, but it is the Cornell Lab of Ornithology (eBird). `tests/prior/test_leakage.py`
+asserts that key is ABSENT from `XENO_CANTO_PUBLISHER_KEYS`; do not weaken that test.
 
 - [ ] **Step 6: Commit**
 
@@ -1267,12 +1292,21 @@ def hierarchical_estimate(
 
     for row in rows:
         sk, cell, week, n = row["species_key"], row["cell"], int(row["week"]), row["n"]
+        total = row["total"]
         cell_week_species[(sk, cell, week)] = cell_week_species.get((sk, cell, week), 0.0) + n
-        cell_week_n[(cell, week)] = cell_week_n.get((cell, week), 0.0) + n
+        # CORRECTED 2026-09-29: the DENOMINATOR must read `total`, never re-derive
+        # itself by summing `n`. The two agree only while the table holds EVERY
+        # species; filtering to a label set is an ordinary pipeline step, and after
+        # it a species with 1 record in a cell-week of 100 (true share 0.01) scores
+        # ~0.1-1.0 instead — up to a hundredfold error toward confident presence,
+        # raising nothing. `total` is counted ONCE per (cell, week), not per row:
+        # per-row accumulation multiplies effort by the species count.
+        if (cell, week) not in cell_week_n:
+            cell_week_n[(cell, week)] = total
+            cell_n[cell] = cell_n.get(cell, 0.0) + total
+            global_n += total
         cell_species[(sk, cell)] = cell_species.get((sk, cell), 0.0) + n
-        cell_n[cell] = cell_n.get(cell, 0.0) + n
         global_species[sk] = global_species.get(sk, 0.0) + n
-        global_n += n
 
     all_cells = list(cells) if cells is not None else sorted(cell_n)
     all_weeks = list(weeks) if weeks is not None else sorted({w for _, w in cell_week_n})
@@ -1552,6 +1586,51 @@ week 52 is adjacent to week 1."
 
 Create `tests/prior/test_tensor.py`:
 
+> **PRE-FLIGHT RULINGS added 2026-09-29 — four defects in this task's own code,
+> all verified against the installed scipy 1.18.1 / pyarrow 25.0.1.** Each is
+> silent: none raises, none produces a nan, each yields a plausible number.
+>
+> **T8-R1 — `_column` must reject a week outside 1..52.** With no bounds check,
+> `week = 53` in cell *i* computes column `i*52 + 52`, which is **exactly** the
+> column of week 1 in cell *i+1*; `week = 0` aliases week 52 of the previous
+> cell. Measured: `col("cell-a", 53) == col("cell-b", 1) == 52`. Upstream folds
+> ISO week 53 into 52, but `lookup`/`vector` are the public interface every
+> downstream plan calls with its own arguments, and an aliased read returns a
+> real probability belonging to a different cell. Raise `ValueError` naming this
+> check; register one mutant per bound (lower and upper separately — a fixture
+> tripping one clause never exercises the other).
+>
+> **T8-R2 — `to_tensor` must reject duplicate `(species_key, cell, week)` rows.**
+> `sparse.csr_matrix((data, (row, col)))` **sums duplicate coordinates silently**:
+> measured, two rows of `p = 0.4` for the same key become `0.8`. Every upstream
+> stage rejects duplicates explicitly and says why (`backoff.py` and
+> `smoothing.py` both raise); this stage would quietly double them instead. Raise
+> `ValueError` naming the offending key.
+>
+> **T8-R3 — normalise the path to `.npz` BEFORE calling `save_npz`.** As written,
+> `save_prior(t, dir/"p.dat")` makes `sparse.save_npz` write **`p.dat.npz`**
+> (scipy appends the suffix), while the next line computes
+> `npz = path.with_suffix(".npz")` = `p.npz` and writes the sidecar to `p.json`.
+> The returned path then names a file that does not exist and `load_prior` fails.
+> Verified. It never fires in the tests below only because every fixture path
+> already ends in `.npz`. Compute the `.npz` path first, save to it, and return it.
+>
+> **T8-R4 — delete the `if r["p"] == 0.0: continue` skip; reject a non-positive or
+> non-finite `p` instead.** The upstream floor (`backoff.FLOOR = 1e-6`) exists so
+> the prior can never veto a correct detection with a hard zero, and the backoff
+> clamps every emitted value into `[floor, 1.0]` — so a `p` of exactly `0.0`
+> arriving here is an upstream contract breach, not a value to optimise away.
+> Silently skipping it converts a real zero into a **structural** zero that
+> `lookup` reports as `0.0`, indistinguishable from "this context is not in the
+> tensor at all". Match the guard Task 7 now applies to the same column.
+>
+> **T8-R5 (documentation, load-bearing) — a context absent from the input table is
+> a structural zero and `lookup` returns a hard `0.0` for it, NOT the floor.**
+> This is correct behaviour for this stage — it cannot invent a probability for a
+> grid point it was never handed — but it means **the caller must supply a dense
+> grid over all 52 weeks**. State it in the module docstring. Task 10 carries the
+> matching obligation (T10-R1, rewritten after the T8-R5 reversal); read both.
+
 ```python
 """Sparse prior tensor, round-tripped through disk."""
 import json
@@ -1626,6 +1705,19 @@ def test_vector_returns_all_species_for_a_context():
     assert vec.shape == (2,)
     assert vec.sum() == pytest.approx(1.0)
 ```
+
+> **T8-R6 — the `vec.sum() == 1.0` above is a property of THIS FIXTURE, not of the
+> code, and must be labelled as such.** `0.25 + 0.75` was chosen to sum to one.
+> The prior is **never renormalised over species** — `backoff.py` and
+> `smoothing.py` both say so at length, and a species absent from the occurrence
+> data contributes the floor *on top*, so a real context routinely sums above or
+> far below 1.0. Left as written, this test reads as though `vector()` normalises,
+> and the next person to touch it will "fix" the code to match.
+> Keep the test, rename it `test_vector_returns_one_entry_per_species_in_order`,
+> assert the shape and the two values positionally, and drop the sum assertion.
+> Then add a second test with a fixture that does **not** sum to 1.0 (e.g. 0.3 and
+> 0.9) asserting the values pass through un-normalised — that is the property the
+> pipeline actually relies on, and nothing currently pins it.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -1792,6 +1884,58 @@ git commit -m "feat(prior): sparse tensor format with a citable sidecar"
 - [ ] **Step 1: Write the failing test**
 
 Create `tests/prior/test_controls.py`:
+
+> **PRE-FLIGHT RULINGS for Task 9 — read all four before writing a line.**
+>
+> **T9-R1 (was ledger finding F2) — the `_tensor()` fixture below makes
+> `test_marginal_still_varies_across_species` UNPASSABLE.** It gives species 1 the
+> values {0.8, 0.4, 0.2, 0.1} and species 2 the values {0.2, 0.1, 0.8, 0.4} — the
+> same multiset, so both species have mean 0.375 and `marginal_prior` (which
+> averages over contexts) emits an identical value for each. `not np.allclose(vec,
+> vec[0])` then fails. Verified. **The test is right and the fixture is wrong:**
+> preserving label-frequency differences is the entire point of the marginal
+> control. Make the fixture asymmetric in total mass — give species 1 strictly more
+> occurrence mass than species 2 (scaling species 2's values by 0.25 is enough) —
+> and keep every assertion exactly as written.
+>
+> **T9-R2 — `uniform_prior` and `marginal_prior` as written silently rescale the
+> prior, and the two controls end up on a different scale from the full prior they
+> are compared against.** This is the defect that would quietly decide the paper's
+> headline comparison. The full prior is **not** normalised per context (see
+> `backoff.py`, `smoothing.py`); measured on a 2-species × 3-context example whose
+> per-context sums are [0.32, 0.12, 0.65], the plan's `uniform_prior` emits
+> per-context sums of [1.0, 1.0, 1.0] and its `marginal_prior` the same — **2.75×
+> the full prior's total mass**. Every fusion method in Section 2 of the spec
+> combines prior with posterior multiplicatively or via `log prior`, so a control
+> sitting at a different scale is not the null hypothesis it claims to be: the
+> comparison measures a scale difference and reports it as a context effect. No
+> test in this plan could catch it — every value is finite, in range and plausible.
+> **Ruling: both controls must preserve the full prior's total mass.**
+>   - `uniform_prior`: fill with `t.values.mean()` (the mean over the whole matrix,
+>     *including* stored zeros), not `1.0 / n_species`.
+>   - `marginal_prior`: use each species' mean over contexts **as-is** — delete the
+>     `per_species / total` renormalisation entirely.
+>   Both still satisfy every assertion in the tests below (verified: uniform stays
+>   flat across species, marginal stays constant across contexts and still varies
+>   across species). Add one test per control asserting total mass is preserved
+>   against the input tensor, and register a mutant that re-introduces the
+>   renormalisation.
+>
+> **T9-R3 — `shuffle_time` permutes all 52 week slots with ONE permutation shared
+> across every cell, and `shuffle_space` permutes cells with one permutation shared
+> across every species.** That is the intended construction — it destroys the
+> space/time association while preserving each block's internal profile — but it is
+> not what the function names suggest, and the tests below only check the value
+> multiset, which a no-op permutation also satisfies. Add, for each shuffle, a test
+> that the permutation is **not** the identity on a fixture where it is observable,
+> and assert that precondition in the test rather than trusting the seed.
+>
+> **T9-R4 — `shuffle_*` reshape to `(species, n_cells, 52)` requires the tensor's
+> column count to be exactly `n_cells * 52`.** That holds by construction from
+> `to_tensor`, but a reshape on a mismatch either raises an opaque numpy error or,
+> worse, succeeds with a wrong block structure. Assert
+> `values.shape[1] == len(cells) * WEEKS_PER_YEAR` at the top of each shuffle with
+> a message naming the check.
 
 ```python
 """The four control priors. A gain surviving all four is a real effect."""
@@ -1998,6 +2142,112 @@ The marginal-frequency control is the one a reviewer will demand."
 - Produces:
   - `build_from_archive(zip_path, *, resolution, source, test_recordings, out_dir, gbif_doi) -> list[Path]` — writes the full prior plus all four controls, returns their paths.
   - CLI: `python scripts/build_prior.py --archive PATH --source dof --resolutions 3 4 5 --out output/priors`
+
+> **ACCEPTANCE CRITERION added 2026-09-29 — prove the GUARDED table is what reaches
+> `target_group_ratios`.** A guarded and an unguarded `CountTable` are structurally
+> identical (same four columns, same dtypes), so NO check inside `effort.py` can tell them
+> apart — this is unenforceable anywhere except here. The failure it guards against is the
+> worst kind: an unguarded denominator under-weights every guarded cell-week uniformly,
+> producing a smooth, plausible, mildly-flat prior with no error, no nan and no missing
+> row. Invisible in the output and invisible in the paper.
+> Close it STRUCTURALLY, not by convention. Cheapest workable form: stamp the guard chain's
+> output with Arrow schema metadata (e.g. `b'leakage_guards_applied'`), have
+> `aggregate_counts` propagate it, and have `target_group_ratios` require it and raise
+> otherwise (~5 lines, machine-checked, compatible with the no-try/except rule). Stronger
+> form: a distinct type (`NewType`/wrapper `GuardedCounts`) so an unguarded table cannot be
+> passed at all. Either way this task must carry an explicit test that the ONLY table
+> reaching `target_group_ratios` is the post-guard one.
+>
+> **CORRECTED 2026-09-29 — the multi-resolution sweep and the test split are incompatible
+> as originally written.** `build_from_archive` takes one `resolution`, but the CLI loops
+> over `--resolutions 3 4 5` while `test_recordings` is supplied ONCE. A `TestRecording`'s
+> `cell` is fixed at whatever resolution it was built at, so from Task 4 onward the guard
+> RAISES `ValueError` on every resolution except the matching one (it used to silently
+> no-op, which is why this was invisible in the original draft).
+> Task 10 obligations, all four binding:
+>   1. **Re-derive the split's cells per resolution.** Carry each test recording's lat/lon
+>      and compute its cell with the SAME `resolution` value handed to `assign_cells` —
+>      never reuse one pre-computed cell across resolutions. (Alternatively restrict the
+>      sweep to the split's own resolution, but re-deriving is what the sweep needs.)
+>   2. **Let a guard ValueError crash the build.** Never try/except it to keep the loop
+>      going: a caught mismatch writes a leak-contaminated artifact under a normal-looking
+>      filename, which is worse than the pre-fix silence because it looks deliberate. Fail
+>      that resolution's artifact entirely and exit non-zero.
+>   3. **Assert the split is non-empty.** `drop_test_contributor_cells` returns early and
+>      silently on an empty `test_recordings` — correct for that module, and `[]` is a
+>      legitimate mode. Task 10 is the ONLY place that knows a split was meant to be wired
+>      in, so require `--test-split PATH` or an explicit `--no-test-split` opt-out. Without
+>      this, the highest-consequence failure in the plan (a paper's numbers computed against
+>      an unguarded prior) has no automated detector anywhere.
+>   4. **Configure logging so WARNING reaches the console and the build log.** The
+>      zero-match warning is the shared symptom of four silent failure modes; an
+>      unconfigured logger discards it and re-silences all of them. Treat that specific
+>      warning as a build failure when a non-empty split was supplied.
+>
+> **PRE-FLIGHT RULINGS added 2026-09-29 — this task's own code below violates three
+> of its own obligations, and the mechanism the acceptance criterion recommends does
+> not work as described. All verified by execution.**
+>
+> **T10-R1 — `build_from_archive` must pass the observed cells AND the full 52-week
+> grid to `hierarchical_estimate` explicitly. The REASON changed on 2026-09-29; the
+> instruction did not.** The code below calls `hierarchical_estimate(ratios, species)`
+> with no `weeks=`. The backoff's documented default is "the observed axes", so on the
+> plan's own end-to-end fixture the grid comes out as **3 weeks, not 52** (measured:
+> weeks [2, 24, 46], 6 rows instead of 104).
+>
+> **What this used to mean, and no longer does.** Under the original T8-R5 an absent
+> context was a structural zero and `lookup` returned a hard `0.0`, so a collapsed grid
+> silently vetoed correct detections. **T8-R5 was REVERSED** (see the ledger): an
+> unstored context on both axes now returns `backoff.FLOOR`, and there are no structural
+> zeros anywhere. The veto is gone, and the old justification for this ruling with it.
+> Do not repeat the structural-zero argument — it describes code that no longer exists.
+>
+> **Why the instruction still stands.** A week the backoff never saw reads as a bare
+> `FLOOR`. A week the backoff *did* see, but with no occurrences, gets a **shrunk
+> estimate** — the cell's annual profile pulled toward the species' global profile,
+> which is the entire point of the hierarchy. Those are different numbers, and the
+> second is the one the paper claims to publish. Omitting `weeks=` silently downgrades
+> ~98% of the artifact from "estimated" to "no evidence", and the failure is invisible:
+> every stored value is right, the artifact is well-formed, and only its coverage is
+> impoverished. So pass `weeks=list(range(1, WEEKS_PER_YEAR + 1))` and
+> `cells=<the observed cells>`.
+>
+> **The cost, which is now real and must be measured, not assumed.** Because
+> `_validate_p` forbids `p <= 0`, every estimated context is an explicit nonzero. A full
+> 52-week grid over the observed cells therefore materialises `n_species * n_cells * 52`
+> stored entries. At Danish national scale (~600 species, ~3000 cells) that is 9.36e7
+> entries, ~1.1 GB of CSR — and Task 9's controls call `t.dense()`, which materialises
+> ~750 MB per control on top. **Measure peak RSS on the real build before assuming this
+> fits.** If it does not, the honest resolutions are (a) build per-species or per-cell
+> in chunks, or (b) restrict the week grid to a documented window, stated in the sidecar
+> — NOT to silently fall back to the observed axes, which reintroduces the defect this
+> ruling exists to prevent. Assert in the test that the full prior's tensor has exactly
+> `n_cells * 52` columns, and that a context in an unobserved week reads a value
+> **strictly greater than `FLOOR`** (i.e. genuinely estimated, not defaulted) — that is
+> the assertion the old structural-zero check should become.
+>
+> **T10-R2 — Arrow schema metadata does NOT survive `group_by().aggregate()`, so the
+> acceptance criterion's "have `aggregate_counts` propagate it" cannot mean "it is
+> carried automatically".** Measured: metadata survives `filter()` and is `None`
+> after `group_by(...).aggregate(...)`, and `rename_columns`/`select` do not restore
+> it. `aggregate_counts` must therefore **re-stamp the marker explicitly on its
+> output, conditional on its input carrying it** — never unconditionally, or the
+> guard authenticates any table that passes through it and the whole check becomes
+> decorative. Add a test that an unstamped input yields an unstamped output and that
+> `target_group_ratios` then raises.
+>
+> **T10-R3 — `main()` below passes `test_recordings=[]` unconditionally, which
+> violates obligations 1, 3 and 4 in the block above.** The CLI has no
+> `--test-split`, no `--no-test-split`, no logging configuration, and re-derives
+> nothing per resolution. The obligations are correct; the code is the stale copy.
+> Implement the CLI to match the obligations, not this snippet. Concretely: require
+> exactly one of `--test-split PATH` / `--no-test-split`; load the split as
+> (lat, lon, week, recorded_by) and build each `TestRecording`'s `cell` **inside**
+> the resolution loop with the same `resolution` handed to `assign_cells`; call
+> `logging.basicConfig(level=logging.INFO)` before any pipeline call; and let a guard
+> `ValueError` propagate — no try/except around the loop body — so a mismatched
+> resolution fails that artifact and exits non-zero rather than writing a
+> leak-contaminated file under a normal-looking name.
 
 - [ ] **Step 1: Write the failing test**
 

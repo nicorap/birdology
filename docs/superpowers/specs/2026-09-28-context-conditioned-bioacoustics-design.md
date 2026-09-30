@@ -94,6 +94,20 @@ than "absent". Three-level hierarchical backoff:
 with shrinkage weight set by the observation count behind each level. Plus smoothing across the 6
 adjacent hexes and ±1 week. Both bandwidths are swept axes.
 
+**Stated limitation — the probability floor erases the absence distinction at scale.**
+A non-zero floor (1e-6) keeps an unobserved cell-week from collapsing to a hard zero, so
+"nobody looked" stays distinguishable from "looked and did not find". That distinction holds
+only while the global denominator stays below `1/floor`. Above it — i.e. once a region
+accumulates more than ~1e6 bird records, which is the normal GBIF regime — a species
+*surveyed and not found* becomes bit-identical to a species *never recorded anywhere*.
+Verified empirically: at 1e6 records in a cell, a species with one sighting elsewhere scores
+exactly 1e-6 in a surveyed week where it was absent, and an unrecorded species also scores
+exactly 1e-6. The floor is still necessary — a hard zero would make the prior veto a correct
+detection outright — but the paper must state the threshold rather than claim the
+distinction holds everywhere. Report it as a known boundary of the method, and if a reviewer
+asks what the prior says about a surveyed absence, the honest answer is "below `1/floor`
+records, less than the cell profile; above it, indistinguishable from unrecorded".
+
 ### Leakage guards
 
 Xeno-Canto is itself a GBIF publisher. If a test recording's own occurrence record is in the prior,
@@ -284,9 +298,13 @@ correctness check: results disagreeing with published ones indicate a stack prob
 ## Section 5 — Cluster execution
 
 **Cluster:** `ssh ubuntu@100.69.23.11` (slurm-login-01.infra.faic.dk), partition `gpu`,
-24 × DGX (dgx160–171, 176–187), 8×H100 80GB each = 192 GPUs (160 usable today, see container
-runtime below), 224 CPU + 2 TB RAM per node,
+24 × DGX (dgx160–171, 176–187), 8×H100 80GB each = 192 GPUs, 224 CPU + 2 TB RAM per node,
 MaxTime 2-00:00:00, driver 595.91.07. Queue empty.
+
+**Fleet state 2026-09-30:** 21 nodes up, **4 down — dgx169, dgx177, dgx179, dgx182** — so
+**168 GPUs usable**, not the 160 recorded earlier. The remediation this section previously
+anticipated for dgx184–187 has landed; all four are up. Node availability drifts, so re-read
+it with `sinfo -N` rather than trusting this line.
 
 ### Storage (resolved)
 
@@ -303,9 +321,50 @@ writable from a job on dgx160. No sysadmin ticket needed.
 
 | Path | Role | Measured |
 |---|---|---|
-| `/shared/apps/ML` | durable: code, priors, checkpoints, results | 317 MB/s w, 239 MB/s r |
-| `/raid/scratch` (node-local, 28 TB) | staging: audio shards, temp | 5.3 GB/s |
+| `/mnt/weka` | **shared, fast — the Phase A corpus belongs here** | 41.6 GB/s r, 27.9 GB/s w (dgx171 only, 2026-09-30) |
+| `/shared/apps/ML` | durable: code, priors, checkpoints, results | 0.54 GB/s r, 0.51 GB/s w |
+| `/raid/scratch` (node-local, 28 TB) | staging: audio shards, temp | 101.6 GB/s r, 48.1 GB/s w |
 | `/tmp` | job scratch | node-local, wiped |
+
+### WEKA (new 2026-09-30, changes the Phase A plan)
+
+A 1.0 PB WEKA filesystem (`10.11.5.11/delta-fs`) is mounted at `/mnt/weka`. **Today it is on
+dgx171 ONLY** — verified node by node across all 21 up nodes; the other 20 report no mount, and
+the login node has none. It is expected fleet-wide soon.
+
+`/mnt/weka` arrives `root:root` 775, so jobs (running as `nvidia`) cannot write to it.
+`/mnt/weka/ML` was created `nvidia:nvidia` mode 2775, mirroring the `/shared/apps/ML`
+convention, using the passwordless sudo available inside a job.
+
+Measured on dgx171 with fio 3.41, all `--direct=1`, 16 jobs, 1 MB blocks. Every figure was
+re-run at a **640 GB working set** (16 × 40 G) that cannot be served from the node's 2 TB of
+RAM, and all four reproduced within ~1% of the 32 GB run — so these are storage numbers, not
+page-cache numbers:
+
+| | WEKA | NFS (`/shared/apps`) | node-local raid0 |
+|---|---|---|---|
+| read, 16 jobs | **41.6 GB/s** | 0.54 GB/s | 101.6 GB/s |
+| write, 16 jobs | **27.9 GB/s** | 0.51 GB/s | 48.1 GB/s |
+| 4k randread | 789k IOPS | 54k IOPS | 3.37M IOPS |
+
+`/raid` is raid0 over 8 NVMe (`/proc/mdstat`), i.e. ~12.7 GB/s per drive — consistent, and the
+reason the node-local figure is genuinely that high rather than a measurement artifact.
+
+**Consequence for Phase A — the staging design becomes unnecessary.** The stage-to-`/raid`
+mitigation exists solely because NFS is flat at ~535 MB/s from 1 reader to 16, with latency
+going 31 ms → 507 ms: a saturated box that cannot feed 24 nodes. WEKA scales instead
+(8 → 41.6 GB/s from 1 to 16 jobs) and is shared, so shards need no per-node copy. Node-local
+RAID stays ~2.4× faster in raw throughput, so staging remains an option for a
+re-read-heavy arm, but it is no longer required.
+
+Two things this does NOT establish, both of which matter before committing the plan:
+
+- **Aggregate behaviour under 24-node load is unmeasured.** This is one client on one node.
+  The multi-node number is the one that decides Phase A, and it can only be taken once the
+  mount is fleet-wide.
+- **The "NFS behaviour under 24-node load" deliverable** (below) is obsoleted rather than
+  satisfied if the corpus moves to WEKA. It needs restating as a WEKA scaling measurement,
+  not quietly dropped — it was a cluster-acceptance deliverable, not a project one.
 
 ### Container runtime (resolved: Apptainer, 20 of 24 nodes)
 
