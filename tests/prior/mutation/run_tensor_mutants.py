@@ -135,6 +135,21 @@ it is
   matrix from one with a sidecar from the other. The nnz-agreement check on
   load would catch the common case, but nothing here exercises it and no lock
   is taken.
+* WHETHER THE RECORDED PARAMS ARE THE ONES THAT PRODUCED THE TABLE. T-I2a
+  through T-I2q pin that whatever params object this module is HANDED reaches
+  the sidecar faithfully, comes back equal, and that absence, `null`, a
+  partial record and an unknown field are each distinguished. What no mutant
+  here can reach is the claim itself: `to_tensor` sees an Arrow table, not the
+  computation that made it, so a caller passing the wrong object writes a
+  faithful-looking record of a different computation. That seam is pinned in
+  `run_build_prior_mutants.py` (B-I2f and siblings) for the CLI path -- the
+  only path that ships artifacts -- and is unpinned for a direct library
+  caller, deliberately: the alternative is a checksum of the computation,
+  which this layer has no way to compute.
+* WHETHER THE CONSTANTS ARE GOOD. The retention tables in `BackoffParams`
+  say an artifact keeps 0.43 of the real seasonal amplitude at res 5. That
+  number is a measurement of a choice, not a defence of it, and no mutation
+  of a serialiser bears on whether the choice is right.
 """
 # ---------------------------------------------------------------------------
 # TEST SCOPE (final-gate finding I1)
@@ -1357,6 +1372,291 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
                 '        "nnz": int(tensor.values.nnz),',
                 '        "row_axis": "species_keys",\n'
                 '        "nnz": int(tensor.values.nnz),',
+            )
+        ],
+    ),
+    # ---- I2: THE ARTIFACT'S RECORD OF ITS OWN SHRINKAGE ------------------
+    #
+    # Commits 70d5f0f and 6e1dbea added the `backoff_params` /
+    # `smoothing_params` sidecar fields and ~50 tests, and registered NO
+    # mutants: the agent that wrote them could not touch this directory, and
+    # the mutant specifications it produced instead were lost with the
+    # transcript. The set below was RE-DERIVED from the committed code and
+    # tests rather than recovered.
+    #
+    # ONE MUTANT PER CONTRACT, and the contracts here are unusually easy to
+    # collapse into one another because they are all about the SAME two keys:
+    #
+    #   * an ABSENT key vs an explicit `null`      -> T-I2a (absent defaulted),
+    #                                                 T-I2l (null refused)
+    #   * WRITING `null` vs writing nothing        -> T-I2b (key omitted),
+    #                                                 T-I2e (`{}` for `None`)
+    #   * the FIELD-SET guard, per direction       -> T-I2h (guard gone),
+    #                                                 T-I2i (unknown allowed),
+    #                                                 T-I2j (missing allowed)
+    #   * the SHAPE guard before the field compare -> T-I2k
+    #   * the read path really READS               -> T-I2g
+    #   * the two keys are not CROSSED             -> T-I2o
+    #   * `to_tensor` carries them at all          -> T-I2n
+    #   * the field list is DERIVED                -> T-I2q
+    #   * the dataclass default is `None`          -> T-I2m
+    (
+        "T-I2a",
+        "an ABSENT params key is DEFAULTED to `None` instead of refused -- the "
+        "silent repair at a boundary the module forbids everywhere else. Every "
+        "foreign or older sidecar would be promoted into an artifact CLAIMING "
+        "to have declared its shrinkage, and a consumer could no longer tell "
+        "'this artifact has no record' from 'this sidecar cannot be asked'. "
+        "Two edits, because defaulting needs both the guard gone AND the read "
+        "made tolerant: `meta[key]` alone would raise KeyError, which is a "
+        "crash rather than the silent repair being pinned",
+        "test_a_sidecar_MISSING_a_params_key_is_REFUSED_not_defaulted",
+        [
+            ("    if key not in meta:", "    if False:"),
+            ("    recorded = meta[key]", "    recorded = meta.get(key)"),
+        ],
+    ),
+    (
+        "T-I2b",
+        "`save_prior` OMITS a params key whose value is `None` instead of "
+        "writing an explicit JSON null. The artifact stops SAYING 'I have no "
+        "record' and becomes one that cannot be asked -- and because "
+        "`load_prior` refuses an absent key, every such artifact is then "
+        "unreadable by its own reader. Measured breadth: 24 failures across "
+        "test_tensor.py and test_controls.py, which is real rather than a "
+        "crude edit -- `_saveable` is the shared fixture for most of "
+        "test_tensor.py and every control tensor carries `None` params, so the "
+        "population of round-tripping params-less artifacts genuinely is that "
+        "large",
+        "test_a_tensor_that_declares_no_params_writes_an_explicit_null",
+        [
+            (
+                '    _sidecar_path(npz).write_text(json.dumps(meta, indent=2), encoding="utf-8")',
+                "    meta = {\n"
+                "        k: v\n"
+                "        for k, v in meta.items()\n"
+                '        if not (k.endswith("_params") and v is None)\n'
+                "    }\n"
+                '    _sidecar_path(npz).write_text(json.dumps(meta, indent=2), encoding="utf-8")',
+            )
+        ],
+    ),
+    # T-I2d IS NOT REGISTERED. It is DOCUMENTED-EQUIVALENT, and the argument is
+    # here rather than in a returned payload because that is how the eleven
+    # specifications this set re-derives were lost.
+    #
+    # The contract it would have pinned is `_params_payload`'s use of `asdict`
+    # rather than a hand-written dict literal, and `_params_from_sidecar`'s
+    # `expected = {f.name for f in dc_fields(cls)}` rather than a literal name
+    # set. The mutation is "spell the field names out instead of deriving
+    # them".
+    #
+    # WHY IT IS EQUIVALENT, and the regime the claim is made over: a literal
+    # spelling of TODAY's field sets -- {cell_week_weight, cell_weight, floor}
+    # and {space_weight, time_weight} -- produces byte-identical output for
+    # EVERY input, because the derivation it replaces enumerates exactly those
+    # names. There is no fixture that separates them and there cannot be one,
+    # because the difference is not in the values but in what happens to a
+    # field that does not exist yet. That is a claim about a FUTURE edit, and a
+    # mutant is a statement about the current program's behaviour.
+    #
+    # The reachability condition is therefore explicit: the mutation becomes
+    # live the moment a field is ADDED to `BackoffParams` or `SmoothingParams`.
+    # T-I2q is the mutant for the observable half of that -- a payload one
+    # field short of the dataclass -- and it dies. The staleness itself is
+    # pinned by `test_the_sidecar_params_keys_are_DERIVED_from_the_dataclasses`,
+    # which compares against `dataclasses.fields` rather than a literal, so
+    # the guard cannot go stale even though no mutant can express its going
+    # stale. NO TEST WAS MANUFACTURED to kill an equivalent mutant.
+    (
+        "T-I2e",
+        "`_params_payload` returns an EMPTY OBJECT instead of `None` for a "
+        "tensor that declares no shrinkage. Distinct from T-I2b, which drops "
+        "the key: here the key is present and its value is a well-formed JSON "
+        "object, so a consumer sees an artifact that answered the question -- "
+        "with a record of NO constants. `load_prior` then refuses it as a "
+        "field-set mismatch, so a hand-built tensor becomes unreadable by a "
+        "path that reports the wrong cause",
+        "test_a_tensor_that_declares_no_params_writes_an_explicit_null",
+        [
+            (
+                "    return None if params is None else asdict(params)",
+                "    return {} if params is None else asdict(params)",
+            )
+        ],
+    ),
+    (
+        "T-I2g",
+        "`load_prior` IGNORES the sidecar's record and constructs THIS build's "
+        "defaults. The read path is where the whole finding lands: every "
+        "artifact would report the constants of whatever code is reading it "
+        "rather than the ones it was built with, and a swept artifact -- the "
+        "one a reader most needs to interpret -- would be described by the "
+        "numbers it was swept AWAY from. A default-valued build round-trips "
+        "correctly under this mutant, which is why the round-trip test uses "
+        "non-default values and asserts they differ from the defaults",
+        "test_the_params_ROUND_TRIP_through_the_sidecar",
+        [
+            (
+                '        backoff_params=_params_from_sidecar(meta, "backoff_params"),\n'
+                '        smoothing_params=_params_from_sidecar(meta, "smoothing_params"),',
+                "        backoff_params=BackoffParams(),\n"
+                "        smoothing_params=SmoothingParams(),",
+            )
+        ],
+    ),
+    (
+        "T-I2h",
+        "the FIELD-SET guard removed entirely, so a partial record is "
+        "COMPLETED from the current defaults. Both params dataclasses give "
+        "every field a default, so `cls(**recorded)` on a record missing "
+        "`cell_week_weight` SUCCEEDS and fills it with 10.0 -- publishing "
+        "today's constant as the one the artifact was built with, which is "
+        "exactly the value the record exists to pin down. Nothing raises and "
+        "nothing in the artifact shows the repair",
+        "test_a_params_record_MISSING_A_FIELD_is_REFUSED_not_completed",
+        [("    if got != expected:", "    if False:")],
+    ),
+    (
+        "T-I2i",
+        "the UNKNOWN-field direction of the guard dropped, keeping the missing "
+        "one: an extra field is silently ignored. The artifact was written by "
+        "a build whose parameter set this one does not implement, and reading "
+        "it as one built WITHOUT that parameter describes the file as poorer "
+        "than it is. Mutated per direction because one shared comparison "
+        "serves both, and a fixture tripping one never exercises the other",
+        "test_a_params_record_with_an_UNKNOWN_FIELD_is_REFUSED_not_ignored",
+        [("    if got != expected:", "    if not expected <= got:")],
+    ),
+    (
+        "T-I2j",
+        "the MISSING-field direction dropped, keeping the unknown one. The "
+        "other half of T-I2i, and the more dangerous half: a missing field is "
+        "then completed from the current default exactly as in T-I2h, while "
+        "the guard still LOOKS like it validates the record",
+        "test_a_params_record_MISSING_A_FIELD_is_REFUSED_not_completed",
+        [("    if got != expected:", "    if not got <= expected:")],
+    ),
+    (
+        "T-I2k",
+        "the SHAPE check removed, so a scalar or a list where an object "
+        "belongs falls through to the field comparison. `set(\"10.0\")` is "
+        "`{'1','0','.'}`, so the refusal still happens but reports a nonsense "
+        "field list and sends whoever reads it to look for a malformed "
+        "parameter set rather than a malformed value. A guard that raises for "
+        "the wrong reason is a diagnostic defect, not a no-op",
+        "test_a_params_record_that_is_not_an_object_is_REFUSED",
+        [("    if not isinstance(recorded, dict):", "    if False:")],
+    ),
+    (
+        "T-I2l",
+        "an explicit `null` is NO LONGER ACCEPTED -- the reverse of T-I2a, and "
+        "it must be mutated separately because a guard written for one "
+        "direction says nothing about the other. A hand-built tensor "
+        "legitimately has no shrinkage to declare; refusing its own writer's "
+        "output would make `save_prior` and `load_prior` disagree about what a "
+        "legal artifact is",
+        "test_a_tensor_that_declares_no_params_writes_an_explicit_null",
+        [
+            (
+                "    if recorded is None:\n        return None\n    cls = _PARAM_TYPES[key]",
+                "    if False:\n        return None\n    cls = _PARAM_TYPES[key]",
+            )
+        ],
+    ),
+    (
+        "T-I2m",
+        "`PriorTensor.backoff_params` DEFAULTS to `BackoffParams()` instead of "
+        "`None`. Every hand-built tensor, and every tensor built by a path "
+        "that does not thread the params, would then publish today's constants "
+        "as the ones it was built with -- a claim about a computation that "
+        "never ran, in a field whose entire purpose is to be believed.\n"
+        "\n"
+        "THIS MUTANT SURVIVED ON FIRST RUN, and that survival is the finding: "
+        "every other construction site in the repository passes both params "
+        "EXPLICITLY, so the field default was reachable only through "
+        "`controls._respec` -- which constructs a `PriorTensor` without them -- "
+        "and the CLI hides even that by overwriting both fields on every "
+        "control. Now pinned by "
+        "`test_a_CONTROL_of_a_params_less_prior_declares_NO_params_rather_than_"
+        "defaults`, which builds every registered control of a params-less "
+        "prior and asserts the sidecar says `null`",
+        "test_a_CONTROL_of_a_params_less_prior_declares_NO_params_rather_than_defaults",
+        [
+            (
+                "    #: backoff would then publish a claim about parameters it never used.\n"
+                "    backoff_params: BackoffParams | None = None",
+                "    #: backoff would then publish a claim about parameters it never used.\n"
+                "    backoff_params: BackoffParams | None = BackoffParams()",
+            )
+        ],
+    ),
+    (
+        "T-I2p",
+        "the SMOOTHING half of T-I2m, mutated separately: a guard or a test "
+        "written for one field says nothing about the other, and these are two "
+        "adjacent declarations either of which can be changed alone",
+        "test_a_CONTROL_of_a_params_less_prior_declares_NO_params_rather_than_defaults",
+        [
+            (
+                "    smoothing_params: SmoothingParams | None = None\n"
+                "    _species_index:",
+                "    smoothing_params: SmoothingParams | None = SmoothingParams()\n"
+                "    _species_index:",
+            )
+        ],
+    ),
+    (
+        "T-I2n",
+        "`to_tensor` accepts the params and DROPS them on the floor: the "
+        "tensor it returns declares none. The CLI passes them here rather than "
+        "assigning them afterwards precisely so no window exists in which a "
+        "full prior has no record of its shrinkage, and this mutant makes that "
+        "window the whole lifetime of the object",
+        "test_the_params_ROUND_TRIP_through_the_sidecar",
+        [
+            (
+                "        backoff_params=backoff_params,\n"
+                "        smoothing_params=smoothing_params,\n"
+                "    )",
+                "    )",
+            )
+        ],
+    ),
+    (
+        "T-I2o",
+        "the two sidecar keys CROSSED: `smoothing_params` records the backoff "
+        "object. Both keys are present, both are well-formed JSON objects, and "
+        "`load_prior` refuses the crossed one as a field-set mismatch -- but a "
+        "consumer reading the JSON directly, which is what the release "
+        "documentation teaches, would calibrate against the wrong constants "
+        "entirely. Neither a round trip through this module nor a field-set "
+        "check on ONE key can see a swap",
+        "test_the_params_ROUND_TRIP_through_the_sidecar",
+        [
+            (
+                '        "smoothing_params": _params_payload(tensor.smoothing_params),',
+                '        "smoothing_params": _params_payload(tensor.backoff_params),',
+            )
+        ],
+    ),
+    (
+        "T-I2q",
+        "the payload built from a HAND-WRITTEN field list one field short of "
+        "the dataclass -- the observable half of the equivalence argument "
+        "recorded above T-I2e. The artifact publishes a complete-LOOKING "
+        "record of a strictly smaller set of constants than produced it, which "
+        "is the I2 defect one field deep: nothing is absent, nothing is null, "
+        "and the record is wrong",
+        "test_the_sidecar_params_keys_are_DERIVED_from_the_dataclasses",
+        [
+            (
+                "    return None if params is None else asdict(params)",
+                "    if params is None:\n"
+                "        return None\n"
+                "    payload = asdict(params)\n"
+                "    payload.pop(next(iter(payload)))\n"
+                "    return payload",
             )
         ],
     ),

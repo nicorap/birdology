@@ -127,6 +127,31 @@ it is
   is still useful to a human reading a log, but NOTHING in this repository
   now depends on it for control flow, so nothing here pins it. That is the
   point of C1: see `ZeroMatchGuardError`.
+* WHETHER THE SHRINKAGE CONSTANTS ARE THE RIGHT ONES. B-I2f and its siblings
+  pin that the constants the caller supplied are the ones the pipeline
+  COMPUTED with and the ones every artifact RECORDS. They say nothing about
+  whether 10 / 50 / 0.3 / 0.3 are good values -- that is untuned and the
+  dataclass docstrings say so. No mutation of a build script can speak to it.
+* WHETHER THE SHIPPED DOCUMENT IS TRUE. B-P1..B-P10 pin that the decoding
+  contract is COPIED beside the artifacts, ACCOUNTED FOR by name and content
+  hash, and that absence and drift both fail closed. Whether the prose in it
+  is correct is pinned elsewhere, by the tests that execute its recipe and
+  compare its examples against real artifacts, and the one thing no test can
+  see remains an explanation that misleads while every fact in it is true.
+* THE UPLOAD. Nothing here observes what is actually published. The build
+  writes the document into `--out`; a release process that uploads a
+  hand-picked subset of that directory, or repackages it, can still ship
+  matrices without their contract, and no test in this repository can see a
+  Zenodo deposit. What changed is that the directory the operator is told to
+  upload is now complete and self-checking.
+* THE ARTIFACTS' OWN INTEGRITY. Only the documentation carries a hash in the
+  manifest. A corrupted `.npz` is caught by `load_prior`'s nnz-against-matrix
+  check on read and by nothing before it; a corrupted SIDECAR whose nnz still
+  matches is caught by nothing at all. Hashing every artifact would close
+  that, and was not done: it costs a full read of every multi-hundred-megabyte
+  file on every build, and the failure it would catch is transport corruption
+  rather than a defect in this pipeline. State it rather than let the
+  documentation's hash imply a guarantee that covers the matrices.
 """
 # ---------------------------------------------------------------------------
 # TEST SCOPE (final-gate finding I1)
@@ -1489,6 +1514,346 @@ MUTANTS: list[Mutant] = [
         "cannot become a provenance change",
         "test_the_cli_REFUSES_a_doi_with_surrounding_whitespace",
         [("    if not DOI_PATTERN.match(value):", "    value = value.strip()\n    if not DOI_PATTERN.match(value):")],
+    ),
+    # ---- I2: THE BUILD'S CONSTANTS REACH THE ARTIFACT *AND* THE ARITHMETIC -
+    #
+    # Commits 70d5f0f and 6e1dbea added these contracts with NO registered
+    # mutants; the set below was RE-DERIVED from the committed code and tests.
+    #
+    # B-I2f IS THE ONE THAT MATTERS and it is split per surface, because a
+    # well-formed artifact publishing a faithful-looking record of a
+    # computation that did not happen is the worst shape this finding takes:
+    #
+    #   * the BACKOFF computed at the defaults while the caller's are recorded
+    #                                               -> B-I2f
+    #   * the SMOOTHER, same                        -> B-I2f2
+    #   * the record reaching the CONTROLS at all   -> B-I2g (backoff),
+    #                                                  B-I2h (smoothing)
+    #   * the EMPTY-species grid                    -> B-I2j (per param)
+    (
+        "B-I2f",
+        "THE ONE THAT MATTERS: the build RECORDS the caller's backoff params "
+        "and COMPUTES with the module defaults. Every sidecar assertion passes "
+        "-- the full prior and all five controls publish exactly the constants "
+        "the operator asked for -- and the matrix beside them was produced by "
+        "different ones. A swept release would therefore ship a table of "
+        "effect sizes measured at 10.0 under labels claiming 0.5, 2.0 and "
+        "50.0, and nothing in the artifact could reveal it. Only a test "
+        "comparing VALUES across two parameterisations can see this; no amount "
+        "of sidecar checking can",
+        "test_the_build_params_actually_CHANGE_the_values_not_just_the_sidecar",
+        [
+            (
+                "        species_chunk=species_chunk,\n"
+                "        backoff_params=backoff_params,\n"
+                "        smoothing_params=smoothing_params,\n"
+                "    )",
+                "        species_chunk=species_chunk,\n"
+                "        backoff_params=BackoffParams(),\n"
+                "        smoothing_params=smoothing_params,\n"
+                "    )",
+            )
+        ],
+    ),
+    (
+        "B-I2f2",
+        "the SMOOTHING half of B-I2f: the smoother runs at the module defaults "
+        "while the sidecar records the caller's. Mutated separately because "
+        "B-I2f's killer moves `cell_week_weight` only, so it cannot see the "
+        "smoothing params being dropped -- and the two are threaded through "
+        "DIFFERENT arguments of the same call, so one can be lost without the "
+        "other. Measured through `build_from_archive`: `time_weight` 0.0 vs "
+        "2.0 moves the largest stored value by 0.130, `space_weight` 0.0 vs "
+        "5.0 by 0.061, so the effect is real rather than a rounding artefact",
+        "test_the_SMOOTHING_params_actually_CHANGE_the_values_not_just_the_sidecar",
+        [
+            (
+                "        species_chunk=species_chunk,\n"
+                "        backoff_params=backoff_params,\n"
+                "        smoothing_params=smoothing_params,\n"
+                "    )",
+                "        species_chunk=species_chunk,\n"
+                "        backoff_params=backoff_params,\n"
+                "        smoothing_params=SmoothingParams(),\n"
+                "    )",
+            )
+        ],
+    ),
+    (
+        "B-I2g",
+        "`control.backoff_params = backoff_params` DELETED. `controls._respec` "
+        "carries `gbif_doi` and does NOT carry the params, so this line and "
+        "its neighbour are the ONLY thing putting a shrinkage record on a "
+        "control artifact -- the comment above them says exactly that, and "
+        "this mutant is what makes the claim checkable rather than asserted. "
+        "Four of the five released artifacts of every resolution are controls, "
+        "so the loss covers most of the release: each would publish `null` and "
+        "a reader could not establish that a control and the prior it is the "
+        "null for came from the same constants",
+        "test_the_build_records_its_params_in_EVERY_artifact_including_controls",
+        [
+            (
+                "        control.backoff_params = backoff_params\n",
+                "",
+            )
+        ],
+    ),
+    (
+        "B-I2h",
+        "the SMOOTHING half of B-I2g, deleted on its own. Separate mutant for "
+        "the same reason: two adjacent assignment lines, either of which can "
+        "be lost alone, and a test asserting only one of the two fields would "
+        "not notice",
+        "test_the_build_records_its_params_in_EVERY_artifact_including_controls",
+        [
+            (
+                "        control.smoothing_params = smoothing_params\n",
+                "",
+            )
+        ],
+    ),
+    (
+        "B-I2j",
+        "`full_grid`'s EMPTY-SPECIES branch computes at the module defaults "
+        "while the populated branch uses the caller's. `pa.concat_tables([])` "
+        "cannot infer a schema, so that branch is a SECOND call site -- the "
+        "one a reader edits last and tests least -- and the comment beside it "
+        "claims the params are threaded there for exactly this reason.\n"
+        "\n"
+        "THE BRIEF RECORDED THIS AS HAVING NO KILLER. It has one now: "
+        "`test_the_params_reach_the_EMPTY_species_grid_not_just_the_populated_"
+        "one`. Nothing about the VALUES can pin it -- an empty grid has zero "
+        "rows -- so the test pins that the params OBJECT reaches the "
+        "validators: `hierarchical_estimate` refuses `floor=2.0`, and under "
+        "this mutant the branch hands it a valid default instead and the "
+        "refusal vanishes",
+        "test_the_params_reach_the_EMPTY_species_grid_not_just_the_populated_one",
+        [
+            (
+                "                ratios, [], backoff_params, cells=list(cells), weeks=weeks",
+                "                ratios, [], BackoffParams(), cells=list(cells), weeks=weeks",
+            )
+        ],
+    ),
+    (
+        "B-I2j2",
+        "the SMOOTHING half of B-I2j: the empty branch smooths at the defaults. "
+        "Per-argument again, and the killer asserts the two refusals "
+        "SEPARATELY so a mutant dropping one cannot hide behind the other "
+        "still raising",
+        "test_the_params_reach_the_EMPTY_species_grid_not_just_the_populated_one",
+        [
+            (
+                "                ratios, [], backoff_params, cells=list(cells), weeks=weeks\n"
+                "            ),\n"
+                "            smoothing_params,",
+                "                ratios, [], backoff_params, cells=list(cells), weeks=weeks\n"
+                "            ),\n"
+                "            SmoothingParams(),",
+            )
+        ],
+    ),
+    (
+        "B-I2i",
+        "`to_tensor` is handed the module defaults while the computation used "
+        "the caller's -- B-I2f inverted. The matrix is right and the RECORD is "
+        "wrong, which is the less dangerous direction only because it is "
+        "detectable: the artifact under-claims its own sweep rather than "
+        "over-claiming it. Still a published lie about how a released file was "
+        "built, and separate from B-I2f because the two are on opposite sides "
+        "of the same threading",
+        "test_a_NON_DEFAULT_build_records_the_params_it_actually_used",
+        [
+            (
+                "        estimates,\n"
+                "        spec,\n"
+                "        backoff_params=backoff_params,\n"
+                "        smoothing_params=smoothing_params,\n"
+                "    )",
+                "        estimates,\n"
+                "        spec,\n"
+                "        backoff_params=BackoffParams(),\n"
+                "        smoothing_params=SmoothingParams(),\n"
+                "    )",
+            )
+        ],
+    ),
+    # ---- RELEASE PACKAGING: the decoding contract ships with the files ----
+    #
+    # The obligation carried open since round 5. One mutant per way the
+    # discharge can be undone, because each leaves a DIFFERENT observable:
+    #
+    #   * the copy never happens                 -> B-P1
+    #   * the copy happens, the manifest is silent about it
+    #                                            -> B-P2
+    #   * the manifest records it, the reader ignores its absence
+    #                                            -> B-P3 (name), B-P5 (entry)
+    #   * the reader ignores DRIFT               -> B-P4
+    #   * the hash is a constant, not a measurement
+    #                                            -> B-P6
+    #   * a missing repository document ships a stub instead of failing
+    #                                            -> B-P7
+    #   * the ORDERING protocol broken           -> B-P8
+    (
+        "B-P1",
+        "the format documentation is NOT copied beside the artifacts -- the "
+        "round-5 defect exactly as it stood: a published `output/priors/` whose "
+        "decoding contract exists only in a git checkout the consumer does not "
+        "have. Every artifact is individually valid, correctly provenanced and "
+        "CC BY 4.0, and a third party has no statement of what an unstored "
+        "context means, what the shrinkage cost, or what the licence obliges",
+        "test_the_build_SHIPS_the_format_documentation_beside_the_artifacts",
+        [
+            (
+                "    copy_format_documentation(out_dir)\n",
+                "",
+            )
+        ],
+    ),
+    (
+        "B-P2",
+        "the document is copied and the MANIFEST DOES NOT ACCOUNT FOR IT. This "
+        "is the half-discharge the previous round recorded: the file is there, "
+        "so a casual look says the obligation is met, but the manifest's whole "
+        "protocol is that a missing entry means an incomplete release -- and "
+        "under this mutant a directory the document was deleted from verifies "
+        "clean. Distinct from B-P1: the observable is the manifest, not the "
+        "directory listing",
+        "test_the_manifest_ACCOUNTS_for_the_shipped_documentation",
+        [
+            (
+                '        "documentation": {\n'
+                '            "path": doc.name,\n'
+                '            "sha256": documentation_digest(doc.read_bytes()),\n'
+                "        },",
+                "",
+            )
+        ],
+    ),
+    (
+        "B-P3",
+        "`check_manifest` records the documentation and then does NOT require "
+        "the file to exist. The manifest names it, so the release LOOKS "
+        "accounted for, and a consumer's completeness check passes over a "
+        "directory whose contract was never uploaded -- which is the "
+        "difference between a manifest and a manifest that is enforced",
+        "test_check_manifest_REFUSES_a_set_whose_documentation_is_missing",
+        [
+            (
+                "    if not doc_path.exists():\n        missing.append(documented)",
+                "    if False:\n        missing.append(documented)",
+            )
+        ],
+    ),
+    (
+        "B-P4",
+        "the HASH CHECK removed, so the shipped copy may DRIFT from the "
+        "document the build published. The artifacts are originals and this one "
+        "file is a copy: edited in place beside the artifacts, or left "
+        "truncated by a failed write, it keeps its name and passes every "
+        "name-based check. A consumer decoding against a drifted contract gets "
+        "plausible wrong numbers rather than an error, which is the whole "
+        "reason the manifest carries a content hash at all",
+        "test_check_manifest_REFUSES_documentation_that_DRIFTED_from_the_hash",
+        [("    if recorded_digest != actual_digest:", "    if False:")],
+    ),
+    (
+        "B-P5",
+        "a manifest that NAMES NO DOCUMENTATION is accepted instead of "
+        "refused. Distinct from B-P3, where the entry exists and the file is "
+        "gone: here the file is present and the manifest is silent, which is "
+        "what a version-1 manifest looks like and what B-P2's writer produces. "
+        "A reader that only checks the entries it finds calls such a directory "
+        "complete, which is precisely the fail-open the version bump exists to "
+        "prevent",
+        "test_check_manifest_REFUSES_a_manifest_that_names_no_documentation",
+        [("    if not documented:", "    if False and not documented:")],
+    ),
+    (
+        "B-P6",
+        "the recorded hash is a CONSTANT rather than a measurement of the "
+        "shipped bytes. The manifest still carries a `sha256`, still has the "
+        "right shape, and attests to nothing: every release would record the "
+        "same 64 hex digits and a drifted document would verify against a "
+        "number that describes no file. A test asserting merely that the field "
+        "is present, or that it is 64 characters, passes",
+        "test_the_manifest_ACCOUNTS_for_the_shipped_documentation",
+        [
+            (
+                "    return hashlib.sha256(payload).hexdigest()",
+                '    return "0" * 64',
+            )
+        ],
+    ),
+    (
+        "B-P7",
+        "a MISSING repository document ships a STUB instead of failing the "
+        "build. This is the silent repair the plan forbids, arriving at the "
+        "packaging boundary: the release would carry a document that says "
+        "nothing, under a hash that verifies, with the manifest reporting a "
+        "complete set. Worse than B-P1, because B-P1 is visible as an absence "
+        "and this is invisible as a lie",
+        "test_a_MISSING_repository_document_FAILS_the_build_rather_than_shipping_a_stub",
+        [
+            (
+                "    if not FORMAT_DOC_SOURCE.exists():\n        raise ValueError(",
+                "    if not FORMAT_DOC_SOURCE.exists():\n"
+                '        return b"# prior artifact format\\n"\n'
+                "    if False:\n        raise ValueError(",
+            )
+        ],
+    ),
+    (
+        "B-P8",
+        "the documentation copied AFTER the manifest, breaking the ordering "
+        "protocol in the direction that matters. The manifest is written LAST "
+        "so its presence is the completion record; a document written after it "
+        "means a build that dies between the two leaves a manifest that "
+        "VERIFIES -- it hashed a file that no longer describes the release -- "
+        "or, on a first build, a manifest whose own `write_manifest` guard "
+        "fires and leaves nothing. Killed by the part-way-failure test, which "
+        "asserts the honest intermediate state: artifacts, document, no "
+        "manifest",
+        "test_the_documentation_is_written_BEFORE_the_manifest_which_is_still_LAST",
+        [
+            (
+                "    copy_format_documentation(out_dir)\n"
+                "    written.append(save_prior(full, out_dir / f\"{stem}_full.npz\"))",
+                "    written.append(save_prior(full, out_dir / f\"{stem}_full.npz\"))",
+            ),
+            (
+                "    # LAST, after every artifact of this resolution. See `write_manifest`.\n",
+                "    copy_format_documentation(out_dir)\n"
+                "    # LAST, after every artifact of this resolution. See `write_manifest`.\n",
+            ),
+        ],
+    ),
+    (
+        "B-P9",
+        "`write_manifest`'s OWN guard removed, so it attests to a set whose "
+        "document is not there. The reader's check (B-P3) protects a consumer; "
+        "this protects the release, and the two are not redundant: without it "
+        "a manifest is written naming a file that vanished between the copy "
+        "and the write, and the failure surfaces to a consumer as a missing "
+        "file with nothing saying the build knew",
+        "test_write_manifest_REFUSES_to_attest_to_a_set_with_no_documentation",
+        [
+            (
+                "    doc = out_dir / FORMAT_DOC_NAME\n    if not doc.exists():",
+                "    doc = out_dir / FORMAT_DOC_NAME\n    if False:",
+            )
+        ],
+    ),
+    (
+        "B-P10",
+        "`MANIFEST_VERSION` put back to 1 while the `documentation` entry "
+        "stays. The bump is what makes the addition fail CLOSED: a version-1 "
+        "reader written against the previous release would accept a set with "
+        "no documentation entry, and ours would accept theirs. The document "
+        "states the current version, so this also desynchronises the release "
+        "documentation from the file it describes",
+        "test_the_documented_manifest_VERSION_and_DOCUMENTATION_entry_match_a_real_one",
+        [("MANIFEST_VERSION = 2", "MANIFEST_VERSION = 1")],
     ),
 ]
 

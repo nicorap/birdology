@@ -2843,3 +2843,478 @@ def test_the_documented_manifest_rule_is_the_one_check_manifest_ENFORCES(tmp_pat
     (out_dir / "prior_dof_r4_manifest.json").unlink()
     with pytest.raises(ValueError, match="not a complete release"):
         check_manifest(out_dir, "dof", 4)
+
+
+# --------------------------------------------------------------------------
+# I2/B-I2j: the params reach the EMPTY-SPECIES path of the full grid.
+# --------------------------------------------------------------------------
+
+
+def test_the_params_reach_the_EMPTY_species_grid_not_just_the_populated_one():
+    """The no-species branch is a SECOND call site, and it is easy to miss.
+
+    `estimate_over_full_grid` cannot use `pa.concat_tables([])`, so an empty
+    species axis is served by a separate `smooth(hierarchical_estimate(...))`
+    call. That call is the one a reader edits last and tests least, and a
+    version of it that omitted the params would silently compute the empty
+    grid at the module defaults while the populated grid used the caller's.
+
+    NOTHING ABOUT THE VALUES CAN PIN IT: the empty grid has zero rows, so
+    there is no number to compare. What is observable is that the params
+    OBJECT REACHES THE VALIDATORS -- `smooth` and `hierarchical_estimate` both
+    validate what they are handed -- so an invalid params object must be
+    refused on the empty path exactly as it is on the populated one. A params
+    argument dropped from that call makes the refusal disappear, because the
+    default the call would fall back to is valid by construction.
+
+    BOTH objects are checked, and asserted separately: a mutant that drops one
+    of the two arguments leaves the other still raising, and a single
+    assertion could not tell that from both arriving.
+    """
+    cell = h3.latlng_to_cell(*POINTS[0], 4)
+    ratios = pa.table(
+        {
+            "species_key": pa.array([1], pa.int64()),
+            "cell": pa.array([cell], pa.string()),
+            "week": pa.array([5], pa.int8()),
+            "n": pa.array([1], pa.int64()),
+            "total": pa.array([1], pa.int64()),
+        }
+    )
+
+    # THE PRECONDITION: this really is the empty branch. Zero rows, and the
+    # schema still the grid's -- so the branch ran rather than short-circuiting.
+    empty = estimate_over_full_grid(ratios, [], [cell])
+    assert empty.num_rows == 0
+    assert set(empty.schema.names) == {"species_key", "cell", "week", "p"}
+
+    # The BACKOFF params reach the empty path.
+    with pytest.raises(ValueError, match="is not below 1.0"):
+        estimate_over_full_grid(
+            ratios, [], [cell], backoff_params=BackoffParams(floor=2.0)
+        )
+    # ...and so do the SMOOTHING params. Asserted separately: one dropped
+    # argument would leave the other's refusal intact.
+    with pytest.raises(ValueError, match="space_weight=-1.0 is negative"):
+        estimate_over_full_grid(
+            ratios, [], [cell], smoothing_params=SmoothingParams(space_weight=-1.0)
+        )
+
+    # And the SAME two objects are refused on the POPULATED path, so the test
+    # above is about the empty branch rather than about the guards existing.
+    with pytest.raises(ValueError, match="is not below 1.0"):
+        estimate_over_full_grid(
+            ratios, [1], [cell], backoff_params=BackoffParams(floor=2.0)
+        )
+    with pytest.raises(ValueError, match="space_weight=-1.0 is negative"):
+        estimate_over_full_grid(
+            ratios, [1], [cell], smoothing_params=SmoothingParams(space_weight=-1.0)
+        )
+
+
+def test_the_SMOOTHING_params_actually_CHANGE_the_values_not_just_the_sidecar():
+    """The smoothing half of `..._CHANGE_the_values_not_just_the_sidecar`.
+
+    That test moves `cell_week_weight` and so pins only that
+    `backoff_params` reaches the computation. A build that threaded the
+    backoff params honestly and passed `SmoothingParams()` to `smooth` while
+    RECORDING the caller's would pass it, pass every sidecar assertion, and
+    publish a faithful-looking record of a smoothing that did not happen.
+
+    Measured through `build_from_archive` on this file's archive, reading the
+    `.npz` back off disk: `time_weight` 0.0 against 2.0 moves the largest
+    stored value by 0.130, and `space_weight` 0.0 against 5.0 by 0.061. The
+    threshold below is two orders of magnitude under the smaller of those, so
+    it is about the params arriving at all rather than about the exact number.
+    """
+    import tempfile
+
+    tmp = Path(tempfile.mkdtemp())
+    archive = _archive(tmp)
+
+    def spread(one, two):
+        a = load_prior(
+            next(
+                p
+                for p in _build(
+                    tmp,
+                    archive=archive,
+                    out_dir=tmp / f"sm_{id(one)}",
+                    smoothing_params=one,
+                )
+                if p.name.endswith("_full.npz")
+            )
+        )
+        b = load_prior(
+            next(
+                p
+                for p in _build(
+                    tmp,
+                    archive=archive,
+                    out_dir=tmp / f"sm_{id(two)}",
+                    smoothing_params=two,
+                )
+                if p.name.endswith("_full.npz")
+            )
+        )
+        assert a.species_keys.tolist() == b.species_keys.tolist()
+        assert a.cells == b.cells
+        return float(np.abs(a.dense() - b.dense()).max())
+
+    time_spread = spread(
+        SmoothingParams(space_weight=0.0, time_weight=0.0),
+        SmoothingParams(space_weight=0.0, time_weight=2.0),
+    )
+    assert time_spread > 1e-3, (
+        f"moving `time_weight` 0.0 -> 2.0 changed the largest stored value by "
+        f"only {time_spread:.3e}; the smoothing params reach the sidecar but "
+        "apparently not the smoother"
+    )
+
+    space_spread = spread(
+        SmoothingParams(space_weight=0.0, time_weight=0.3),
+        SmoothingParams(space_weight=5.0, time_weight=0.3),
+    )
+    assert space_spread > 1e-3, (
+        f"moving `space_weight` 0.0 -> 5.0 changed the largest stored value by "
+        f"only {space_spread:.3e}; `time_weight` alone reaching the smoother "
+        "would satisfy the assertion above"
+    )
+
+
+# --------------------------------------------------------------------------
+# RELEASE PACKAGING: the decoding contract ships BESIDE the artifacts, and the
+# manifest accounts for it (the obligation carried open since round 5).
+# --------------------------------------------------------------------------
+
+
+def test_a_CONTROL_of_a_params_less_prior_declares_NO_params_rather_than_defaults(
+    tmp_path,
+):
+    """`_respec` does not carry the params, so it must not INVENT them either.
+
+    `controls._respec` constructs a `PriorTensor` without passing
+    `backoff_params`, so the DATACLASS FIELD DEFAULT is what decides what a
+    control of a params-less prior declares. If that default were
+    `BackoffParams()` rather than `None`, every control built by a library
+    caller -- and every control of a hand-assembled tensor -- would publish
+    today's constants as the ones it was built with, which is a claim about a
+    computation that never ran in the one field whose whole purpose is to be
+    believed.
+
+    WHY THIS TEST EXISTS AND WHERE IT WAS FOUND. The mutation harness scored
+    exactly these two edits (T-I2m, T-I2p) as SURVIVORS: every other
+    construction path passes the params explicitly, so the field defaults were
+    reachable only through `_respec` and nothing asserted them. The CLI hides
+    it -- `build_from_archive` overwrites both fields on every control -- which
+    is precisely why the property needs its own test rather than being read off
+    an end-to-end build.
+
+    IT LIVES IN THIS FILE rather than `test_controls.py` only because the round
+    that found it did not own that file. The contract belongs to `tensor.py`'s
+    dataclass and the reachable path belongs to `controls.py`; a later round
+    consolidating control tests should move it.
+
+    Asserted through `save_prior`/`load_prior` on a real sidecar, because the
+    harm is what the ARTIFACT says, not what the object holds.
+    """
+    from birdology.prior.controls import CONTROLS as CONTROL_REGISTRY
+    from birdology.prior.tensor import save_prior, to_tensor
+
+    prior = to_tensor(
+        pa.table(
+            {
+                "species_key": pa.array([1, 2], pa.int64()),
+                "cell": pa.array(["cell-a", "cell-b"], pa.string()),
+                "week": pa.array([4, 9], pa.int8()),
+                "p": pa.array([0.25, 0.5], pa.float64()),
+            }
+        ),
+        build_prior.PriorSpec(resolution=4, source="dof", variant="full"),
+    )
+    prior.gbif_doi = DOI
+    # THE PRECONDITION: the prior itself declares nothing, so what the control
+    # declares is the control's own doing.
+    assert prior.backoff_params is None and prior.smoothing_params is None
+
+    assert CONTROL_REGISTRY, "an empty registry would make this vacuous"
+    for name, make in CONTROL_REGISTRY.items():
+        control = make(prior)
+        npz = save_prior(control, tmp_path / f"c_{name}.npz")
+        back = load_prior(npz)
+        assert back.backoff_params is None, (
+            f"the {name!r} control of a params-less prior claims "
+            f"{back.backoff_params!r}; `_respec` fabricated a record of a "
+            "shrinkage that never ran"
+        )
+        assert back.smoothing_params is None, name
+
+
+def test_the_build_SHIPS_the_format_documentation_beside_the_artifacts(tmp_path):
+    """A Zenodo upload of the output directory carries its own decoding contract.
+
+    THE DEFECT: nothing copied `docs/prior-artifact-format.md` out of the
+    repository. Every reference to it was a test reading it from the checkout,
+    so a published `output/priors/` was a set of `.npz` files whose format was
+    documented only somewhere the consumer does not have. The sidecar alone
+    does not say that filling with 0.0 vetoes every unobserved context, or
+    what the shrinkage constants cost, or what CC BY obliges.
+
+    Asserted on a PIPELINE build, and BYTE-FOR-BYTE against the repository's
+    copy -- a rendered, templated or summarised copy would be a second version
+    of the contract that could disagree with the one the tests pin.
+    """
+    paths = _build(tmp_path)
+    out_dir = paths[0].parent
+
+    shipped = out_dir / build_prior.FORMAT_DOC_NAME
+    assert shipped.exists(), (
+        f"the build wrote {len(paths)} artifacts and no format documentation; "
+        "an upload of this directory ships matrices a third party cannot "
+        "correctly decode"
+    )
+    assert shipped.read_bytes() == ARTIFACT_DOC.read_bytes()
+    # ...and it really is the document the doc tests pin, not an empty file.
+    assert b"A missing entry is NOT zero" in shipped.read_bytes()
+
+
+def test_the_manifest_ACCOUNTS_for_the_shipped_documentation(tmp_path):
+    """By name and by content hash, under the manifest's own protocol.
+
+    The manifest's whole protocol is that a missing entry means an incomplete
+    release. Copying the document without recording it would leave a release
+    whose completeness check passes over a directory the document was deleted
+    from -- the round-5 obligation half-discharged a second time.
+
+    The `sha256` is checked to be the hash of the SHIPPED bytes rather than
+    merely present: a recorded constant would satisfy a presence assertion.
+    """
+    import hashlib
+    import json
+
+    paths = _build(tmp_path, resolution=4, source="dof")
+    out_dir = paths[0].parent
+    meta = json.loads(
+        build_prior.manifest_path(out_dir, "dof", 4).read_text(encoding="utf-8")
+    )
+
+    entry = meta["documentation"]
+    assert entry["path"] == build_prior.FORMAT_DOC_NAME
+    shipped = (out_dir / entry["path"]).read_bytes()
+    assert entry["sha256"] == hashlib.sha256(shipped).hexdigest()
+    # DERIVED, not a constant: the same hash must be the repository copy's.
+    assert entry["sha256"] == hashlib.sha256(ARTIFACT_DOC.read_bytes()).hexdigest()
+
+
+def test_check_manifest_REFUSES_a_set_whose_documentation_is_missing(tmp_path):
+    """Absence fails closed, exactly like a missing control.
+
+    A release is what a third party downloads. A directory of well-formed,
+    correctly provenanced matrices with no decoding contract is incomplete in
+    the only sense that matters, and `check_manifest` is the check that has to
+    say so.
+    """
+    paths = _build(tmp_path, resolution=4, source="dof")
+    out_dir = paths[0].parent
+    assert check_manifest(out_dir, "dof", 4)  # precondition: it verifies first
+
+    (out_dir / build_prior.FORMAT_DOC_NAME).unlink()
+    with pytest.raises(ValueError, match="truncated artifact set"):
+        check_manifest(out_dir, "dof", 4)
+
+
+def test_check_manifest_REFUSES_a_manifest_that_names_no_documentation(tmp_path):
+    """A manifest silent about the contract would authenticate its absence.
+
+    Distinct from the test above: there the file is gone and the manifest
+    still names it. Here the FILE IS PRESENT and the manifest does not account
+    for it, which is what a version of `write_manifest` that skipped the entry
+    would produce -- and a reader that only looked at entries it found would
+    call that directory complete.
+    """
+    import json
+
+    paths = _build(tmp_path, resolution=4, source="dof")
+    out_dir = paths[0].parent
+    path = build_prior.manifest_path(out_dir, "dof", 4)
+    meta = json.loads(path.read_text(encoding="utf-8"))
+    del meta["documentation"]
+    path.write_text(json.dumps(meta), encoding="utf-8")
+
+    assert (out_dir / build_prior.FORMAT_DOC_NAME).exists()
+    with pytest.raises(ValueError, match="names no format documentation"):
+        check_manifest(out_dir, "dof", 4)
+
+
+def test_check_manifest_REFUSES_documentation_that_DRIFTED_from_the_hash(tmp_path):
+    """The failure a NAME cannot see: the shipped copy was edited or truncated.
+
+    The artifacts are originals; this one file is a COPY, and a copy keeps its
+    name when someone edits it in place beside the artifacts or a write leaves
+    it half-written. A consumer decoding against a drifted contract gets
+    plausible wrong numbers rather than an error, which is why the hash is
+    recorded and checked rather than the name alone.
+    """
+    paths = _build(tmp_path, resolution=4, source="dof")
+    out_dir = paths[0].parent
+    shipped = out_dir / build_prior.FORMAT_DOC_NAME
+
+    # A TRUNCATION, not a random edit: it is the failure that actually happens,
+    # and it leaves a file that still parses as markdown and still has the
+    # right name.
+    shipped.write_bytes(shipped.read_bytes()[: len(shipped.read_bytes()) // 2])
+    with pytest.raises(ValueError, match="is not the document this build published"):
+        check_manifest(out_dir, "dof", 4)
+
+
+def test_the_documentation_is_written_BEFORE_the_manifest_which_is_still_LAST(
+    tmp_path,
+):
+    """The ordering protocol survives the addition. Proved by killing the build.
+
+    The manifest is written LAST so that its absence is exactly the state a
+    truncated build leaves. Adding a file to the release could have broken
+    that two ways: written after the manifest (a verified set could be missing
+    its contract) or written so late that a part-way failure leaves neither.
+
+    An exception forced in the third `save_prior` reproduces a part-way build
+    and asserts the honest directory: partial artifacts, the DOCUMENT, and NO
+    manifest. `check_manifest` then refuses, as it must.
+    """
+    out = tmp_path / "priors"
+    real_save = build_prior.save_prior
+    calls = []
+
+    def exploding(tensor, path):
+        calls.append(path)
+        if len(calls) == 3:
+            raise RuntimeError("forced failure part-way through the resolution")
+        return real_save(tensor, path)
+
+    build_prior.save_prior = exploding
+    try:
+        with pytest.raises(RuntimeError, match="forced failure"):
+            _build(tmp_path, out_dir=out)
+    finally:
+        build_prior.save_prior = real_save
+
+    assert len(list(out.glob("*.npz"))) == 2
+    # The document IS there: it is written before the first artifact.
+    assert (out / build_prior.FORMAT_DOC_NAME).exists()
+    # The manifest is NOT: it is still last, so its absence is the signal.
+    assert not build_prior.manifest_path(out, "dof", 4).exists()
+    with pytest.raises(ValueError, match="no artifact manifest"):
+        check_manifest(out, "dof", 4)
+
+
+def test_write_manifest_REFUSES_to_attest_to_a_set_with_no_documentation(tmp_path):
+    """The writer's own guard, independent of the reader's.
+
+    `check_manifest` protects a consumer; this protects the release. A
+    manifest written over a directory whose document was removed between the
+    copy and the manifest write would be a completion record attesting to a
+    file that is not there -- and it would then fail the consumer's check with
+    no explanation of where the file went. Both directions are load-bearing
+    and neither is redundant.
+    """
+    out = tmp_path / "priors"
+    paths = _build(tmp_path, out_dir=out)
+    (out / build_prior.FORMAT_DOC_NAME).unlink()
+    with pytest.raises(ValueError, match="is not beside the artifacts"):
+        build_prior.write_manifest(out, "dof", 4, paths, DOI)
+
+
+def test_a_MISSING_repository_document_FAILS_the_build_rather_than_shipping_a_stub(
+    tmp_path, monkeypatch
+):
+    """No silent repair at the packaging boundary either.
+
+    Substituting a placeholder, or skipping the copy, would reinstate the
+    defect while the manifest looked discharged -- worse than the original,
+    because the release would then carry a document that says nothing under a
+    hash that verifies.
+    """
+    monkeypatch.setattr(
+        build_prior, "FORMAT_DOC_SOURCE", tmp_path / "definitely-not-here.md"
+    )
+    out = tmp_path / "priors"
+    with pytest.raises(ValueError, match="format documentation .* is missing"):
+        _build(tmp_path, out_dir=out)
+    # NOTHING written: the refusal comes before the first artifact.
+    assert not out.exists() or not list(out.glob("*.npz"))
+
+
+def test_a_RESOLUTION_SWEEP_ships_ONE_document_that_every_manifest_agrees_on(
+    tmp_path,
+):
+    """Three resolutions into one `--out` is the normal invocation.
+
+    The document is per-DIRECTORY, not per-resolution, so the copy is written
+    three times with the same bytes and every manifest records the same hash.
+    A per-resolution name would leave a consumer with three files and nothing
+    saying they are identical; a per-resolution hash disagreement would mean
+    the copy drifted mid-sweep.
+    """
+    import json
+
+    out = tmp_path / "priors"
+    archive = _archive(tmp_path)
+    for resolution in (3, 4, 5):
+        _build(tmp_path, archive=archive, out_dir=out, resolution=resolution)
+
+    docs = sorted(p.name for p in out.glob("*.md"))
+    assert docs == [build_prior.FORMAT_DOC_NAME]
+
+    hashes = set()
+    for resolution in (3, 4, 5):
+        assert check_manifest(out, "dof", resolution)
+        meta = json.loads(
+            build_prior.manifest_path(out, "dof", resolution).read_text(
+                encoding="utf-8"
+            )
+        )
+        hashes.add(meta["documentation"]["sha256"])
+    assert len(hashes) == 1, (
+        f"the three resolutions of one sweep recorded {len(hashes)} different "
+        "documentation hashes; the shipped copy changed mid-sweep"
+    )
+
+
+def test_the_documented_manifest_VERSION_and_DOCUMENTATION_entry_match_a_real_one(
+    tmp_path,
+):
+    """Section 2c and 2d, executed against a manifest the build wrote.
+
+    The version BUMP is the load-bearing half: version 1 carried no
+    documentation entry, so a reader that skipped an absent key would
+    authenticate exactly the release this entry exists to prevent. If the
+    document still said 1 a third party would write a version-1 reader and
+    accept our undocumented sets.
+
+    The `sha256` is deliberately NOT compared against the document's example:
+    the example is inside the document being hashed, so no literal printed
+    there can ever be right. That is asserted, so nobody 'fixes' it.
+    """
+    import json
+
+    doc = ARTIFACT_DOC.read_text(encoding="utf-8")
+    paths = _build(tmp_path, resolution=4, source="dof")
+    out_dir = paths[0].parent
+    real = json.loads(
+        (out_dir / "prior_dof_r4_manifest.json").read_text(encoding="utf-8")
+    )
+
+    example = next(
+        json.loads(b) for b in _fenced(doc, "json") if "manifest_version" in b
+    )
+    assert sorted(example) == sorted(real)
+    assert example["manifest_version"] == real["manifest_version"] == MANIFEST_VERSION
+    assert sorted(example["documentation"]) == sorted(real["documentation"])
+    assert example["documentation"]["path"] == real["documentation"]["path"]
+    # The one field the document cannot state truthfully, and says so.
+    assert example["documentation"]["sha256"] != real["documentation"]["sha256"]
+    assert "placeholder" in doc
+
+    # The rule a reader acts on, in the words they act on.
+    assert "not a complete artifact set" in doc
+    assert "prior-artifact-format.md` is in it" in doc

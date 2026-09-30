@@ -252,7 +252,7 @@ for example `prior_dof_r4_manifest.json`. A real one:
 
 ```json
 {
-  "manifest_version": 1,
+  "manifest_version": 2,
   "source": "dof",
   "resolution": 3,
   "stem": "prior_dof_r3",
@@ -265,19 +265,34 @@ for example `prior_dof_r4_manifest.json`. A real one:
     {"npz": "prior_dof_r3_shuffle_space.npz", "sidecar": "prior_dof_r3_shuffle_space.json"},
     {"npz": "prior_dof_r3_shuffle_time.npz",  "sidecar": "prior_dof_r3_shuffle_time.json"},
     {"npz": "prior_dof_r3_separable.npz",     "sidecar": "prior_dof_r3_separable.json"}
-  ]
+  ],
+  "documentation": {
+    "path": "prior-artifact-format.md",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  }
 }
 ```
 
+The `sha256` above is a placeholder and is the one field of this example that
+is deliberately not a real value: it is the hash of *this document*, so no
+example printed inside this document can carry it. Check it against the file
+you received, never against anything written here.
+
 | field | meaning |
 |---|---|
-| `manifest_version` | schema version of this file. Currently `1`. A reader that does not know the version must **refuse** the file, not half-read it |
+| `manifest_version` | schema version of this file. Currently `2`. A reader that does not know the version must **refuse** the file, not half-read it |
 | `source` | matches the artifacts' `spec.source` |
 | `resolution` | matches the artifacts' `spec.resolution` |
 | `stem` | the filename prefix every artifact of this resolution shares |
 | `gbif_doi` | the same DOI every sidecar in the set carries |
 | `artifact_count` | how many entries `artifacts` has. Informational — **verify the names, not this number**; any six files would satisfy a count, including six copies of the full prior |
 | `artifacts` | one entry per artifact, each naming its `npz` and its `sidecar`, both as bare filenames in the same directory |
+| `documentation` | **this document, shipped with the release** — `path` is its bare filename in the same directory, `sha256` is the hash of its bytes. See section 2d |
+
+Version `1` of this manifest had no `documentation` entry. That is why the
+version was bumped rather than the field simply added: a reader that skipped an
+absent key would authenticate exactly the release this entry exists to prevent
+— artifacts with no decoding contract beside them.
 
 ### The rule
 
@@ -303,9 +318,46 @@ supposed to be.
 
 To check a set: read the manifest, refuse if it is absent, refuse if
 `manifest_version` is not one you know, confirm `source` and `resolution` match
-what you asked for, and confirm every `npz` **and** every `sidecar` it names
-exists in the directory. An `.npz` whose sidecar never landed is a truncated
-*artifact*, and the same mid-resolution failure produces it.
+what you asked for, confirm every `npz` **and** every `sidecar` it names exists
+in the directory, and confirm the `documentation` file it names exists and
+hashes to the recorded `sha256`. An `.npz` whose sidecar never landed is a
+truncated *artifact*, and the same mid-resolution failure produces it.
+
+---
+
+## 2d. This document ships with the artifacts
+
+**A copy of this file is written into the artifact directory by the build, and
+the manifest accounts for it by name and by content hash.** If you received a
+directory of `.npz` files, `prior-artifact-format.md` is in it, and it is the
+document those files were released with.
+
+This exists because the artifacts are not self-describing enough to be used
+without it. The sidecar says `missing_value` is `1e-06` but not that filling
+with `0.0` instead is a silent veto on every unobserved context; it records
+`cell_week_weight` but not that a res-5 artifact therefore retains under half
+of the real seasonal amplitude; it carries a licence and a DOI but not the
+obligation that CC BY places on you. Shipping the matrices without this file
+would leave all of that in a source repository that a consumer of a data
+archive has no reason to have.
+
+Three properties worth knowing:
+
+1. **It is byte-identical to the repository's copy.** The build copies the
+   bytes; it does not render, template or summarise them.
+2. **The manifest records its `sha256`.** A name cannot detect that a *copy*
+   drifted — edited in place beside the artifacts, or left truncated by a
+   failed write — and a consumer decoding against a drifted contract gets
+   plausible wrong numbers rather than an error. The artifacts themselves are
+   not hashed in the manifest: each already carries a sidecar whose `nnz` you
+   check against the matrix.
+3. **It is written before the first artifact, and the manifest is still
+   last.** So a build that died part-way leaves partial artifacts, this
+   document, and no manifest — which is exactly the state the rule in section
+   2c tells you to refuse.
+
+If the document is absent, or its hash does not match, treat the directory the
+same way you would treat a missing control: **not a complete release.**
 
 ---
 
@@ -523,4 +575,8 @@ are pinned by `tests/prior/test_amplitude_retention.py`, which generates a known
 seasonal and spatial signal, builds it through the CLI's own entry point and
 asserts floors under the retained fraction at every default resolution. Section
 2c's manifest shape and its named-artifacts rule are pinned by
-`tests/prior/test_build_prior.py::test_the_documented_MANIFEST_shape_matches_a_real_one`.*
+`tests/prior/test_build_prior.py::test_the_documented_MANIFEST_shape_matches_a_real_one`.
+Section 2d's claim that this document ships beside the artifacts is pinned by
+`tests/prior/test_build_prior.py::test_the_build_SHIPS_the_format_documentation_beside_the_artifacts`,
+which builds through `build_from_archive` and compares the shipped bytes with
+this file's.*

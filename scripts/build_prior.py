@@ -123,6 +123,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import logging
 import re
 import resource
@@ -680,7 +681,91 @@ def cell_axis(counts: pa.Table) -> list[str]:
 #: Bumped when the SHAPE changes; `check_manifest` refuses a version it does
 #: not know rather than guessing, because a manifest it half-understands is
 #: worse than none (it would report a complete set from fields it skipped).
-MANIFEST_VERSION = 1
+#:
+#: 2 adds the `documentation` entry. The bump is what makes the addition
+#: FAIL CLOSED: a version-1 manifest carries no documentation entry, and a
+#: reader that merely skipped the absent key would authenticate the very
+#: release this round exists to stop shipping -- artifacts with no decoding
+#: contract beside them.
+MANIFEST_VERSION = 2
+
+#: The release's decoding contract, and the name it ships under.
+#:
+#: WHY THE BUILD COPIES IT (the round-5 packaging obligation, closed here)
+#: ----------------------------------------------------------------------
+#: `docs/prior-artifact-format.md` is what lets a third party with numpy and
+#: the standard library decode the `.npz` and its sidecar CORRECTLY -- the
+#: column packing, the rule that an unstored context is the floor and not
+#: zero, the shrinkage constants and what they cost, and the CC BY 4.0
+#: attribution the licence obliges. Until now nothing copied it beside the
+#: files `save_prior` writes: every reference to it lived in a test reading it
+#: out of the repository. An upload of `output/priors/` therefore shipped
+#: artifacts whose format was documented only in a git checkout the consumer
+#: does not have.
+#:
+#: So the build writes it into the output directory and the manifest accounts
+#: for it exactly as it accounts for everything else: by NAME, with the rule
+#: that an absent entry means an incomplete release.
+#:
+#: ONE COPY PER OUTPUT DIRECTORY, not one per resolution. A `--resolutions 3 4
+#: 5` sweep writes the same bytes to the same path three times; that is
+#: idempotent, and it is what a consumer of the directory wants (one document,
+#: not one per resolution with nothing saying they are identical).
+FORMAT_DOC_SOURCE = (
+    Path(__file__).resolve().parent.parent / "docs" / "prior-artifact-format.md"
+)
+FORMAT_DOC_NAME = FORMAT_DOC_SOURCE.name
+
+
+def format_documentation_bytes() -> bytes:
+    """The decoding contract's bytes, or a refusal naming the missing file.
+
+    RAISES rather than shipping a stub or skipping the copy. A release whose
+    format documentation is absent is the defect this closes; substituting a
+    placeholder, or writing the artifacts anyway, would reinstate it while
+    looking discharged -- and the manifest would then attest to a document
+    that says nothing.
+    """
+    if not FORMAT_DOC_SOURCE.exists():
+        raise ValueError(
+            f"the release format documentation {FORMAT_DOC_SOURCE} is missing; "
+            "refusing to write an artifact set with no decoding contract "
+            "beside it. Every artifact is released CC BY 4.0 and its sidecar "
+            "is the only thing saying what a value means, what an unstored "
+            "context is, and how hard the estimate was shrunk -- a consumer "
+            "who has the files and not this document cannot decode them "
+            "correctly and cannot know they got it wrong"
+        )
+    return FORMAT_DOC_SOURCE.read_bytes()
+
+
+def documentation_digest(payload: bytes) -> str:
+    """The sha256 the manifest records for the shipped documentation.
+
+    A CONTENT hash, because the failure a name cannot see is DRIFT: the copy
+    beside the artifacts is a copy, and a copy edited in place -- or truncated
+    by a failed write -- still has the right name. The artifacts themselves
+    are not hashed here; each one already carries a sidecar whose `nnz` the
+    reader checks against the matrix, and hashing multi-hundred-megabyte
+    `.npz` files on every build buys less than it costs.
+    """
+    return hashlib.sha256(payload).hexdigest()
+
+
+def copy_format_documentation(out_dir: Path) -> Path:
+    """Put the decoding contract BESIDE the artifacts. Returns the path written.
+
+    Called before the first artifact of a resolution and therefore before the
+    manifest, which is still the LAST file to appear: `write_manifest` hashes
+    the bytes of the file this wrote, so it CANNOT run first. The ordering
+    that makes a truncated build detectable is a data dependency here rather
+    than a convention someone has to remember.
+    """
+    payload = format_documentation_bytes()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / FORMAT_DOC_NAME
+    path.write_bytes(payload)
+    return path
 
 
 def artifact_stem(source: str, resolution: int) -> str:
@@ -751,6 +836,17 @@ def write_manifest(
     added to that registry appears in the manifest with no edit here, and
     `check_manifest` then requires it. Nothing in this file hardcodes four,
     five, or the current control names.
+
+    IT ALSO ACCOUNTS FOR THE FORMAT DOCUMENTATION, BY NAME AND BY CONTENT
+    --------------------------------------------------------------------
+    The decoding contract is part of the release, not a repository file: an
+    artifact set shipped without it is undecodable by the third party it is
+    published for. So it gets a `documentation` entry under the same protocol
+    as everything else -- a missing entry means an incomplete release -- plus a
+    `sha256`, because a NAME cannot see the one failure a copy has and an
+    original does not: drift. The bytes are re-read HERE rather than taken from
+    the caller, so the hash describes the file that is on disk at the moment
+    the manifest attests to it.
     """
     import json
 
@@ -763,6 +859,15 @@ def write_manifest(
                 "sidecar": npz.with_suffix(".json").name,
             }
         )
+    doc = out_dir / FORMAT_DOC_NAME
+    if not doc.exists():
+        raise ValueError(
+            f"the format documentation {doc} is not beside the artifacts this "
+            "manifest is about to attest to; the manifest is the completion "
+            "record for the whole release and a set with no decoding contract "
+            "is not complete. `copy_format_documentation` writes it before the "
+            "first artifact, so this means it was removed or never ran"
+        )
     payload = {
         "manifest_version": MANIFEST_VERSION,
         "source": source,
@@ -774,6 +879,13 @@ def write_manifest(
         # any five files, including five copies of the full prior.
         "artifact_count": len(artifacts),
         "artifacts": artifacts,
+        # The release's decoding contract. `sha256` is what a name cannot do:
+        # detect that the shipped copy drifted from the document this build
+        # published. Read off disk, so the hash is of the shipped bytes.
+        "documentation": {
+            "path": doc.name,
+            "sha256": documentation_digest(doc.read_bytes()),
+        },
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -797,6 +909,18 @@ def check_manifest(out_dir: Path, source: str, resolution: int) -> list[Path]:
     writes both and `load_prior` requires both: an `.npz` whose sidecar never
     landed is a truncated artifact rather than a truncated set, and the same
     mid-resolution failure produces it.
+
+    THE FORMAT DOCUMENTATION IS CHECKED THE SAME WAY, AND ALSO BY HASH
+    -----------------------------------------------------------------
+    A set whose decoding contract is missing is incomplete in the sense that
+    matters to the only audience the release has: a third party holding the
+    files and nothing else cannot decode them correctly and cannot tell that
+    they got it wrong. Absence fails closed exactly like a missing control.
+
+    The `sha256` is checked too, which nothing else here needs: the artifacts
+    are originals, the document is a COPY, and a copy can drift while keeping
+    its name -- edited in place beside the artifacts, or left truncated by a
+    failed write. A name check cannot see either.
     """
     import json
 
@@ -839,6 +963,18 @@ def check_manifest(out_dir: Path, source: str, resolution: int) -> list[Path]:
             name = entry.get(key)
             if not name or not (out_dir / name).exists():
                 missing.append(name or f"<no {key} in manifest entry>")
+    recorded_doc = meta.get("documentation") or {}
+    documented = recorded_doc.get("path")
+    if not documented:
+        raise ValueError(
+            f"artifact manifest {path} names no format documentation; the "
+            "release's decoding contract is part of the release, and a "
+            "manifest that does not account for it would authenticate a set "
+            "of `.npz` files a third party cannot correctly decode"
+        )
+    doc_path = out_dir / documented
+    if not doc_path.exists():
+        missing.append(documented)
     if missing:
         raise ValueError(
             f"artifact manifest {path} names {len(entries)} artifact(s) but "
@@ -846,6 +982,18 @@ def check_manifest(out_dir: Path, source: str, resolution: int) -> list[Path]:
             f"{sorted(missing)}. This is a truncated artifact set: each file "
             "present is individually valid and correctly provenanced, which "
             "is precisely why the absence cannot be seen without the manifest"
+        )
+    recorded_digest = recorded_doc.get("sha256")
+    actual_digest = documentation_digest(doc_path.read_bytes())
+    if recorded_digest != actual_digest:
+        raise ValueError(
+            f"the format documentation {doc_path} has sha256 {actual_digest} "
+            f"but the manifest records {recorded_digest!r}; the shipped "
+            "decoding contract is not the document this build published. A "
+            "copy keeps its name when it is edited in place or left truncated "
+            "by a failed write, so only the content hash can see this, and a "
+            "consumer decoding against a drifted contract gets plausible "
+            "wrong numbers rather than an error"
         )
     return [out_dir / entry["npz"] for entry in entries]
 
@@ -1021,6 +1169,14 @@ def build_from_archive(
     # being overwritten right now, and a build that failed half way through
     # would leave a mixture of two builds under a manifest that verifies.
     manifest_path(out_dir, source, resolution).unlink(missing_ok=True)
+    # BEFORE the first artifact. The decoding contract ships WITH the files,
+    # not in a git checkout the consumer does not have (the round-5 packaging
+    # obligation). Before, rather than after, so a build that dies part-way
+    # leaves a directory that is honest about itself: partial artifacts, the
+    # document that describes them, and NO manifest. Writing it after the
+    # artifacts would add a second way to get a complete-looking set with no
+    # contract beside it.
+    copy_format_documentation(out_dir)
     written.append(save_prior(full, out_dir / f"{stem}_full.npz"))
     for name, make in CONTROLS.items():
         control = make(full)
