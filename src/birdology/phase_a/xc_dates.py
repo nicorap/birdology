@@ -196,7 +196,23 @@ def fetch_species_dates(
                         key,
                     )
                 ) from None
-            payload = resp.json()
+            try:
+                payload = resp.json()
+            except ValueError as exc:
+                # A 200 with a non-JSON body (proxy or gateway HTML). Without
+                # this, the JSONDecodeError escapes fetch_species_dates and
+                # aborts the whole multi-species sweep; as DateFetchFailed it
+                # is counted per species and the sweep continues. The body is
+                # NOT included in the message: a captive-portal page can be
+                # arbitrarily large and is useless in a Slurm log.
+                raise DateFetchFailed(
+                    _redact(
+                        f"XC returned a non-JSON body for {query!r} page "
+                        f"{page} (HTTP {resp.status_code}): "
+                        f"{type(exc).__name__}",
+                        key,
+                    )
+                ) from None
             if "error" in payload:
                 raise DateFetchFailed(
                     _redact(

@@ -348,3 +348,26 @@ def test_injected_session_is_used_unchanged():
     session.get.return_value = _resp({"numPages": 1, "recordings": []})
     fetch_species_dates("parus", "major", key=FAKE_KEY, session=session)
     assert session.get.call_count == 1
+
+
+def test_a_200_with_a_NON_JSON_body_is_DateFetchFailed_not_an_escape():
+    """Final-gate I1: a proxy/captive-portal HTML page behind HTTP 200.
+
+    Without the guard, json.JSONDecodeError escapes fetch_species_dates and
+    aborts the whole multi-species sweep; as DateFetchFailed the driver counts
+    one failed species and continues. The message must carry neither the key
+    nor the body.
+    """
+    session = MagicMock()
+    resp = MagicMock()
+    resp.raise_for_status.return_value = None
+    resp.status_code = 200
+    resp.json.side_effect = ValueError("Expecting value: line 1 column 1")
+    session.get.return_value = resp
+    with pytest.raises(DateFetchFailed, match="non-JSON body"):
+        fetch_species_dates("parus", "major", key="sekrit_k", session=session)
+    # And the failure must not leak the key.
+    try:
+        fetch_species_dates("parus", "major", key="sekrit_k", session=session)
+    except DateFetchFailed as exc:
+        assert "sekrit_k" not in str(exc)
