@@ -452,3 +452,21 @@ def test_factories_return_callables_with_mocked_runtime():
 def test_module_import_pulls_no_tensorflow():
     """encoders.py must stay importable on TF-less machines (melsummary users)."""
     assert "tensorflow" not in sys.modules
+
+
+def test_pool_perch_outputs_accepts_the_MEASURED_4d_shape():
+    """batch_embed on the real perch_v2 returns (n, 1, 1, 1536) — measured on
+    the fleet 2026-09-30. The first golden-reference run failed here."""
+    n = 3
+    x = np.arange(n * 1536, dtype=np.float32).reshape(n, 1, 1, 1536)
+    out = _pool_perch_outputs(x)
+    assert out.shape == (n, 1536)
+    # Asymmetric content check: row i must be row i's values, untangled.
+    assert (out == x.reshape(n, 1536)).all()
+
+
+def test_pool_perch_outputs_refuses_a_nonsingleton_middle_axis():
+    """time=2 means the model saw >5 s inputs; squeezing would interleave."""
+    x = np.zeros((2, 2, 1, 1536), dtype=np.float32)
+    with pytest.raises(ValueError, match="non-singleton"):
+        _pool_perch_outputs(x)

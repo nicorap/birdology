@@ -107,23 +107,27 @@ def _frame_for_perch(samples: np.ndarray, sr: int) -> np.ndarray:
 def _pool_perch_outputs(embeddings_array: np.ndarray) -> np.ndarray:
     """Adapt hoplite batch_embed output to (n_windows, 1536) float32.
 
-    hoplite returns [batch, time, channels]; each input here is exactly one
-    5 s window, so time == 1 — squeeze to (batch, 1536). Already-flat
-    (batch, 1536) passes through unchanged. Anything else (e.g. time > 1)
-    raises loudly: reshaping it away would silently interleave values from
-    different windows into every embedding.
+    MEASURED on the fleet (2026-09-30, perch_v2 GPU SavedModel via
+    perch-hoplite 1.0.4): `batch_embed([n, 160000])` returns
+    **(n, 1, 1, 1536)** — batch, time, channel, features — and `embed(7 s)`
+    returns (1, 1, 1536), confirming one window per 5 s with the trailing
+    remainder dropped. Each input here is exactly one 5 s window, so every
+    middle axis must be singleton; squeeze them to (batch, 1536).
+    Already-flat (batch, 1536) passes through unchanged. A NON-singleton
+    middle axis raises loudly: reshaping it away would silently interleave
+    values from different windows into every embedding.
 
     Pure numpy so contract tests can pin the axis logic without TensorFlow.
     """
     emb = np.asarray(embeddings_array, dtype=np.float32)
     if emb.ndim == 2:
         return emb
-    if emb.ndim == 3 and emb.shape[1] == 1:
-        return emb[:, 0, :]
+    if emb.ndim >= 3 and all(s == 1 for s in emb.shape[1:-1]):
+        return emb.reshape(emb.shape[0], emb.shape[-1])
     raise ValueError(
         f"unexpected perch embeddings shape {emb.shape}; expected "
-        "(batch, 1536) or (batch, 1, 1536) — a time axis > 1 means the "
-        "model saw inputs longer than one 5 s window"
+        "(batch, 1536) with only singleton middle axes — a non-singleton "
+        "time axis means the model saw inputs longer than one 5 s window"
     )
 
 
