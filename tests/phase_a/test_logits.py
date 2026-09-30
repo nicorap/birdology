@@ -246,8 +246,22 @@ class _FakeSession:
         self._result_fn = result_fn
         self.run_inputs: list = []
         self.ended = 0
+        self.entered = 0
+
+    def __enter__(self):
+        # The REAL birdnet session starts its pipeline processes here.
+        # A run_arrays before __enter__ raises exactly like birdnet 1.1.1:
+        # this is the bug that failed all 12000 pilot recordings.
+        self.entered += 1
+        return self
+
+    def __exit__(self, *exc):
+        self.end()
+        return False
 
     def run_arrays(self, inputs):
+        if self.entered == 0:
+            raise RuntimeError("Pipeline is not initialized.")
         self.run_inputs.append(inputs)
         return self._result_fn(inputs)
 

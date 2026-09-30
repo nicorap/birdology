@@ -374,7 +374,18 @@ class _BirdnetSession:
 
     def _open(self):
         if self._session is None:
-            self._session = self._open_session()
+            session = self._open_session()
+            # birdnet sessions are CONTEXT MANAGERS: __enter__ is what
+            # actually starts the pipeline (producer/worker processes).
+            # Calling run_arrays on a constructed-but-unentered session
+            # raises RuntimeError('Pipeline is not initialized.') — measured
+            # on the fleet 2026-09-30: the first pilot failed all 12000
+            # recordings this way (the probes all used `with`, the wrapper
+            # didn't).
+            enter = getattr(session, "__enter__", None)
+            if enter is not None:
+                enter()
+            self._session = session
             if not self._atexit_registered:
                 # Register once per wrapper, not per re-open: atexit holds a
                 # reference forever and close() is idempotent anyway.
