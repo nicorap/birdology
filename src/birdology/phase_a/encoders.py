@@ -50,6 +50,12 @@ PERCH_SR = 32_000
 PERCH_WINDOW_SAMPLES = 160_000  # 5 s at 32 kHz
 PERCH_HOP_SAMPLES = 160_000  # hop 5 s: non-overlapping windows
 PERCH_TARGET_PEAK = 0.25
+# Hard ceiling on windows per batch_embed call. MEASURED (XCL production
+# array 4493, 2026-09-30): passing an hour-class recording as ONE call makes
+# hoplite run every window in a single GPU pass — a 76.66 GiB activation
+# allocation that OOM-killed 14 tasks and took dgx160 AND dgx176 down with
+# them. 64 windows = 320 s of audio per pass, comfortably bounded on an H100.
+PERCH_MAX_WINDOWS_PER_CALL = 64
 
 
 def _mean_log_mel(samples: np.ndarray, sr: int, n_mels: int = 64) -> np.ndarray:
@@ -173,6 +179,90 @@ def _pool_perch_logits(logits_array: np.ndarray) -> np.ndarray:
     )
 
 
+def _iter_perch_chunks(batch: np.ndarray) -> "list[np.ndarray]":
+    """Cut a (1, n_samples) raw-audio batch at window boundaries into pieces
+    of at most PERCH_MAX_WINDOWS_PER_CALL windows each.
+
+    Semantics preserved exactly (hoplite reference behaviour, measured): the
+    chunk size is a multiple of PERCH_WINDOW_SAMPLES so window boundaries are
+    identical to the unchunked call; a trailing piece shorter than one full
+    window is DROPPED (hoplite drops the trailing remainder of a long
+    recording — but PADS a sub-window recording, so a batch that is short in
+    its entirety passes through whole and keeps that padding behaviour).
+    """
+    x = np.asarray(batch)[0]
+    chunk = PERCH_MAX_WINDOWS_PER_CALL * PERCH_WINDOW_SAMPLES
+    if x.size <= chunk:
+        return [x[None, :]]
+    pieces = []
+    for start in range(0, x.size, chunk):
+        piece = x[start : start + chunk]
+        if piece.size >= PERCH_WINDOW_SAMPLES:
+            pieces.append(piece[None, :])
+    return pieces
+
+
+def _chunked_perch_infer(
+    batch_embed: Callable[[np.ndarray], Any],
+    batch: np.ndarray,
+    want_logits: bool,
+) -> Mapping[str, np.ndarray]:
+    """Run batch_embed over bounded chunks and pool to recording level.
+
+    The recording-level embedding/logits are the mean over ALL windows, so
+    per-chunk sums are accumulated and divided by the total window count —
+    mathematically identical to the single-call mean (window boundaries are
+    unchanged, see _iter_perch_chunks), but the GPU never sees more than
+    PERCH_MAX_WINDOWS_PER_CALL windows at once (the single-call path OOM-
+    killed hour-class XCL recordings at 76.66 GiB and crashed two nodes).
+    """
+    emb_sum: np.ndarray | None = None
+    logit_sum: np.ndarray | None = None
+    total_windows = 0
+    for piece in _iter_perch_chunks(batch):
+        outputs = batch_embed(piece)
+        emb = np.asarray(outputs.embeddings, dtype=np.float32)
+        if not (emb.ndim == 4 and emb.shape[0] == 1 and emb.shape[2] == 1):
+            raise ValueError(
+                f"unexpected perch embeddings shape {emb.shape}; expected "
+                "(1, n_windows, 1, 1536) from batch_embed of ONE recording — "
+                "a batch > 1 here would silently mix recordings"
+            )
+        n_windows = emb.shape[1]
+        piece_emb_sum = emb[0, :, 0, :].sum(axis=0)
+        emb_sum = piece_emb_sum if emb_sum is None else emb_sum + piece_emb_sum
+        if want_logits:
+            logits_dict = getattr(outputs, "logits", None)
+            if not logits_dict or "label" not in logits_dict:
+                have = sorted(logits_dict) if logits_dict else []
+                raise ValueError(
+                    "perch batch_embed returned no logits['label'] "
+                    f"(logits keys: {have}); the with-logits encoder refuses "
+                    "to write an embedding-only row silently — use "
+                    "load_encoder('perch') if logits are genuinely not wanted"
+                )
+            lg = np.asarray(logits_dict["label"], dtype=np.float32)
+            if not (lg.ndim == 3 and lg.shape[0] == 1 and lg.shape[1] == n_windows):
+                raise ValueError(
+                    f"unexpected perch logits shape {lg.shape}; expected "
+                    f"(1, {n_windows}, n_classes) matching this chunk's "
+                    "windows — refusing to guess axes on a surprise shape"
+                )
+            piece_lg_sum = lg[0].sum(axis=0)
+            logit_sum = (
+                piece_lg_sum if logit_sum is None else logit_sum + piece_lg_sum
+            )
+        total_windows += n_windows
+    assert emb_sum is not None and total_windows > 0  # _iter never yields []
+    result: dict[str, np.ndarray] = {
+        "embedding": (emb_sum / total_windows).astype(np.float32)
+    }
+    if want_logits:
+        assert logit_sum is not None
+        result["logits"] = (logit_sum / total_windows).astype(np.float32)
+    return result
+
+
 def _load_perch_model() -> Callable[[np.ndarray], Mapping[str, np.ndarray]]:
     """Lazy-load Perch 2.0 via perch-hoplite; adapt to windows -> {'embedding'}.
 
@@ -192,7 +282,9 @@ def _load_perch_model() -> Callable[[np.ndarray], Mapping[str, np.ndarray]]:
 
     def infer(batch: np.ndarray) -> Mapping[str, np.ndarray]:
         # batch is (1, n_samples) RAW audio; hoplite frames and normalizes.
-        return {"embedding": _pool_perch_outputs(loaded.batch_embed(batch).embeddings)}
+        # Chunked: hour-class XCL recordings OOM a single batch_embed call
+        # (76.66 GiB measured) — see _chunked_perch_infer.
+        return _chunked_perch_infer(loaded.batch_embed, batch, want_logits=False)
 
     return infer
 
@@ -247,20 +339,10 @@ def _load_perch_model_with_logits() -> Callable[[np.ndarray], Mapping[str, np.nd
     loaded = model_configs.load_model_by_name("perch_v2")
 
     def infer(batch: np.ndarray) -> Mapping[str, np.ndarray]:
-        outputs = loaded.batch_embed(batch)
-        logits_dict = getattr(outputs, "logits", None)
-        if not logits_dict or "label" not in logits_dict:
-            have = sorted(logits_dict) if logits_dict else []
-            raise ValueError(
-                "perch batch_embed returned no logits['label'] "
-                f"(logits keys: {have}); the with-logits encoder refuses to "
-                "write an embedding-only row silently — use load_encoder("
-                "'perch') if logits are genuinely not wanted"
-            )
-        return {
-            "embedding": _pool_perch_outputs(outputs.embeddings),
-            "logits": _pool_perch_logits(logits_dict["label"]),
-        }
+        # Chunked: hour-class XCL recordings OOM a single batch_embed call
+        # (76.66 GiB measured) — see _chunked_perch_infer. The missing-logits
+        # refusal lives inside the chunked path.
+        return _chunked_perch_infer(loaded.batch_embed, batch, want_logits=True)
 
     return infer
 

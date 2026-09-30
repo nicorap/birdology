@@ -17,10 +17,13 @@ import pytest
 
 from birdology.phase_a.encoders import (
     PERCH_HOP_SAMPLES,
+    PERCH_MAX_WINDOWS_PER_CALL,
     PERCH_SR,
     PERCH_TARGET_PEAK,
     PERCH_WINDOW_SAMPLES,
     _batch_for_perch,
+    _chunked_perch_infer,
+    _iter_perch_chunks,
     _masked_mean,
     _pool_perch_outputs,
     load_encoder,
@@ -445,3 +448,129 @@ def test_factories_return_callables_with_mocked_runtime():
 def test_module_import_pulls_no_tensorflow():
     """encoders.py must stay importable on TF-less machines (melsummary users)."""
     assert "tensorflow" not in sys.modules
+
+
+class _FakeBatchEmbedOutputs:
+    """Shape-faithful stand-in for hoplite InferenceOutputs: embeddings
+    (1, n_windows, 1, 1536), logits {'label': (1, n_windows, C)}."""
+
+    def __init__(self, emb, logits=None):
+        self.embeddings = emb
+        self.logits = logits
+
+
+def _fake_batch_embed(calls, n_classes=7, with_logits=True, dim=1536):
+    """batch_embed double that derives per-window values from the AUDIO
+    CONTENT (window index encoded in the samples), so chunked and unchunked
+    calls can be compared for exact pooling equivalence. Records every call's
+    window count in `calls`."""
+
+    def batch_embed(piece):
+        x = np.asarray(piece)[0]
+        n_windows = max(1, x.size // PERCH_WINDOW_SAMPLES)
+        calls.append(n_windows)
+        # window value = mean of its samples (deterministic content hash)
+        vals = np.array(
+            [
+                x[i * PERCH_WINDOW_SAMPLES : (i + 1) * PERCH_WINDOW_SAMPLES].mean()
+                if x.size >= PERCH_WINDOW_SAMPLES
+                else x.mean()
+                for i in range(n_windows)
+            ],
+            dtype=np.float32,
+        )
+        emb = np.tile(vals[None, :, None, None], (1, 1, 1, dim))
+        lg = (
+            {"label": np.tile(vals[None, :, None], (1, 1, n_classes)) * 2.0}
+            if with_logits
+            else None
+        )
+        return _FakeBatchEmbedOutputs(emb, lg)
+
+    return batch_embed
+
+
+def _windows_audio(n_windows: int) -> np.ndarray:
+    """Audio of exactly n_windows full perch windows, window i filled with
+    the constant i+1 (so each window's mean identifies it)."""
+    return np.concatenate(
+        [
+            np.full(PERCH_WINDOW_SAMPLES, float(i + 1), dtype=np.float32)
+            for i in range(n_windows)
+        ]
+    )[None, :]
+
+
+def test_iter_perch_chunks_short_batch_passes_through_whole():
+    batch = np.zeros((1, PERCH_WINDOW_SAMPLES // 2), dtype=np.float32)
+    pieces = _iter_perch_chunks(batch)
+    assert len(pieces) == 1
+    assert pieces[0].shape == batch.shape
+
+
+def test_iter_perch_chunks_cuts_at_window_boundaries():
+    n = PERCH_MAX_WINDOWS_PER_CALL + 3
+    pieces = _iter_perch_chunks(_windows_audio(n))
+    assert len(pieces) == 2
+    assert pieces[0].shape[1] == PERCH_MAX_WINDOWS_PER_CALL * PERCH_WINDOW_SAMPLES
+    assert pieces[1].shape[1] == 3 * PERCH_WINDOW_SAMPLES
+
+
+def test_iter_perch_chunks_drops_subwindow_trailing_remainder():
+    """Hoplite drops a long recording's trailing sub-window remainder; the
+    chunker must not turn it into a padded phantom window."""
+    n = PERCH_MAX_WINDOWS_PER_CALL
+    full = _windows_audio(n)
+    with_tail = np.concatenate(
+        [full, np.ones((1, PERCH_WINDOW_SAMPLES // 4), dtype=np.float32)], axis=1
+    )
+    pieces = _iter_perch_chunks(with_tail)
+    assert len(pieces) == 1
+    assert pieces[0].shape[1] == n * PERCH_WINDOW_SAMPLES
+
+
+def test_chunked_infer_never_exceeds_window_ceiling():
+    """The OOM shape: an hour-class recording must reach the GPU as bounded
+    calls — the single-call path allocated 76.66 GiB and crashed two nodes
+    (measured, XCL array 4493)."""
+    calls: list[int] = []
+    batch = _windows_audio(3 * PERCH_MAX_WINDOWS_PER_CALL + 5)
+    _chunked_perch_infer(_fake_batch_embed(calls), batch, want_logits=True)
+    assert len(calls) == 4
+    assert max(calls) <= PERCH_MAX_WINDOWS_PER_CALL
+
+
+def test_chunked_infer_pooling_equals_single_call_mean():
+    """Chunked mean must equal the unchunked mean EXACTLY in float64-free
+    arithmetic terms (same window boundaries, sum/total)."""
+    calls: list[int] = []
+    be = _fake_batch_embed(calls)
+    n = PERCH_MAX_WINDOWS_PER_CALL + 7
+    batch = _windows_audio(n)
+    got = _chunked_perch_infer(be, batch, want_logits=True)
+    # reference: single call over the whole batch
+    ref_out = be(batch)
+    ref_emb = ref_out.embeddings[0, :, 0, :].mean(axis=0)
+    ref_lg = ref_out.logits["label"][0].mean(axis=0)
+    np.testing.assert_allclose(got["embedding"], ref_emb, rtol=0, atol=1e-6)
+    np.testing.assert_allclose(got["logits"], ref_lg, rtol=0, atol=1e-6)
+    assert got["embedding"].dtype == np.float32
+    assert got["logits"].dtype == np.float32
+
+
+def test_chunked_infer_without_logits_omits_the_column():
+    calls: list[int] = []
+    got = _chunked_perch_infer(
+        _fake_batch_embed(calls, with_logits=False), _windows_audio(2), want_logits=False
+    )
+    assert set(got) == {"embedding"}
+
+
+def test_chunked_infer_missing_logits_refuses_loudly():
+    calls: list[int] = []
+    with pytest.raises(ValueError, match="no logits"):
+        _chunked_perch_infer(
+            _fake_batch_embed(calls, with_logits=False),
+            _windows_audio(2),
+            want_logits=True,
+        )
