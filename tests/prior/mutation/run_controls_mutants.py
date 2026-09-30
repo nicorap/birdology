@@ -1183,6 +1183,213 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
             )
         ],
     ),
+    # ---- final-gate I1: a shuffle may never BE the prior ------------------
+    #
+    # The gate built a single-cell prior end to end and got a
+    # `prior_dof_r4_shuffle_space.npz` with the FULL PRIOR'S sha256. Every
+    # clause of `_refuse_an_unmoved_shuffle` gets a mutant, and so does each
+    # of its two call sites, because the recurrence history on this branch is
+    # exactly "a guard with no mutant": the same class of defect was fixed
+    # twice in the TEST FIXTURE and came back in the artifact.
+    (
+        "C63",
+        "the unmoved-shuffle refusal BYPASSED at `shuffle_space`'s call site, "
+        "restoring the gate's finding exactly: on a 1- or 2-cell axis the "
+        "seed-0 permutation is the identity, so the control is written out "
+        "byte-identical to the full prior -- correctly packed, correctly "
+        "provenanced, labelled `shuffle_space`, and read by a sweep as 'the "
+        "spatial effect does not survive its control'",
+        "test_shuffle_space_REFUSES_to_emit_the_prior_on_a_degenerate_cell_axis",
+        [
+            (
+                '        _refuse_an_unmoved_shuffle(\n'
+                "            blocks.reshape(dense.shape),\n"
+                "            dense,\n"
+                '            "shuffle_space",\n'
+                '            "cell",\n'
+                "            n_cells,\n"
+                "            seed,\n"
+                "        ),",
+                "        blocks.reshape(dense.shape),",
+            )
+        ],
+    ),
+    (
+        "C64",
+        "the refusal bypassed at `shuffle_time`'s call site -- the time "
+        "mirror of C63, and a separate mutant because a guard present on one "
+        "shuffle and absent on its mirror is how the two drift apart. The "
+        "week axis cannot reach the identity regime, but a prior with a flat "
+        "season in every cell is returned unchanged by any week permutation",
+        "test_shuffle_time_is_refused_on_a_PRIOR_WITH_NO_SEASON_at_all",
+        [
+            (
+                '        _refuse_an_unmoved_shuffle(\n'
+                "            blocks.reshape(dense.shape),\n"
+                "            dense,\n"
+                '            "shuffle_time",\n'
+                '            "week",\n'
+                "            WEEKS_PER_YEAR,\n"
+                "            seed,\n"
+                "        ),",
+                "        blocks.reshape(dense.shape),",
+            )
+        ],
+    ),
+    (
+        "C65",
+        "the refusal's condition removed inside the helper, so both call "
+        "sites keep their guard and the guard keeps nothing. Separate from "
+        "C63/C64: a test that catches a bypassed call site need not catch a "
+        "hollowed-out helper, and this is the shape a refactor produces",
+        "test_BOTH_shuffles_are_refused_on_the_prior_the_others_legitimately_match",
+        [("    if np.array_equal(shuffled, dense):", "    if False:")],
+    ),
+    (
+        "C66",
+        "the condition INVERTED, so every ordinary prior is refused and only "
+        "a degenerate one is accepted -- the C40/C60-shaped mirror, which "
+        "takes the paper's credibility section down before it computes "
+        "anything rather than corrupting a number",
+        "test_an_ORDINARY_prior_is_not_refused_by_either_shuffle",
+        [
+            (
+                "    if np.array_equal(shuffled, dense):",
+                "    if not np.array_equal(shuffled, dense):",
+            )
+        ],
+    ),
+    (
+        "C67",
+        "the refusal WEAKENED to a permutation-identity check, which is the "
+        "obvious spelling and is strictly weaker: an identity permutation "
+        "implies an unmoved grid, but an unmoved grid does NOT imply an "
+        "identity permutation. A prior whose cell blocks all carry the same "
+        "values is relabelled into itself by a permutation that displaces "
+        "every cell, so this spelling ships the same byte-identical file",
+        "test_shuffle_space_is_refused_on_an_UNMOVED_GRID_even_at_a_GOOD_permutation",
+        [
+            (
+                "    blocks = blocks[:, np.random.default_rng(seed).permutation(n_cells), :]\n"
+                "    return _respec(\n"
+                "        t,\n"
+                '        "shuffle_space",\n'
+                "        _refuse_an_unmoved_shuffle(\n"
+                "            blocks.reshape(dense.shape),\n"
+                "            dense,\n"
+                '            "shuffle_space",\n'
+                '            "cell",\n'
+                "            n_cells,\n"
+                "            seed,\n"
+                "        ),\n"
+                "    )",
+                "    _perm = np.random.default_rng(seed).permutation(n_cells)\n"
+                "    if np.array_equal(_perm, np.arange(n_cells)):\n"
+                "        raise ValueError(\n"
+                '            "the shuffle_space control is byte-identical to the full "\n'
+                '            "prior it is the null for"\n'
+                "        )\n"
+                "    blocks = blocks[:, _perm, :]\n"
+                '    return _respec(t, "shuffle_space", blocks.reshape(dense.shape))',
+            )
+        ],
+    ),
+    (
+        "C68",
+        "a fixed-point RATE THRESHOLD added on top -- the arbitrary-constant "
+        "trap this branch has hit before. The fixed-point count of a uniform "
+        "random permutation is Poisson(1) at EVERY axis length, so a rate "
+        "rule tight enough to reject the 3-of-10 draw at seed 0 rejects ~8% "
+        "of perfectly good draws on a 897-cell national axis too, and a "
+        "control drawn from fixed-point-free permutations is a DIFFERENT null",
+        "test_a_permutation_with_FIXED_POINTS_is_deliberately_ACCEPTED",
+        [
+            (
+                "    blocks = blocks[:, np.random.default_rng(seed).permutation(n_cells), :]\n"
+                "    return _respec(\n"
+                "        t,\n"
+                '        "shuffle_space",',
+                "    _perm = np.random.default_rng(seed).permutation(n_cells)\n"
+                "    if float((_perm == np.arange(n_cells)).mean()) > 0.2:\n"
+                '        raise ValueError("too many fixed points in the drawn permutation")\n'
+                "    blocks = blocks[:, _perm, :]\n"
+                "    return _respec(\n"
+                "        t,\n"
+                '        "shuffle_space",',
+            )
+        ],
+    ),
+    (
+        "C69",
+        "the refusal SILENTLY REPAIRS instead of raising: an unmoved grid is "
+        "rolled by one column rather than refused. The warn-and-continue "
+        "shape the plan's rule B forbids, in its worst form -- the artifact "
+        "is still written, is still labelled a shuffle, and is now a "
+        "one-column roll of the prior rather than a random relabelling, so "
+        "it is not the null it claims either way",
+        "test_the_unmoved_shuffle_guard_RAISES_rather_than_warning_or_repairing",
+        [
+            (
+                "    if np.array_equal(shuffled, dense):\n        raise ValueError(",
+                "    if np.array_equal(shuffled, dense):\n"
+                "        return np.roll(shuffled, 1, axis=1)\n"
+                "    if False:\n        raise ValueError(",
+            )
+        ],
+    ),
+    (
+        "C70",
+        "the guard MISFIRED onto `uniform`, which legitimately coincides with "
+        "an already-constant prior: 'the prior's mass with no information at "
+        "all' genuinely equals a prior that carries no information. A guard "
+        "that fired there would refuse a correct control, and the same "
+        "argument covers `marginal` on a per-species-constant prior and "
+        "`separable` on a prior with no interaction -- which is why the guard "
+        "is at the two shuffles and not in `_respec`",
+        "test_the_unmoved_guard_does_NOT_MISFIRE_on_the_non_shuffle_controls",
+        [
+            (
+                '    return _respec(t, "uniform", np.full(dense.shape, fill, dtype=np.float64))',
+                "    return _respec(\n"
+                '        t,\n        "uniform",\n'
+                "        _refuse_an_unmoved_shuffle(\n"
+                "            np.full(dense.shape, fill, dtype=np.float64),\n"
+                '            dense,\n            "uniform",\n            "cell",\n'
+                "            len(t.cells),\n            0,\n"
+                "        ),\n    )",
+            )
+        ],
+    ),
+    (
+        "C71",
+        "the refusal message reports seed 0 rather than the seed it was "
+        "given. The refusal still fires, so every `pytest.raises` passes -- "
+        "and the operator, whose remedy for a degenerate draw is a DIFFERENT "
+        "SEED, is told the wrong one. A message is the only output a refusal "
+        "has",
+        "test_the_unmoved_shuffle_refusal_names_the_axis_its_LENGTH_and_the_SEED",
+        [
+            (
+                'f"the null for: seed {seed} moved nothing on a {axis} axis of "',
+                'f"the null for: seed 0 moved nothing on a {axis} axis of "',
+            )
+        ],
+    ),
+    (
+        "C72",
+        "`shuffle_space` names the WEEK axis in its refusal, so a build that "
+        "collapsed to one CELL reports a 52-week axis as the cause. The "
+        "operator's fix differs by axis -- a coarser resolution against a "
+        "different control -- and the message is what decides which they try",
+        "test_the_unmoved_shuffle_refusal_names_the_axis_its_LENGTH_and_the_SEED",
+        [
+            (
+                '            "shuffle_space",\n            "cell",\n            n_cells,',
+                '            "shuffle_space",\n            "week",\n'
+                "            WEEKS_PER_YEAR,",
+            )
+        ],
+    ),
 ]
 
 

@@ -2405,6 +2405,72 @@ def test_the_manifest_machinery_hardcodes_no_control_COUNT_or_NAME():
         )
 
 
+#: The two USER-FACING files that describe what a build produces. Prose has no
+#: equivalent of `test_the_manifest_machinery_hardcodes_no_control_COUNT_or_NAME`,
+#: and it is exactly where the count went stale: both said "four controls" for
+#: every commit after `0a352e1` added the fifth (final-gate M1).
+_PROSE_FILES = (
+    Path(__file__).parent.parent.parent / "README.md",
+    Path(__file__).parent.parent.parent / "Makefile",
+)
+
+
+def test_the_USER_FACING_PROSE_states_no_control_COUNT_that_can_go_stale():
+    """M1. The release must not describe its own contents with a stale number.
+
+    `README.md` and the `Makefile`'s `prior` target both claimed FOUR controls
+    from the commit that added the fifth until this one -- the release's own
+    description of what it ships, wrong, in the two places a user reads first.
+
+    The fix is NOT to write five. Nothing here asserts a count at all: the
+    build loop iterates `CONTROLS`, the manifest is derived from the paths it
+    writes, and the prose is now phrased so a sixth control needs no edit.
+    This test forbids the count from coming BACK -- in digits or in words --
+    rather than checking it is currently right, because "currently right" is
+    what the last two years of this file were.
+
+    Checked against `len(CONTROLS)` too: a claim that happens to match today
+    is still a claim that will not match tomorrow, so even the CORRECT number
+    is refused.
+    """
+    import re
+
+    words = (
+        "one", "two", "three", "four", "five", "six",
+        "seven", "eight", "nine", "ten",
+    )
+    # "<count> controls", "<count> registered controls", "<count> control
+    # artifacts". The `(?<!per )` is not a loophole: "one artifact per control"
+    # is DISTRIBUTIVE prose -- it says the set is derived per registry entry,
+    # which is exactly the phrasing this test wants -- rather than a claim
+    # about how many there are.
+    pattern = re.compile(
+        r"\b(\d+|" + "|".join(words) + r")\s+(?:\w+\s+){0,2}?"
+        r"(?<!per )controls?\b",
+        re.IGNORECASE,
+    )
+    for path in _PROSE_FILES:
+        text = path.read_text(encoding="utf-8")
+        found = [m.group(0) for m in pattern.finditer(text)]
+        assert not found, (
+            f"{path.name} states a control count -- {found!r}. Even "
+            f"{len(CONTROLS)}, which is right today, goes stale the day a "
+            "control is added; the build derives the set from `CONTROLS`, so "
+            "the prose should describe it by REFERENCE rather than by number"
+        )
+
+    # ...and the reference must actually be there, or "no number" is satisfied
+    # by prose that says nothing at all.
+    readme = _PROSE_FILES[0].read_text(encoding="utf-8")
+    assert "CONTROLS" in readme, (
+        "README must point at the registry it derives the artifact set from"
+    )
+    assert "manifest" in readme.lower(), (
+        "README must point a consumer at the manifest, which is the only "
+        "authoritative list of what a given release contains"
+    )
+
+
 # --------------------------------------------------------------------------
 # M2: the memory constant is pinned against a COMMITTED MEASUREMENT.
 # --------------------------------------------------------------------------
@@ -3024,10 +3090,17 @@ def test_a_CONTROL_of_a_params_less_prior_declares_NO_params_rather_than_default
     prior = to_tensor(
         pa.table(
             {
-                "species_key": pa.array([1, 2], pa.int64()),
-                "cell": pa.array(["cell-a", "cell-b"], pa.string()),
-                "week": pa.array([4, 9], pa.int8()),
-                "p": pa.array([0.25, 0.5], pa.float64()),
+                # THREE cells, not two: at two cells the seed-0 cell
+                # permutation is the IDENTITY, so `shuffle_space` emitted a
+                # grid byte-identical to this prior and
+                # `controls._refuse_an_unmoved_shuffle` (final-gate I1) now
+                # refuses it. The distinct stored week per cell is what makes
+                # the cell blocks differ, so the permutation has something to
+                # move.
+                "species_key": pa.array([1, 2, 1], pa.int64()),
+                "cell": pa.array(["cell-a", "cell-b", "cell-c"], pa.string()),
+                "week": pa.array([4, 9, 15], pa.int8()),
+                "p": pa.array([0.25, 0.5, 0.3], pa.float64()),
             }
         ),
         build_prior.PriorSpec(resolution=4, source="dof", variant="full"),

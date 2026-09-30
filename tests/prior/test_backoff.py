@@ -1574,16 +1574,41 @@ _E2E_POINTS = [(55.6867, 12.5700), (55.9000, 12.5000), (56.1629, 10.2039)]
 _E2E_DATES = ("2025-01-07", "2025-06-10", "2025-11-14")
 _E2E_SPECIES = (1001, 1002, 1003)
 
+#: Records per (species, point, date), DELIBERATELY UNBALANCED.
+#:
+#: With a flat four-records-each fixture every species' share is exactly 1/3
+#: in every cell-week, so the artifact is a GLOBALLY CONSTANT grid -- and a
+#: constant grid is returned unchanged by every permutation, so both shuffle
+#: controls came out byte-identical to the full prior. That is finding I1
+#: arriving through the fixture: this "the good build works" control test was
+#: passing while producing two controls that could not fail, and
+#: `controls._refuse_an_unmoved_shuffle` now refuses them.
+#:
+#: The balance varies by species AND by week, so no level of the hierarchy
+#: collapses to a shared number: a constant balance makes an observed
+#: cell-week numerically indistinguishable from a copied cell profile
+#: (`test_build_prior.py::COUNTS_BY_WEEK` records the same lesson).
+_E2E_COUNTS = {
+    1001: (7, 4, 2),
+    1002: (2, 6, 5),
+    1003: (3, 2, 8),
+}
+
 
 def _e2e_archive(tmp_path):
     import zipfile
 
     rows = []
     i = 0
-    for date in _E2E_DATES:
-        for lat, lon in _E2E_POINTS:
+    for di, date in enumerate(_E2E_DATES):
+        for pi, (lat, lon) in enumerate(_E2E_POINTS):
             for sk in _E2E_SPECIES:
-                for _ in range(4):
+                # Rotate the per-week balance by point as well, so the grid
+                # carries a space x time INTERACTION and not just two
+                # marginals: `separable` of a purely separable prior is that
+                # prior, which would be a third degenerate control.
+                n = _E2E_COUNTS[sk][(di + pi) % len(_E2E_DATES)]
+                for _ in range(n):
                     i += 1
                     rows.append(
                         "\t".join(

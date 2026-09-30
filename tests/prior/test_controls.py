@@ -1056,6 +1056,362 @@ def test_the_controls_read_an_unsurveyed_context_as_the_floor_not_zero():
 
 
 # ---------------------------------------------------------------------------
+# I1 (final gate): A SHUFFLE MAY NEVER BE THE PRIOR IT IS THE NULL FOR.
+#
+# `np.random.default_rng(0).permutation(n)` is the IDENTITY at n <= 2, and the
+# gate built a single-cell prior end to end and got a
+# `prior_dof_r4_shuffle_space.npz` with the FULL PRIOR'S SHA256 -- correctly
+# packed, correctly provenanced, labelled `shuffle_space`. Nothing raised.
+#
+# This is the THIRD time a permutation draw has produced a control here that
+# cannot fail. The first two were fixed by widening THIS FILE's cell axis,
+# which left shipped code with no guard, so the defect moved from the fixture
+# into the artifact. The guard is now in `src/` and these tests are what keep
+# it honest -- including the two things it must NOT do: fire on `uniform` /
+# `marginal` / `separable`, which legitimately coincide with a degenerate
+# prior, and reject a merely WEAK permutation.
+# ---------------------------------------------------------------------------
+
+#: Ten cells, because a fixed-point RATE threshold is only testable where the
+#: drawn permutation HAS fixed points: at seed 0, n=10 leaves 3 of 10 fixed
+#: (and n=5, the main fixture, leaves none). Real lower-case canonical H3
+#: res-4 spellings, like `CELLS`.
+CELLS_TEN = (
+    "8418c4bffffffff", "8418c1bffffffff", "8418c33ffffffff", "8418c09ffffffff",
+    "8418c47ffffffff", "8418c53ffffffff", "8418c0bffffffff", "8418c17ffffffff",
+    "8418c37ffffffff", "8418c43ffffffff",
+)
+
+
+def _degenerate_tensor(cells, p_of):
+    """A fully stored grid over *cells* whose value is `p_of(cell_i, week)`."""
+    return _to_tensor(
+        [
+            (SPECIES[si], cell, week, p_of(ci, week) * (_MASS_RATIO if si else 1.0))
+            for si in range(len(SPECIES))
+            for ci, cell in enumerate(cells)
+            for week in range(1, WEEKS_PER_YEAR + 1)
+        ]
+    )
+
+
+def _flat_in_cell_tensor(cells=CELLS):
+    """Every cell block IDENTICAL; the weekly profile is real.
+
+    A cell permutation maps this grid to itself for ANY permutation, identity
+    or not -- which is why the guard is on the emitted grid and not on the
+    permutation.
+    """
+    return _degenerate_tensor(cells, lambda ci, week: 0.02 + 0.0001 * week * week)
+
+
+def _flat_in_week_tensor(cells=CELLS):
+    """Every week slot IDENTICAL; the spatial profile is real. The mirror."""
+    return _degenerate_tensor(cells, lambda ci, week: 0.01 + 0.02 * (ci + 1) ** 2)
+
+
+def _constant_tensor(cells=CELLS):
+    """One value per species, everywhere. Degenerate on BOTH axes at once.
+
+    Per-species rather than globally constant, so it is `marginal`'s own fixed
+    point and still varies across species -- a globally flat grid would make
+    `marginal` coincide only because it had collapsed to `uniform`.
+    """
+    return _degenerate_tensor(cells, lambda ci, week: 0.2)
+
+
+def _globally_constant_tensor(cells=CELLS):
+    """ONE value across species as well: `uniform`'s own fixed point."""
+    return _to_tensor(
+        [
+            (SPECIES[si], cell, week, 0.2)
+            for si in range(len(SPECIES))
+            for cell in cells
+            for week in range(1, WEEKS_PER_YEAR + 1)
+        ]
+    )
+
+
+def _separable_tensor(cells=CELLS):
+    """A MULTIPLICATIVELY separable prior: `separable`'s own fixed point.
+
+    `cellmean * weekmean / grandmean` reproduces a block of the form
+    `c_term * w_term` exactly, so this grid has real space and real time
+    structure and NO interaction between them.
+    """
+    return _degenerate_tensor(
+        cells, lambda ci, week: (0.3 + 0.1 * ci) * (0.5 + 0.005 * week)
+    )
+
+
+#: The prior each non-shuffle control legitimately COINCIDES with. One per
+#: control, because a single globally-flat fixture would let `marginal` and
+#: `separable` pass by having collapsed to `uniform` rather than by being
+#: their own fixed points.
+_OWN_FIXED_POINT = {
+    "uniform": _globally_constant_tensor,
+    "marginal": _constant_tensor,
+    "separable": _separable_tensor,
+}
+
+
+def test_the_degenerate_fixtures_really_are_degenerate_the_way_they_claim():
+    """The precondition for everything below. A fixture that accidentally
+    carried structure would make every refusal test below pass for the wrong
+    reason -- and "the fixture could not show the effect" is the trap this
+    branch has hit four times."""
+    flat_cell = _flat_in_cell_tensor().dense()
+    blocks = flat_cell.reshape(len(SPECIES), len(CELLS), WEEKS_PER_YEAR)
+    for ci in range(1, len(CELLS)):
+        assert np.array_equal(blocks[:, ci, :], blocks[:, 0, :])
+    # ...but it DOES vary over weeks, so `shuffle_time` has work to do on it.
+    assert blocks[0, 0, :].std() > 0.0
+
+    flat_week = _flat_in_week_tensor().dense()
+    wblocks = flat_week.reshape(len(SPECIES), len(CELLS), WEEKS_PER_YEAR)
+    for wi in range(1, WEEKS_PER_YEAR):
+        assert np.array_equal(wblocks[:, :, wi], wblocks[:, :, 0])
+    assert wblocks[0, :, 0].std() > 0.0
+
+    const = _constant_tensor().dense()
+    for row in const:
+        assert np.array_equal(row, np.full(row.shape, row[0]))
+    # ...but the two species still differ, so `marginal` coincides with it by
+    # being its own fixed point rather than by collapsing to `uniform`.
+    assert const[0, 0] != const[1, 0]
+
+    flat = _globally_constant_tensor().dense()
+    assert np.array_equal(flat, np.full(flat.shape, flat[0, 0]))
+
+    # `separable`'s fixed point must have REAL space and REAL time structure
+    # and no interaction between them, or the coincidence proves nothing.
+    sep = _separable_tensor().dense()
+    sblocks = sep.reshape(len(SPECIES), len(CELLS), WEEKS_PER_YEAR)
+    assert sblocks[0].mean(axis=1).std() > 0.0, "no spatial structure"
+    assert sblocks[0].mean(axis=0).std() > 0.0, "no seasonal structure"
+    outer = np.outer(sblocks[0].mean(axis=1), sblocks[0].mean(axis=0))
+    assert sblocks[0] == pytest.approx(outer / sblocks[0].mean())
+
+
+@pytest.mark.parametrize("n_cells", [1, 2])
+def test_shuffle_space_REFUSES_to_emit_the_prior_on_a_degenerate_cell_axis(n_cells):
+    """The gate's finding, at both lengths where seed 0 draws the identity.
+
+    At n=1 the identity is the ONLY permutation there is, so no seed can
+    rescue it; at n=2 seed 0 happens to draw it. Both produce a control whose
+    bytes are the prior's, which a sweep reads as "the spatial effect does not
+    survive its control".
+    """
+    t = _to_tensor(
+        [
+            (SPECIES[si], cell, week, _p(ci, week, si))
+            for si in range(len(SPECIES))
+            for ci, cell in enumerate(CELLS[:n_cells])
+            for week in range(1, WEEKS_PER_YEAR + 1)
+        ]
+    )
+    perm = np.random.default_rng(SPACE_SEED).permutation(n_cells)
+    assert np.array_equal(perm, np.arange(n_cells)), (
+        "precondition: this test is about the regime where the draw IS the "
+        "identity, and it must be asserted rather than assumed"
+    )
+    with pytest.raises(ValueError, match="byte-identical to the full prior"):
+        shuffle_space(t, seed=SPACE_SEED)
+
+
+def test_the_unmoved_shuffle_refusal_names_the_axis_its_LENGTH_and_the_SEED():
+    """An operator's fix differs by cause -- a coarser build, a different
+    seed, or a different control -- so the message has to say which axis
+    collapsed, how long it was, and which seed drew the permutation. A bare
+    "control is degenerate" would leave them guessing."""
+    t = _flat_in_cell_tensor(CELLS[:1])
+    with pytest.raises(ValueError) as excinfo:
+        shuffle_space(t, seed=3)
+    message = str(excinfo.value)
+    assert "shuffle_space" in message
+    assert "cell axis of length 1" in message
+    assert "seed 3" in message
+    # Both CAUSES are named, because the code cannot tell them apart and the
+    # operator's remedy depends on which it is.
+    assert "displaces no cell" in message
+    assert "same values" in message
+
+
+def test_shuffle_space_is_refused_on_an_UNMOVED_GRID_even_at_a_GOOD_permutation():
+    """THE reason the guard is on the grid and not on the permutation.
+
+    A check spelled `if np.array_equal(perm, np.arange(n))` passes here -- the
+    draw displaces every one of the five cells -- and still ships a file
+    byte-identical to the prior, because every cell block holds the same
+    values. The grid-level check is strictly stronger and this fixture is what
+    separates the two spellings.
+    """
+    perm = np.random.default_rng(SPACE_SEED).permutation(len(CELLS))
+    assert not np.array_equal(perm, np.arange(len(CELLS)))
+    assert int((perm == np.arange(len(CELLS))).sum()) == 0, (
+        "precondition: the permutation must be entirely non-degenerate, so "
+        "ONLY the grid-level check can refuse this"
+    )
+    with pytest.raises(ValueError, match="byte-identical to the full prior"):
+        shuffle_space(_flat_in_cell_tensor(), seed=SPACE_SEED)
+
+
+def test_shuffle_time_is_refused_on_a_PRIOR_WITH_NO_SEASON_at_all():
+    """The time mirror, and the only route by which `shuffle_time` can
+    degenerate: the week axis is a schema constant, so no input shrinks it,
+    but a prior that is flat across weeks in every cell is returned unchanged
+    by every week permutation."""
+    perm = np.random.default_rng(TIME_SEED).permutation(WEEKS_PER_YEAR)
+    assert not np.array_equal(perm, np.arange(WEEKS_PER_YEAR))
+    with pytest.raises(ValueError, match="byte-identical to the full prior"):
+        shuffle_time(_flat_in_week_tensor(), seed=TIME_SEED)
+    with pytest.raises(ValueError, match="week axis of length 52"):
+        shuffle_time(_flat_in_week_tensor(), seed=TIME_SEED)
+
+
+def test_the_WEEK_axis_length_is_a_SCHEMA_CONSTANT_not_a_lucky_number():
+    """Why `shuffle_time` is safer than `shuffle_space`, stated as a property
+    rather than left as an accident of 52 being large.
+
+    The asymmetry is not the size of the two axes. It is that `WEEKS_PER_YEAR`
+    is fixed by the schema and no archive can shrink it, while the cell axis is
+    a function of the data -- a single-region case study or a coarse resolution
+    really does produce one or two cells. So the identity regime is
+    UNREACHABLE on the week axis and reachable on the cell axis.
+    """
+    assert WEEKS_PER_YEAR == 52
+    # The week permutation is drawn at a length that is the same for every
+    # artifact this package can write, so it cannot enter the n <= 2 regime.
+    assert WEEKS_PER_YEAR > 2
+    # And the identity is astronomically unlikely there rather than merely
+    # unlikely: 1/52! is ~8e-69. Checked over a wide seed sweep, because
+    # "unlikely" is not an assertion.
+    for seed in range(200):
+        perm = np.random.default_rng(seed).permutation(WEEKS_PER_YEAR)
+        assert not np.array_equal(perm, np.arange(WEEKS_PER_YEAR)), seed
+
+
+def test_a_permutation_with_FIXED_POINTS_is_deliberately_ACCEPTED():
+    """The subtler half of I1, answered NO.
+
+    At seed 0 a ten-cell axis leaves 3 of 10 cells fixed. That is not a
+    defect: the grid still moved, so the control still ran the experiment. A
+    rate threshold tight enough to reject it would reject ~8% of legitimate
+    draws at EVERY axis length (see the Poisson test below), and a control
+    drawn from fixed-point-free permutations is no longer a uniform random
+    relabelling -- a different null, which is a subtler version of the very
+    defect being fixed.
+    """
+    perm = np.random.default_rng(SPACE_SEED).permutation(len(CELLS_TEN))
+    fixed = int((perm == np.arange(len(CELLS_TEN))).sum())
+    assert fixed == 3, (
+        f"precondition: this test is about a WEAK draw and the draw has "
+        f"{fixed} fixed points; without any it pins nothing"
+    )
+    t = _degenerate_tensor(
+        CELLS_TEN, lambda ci, week: 0.02 + 0.005 * ci + 0.0001 * week * week
+    )
+    dense = t.dense()
+    blocks = dense.reshape(len(SPECIES), len(CELLS_TEN), WEEKS_PER_YEAR)
+    assert len({tuple(b) for b in blocks[0]}) == len(CELLS_TEN), (
+        "precondition: every cell block must be distinct, or a permutation "
+        "that displaces seven of ten cells could still emit the same grid"
+    )
+    out = shuffle_space(t, seed=SPACE_SEED)
+    assert out.spec.variant == "shuffle_space"
+    # It moved, and it preserved mass -- the two things a control owes.
+    assert not np.array_equal(out.dense(), dense)
+    assert out.dense().sum() == pytest.approx(dense.sum())
+
+
+def test_the_fixed_point_count_is_POISSON_ONE_so_a_RATE_THRESHOLD_pins_nothing():
+    """Why there is no fixed-point rate check, as a measurement.
+
+    The number of fixed points of a uniform random permutation is Poisson(1)
+    for EVERY n -- mean 1, variance 1, and `P(F >= 3)` the same at n=10 as at
+    n=897. So a rate threshold does not distinguish a degenerate axis from a
+    healthy one; it just rejects a fixed fraction of perfectly good draws at
+    any length, which is the arbitrary-constant trap this branch has hit
+    before. Asserted as numbers so the next reader does not re-litigate it.
+    """
+    for n in (10, 27, 115):
+        counts = np.array(
+            [
+                int((np.random.default_rng(s).permutation(n) == np.arange(n)).sum())
+                for s in range(2000)
+            ]
+        )
+        assert counts.mean() == pytest.approx(1.0, abs=0.1), n
+        assert counts.var() == pytest.approx(1.0, abs=0.15), n
+        # ~8% of draws have three or more fixed points AT EVERY n, so a
+        # "reject 3 of 10" rule rejects 8% of valid draws on a 897-cell
+        # national axis too.
+        assert (counts >= 3).mean() == pytest.approx(0.080, abs=0.02), n
+    # The one regime that IS structurally degenerate, and it is about length
+    # rather than about a rate: at n <= 2 the identity has probability >= 1/2.
+    assert np.array_equal(np.random.default_rng(0).permutation(1), np.arange(1))
+    assert np.array_equal(np.random.default_rng(0).permutation(2), np.arange(2))
+
+
+@pytest.mark.parametrize("name", list(_OWN_FIXED_POINT))
+def test_the_unmoved_guard_does_NOT_MISFIRE_on_the_non_shuffle_controls(name):
+    """The mirror obligation, and the reason the guard is not in `_respec`.
+
+    `uniform` of an already-constant prior IS that prior, and that is the
+    correct answer rather than a degeneracy: "the prior's mass with no
+    information at all" genuinely equals a prior that carries no information.
+    `marginal` of a per-species-constant prior and `separable` of a prior with
+    no space x time interaction are the same statement one structure further
+    along. Each coincidence MEANS something; a shuffle's does not.
+
+    Each control gets ITS OWN fixed point rather than one shared flat grid, so
+    `marginal` and `separable` cannot pass by having collapsed to `uniform`.
+    """
+    t = _OWN_FIXED_POINT[name]()
+    out = CONTROLS[name](t)
+    assert out.spec.variant == name
+    assert np.allclose(out.dense(), t.dense()), (
+        f"precondition: {name} must actually COINCIDE with this prior, or the "
+        "test is not exercising the misfire it exists to rule out"
+    )
+
+
+def test_BOTH_shuffles_are_refused_on_the_prior_the_others_legitimately_match():
+    """The same degenerate prior, from the shuffles' side: where `uniform`,
+    `marginal` and `separable` correctly return it unchanged, a shuffle must
+    refuse. That asymmetry is the whole design of the guard."""
+    t = _constant_tensor()
+    with pytest.raises(ValueError, match="byte-identical to the full prior"):
+        shuffle_space(t, seed=SPACE_SEED)
+    with pytest.raises(ValueError, match="byte-identical to the full prior"):
+        shuffle_time(t, seed=TIME_SEED)
+
+
+def test_an_ORDINARY_prior_is_not_refused_by_either_shuffle():
+    """The guard must not be so strict it rejects the input the controls are
+    defined on -- the C40/C60-shaped mirror, which takes the paper's
+    credibility section down before it computes anything."""
+    for fixture in (_tensor, _sparse_tensor):
+        t = fixture()
+        for seed in range(8):
+            assert shuffle_space(t, seed=seed).spec.variant == "shuffle_space"
+            assert shuffle_time(t, seed=seed).spec.variant == "shuffle_time"
+
+
+def test_the_unmoved_shuffle_guard_RAISES_rather_than_warning_or_repairing():
+    """The house rule: no silent repair, no warn-and-continue. A shuffle that
+    re-drew until it moved would be sampling from a conditioned distribution
+    and quietly reporting a different null; one that warned would leave the
+    byte-identical file on disk."""
+    t = _flat_in_cell_tensor(CELLS[:1])
+    with pytest.raises(ValueError):
+        shuffle_space(t, seed=SPACE_SEED)
+    # Nothing was mutated on the way out: the input is still the full prior.
+    assert t.spec.variant == "full"
+    assert t.dense().sum() == pytest.approx(_flat_in_cell_tensor(CELLS[:1]).dense().sum())
+
+
+# ---------------------------------------------------------------------------
 # C1: a control of a control is refused. The consumed contract is a
 # `PriorTensor` with `spec.variant == "full"`, and nothing used to enforce it:
 # all four controls accepted a control as input and RELABELLED the output, so

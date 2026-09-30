@@ -677,6 +677,18 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
             )
         ],
     ),
+    # The `sorted_keys.size > 1 and` conjunct S35's anchor used to carry is
+    # GONE FROM THE SOURCE, and no mutant replaces it -- deliberately, and for
+    # the same reason as the `and p.size` clause noted at S13. `np.diff` of a
+    # 0- or 1-element array is empty and `np.any` of an empty array is False,
+    # so the conjunct could never decide the branch: every input it was
+    # supposed to protect already takes the correct path without it. A mutant
+    # of a clause that cannot change an output would be unkillable by
+    # construction and would sit in this table as permanent NOT APPLIED or a
+    # survivor. What IS mutable is the check itself, which S35 covers; the
+    # short-table behaviour it used to claim to guard is pinned directly by
+    # `test_a_TABLE_TOO_SHORT_TO_HOLD_A_DUPLICATE_needs_no_size_guard`, which
+    # asserts the numpy fact and both reachable table lengths.
     (
         "S35",
         "the duplicate-grid-point check removed, so a table concatenated from "
@@ -685,7 +697,7 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         "test_a_duplicate_species_cell_week_row_is_rejected",
         [
             (
-                "    if sorted_keys.size > 1 and np.any(np.diff(sorted_keys) == 0):",
+                "    if np.any(np.diff(sorted_keys) == 0):",
                 "    if False:",
             )
         ],

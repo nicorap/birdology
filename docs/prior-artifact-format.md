@@ -15,6 +15,12 @@ it spans; the third is the one that changes what the numbers *mean* — at H3
 resolution 5 an artifact retains under half of the real seasonal amplitude, and
 the constants that decide that are published in the sidecar.
 
+Two known limitations are stated as such rather than hidden: the sidecar's
+recorded constants are **not verifiable** against the values (section 2b,
+"Known limitation" — the released CLI path is protected, a library caller's is
+not), and **week 52 is systematically shrunk less** than its neighbours because
+ISO week 53 folds into it (section 2e).
+
 ---
 
 ## 1. File layout
@@ -237,6 +243,51 @@ on the *size* of a seasonal swing:
 Two artifacts that differ only in these fields are genuinely different
 datasets. Compare `backoff_params` before comparing values across releases.
 
+### Known limitation: the recorded params are not *verified* against the values
+
+**Nothing in the artifact proves that the constants in the sidecar are the
+constants the numbers were computed with.** The sidecar is a faithful record
+of what the writer was *told*, not a checksum over the computation.
+
+Reproduced, on two real builds through the pipeline's own entry point:
+
+| | build A | build B |
+|---|---|---|
+| `backoff_params` | `BackoffParams(10.0, 50.0, 1e-06)` | different constants |
+| seasonal CV of the values | 1.176 | 1.495 |
+| `max|A − B|` over the shared grid | — | **0.176** |
+
+So the constants do genuinely change the numbers. Build A's params object was
+then assigned onto build B's tensor and saved. The result was a well-formed,
+fully provenanced artifact — `nnz` 4420, fill 1.0, DOI present, manifest
+written — whose sidecar claims A's constants over B's values. **Nothing was
+raised, at write time or at read time.**
+
+What this does and does not mean for you:
+
+1. **The path that produces released artifacts IS protected.** Everything
+   published here is built by `scripts/build_prior.py`, which threads a single
+   params object into both the estimation stage and the writer, and that
+   property is pinned by a test that fails if the constants stop reaching the
+   computation (mutant `B-I2f`, killer
+   `test_the_build_params_actually_CHANGE_the_values_not_just_the_sidecar`).
+   If your files came from a release of this project, the sidecar describes
+   the build.
+2. **The gap is reachable only by a library caller.** Someone importing
+   `birdology.prior` who constructs a tensor and then *assigns* a foreign
+   `BackoffParams` / `SmoothingParams` object to it gets an artifact whose
+   record is a confident lie. That is the same class as handing any stage the
+   wrong data, but it is worth naming because these two fields are the ones
+   whose entire purpose is to be believed.
+3. **What you can check yourself, and what you cannot.** You can confirm the
+   sidecar and the matrix are halves of the same artifact (`nnz` against
+   `len(data)`, the axes against `shape` — the recipe in section 5 does both).
+   You cannot confirm the *constants*: shrinkage is not invertible from the
+   output, so no decoder, including this repository's, can recompute them. If
+   the provenance of a third-party artifact matters to your result, treat
+   `backoff_params` as an attestation by whoever built it and not as a
+   measurement.
+
 ---
 
 ## 2c. The per-resolution manifest — its absence means the set is incomplete
@@ -358,6 +409,66 @@ Three properties worth knowing:
 
 If the document is absent, or its hash does not match, treat the directory the
 same way you would treat a missing control: **not a complete release.**
+
+---
+
+## 2e. Known limitation: ISO week 53 makes week 52 the least-shrunk week
+
+**Week 52 systematically carries more records — and therefore less shrinkage —
+than its neighbours. The effect is small, real, and undocumented anywhere
+else.**
+
+The ISO calendar gives some years a week 53. The build folds it into week 52
+rather than publishing a 53rd column, because a 53rd index would be treated by
+the circular smoothing kernel as a real week with a seventh of the usual data
+behind it. That fold is correct and it has a consequence worth stating. (Both
+halves are checkable: `weeks_per_year` is 52 and the sidecar says weeks run
+`1..52` inclusive — see section 2.)
+
+**71 of every 400 Gregorian years carry an ISO week 53 — 17.75%.** So in an
+archive pooling many years, week 52 absorbs its own records *plus* every
+week-53 record:
+
+```text
+expected week-52 record count / expected count of any other week = 1.1775
+```
+
+The *ratio* a prior reports is unaffected: record counts appear in the
+numerator and the denominator of every level of the hierarchy, and every
+species' week-53 records inflate together. What changes is the **effort
+proxy**. The record count is what decides how strongly a cell-week is pulled
+toward its parent — `cell_week_weight` is a pseudo-count *in records*
+(section 2b) — so a week with 1.18x the records is shrunk *less*. Its local
+evidence share, `total / (total + cell_week_weight)`, at the default
+`cell_week_weight = 10.0` and the median records-per-cell-week of each
+resolution in section 2b's table:
+
+| resolution | median records/cell-week | local share, weeks 1–51 | local share, week 52 | week 52 is this much less shrunk |
+|---|---|---|---|---|
+| 3 | 102 | 0.911 | 0.923 | +1.4% |
+| 4 | 31 | 0.756 | 0.785 | +3.8% |
+| 5 | 6 | 0.375 | 0.414 | +10.4% |
+| 6 | 2 | 0.167 | 0.191 | +14.4% |
+
+So the bias grows as the grid gets finer, because that is where shrinkage is
+doing the most work. It is a difference in *how much a week trusts itself*, not
+a difference in the expected value, and it is second-order compared with the
+amplitude decay in section 2b — but it is a systematic, data-dependent
+asymmetry between one column and its 51 neighbours.
+
+What to do about it:
+
+- For "when does this species peak?", ignore it. It cannot move a peak by a
+  week, and no peak estimate is decided by a few percent of shrinkage.
+- For anything that compares weeks to each other at fine resolution —
+  smoothness of a seasonal curve, a week-over-week change, an anomaly score
+  — **treat week 52 as a known outlier** rather than reading its slightly
+  sharper, slightly noisier value as signal.
+- If you are building your own prior from this code, the honest alternatives
+  are to drop week-53 records rather than fold them (losing ~0.34% of a
+  multi-year archive) or to publish 53 columns (reintroducing a column with a
+  seventh of the data). Neither is clearly better; the fold is the chosen
+  trade-off and this is what it costs.
 
 ---
 
@@ -562,8 +673,9 @@ so `fill` does not distinguish them either.
 
 ---
 
-*This file is kept honest by four tests. Field names, constants and the
-decoding recipe are executed against a freshly saved artifact by
+*This file is kept honest by executable tests, not by review. Field names,
+constants and the decoding recipe are executed against a freshly saved artifact
+by
 `tests/prior/test_tensor.py::test_the_artifact_documentation_matches_a_freshly_saved_artifact`.
 The fill regime section 2a asserts is pinned against an artifact built through
 `build_from_archive` — a real pipeline output, not a hand-built fixture — by
@@ -574,9 +686,16 @@ and is false of everything the pipeline writes. Section 2b's retention claims
 are pinned by `tests/prior/test_amplitude_retention.py`, which generates a known
 seasonal and spatial signal, builds it through the CLI's own entry point and
 asserts floors under the retained fraction at every default resolution. Section
+2b's params-provenance limitation is pinned by
+`tests/prior/test_tensor.py::test_the_documented_PARAMS_PROVENANCE_GAP_is_stated_and_is_still_real`,
+which REPRODUCES the gap — so if a later round closes it, the test fails and the
+limitation is deleted rather than left standing as a stale warning. Section
 2c's manifest shape and its named-artifacts rule are pinned by
 `tests/prior/test_build_prior.py::test_the_documented_MANIFEST_shape_matches_a_real_one`.
 Section 2d's claim that this document ships beside the artifacts is pinned by
 `tests/prior/test_build_prior.py::test_the_build_SHIPS_the_format_documentation_beside_the_artifacts`,
 which builds through `build_from_archive` and compares the shipped bytes with
-this file's.*
+this file's. Every number in section 2e — the 71-in-400 week-53 frequency, the
+1.1775 inflation and all four shrinkage rows — is recomputed from the Gregorian
+calendar and the shipped default weight by
+`tests/prior/test_tensor.py::test_the_documented_WEEK_53_ASYMMETRY_matches_the_calendar_and_the_code`.*

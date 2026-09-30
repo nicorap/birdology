@@ -73,11 +73,12 @@ read:
   test.
 * ``shuffle_space`` permutes whole cell blocks with one permutation shared
   across species, so the output is a PERMUTATION of ``D``. Every row's value
-  multiset survives, hence every row's mass, hence the total.
+  multiset survives, hence every row's mass, hence the total. It REFUSES to
+  emit a grid equal to ``D``: see ``_refuse_an_unmoved_shuffle``.
 * ``shuffle_time``  permutes week slots inside each (species, cell) block, so
   mass is preserved per species AND per cell -- a strictly stronger invariant
   than ``shuffle_space``'s, because a week permutation never crosses a cell
-  boundary.
+  boundary. Same refusal, same reason.
 * ``separable``     replaces each (species) block by the outer product of its
   own cell and week marginals, ``cellmean * weekmean / grandmean``. That
   identity is exactly mass-preserving per species (and so in total), and it
@@ -208,7 +209,11 @@ Errors
 ------
 Every contract violation raises ``ValueError`` naming that specific check.
 There is no try/except, no repair and no silent skip: a control that repaired
-its input would be compared against a full prior that was not repaired.
+its input would be compared against a full prior that was not repaired. The
+same rule covers a control that came out DEGENERATE rather than one whose
+input was malformed -- a shuffle equal to the prior it is the null for raises
+instead of shipping (``_refuse_an_unmoved_shuffle``), because the alternative
+is an artifact nothing downstream can tell from the prior.
 """
 from __future__ import annotations
 
@@ -353,6 +358,132 @@ def _respec(t: PriorTensor, variant: str, values: np.ndarray) -> PriorTensor:
     )
 
 
+def _refuse_an_unmoved_shuffle(
+    shuffled: np.ndarray,
+    dense: np.ndarray,
+    where: str,
+    axis: str,
+    axis_len: int,
+    seed: int,
+) -> np.ndarray:
+    """*shuffled*, unless it is the grid it was drawn from.
+
+    A SHUFFLE THAT MOVED NOTHING IS THE PRIOR WEARING THE NULL'S LABEL
+    ------------------------------------------------------------------
+    ``np.random.default_rng(seed).permutation(n)`` is the IDENTITY whenever
+    ``n <= 2`` at seed 0 -- measured, not feared:
+
+        n=1  perm=[0]    identity  (the only permutation there is)
+        n=2  perm=[0 1]  identity
+        n=3  perm=[2 0 1]
+
+    The final gate built a single-cell prior end to end through
+    ``build_from_archive`` and got ``prior_dof_r4_shuffle_space.npz`` with
+    ``max|control - full| = 0.000e+00`` and the SAME sha256 as the full prior:
+    correctly packed, correctly provenanced, labelled ``"shuffle_space"`` in
+    its own sidecar. A sweep reads that as "the spatial effect does not survive
+    its control", from a control that IS the prior. Nothing downstream can
+    detect it -- every value is finite, in range, on the right axes, and the
+    masses match exactly, because the two grids are the same grid.
+
+    This is the THIRD time a permutation draw has produced a control that
+    cannot fail here. The first two (seed 1 was the identity on a 3-cell axis;
+    seed 3 was its own inverse) were fixed by widening the TEST FIXTURE's axis,
+    which left the shipped code with no guard at all -- so the defect moved out
+    of the fixture and into the artifact. Hence a refusal in ``src/``: a lucky
+    axis size is not a contract.
+
+    WHY THE CHECK IS ON THE EMITTED GRID AND NOT ON THE PERMUTATION
+    ---------------------------------------------------------------
+    The obvious spelling is ``if np.array_equal(perm, np.arange(n)): raise``.
+    It is strictly WEAKER, and the difference is a real artifact:
+
+    * an identity permutation implies an unmoved grid, so this check fires
+      everywhere that one would;
+    * an unmoved grid does NOT imply an identity permutation. A prior whose
+      cell blocks are all equal (or whose every week slot is equal) is
+      relabelled by a perfectly non-degenerate permutation into itself. The
+      permutation check passes and ships the same byte-identical file.
+
+    So the property worth refusing is the one the sweep is actually misled by
+    -- "this control equals the prior it is the null for" -- and it is the one
+    the gate measured. Checking the permutation as WELL would add a clause that
+    can never fire on its own, which is the dead-conjunct defect this round is
+    also removing from ``smoothing.py``. One clause, and it is total.
+
+    The message names both causes because the operator's fix differs: a
+    degenerate axis wants a coarser build or a different seed, an axis with no
+    structure wants a different control.
+
+    WEAK-BUT-NOT-IDENTITY PERMUTATIONS ARE DELIBERATELY ACCEPTED
+    ------------------------------------------------------------
+    At seed 0 a 10-cell axis leaves 3 of 10 cells fixed, which looks like a
+    30% failure and is not one. The number of fixed points of a UNIFORM random
+    permutation is Poisson(1) for every n: mean 1, variance 1, and
+    ``P(F >= 3) = 0.0803`` at n=10 and 0.0803 at n=27 -- identical, because the
+    distribution does not depend on n. Measured over seeds 0..1999: mean 0.986
+    at n=10, 1.008 at n=27, 1.000 at n=897.
+
+    A fixed-point RATE threshold is therefore the arbitrary-constant trap this
+    branch has hit before. Any threshold tight enough to reject the 3-of-10
+    draw rejects ~8% of legitimate draws at EVERY axis length, and one that
+    rejects any fixed point at all rejects ``1 - 1/e`` = 63% of all valid
+    permutations -- it would be rejecting the null distribution itself. Worse,
+    a control drawn from permutations CONDITIONED to have no fixed point is no
+    longer a uniform random relabelling, so its null is a different null: a
+    subtler version of the defect being fixed. So there is no rate check, and
+    ``test_a_permutation_with_FIXED_POINTS_is_deliberately_accepted`` plus
+    ``test_the_fixed_point_count_is_POISSON_ONE_so_a_RATE_THRESHOLD_pins_nothing``
+    pin that absence as a number rather than leaving it to be re-litigated.
+
+    WHY ``shuffle_time`` IS SAFER, STATED RATHER THAN OBSERVED
+    ----------------------------------------------------------
+    ``shuffle_time`` permutes ``WEEKS_PER_YEAR`` slots and ``shuffle_space``
+    permutes ``len(t.cells)``. The asymmetry is not that 52 is bigger than 1:
+    it is that 52 is a SCHEMA CONSTANT that no input can shrink, while the cell
+    axis is a function of the archive -- a single-region case study, a smoke
+    archive or a coarse resolution produces one or two cells. So the week axis
+    cannot reach the degenerate regime at all and the cell axis reaches it on
+    real inputs. Both shuffles route through this same guard anyway, because
+    ``shuffle_time`` still has the OTHER cause available to it (a prior with a
+    flat season in every cell is unmoved by any week permutation), and because
+    a guard present on one shuffle and absent on its mirror is how the two
+    drift apart.
+
+    NOT APPLIED TO ``uniform``, ``marginal`` OR ``separable``
+    ---------------------------------------------------------
+    They are allowed to coincide with a degenerate prior and a guard here would
+    misfire on them. ``uniform`` of an already-constant prior IS that prior,
+    and that is the correct answer: "the prior's mass with no information at
+    all" genuinely equals a prior that carries no information. ``marginal`` of
+    a per-species-constant prior, and ``separable`` of a prior with no space x
+    time interaction, are the same statement one structure further along. Each
+    is a fixed point that MEANS something. A shuffle has no such reading: its
+    entire definition is that values move, so a shuffle that moved nothing did
+    not run the experiment.
+
+    Cost: one ``dense_capacity`` boolean temporary, an eighth of the float64
+    grid this function is already handed. ``np.array_equal`` is value equality,
+    which coincides with byte equality here because ``tensor._validate_p``
+    forbids ``p <= 0`` -- there is no ``nan`` to compare unequal to itself and
+    no ``-0.0`` to compare equal to ``0.0``.
+    """
+    if np.array_equal(shuffled, dense):
+        raise ValueError(
+            f"the {where} control is byte-identical to the full prior it is "
+            f"the null for: seed {seed} moved nothing on a {axis} axis of "
+            f"length {axis_len}. Either the drawn permutation displaces no "
+            f"{axis} -- unavoidable at length 1, where the identity is the "
+            f"only permutation there is -- or every {axis} block of this "
+            "prior carries the same values, so there is no structure along "
+            "that axis for a shuffle to destroy. Refusing, because the "
+            f"alternative is a released file labelled {where!r} whose bytes "
+            "ARE the prior, which a sweep reads as 'the effect does not "
+            "survive its control'"
+        )
+    return shuffled
+
+
 def uniform_prior(t: PriorTensor) -> PriorTensor:
     """No information at all: one constant everywhere, at the full prior's mass.
 
@@ -468,12 +599,30 @@ def shuffle_space(t: PriorTensor, seed: int = 0) -> PriorTensor:
     correct and is the whole construction: "nobody looked here" is one of the
     prior's values, and a control that held it in place would be leaking the
     survey-effort map -- which is spatial information.
+
+    IT REFUSES TO EMIT THE PRIOR ITSELF. See ``_refuse_an_unmoved_shuffle``:
+    at ``len(t.cells) <= 2`` the drawn permutation is the identity at seed 0,
+    and the gate shipped a ``shuffle_space`` artifact with the full prior's
+    sha256 from a single-cell build. The guard is on the EMITTED GRID rather
+    than on the permutation, because a prior whose cell blocks are all equal is
+    unmoved by a perfectly good permutation too.
     """
     dense = _control_grid(t, "shuffle_space")
     n_cells = len(t.cells)
     blocks = dense.reshape(dense.shape[0], n_cells, WEEKS_PER_YEAR)
     blocks = blocks[:, np.random.default_rng(seed).permutation(n_cells), :]
-    return _respec(t, "shuffle_space", blocks.reshape(dense.shape))
+    return _respec(
+        t,
+        "shuffle_space",
+        _refuse_an_unmoved_shuffle(
+            blocks.reshape(dense.shape),
+            dense,
+            "shuffle_space",
+            "cell",
+            n_cells,
+            seed,
+        ),
+    )
 
 
 def shuffle_time(t: PriorTensor, seed: int = 0) -> PriorTensor:
@@ -487,12 +636,31 @@ def shuffle_time(t: PriorTensor, seed: int = 0) -> PriorTensor:
     It permutes the FLOORED grid, for the temporal mirror of ``shuffle_space``'s
     reason: when a survey happened is temporal information, so the floor has to
     move with everything else.
+
+    IT ROUTES THROUGH THE SAME REFUSAL, and not because the week axis is at
+    risk of being degenerate. ``WEEKS_PER_YEAR`` is a schema constant no input
+    can shrink, so the identity draw ``shuffle_space`` hits at one or two cells
+    is unreachable here -- that is a property worth stating rather than an
+    accident of 52 being large. What IS reachable is the other cause: a prior
+    with a flat season in every cell is unmoved by any week permutation, and
+    the emitted-grid guard catches that where a permutation check would not.
     """
     dense = _control_grid(t, "shuffle_time")
     n_cells = len(t.cells)
     blocks = dense.reshape(dense.shape[0], n_cells, WEEKS_PER_YEAR)
     blocks = blocks[:, :, np.random.default_rng(seed).permutation(WEEKS_PER_YEAR)]
-    return _respec(t, "shuffle_time", blocks.reshape(dense.shape))
+    return _respec(
+        t,
+        "shuffle_time",
+        _refuse_an_unmoved_shuffle(
+            blocks.reshape(dense.shape),
+            dense,
+            "shuffle_time",
+            "week",
+            WEEKS_PER_YEAR,
+            seed,
+        ),
+    )
 
 
 def separable_prior(t: PriorTensor) -> PriorTensor:

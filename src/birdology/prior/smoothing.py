@@ -367,7 +367,15 @@ def smooth(
     keys = pack(cell_code, weeks)
     order = np.argsort(keys, kind="stable")
     sorted_keys = keys[order]
-    if sorted_keys.size > 1 and np.any(np.diff(sorted_keys) == 0):
+    # No size guard: `np.diff` of a 0- or 1-element array is empty and
+    # `np.any` of an empty array is False, so the fewer-than-two-rows case is
+    # already handled by the arithmetic. The `sorted_keys.size > 1 and` that
+    # used to sit here was unreachable as a guard, and it contradicted
+    # `tensor._reject_duplicates`, which states this same fact in its
+    # docstring and carries no such conjunct. Two modules disagreeing about
+    # one arithmetic fact is how the next reader concludes one of them knows
+    # something the other does not.
+    if np.any(np.diff(sorted_keys) == 0):
         raise ValueError(
             "estimate table has duplicate (species_key, cell, week) rows; one "
             "grid point with two values means a neighbour reads whichever copy "

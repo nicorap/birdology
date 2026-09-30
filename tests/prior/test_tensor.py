@@ -1877,3 +1877,127 @@ def test_the_documented_PARAMS_fields_match_a_real_sidecar(tmp_path):
         "the documented res-5 seasonal retention is missing; section 2b's "
         "table is what a consumer calibrates against"
     )
+
+
+def test_the_documented_PARAMS_PROVENANCE_GAP_is_stated_and_is_still_real(tmp_path):
+    """Final-gate I2, documented rather than fixed -- so it must stay TRUE.
+
+    `save_prior` records the params it is handed. Nothing verifies they are
+    the ones the values were computed with, and section 2b's "Known
+    limitation" subsection now tells a consumer exactly that. A document that
+    warned about a gap somebody had since closed would be as misleading as one
+    that hid a real gap, so this test REPRODUCES the gap: it assigns a foreign
+    params object onto a tensor and asserts the artifact is written without
+    complaint, carrying the assigned constants.
+
+    If a future round DOES close it -- by freezing the fields, or by making
+    `to_tensor` the only setter -- this test fails, and the correct response is
+    to delete the documented limitation rather than to weaken the test.
+    """
+    doc = ARTIFACT_DOC.read_text(encoding="utf-8")
+
+    # -- the document states the limitation, in the words a reader acts on --
+    assert "the recorded params are not *verified* against the values" in doc
+    assert "0.176" in doc, (
+        "the measured divergence between two real builds is the evidence for "
+        "the claim; without it the subsection is an unsupported worry"
+    )
+    # It must name the protection as well as the gap: a consumer of a RELEASED
+    # artifact has a stronger guarantee than a library caller, and telling
+    # them only the bad half would be its own distortion.
+    assert (
+        "test_the_build_params_actually_CHANGE_the_values_not_just_the_sidecar"
+        in doc
+    )
+    assert "reachable only by a library caller" in doc
+
+    # -- and the gap is REAL: a foreign params object is recorded verbatim --
+    t = to_tensor(
+        _table([(1, "cell-a", 46, 0.25)]),
+        SPEC,
+        backoff_params=BackoffParams(),
+        smoothing_params=SmoothingParams(),
+    )
+    t.gbif_doi = DOI
+    foreign = BackoffParams(cell_week_weight=1.0, cell_weight=2.0, floor=1e-05)
+    assert foreign != BackoffParams(), "the fixture must actually differ"
+    t.backoff_params = foreign
+
+    npz = save_prior(t, tmp_path / "foreign.npz")
+    meta = json.loads(npz.with_suffix(".json").read_text(encoding="utf-8"))
+    assert meta["backoff_params"]["cell_week_weight"] == 1.0, (
+        "the sidecar no longer records an assigned params object verbatim -- "
+        "the I2 gap may have been CLOSED, in which case delete the documented "
+        "limitation in section 2b rather than relaxing this assertion"
+    )
+    # And `load_prior` accepts it too: neither boundary checks the claim.
+    assert load_prior(npz).backoff_params == foreign
+
+
+def test_the_documented_WEEK_53_ASYMMETRY_matches_the_calendar_and_the_code():
+    """Final-gate M3, documented. Every number recomputed from the source.
+
+    Section 2e tells a consumer that week 52 is systematically shrunk LESS
+    than its neighbours. Each figure in it is derived here from the Gregorian
+    calendar and from the SHIPPED constants rather than compared against a
+    literal typed beside it, because a documented bias with a drifted
+    magnitude is the "plausible-but-wrong number" this release guards against.
+    """
+    import datetime
+
+    from birdology.prior.backoff import BackoffParams as BP
+    from birdology.prior.indexing import iso_week
+
+    doc = ARTIFACT_DOC.read_text(encoding="utf-8")
+
+    # THE FOLD ITSELF, through the shipped function: an ISO week 53 date is
+    # reported as week 52, so its records land in that column.
+    w53 = datetime.date(2020, 12, 31)
+    assert w53.isocalendar().week == 53, "fixture must really be in ISO W53"
+    assert iso_week(w53) == WEEKS_PER_YEAR == 52
+
+    # THE FREQUENCY: 71 of every 400 Gregorian years carry an ISO week 53.
+    # The 400-year cycle is exact, so this is a count rather than a sample.
+    with_53 = sum(
+        1
+        for year in range(1601, 2001)
+        if datetime.date(year, 12, 28).isocalendar().week == 53
+    )
+    assert with_53 == 71
+    assert f"{with_53} of every 400" in doc
+    fraction = with_53 / 400
+    assert f"{fraction:.2%}" == "17.75%"
+    assert "17.75%" in doc
+
+    # THE INFLATION: week 52 absorbs its own records plus every week-53 one.
+    assert f"{1 + fraction:.4f}" == "1.1775"
+    assert "1.1775" in doc
+
+    # THE CONSEQUENCE, from the SHIPPED default weight: the local-evidence
+    # share is total / (total + cell_week_weight), so more records means less
+    # shrinkage. Both the direction and every documented row are recomputed.
+    weight = BP().cell_week_weight
+    assert weight == 10.0
+    for median, plain, inflated in (
+        (102, "0.911", "0.923"),
+        (31, "0.756", "0.785"),
+        (6, "0.375", "0.414"),
+        (2, "0.167", "0.191"),
+    ):
+        share = median / (median + weight)
+        share_52 = (median * (1 + fraction)) / (median * (1 + fraction) + weight)
+        assert f"{share:.3f}" == plain, median
+        assert f"{share_52:.3f}" == inflated, median
+        assert share_52 > share, "week 52 must be shrunk LESS, not more"
+        assert f"| {median} | {plain} | {inflated} |" in doc, (
+            f"section 2e's row for {median} records/cell-week does not match "
+            "the shares recomputed from the shipped weight"
+        )
+
+    # The share of an archive that week 53 actually contributes, which is what
+    # makes "drop the records instead" a real option rather than a dismissal.
+    assert f"{fraction / (WEEKS_PER_YEAR + fraction):.2%}" == "0.34%"
+    assert "0.34%" in doc
+
+    # And the RULE a reader acts on, in the words they act on.
+    assert "treat week 52 as a known outlier" in doc

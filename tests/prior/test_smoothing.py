@@ -5,6 +5,7 @@ import tracemalloc
 from pathlib import Path
 
 import h3
+import numpy as np
 import pyarrow as pa
 import pytest
 
@@ -595,6 +596,29 @@ def test_an_empty_table_smooths_to_an_empty_table():
     out = smooth(_est([]))
     assert out.num_rows == 0
     assert out.schema.names == ["species_key", "cell", "week", "p"]
+
+
+def test_a_TABLE_TOO_SHORT_TO_HOLD_A_DUPLICATE_needs_no_size_guard():
+    """M5. The duplicate check used to read
+    `sorted_keys.size > 1 and np.any(np.diff(sorted_keys) == 0)`, and the
+    conjunct was DEAD: `np.diff` of a 0- or 1-element array is empty and
+    `np.any` of an empty array is False, so the short-table cases already take
+    the correct path on the arithmetic alone. `tensor._reject_duplicates` says
+    so in its docstring and carries no such conjunct, so the two modules
+    disagreed about one arithmetic fact.
+
+    The conjunct is gone. This pins the behaviour it *claimed* to protect
+    directly, at both lengths that could reach it, so the removal is a
+    measured fact rather than an argument -- and so it cannot be reinstated as
+    a cargo-culted guard.
+    """
+    assert np.any(np.diff(np.array([], dtype=np.int64)) == 0) is np.False_
+    assert np.any(np.diff(np.array([7], dtype=np.int64)) == 0) is np.False_
+
+    assert smooth(_est([])).num_rows == 0
+    single = smooth(_est([(1, CPH, 20, 0.42)]))
+    assert single.num_rows == 1
+    assert single.column("p").to_pylist() == pytest.approx([0.42])
 
 
 # --------------------------------------------------------------------------
