@@ -1577,11 +1577,19 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         "EXPLICITLY, so the field default was reachable only through "
         "`controls._respec` -- which constructs a `PriorTensor` without them -- "
         "and the CLI hides even that by overwriting both fields on every "
-        "control. Now pinned by "
+        "control.\n"
+        "\n"
+        "IT WAS THEN PINNED ONLY FROM OUTSIDE ITS OWN MODULE'S TEST FILE: the "
+        "first kill was `test_build_prior.py`'s "
         "`test_a_CONTROL_of_a_params_less_prior_declares_NO_params_rather_than_"
-        "defaults`, which builds every registered control of a params-less "
-        "prior and asserts the sidecar says `null`",
-        "test_a_CONTROL_of_a_params_less_prior_declares_NO_params_rather_than_defaults",
+        "defaults`, so a contract of THIS module's dataclass depended on "
+        "another module's suite. Unlike `run_indexing_mutants.py`'s X1-X4, "
+        "where the guard-marker contract genuinely spans two modules, nothing "
+        "here required that: the named killer below constructs a "
+        "`PriorTensor` directly in `test_tensor.py` and asserts the sidecar "
+        "says `null`. The control test is KEPT -- it asserts the CLI/control "
+        "path -- and both now fail on this edit",
+        "test_the_params_DATACLASS_DEFAULT_is_None_and_the_artifact_says_so",
         [
             (
                 "    #: backoff would then publish a claim about parameters it never used.\n"
@@ -1595,8 +1603,10 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         "T-I2p",
         "the SMOOTHING half of T-I2m, mutated separately: a guard or a test "
         "written for one field says nothing about the other, and these are two "
-        "adjacent declarations either of which can be changed alone",
-        "test_a_CONTROL_of_a_params_less_prior_declares_NO_params_rather_than_defaults",
+        "adjacent declarations either of which can be changed alone. Its "
+        "killer is parametrised over both fields for exactly that reason -- "
+        "one case per declaration, so neither can be satisfied by the other",
+        "test_the_params_DATACLASS_DEFAULT_is_None_and_the_artifact_says_so",
         [
             (
                 "    smoothing_params: SmoothingParams | None = None\n"

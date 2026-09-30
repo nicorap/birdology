@@ -1314,13 +1314,27 @@ MUTANTS: list[Mutant] = [
         "reports a truncated set as... still truncated, but the manifest now "
         "EXISTS for a build that never completed, so a crash between the "
         "manifest and the first save leaves a release-shaped record of "
-        "nothing",
+        "nothing.\n"
+        "\n"
+        "RE-TARGETED. Its anchor was the unlink line immediately followed by "
+        "the first `save_prior`; the format-doc commit inserted "
+        "`copy_format_documentation(out_dir)` and an eight-line comment "
+        "between them, the pattern stopped matching, and the row went NOT "
+        "APPLIED -- leaving the ordering contract pinned by nothing. The "
+        "injected `write_manifest` now sits AFTER the doc copy rather than "
+        "before it, deliberately: `write_manifest` refuses a set whose "
+        "documentation is not beside the artifacts (B-P9), so injecting it "
+        "above the copy would model a build that dies in `write_manifest`'s "
+        "own guard instead of a manifest that exists too early. What is "
+        "mutated is still ONLY the ordering -- a successful build rewrites "
+        "the same manifest last, so the sole observable is what a part-way "
+        "death leaves behind",
         "test_a_build_that_dies_part_way_leaves_NO_manifest",
         [
             (
-                "    manifest_path(out_dir, source, resolution).unlink(missing_ok=True)\n"
+                "    copy_format_documentation(out_dir)\n"
                 "    written.append(save_prior(full, out_dir / f\"{stem}_full.npz\"))",
-                "    manifest_path(out_dir, source, resolution).unlink(missing_ok=True)\n"
+                "    copy_format_documentation(out_dir)\n"
                 "    write_manifest(\n"
                 "        out_dir,\n"
                 "        source,\n"
@@ -1805,15 +1819,28 @@ MUTANTS: list[Mutant] = [
     ),
     (
         "B-P8",
-        "the documentation copied AFTER the manifest, breaking the ordering "
-        "protocol in the direction that matters. The manifest is written LAST "
-        "so its presence is the completion record; a document written after it "
-        "means a build that dies between the two leaves a manifest that "
-        "VERIFIES -- it hashed a file that no longer describes the release -- "
-        "or, on a first build, a manifest whose own `write_manifest` guard "
-        "fires and leaves nothing. Killed by the part-way-failure test, which "
-        "asserts the honest intermediate state: artifacts, document, no "
-        "manifest",
+        "the documentation copied AFTER THE ARTIFACTS instead of before the "
+        "first one -- the second orderable statement the doc copy introduced, "
+        "and a contract distinct from B61's. B61 pins the MANIFEST as last; "
+        "this pins the DOCUMENT as first. The manifest is written last so its "
+        "presence is the completion record, and the document is written first "
+        "so that a build which dies part-way leaves a directory that is "
+        "HONEST about itself: partial artifacts, the contract that decodes "
+        "them, and no manifest. Under this mutant that same death leaves "
+        "artifacts a third party cannot decode and nothing saying why. Killed "
+        "by the part-way-failure test, which asserts the honest intermediate "
+        "state.\n"
+        "\n"
+        "THE EDIT MOVES IT TO JUST BEFORE `write_manifest`, WHICH IS AS LATE "
+        "AS IT CAN GO. Moving it AFTER `write_manifest` is not a behavioural "
+        "mutant at all: `write_manifest` hashes the bytes of the file the copy "
+        "writes and refuses a set whose document is not beside the artifacts "
+        "(its own guard, mutated by B-P9), so the ordering is a DATA "
+        "DEPENDENCY rather than a convention -- such an edit fails every build "
+        "in the suite with a `ValueError` from the guard, which is the guard "
+        "working, not a contract going unpinned. The observable this row is "
+        "about is the part-way state, and it is identical for any placement "
+        "after the first artifact",
         "test_the_documentation_is_written_BEFORE_the_manifest_which_is_still_LAST",
         [
             (

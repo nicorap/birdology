@@ -1615,6 +1615,75 @@ def test_a_tensor_that_declares_no_params_writes_an_explicit_null(tmp_path):
     assert back.smoothing_params is None
 
 
+@pytest.mark.parametrize(
+    "field_name, cls",
+    [("backoff_params", BackoffParams), ("smoothing_params", SmoothingParams)],
+)
+def test_the_params_DATACLASS_DEFAULT_is_None_and_the_artifact_says_so(
+    tmp_path, field_name, cls
+):
+    """A `PriorTensor` built WITHOUT the params must declare none, not defaults.
+
+    WHY THIS IS NOT THE TEST ABOVE. `_saveable` goes through `to_tensor`,
+    whose own signature defaults both params to `None` and PASSES THEM ON
+    explicitly -- so the dataclass FIELD default is never reached and the
+    assertion above holds whatever that default is. This test constructs
+    `PriorTensor` directly, which is the only way the field default decides
+    anything.
+
+    WHY IT MATTERS. If the default were `BackoffParams()` / `SmoothingParams()`
+    rather than `None`, every tensor built by a path that does not thread the
+    params would publish TODAY'S CONSTANTS as the ones it was built with: a
+    well-formed artifact whose provenance is a confident lie, in the one field
+    whose entire purpose is to be believed. The reachable path in this
+    repository is `controls._respec`, which constructs a `PriorTensor` without
+    either params object -- and the CLI hides even that, because
+    `build_from_archive` overwrites both fields on every control it writes.
+
+    WHERE IT WAS FOUND. The mutation harness scored exactly these two edits
+    (`T-I2m`, `T-I2p` in `run_tensor_mutants.py`) as killed ONLY by
+    `tests/prior/test_build_prior.py` -- a contract of `tensor.py`'s own
+    dataclass pinned solely from another module's test file. That test asserts
+    the CLI/control path and stays; this one asserts the declaration itself,
+    where it lives.
+
+    Asserted through a real `save_prior`/`load_prior` round trip as well as on
+    the object, because the harm is what the ARTIFACT says to a third party
+    who has only the files.
+    """
+    t = PriorTensor(
+        spec=SPEC,
+        species_keys=np.asarray([1, 2], dtype=np.int64),
+        cells=["cell-a", "cell-b"],
+        values=sparse.csr_matrix((2, 2 * WEEKS_PER_YEAR)),
+    )
+    t.gbif_doi = DOI
+
+    # The precondition and the whole point: nothing was passed, so the FIELD
+    # DEFAULT is what answers here.
+    assert getattr(t, field_name) is None, (
+        f"a directly-constructed PriorTensor declares "
+        f"{getattr(t, field_name)!r} for {field_name!r}; the dataclass default "
+        f"fabricated a record of a {cls.__name__} this tensor never used"
+    )
+    # ...and it would have been a claim about real constants, not an empty
+    # placeholder, so the lie would be indistinguishable from a measurement.
+    assert {f.name for f in dc_fields(cls)}, f"{cls.__name__} has no fields"
+
+    npz = save_prior(t, tmp_path / "p.npz")
+    meta = json.loads(npz.with_suffix(".json").read_text(encoding="utf-8"))
+    assert field_name in meta, (
+        f"the sidecar omits {field_name!r}; `load_prior` refuses an absent "
+        "key, so this artifact would be unreadable by its own reader"
+    )
+    assert meta[field_name] is None, (
+        f"the sidecar of a params-less tensor records {meta[field_name]!r} "
+        f"for {field_name!r}; a consumer would calibrate against constants no "
+        "computation ever ran with"
+    )
+    assert getattr(load_prior(npz), field_name) is None
+
+
 @pytest.mark.parametrize("key", ["backoff_params", "smoothing_params"])
 def test_a_sidecar_MISSING_a_params_key_is_REFUSED_not_defaulted(tmp_path, key):
     """An ABSENT key is not a `null`. No silent repair at the boundary.
