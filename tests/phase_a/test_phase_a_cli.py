@@ -663,3 +663,45 @@ def test_split_that_does_not_exist_fails_loudly_naming_the_alternatives(tmp_path
             tmp_path, config="HSN", resolution=4, key_file=None,
             out_dir=tmp_path / "out", split="nope",
         )
+
+
+def test_a_bare_filename_with_no_directory_raises_for_the_caller_to_count():
+    """Measured in the real XCM metadata: 2 of 89795 filepaths are bare
+    'XC723553.ogg'. An IndexError here aborted the whole 409-species run;
+    ValueError lets the caller skip and count."""
+    with pytest.raises(ValueError, match="no parent directory"):
+        species_tag("streptopelia", "XC723553.ogg")
+
+
+def test_underivable_filepaths_do_not_abort_the_species_sweep(tmp_path):
+    corpus = tmp_path / "XCM" / "XCM"
+    corpus.mkdir(parents=True)
+    pq.write_table(
+        pa.table(
+            {
+                "filepath": pa.array(
+                    ["data/xc/parus_major/XC1.ogg", "XC723553.ogg"], pa.string()
+                ),
+                "lat": pa.array([55.0, 55.0], pa.float64()),
+                "long": pa.array([12.0, 12.0], pa.float64()),
+                "ebird_code": pa.array(["gretit", "eucdov"], pa.string()),
+                "genus": pa.array(["parus", "streptopelia"], pa.string()),
+                "id": pa.array([1, 723553], pa.int64()),
+            }
+        ),
+        corpus / "XCM_metadata.parquet",
+    )
+    key = tmp_path / "key"
+    key.write_text("k\n")
+    with patch(
+        "phase_a_manifest.date_focal_species",
+        return_value=({1: date(2021, 10, 15)}, {}),
+    ) as mocked:
+        build_all(
+            tmp_path, config="XCM", resolution=4, key_file=key,
+            out_dir=tmp_path / "out",
+        )
+    # The sweep ran with ONLY the derivable species; the bare row was skipped.
+    called_species = mocked.call_args[0][0]
+    assert ("parus", "major") in called_species
+    assert not any(g == "streptopelia" for g, _ in called_species)

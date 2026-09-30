@@ -97,8 +97,17 @@ def species_tag(genus: str, filepath: str) -> tuple[str, str]:
     The coverage floor in `build_all` is the backstop for all of these: a
     species dated 0/N drags coverage down, and a corpus-wide derivation bug
     drops it below `min_coverage` and refuses the build.
+
+    Raises ValueError for a filepath with NO parent directory (measured in the
+    real XCM metadata: 2 of 89795 rows are bare `XC723553.ogg`) -- there is no
+    epithet to derive, and the caller SKIPS and COUNTS the row rather than
+    letting an IndexError abort the whole 409-species run. The recording then
+    falls out as a counted NO_DATE drop, the designed path for undatable rows.
     """
-    return genus, filepath.split("/")[-2].split("_")[-1]
+    parts = filepath.split("/")
+    if len(parts) < 2:
+        raise ValueError(f"no parent directory in {filepath!r} to derive a species from")
+    return genus, parts[-2].split("_")[-1]
 
 
 def _load_progress(path: Path) -> dict[str, dict[str, str]]:
@@ -213,13 +222,22 @@ def build_all(
         # read_key(path), NEVER an env var or a raw argv value: argv shows in
         # `ps`, env leaks into sbatch exports.
         key = read_key(Path(key_file))
-        species = sorted(
-            {
-                species_tag(row["genus"], row["filepath"])
-                for row in metadata.select(["genus", "filepath"]).to_pylist()
-                if row.get("genus")
-            }
-        )
+        species_set = set()
+        underivable = 0
+        for row in metadata.select(["genus", "filepath"]).to_pylist():
+            if not row.get("genus"):
+                continue
+            try:
+                species_set.add(species_tag(row["genus"], row["filepath"] or ""))
+            except ValueError:
+                underivable += 1
+        if underivable:
+            log.warning(
+                "%d rows have no parent directory in filepath -- species "
+                "underivable; they will fall out as counted no_date drops",
+                underivable,
+            )
+        species = sorted(species_set)
         log.info("dating %d species from the XC API", len(species))
         dates, _ = date_focal_species(
             species,
