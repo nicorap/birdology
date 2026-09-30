@@ -136,9 +136,18 @@ def _pool_perch_logits(logits_array: np.ndarray) -> np.ndarray:
     as the embedding. BirdNET deliberately differs (max — BirdSet's
     convention); the asymmetry is intentional, see _max_pool_birdnet_logits.
 
-    Calibration (*0.97 - 10.0 for perch_v2) is applied by hoplite's own model
-    object (model_configs) BEFORE these logits reach us — re-applying it here
-    would double-shift every logit. Do not.
+    THESE ARE RAW, UNCALIBRATED LOGITS. MEASURED on the fleet (2026-09-30):
+    hoplite's model object does NOT apply the perch_v2 calibration
+    (*0.97 - 10.0). batch_embed logits equal the raw serving_default logits
+    (max|diff| 9.2e-1 against the calibrated version — i.e. equals raw, not
+    calibrated; silence median -1.70, nowhere near the calibrated -10). The
+    reconnaissance claim "calibration is applied by the model object" was
+    FALSE. Decision: the cache stores RAW model logits — calibration is a
+    downstream display concern; Phase B fuses RELATIVE scores, and a fixed
+    affine map cancels in a softmax. The perch encoder declares
+    'perch_logits_are_raw_uncalibrated: true' in the parquet schema metadata
+    (via its `parquet_metadata` attribute, written by embed_shard) so no
+    consumer can assume calibrated values.
 
     A 2-D (n_windows, n_classes) input is accepted for mocked tests. Anything
     else raises loudly rather than squeezing/reshaping blind: a cited API
@@ -214,10 +223,11 @@ def _load_perch_model_with_logits() -> Callable[[np.ndarray], Mapping[str, np.nd
     batch_embed's InferenceOutputs carries a `.logits` dict whose 'label'
     entry is the (1, n_windows, 14795) species head (MEASURED: batch_embed
     source reshapes logits to framed_audio.shape[:2] + (n_classes,)).
-    hoplite's model object applies the perch_v2 calibration (*0.97 - 10.0)
-    itself — we pool, never re-calibrate. A missing logits dict or 'label'
-    key raises loudly: a cache silently built without its posterior would
-    force the second 581 GB pass this column exists to avoid.
+    These logits are RAW and UNCALIBRATED — measured, see _pool_perch_logits
+    — and are cached as-is; never apply the *0.97 - 10.0 map here. A missing
+    logits dict or 'label' key raises loudly: a cache silently built without
+    its posterior would force the second 581 GB pass this column exists to
+    avoid.
     """
     try:
         from perch_hoplite.zoo import model_configs
@@ -275,6 +285,13 @@ def make_perch_encoder_with_logits(
         )
         return emb.astype(np.float32), logits
 
+    # The measured falsification (hoplite does NOT apply the perch_v2
+    # calibration — see _pool_perch_logits) must travel WITH the cache:
+    # embed_shard copies this declaration into the parquet schema metadata
+    # so no consumer can assume calibrated values.
+    encode2.parquet_metadata = {  # type: ignore[attr-defined]
+        "perch_logits_are_raw_uncalibrated": "true"
+    }
     return encode2
 
 
@@ -369,7 +386,7 @@ def make_birdnet_encoder(model=None, device: str = "GPU") -> Encoder:
 
 
 def _max_pool_birdnet_logits(predictions: np.ndarray) -> np.ndarray:
-    """MAX over segments of (n_segments, n_classes) predictions.
+    """MAX over segments of (n_segments, n_classes) DENSE scores.
 
     BirdSet's own convention for recording-level BirdNET scores is
     max-pooling over segments — deliberately NOT the mean used for the
@@ -377,6 +394,11 @@ def _max_pool_birdnet_logits(predictions: np.ndarray) -> np.ndarray:
     documented in the Task 6 plan: a bird audible in one 3 s segment of a
     long recording should dominate its recording-level score, and BirdSet's
     published numbers were computed under exactly this rule.
+
+    The input must already be DENSE and class-aligned — column j is species
+    j for every row (see _dense_birdnet_scores, which verifies/repairs the
+    id alignment first). Max over a sorted-by-confidence matrix would be
+    meaningless.
 
     Strict 2-D only: predict output whose shape surprises us is refused,
     never squeezed — a cited API claim is a hypothesis until measured.
@@ -393,18 +415,107 @@ def _max_pool_birdnet_logits(predictions: np.ndarray) -> np.ndarray:
     return p.max(axis=0).astype(np.float32)
 
 
-def make_birdnet_encoder_with_logits(model=None, device: str = "GPU") -> EncoderWithLogits:
-    """Build the BirdNET V2.4 encoder that also returns max-pooled logits.
+def _dense_birdnet_scores(
+    species_probs: np.ndarray, species_ids: np.ndarray, n_species: int
+) -> np.ndarray:
+    """Dense class-aligned (n_segments, n_species) scores for ONE recording.
 
-    `encode_arrays` does NOT return logits (measured on the fleet), so the
-    posterior needs the package's predict API. birdnet 1.1.1's exact predict
-    call was NOT measurable locally (no TF on the dev Mac): this wrapper
-    pins `model.predict_arrays([(samples, sr)], n_workers=1, device=...)`
-    returning an object with `.predictions` shaped
-    (1, n_segments, n_classes) — the contract the injectable mock enforces.
-    If the real package's API differs, the wrapper raises
-    NotImplementedError NAMING the API it needs instead of guessing a call
-    signature; the Task 6.4 pilot is the measurement that tells us.
+    MEASURED (birdnet 1.1.1 pb backend, fleet 2026-09-30): predict_arrays
+    with top_k=None returns .species_probs (n_inputs, n_segments, k) with
+    k == n_species (6522) — ALREADY dense — and .species_ids (same shape,
+    uint16) OBSERVED to be the identity permutation 0..n_species-1 per
+    segment. Observed is not guaranteed: identity is VERIFIED here, and when
+    ids come back permuted (e.g. sorted by confidence, which top_k<full
+    output does), scores are SCATTERED into a dense vector by their ids
+    instead of trusted positionally — max over a confidence-sorted matrix
+    would be garbage no downstream check could catch.
+
+    The truncation guard: k < n_species means top_k was left at the package
+    default (5) somewhere upstream. Pooling a truncated vector writes a
+    cache that is silently wrong for n_species - k classes — REFUSED, never
+    pooled. k > n_species is an id-space mismatch and equally refused.
+    """
+    probs = np.asarray(species_probs, dtype=np.float32)
+    ids = np.asarray(species_ids)
+    if probs.ndim != 2 or ids.shape != probs.shape:
+        raise ValueError(
+            f"unexpected birdnet species_probs/species_ids shapes "
+            f"{probs.shape}/{ids.shape}; expected matching (n_segments, k) "
+            "for ONE recording — refusing to guess axes on a surprise shape"
+        )
+    n_segments, k = probs.shape
+    if n_segments == 0:
+        raise ValueError("birdnet returned zero prediction segments")
+    if k != n_species:
+        raise ValueError(
+            f"birdnet species_probs carry k={k} classes but the model has "
+            f"n_species={n_species}: a k < n_species result means "
+            "predict_arrays ran with a truncating top_k (the package "
+            "default is 5) and max-pooling it would write a cache silently "
+            "wrong for the other classes — call with top_k=None; refusing "
+            "to pool a non-dense result"
+        )
+    ids = ids.astype(np.int64)
+    if np.array_equal(
+        ids, np.broadcast_to(np.arange(n_species, dtype=np.int64), ids.shape)
+    ):
+        # The measured dense case: column j IS species j. No scatter needed.
+        return probs
+    # Permuted ids: verify each segment's ids are a permutation of
+    # 0..n_species-1 (a duplicate would silently drop a score in the
+    # scatter), then place every score at its own class index.
+    if not np.array_equal(
+        np.sort(ids, axis=1),
+        np.broadcast_to(np.arange(n_species, dtype=np.int64), ids.shape),
+    ):
+        raise ValueError(
+            "birdnet species_ids are neither the identity permutation nor a "
+            "per-segment permutation of 0..n_species-1; scattering would "
+            "drop or misplace scores — refusing to build a dense vector "
+            "from inconsistent ids"
+        )
+    dense = np.empty((n_segments, n_species), dtype=np.float32)
+    dense[np.arange(n_segments)[:, None], ids] = probs
+    return dense
+
+
+def make_birdnet_encoder_with_logits(model=None, device: str = "GPU") -> EncoderWithLogits:
+    """Build the BirdNET V2.4 encoder that also returns max-pooled scores.
+
+    `encode_arrays` does NOT return scores, so the posterior comes from
+    `predict_arrays`. MEASURED (birdnet 1.1.1, pb backend, fleet
+    2026-09-30) — replacing this wrapper's earlier mock-pinned
+    `.predictions` contract, which DOES NOT EXIST on the real package:
+
+        predict_arrays(inp, /, *, top_k=5, n_workers=None, batch_size=1,
+                       device='CPU', apply_sigmoid=True,
+                       sigmoid_sensitivity=1.0,
+                       default_confidence_threshold=0.1,
+                       apply_softmax=False, ...)
+
+    returning a result with `.species_probs` (n_inputs, n_segments, k)
+    float32, `.species_ids` (same shape) uint16, and `.species_list` /
+    `.n_species` (6522). Called here with:
+
+    - top_k=None — MEASURED to return the FULL n_species-wide vector
+      (species_probs (1, 3, 6522)); the default top_k=5 TRUNCATES, and
+      _dense_birdnet_scores refuses any k < n_species result.
+    - apply_sigmoid=True — BirdNET's head emits per-class sigmoid
+      PROBABILITIES in [0, 1], NOT raw logits. The column concept is
+      'scores': the cache stores what the official tooling emits.
+    - default_confidence_threshold=None — asking for NO thresholding.
+      LOUD CAVEAT: None was probed only against the mock, not the real
+      call; birdnet 1.1.1's signature defaults it to 0.1 (float). If the
+      real package rejects None, the Task 6.4 pilot fails RIGHT HERE with
+      birdnet's own TypeError/ValueError — adapt the wrapper then; do NOT
+      pre-emptively pass a magic float that silently zeroes sub-threshold
+      scores.
+    - n_workers=1 (Slurm: never one worker per core), device forwarded
+      exactly like encode_arrays.
+
+    Pooling is MAX over segments (BirdSet's convention) on the DENSE
+    class-aligned scores; _dense_birdnet_scores verifies species_ids are
+    the identity permutation and scatters by id when they are not.
 
     Embeddings come from the same masked-mean path as make_birdnet_encoder.
     """
@@ -416,32 +527,54 @@ def make_birdnet_encoder_with_logits(model=None, device: str = "GPU") -> Encoder
         emb = embed_only(samples, sr)
         if not hasattr(model, "predict_arrays"):
             raise NotImplementedError(
-                "birdnet logits require the model to expose "
-                "predict_arrays(arrays, n_workers=1, device=...) returning "
-                "an object with .predictions of shape "
-                "(1, n_segments, n_classes); this birdnet build does not "
-                f"have it (model type: {type(model).__name__}). Measure the "
-                "real predict API on the cluster (Task 6.4 pilot) and adapt "
-                "the wrapper — do NOT guess a call signature."
+                "birdnet scores require the model to expose "
+                "predict_arrays(inp, /, *, top_k=None, apply_sigmoid=True, "
+                "n_workers=1, device=...) returning a result with "
+                ".species_probs and .species_ids of shape "
+                "(1, n_segments, k) plus .n_species; this birdnet build "
+                f"does not have it (model type: {type(model).__name__})."
             )
         x = np.asarray(samples, dtype=np.float32).reshape(-1)
-        result = model.predict_arrays([(x, sr)], n_workers=1, device=device)
-        predictions = getattr(result, "predictions", None)
-        if predictions is None:
+        result = model.predict_arrays(
+            [(x, sr)],
+            top_k=None,
+            apply_sigmoid=True,
+            default_confidence_threshold=None,
+            n_workers=1,
+            device=device,
+        )
+        species_probs = getattr(result, "species_probs", None)
+        species_ids = getattr(result, "species_ids", None)
+        if species_probs is None or species_ids is None:
             raise NotImplementedError(
                 "birdnet predict_arrays returned an object without "
-                f".predictions (got {type(result).__name__}); the wrapper "
-                "needs (1, n_segments, n_classes) predictions — measure the "
-                "real API on the cluster and adapt, do NOT guess."
+                ".species_probs/.species_ids "
+                f"(got {type(result).__name__}); the wrapper needs the "
+                "measured 1.1.1 pb result shape (1, n_segments, k) — "
+                "re-measure the API on the cluster and adapt, do NOT guess."
             )
-        preds = np.asarray(predictions, dtype=np.float32)
-        if preds.ndim != 3 or preds.shape[0] != 1:
+        n_species = getattr(result, "n_species", None)
+        if n_species is None:
+            species_list = getattr(result, "species_list", None)
+            if species_list is None:
+                raise NotImplementedError(
+                    "birdnet predict_arrays result exposes neither "
+                    ".n_species nor .species_list; without the class count "
+                    "the k<n_species truncation guard cannot run — "
+                    "re-measure the API, do NOT pool unguarded."
+                )
+            n_species = len(species_list)
+        probs = np.asarray(species_probs, dtype=np.float32)
+        ids = np.asarray(species_ids)
+        if probs.ndim != 3 or probs.shape[0] != 1 or ids.shape != probs.shape:
             raise ValueError(
-                f"unexpected birdnet predictions shape {preds.shape}; "
-                "expected (1, n_segments, n_classes) from predict_arrays of "
-                "ONE recording — refusing to guess axes on a surprise shape"
+                f"unexpected birdnet species_probs/species_ids shapes "
+                f"{probs.shape}/{ids.shape}; expected matching "
+                "(1, n_segments, k) from predict_arrays of ONE recording — "
+                "refusing to guess axes on a surprise shape"
             )
-        return emb, _max_pool_birdnet_logits(preds[0])
+        dense = _dense_birdnet_scores(probs[0], ids[0], int(n_species))
+        return emb, _max_pool_birdnet_logits(dense)
 
     return encode2
 

@@ -36,6 +36,7 @@ from birdology.phase_a.embed import (
 )
 from birdology.phase_a.encoders import (
     PERCH_SR,
+    _dense_birdnet_scores,
     _max_pool_birdnet_logits,
     _pool_perch_logits,
     load_encoder_with_logits,
@@ -127,6 +128,87 @@ def test_birdnet_logits_refuses_zero_segments():
 
 
 # ---------------------------------------------------------------------------
+# _dense_birdnet_scores: identity verification, scatter, truncation guard
+# ---------------------------------------------------------------------------
+
+_BN_N_SPECIES = 7  # stand-in for 6522; what's pinned is k == n_species
+
+# Dense (2 segments, 7 species), asymmetric per class: max != mean, and no
+# two columns share values — a positional read of permuted columns changes
+# the answer instead of hiding.
+_BN_DENSE_PROBS = np.array(
+    [
+        [0.9, 0.1, 0.0, 0.4, 0.2, 0.7, 0.3],
+        [0.1, 0.5, 0.2, 0.6, 0.8, 0.3, 0.05],
+    ],
+    dtype=np.float32,
+)
+_BN_DENSE_MAX = np.array([0.9, 0.5, 0.2, 0.6, 0.8, 0.7, 0.3], dtype=np.float32)
+
+# Two DIFFERENT per-segment permutations (the confidence-sorted case).
+_BN_PERMUTED_IDS = np.array(
+    [
+        [3, 0, 6, 1, 5, 2, 4],
+        [6, 5, 4, 3, 2, 1, 0],
+    ],
+    dtype=np.uint16,
+)
+# probs[seg, j] carries the score OF species _BN_PERMUTED_IDS[seg, j].
+_BN_PERMUTED_PROBS = np.take_along_axis(
+    _BN_DENSE_PROBS, _BN_PERMUTED_IDS.astype(np.int64), axis=1
+)
+
+_BN_IDENTITY_IDS = np.broadcast_to(
+    np.arange(_BN_N_SPECIES, dtype=np.uint16), _BN_DENSE_PROBS.shape
+)
+
+
+def test_dense_scores_identity_ids_pass_through():
+    out = _dense_birdnet_scores(_BN_DENSE_PROBS, _BN_IDENTITY_IDS, _BN_N_SPECIES)
+    np.testing.assert_array_equal(out, _BN_DENSE_PROBS)
+
+
+def test_dense_scores_scatter_by_permuted_ids():
+    """When ids are NOT the identity, every score must land at its own class
+    index — reading the permuted matrix positionally gives different numbers
+    (the fixture guarantees it), so a skipped scatter cannot hide."""
+    out = _dense_birdnet_scores(_BN_PERMUTED_PROBS, _BN_PERMUTED_IDS, _BN_N_SPECIES)
+    np.testing.assert_array_equal(out, _BN_DENSE_PROBS)
+    assert not np.array_equal(_BN_PERMUTED_PROBS, _BN_DENSE_PROBS)
+
+
+def test_dense_scores_refuse_truncated_k_below_n_species():
+    """The silently-wrong-cache case: top_k left at the package default (5)
+    yields k < n_species, and pooling it would write scores that are wrong
+    for every class outside the top k. REFUSED, never pooled."""
+    with pytest.raises(ValueError, match="top_k"):
+        _dense_birdnet_scores(
+            _BN_PERMUTED_PROBS[:, :5], _BN_PERMUTED_IDS[:, :5], _BN_N_SPECIES
+        )
+
+
+def test_dense_scores_refuse_non_permutation_ids():
+    """Duplicate ids would silently drop a score in the scatter."""
+    bad_ids = _BN_PERMUTED_IDS.copy()
+    bad_ids[0, 1] = bad_ids[0, 0]  # duplicate -> not a permutation
+    with pytest.raises(ValueError, match="permutation"):
+        _dense_birdnet_scores(_BN_PERMUTED_PROBS, bad_ids, _BN_N_SPECIES)
+
+
+def test_dense_scores_refuse_zero_segments_and_shape_mismatch():
+    with pytest.raises(ValueError, match="zero prediction segments"):
+        _dense_birdnet_scores(
+            np.zeros((0, _BN_N_SPECIES), np.float32),
+            np.zeros((0, _BN_N_SPECIES), np.uint16),
+            _BN_N_SPECIES,
+        )
+    with pytest.raises(ValueError, match="species_probs/species_ids"):
+        _dense_birdnet_scores(
+            _BN_DENSE_PROBS, _BN_IDENTITY_IDS[:, :5], _BN_N_SPECIES
+        )
+
+
+# ---------------------------------------------------------------------------
 # encoder2 wrappers (mocked models)
 # ---------------------------------------------------------------------------
 
@@ -157,34 +239,113 @@ def test_perch_encoder_with_logits_rejects_non_32khz():
         encoder2(np.zeros(1000, dtype=np.float32), 44100)
 
 
-def test_birdnet_encoder_with_logits_max_pools_predictions():
-    calls = {}
+class _MeasuredBirdnetModel:
+    """Mock pinned to birdnet 1.1.1's MEASURED predict_arrays API (fleet,
+    2026-09-30): POSITIONAL-ONLY inp, KEYWORD-ONLY knobs, and a
+    top_k-HONOURING result — a wrapper that drops top_k=None receives the
+    default-5 confidence-sorted TRUNCATED result, exactly like the real
+    package, and the k < n_species guard must refuse it. The old
+    `.predictions` attribute does not exist here because it does not exist
+    on the real package either.
+    """
 
-    class FakeModel:
-        def encode_arrays(self, arrays, n_workers, device):
-            emb = np.array([[[1.0, 3.0], [5.0, 7.0]]], dtype=np.float32)
-            mask = np.zeros((1, 2, 2), dtype=bool)
-            return SimpleNamespace(embeddings=emb, embeddings_masked=mask)
+    def __init__(self, ids=None, probs=None):
+        # ids/probs default to the dense identity case.
+        self._ids = _BN_IDENTITY_IDS if ids is None else ids
+        self._probs = _BN_DENSE_PROBS if probs is None else probs
+        self.calls: dict = {}
 
-        def predict_arrays(self, arrays, n_workers, device):
-            calls["n_workers"] = n_workers
-            calls["device"] = device
-            calls["sr"] = arrays[0][1]
-            return SimpleNamespace(predictions=_BIRDNET_PREDICTIONS[None, :, :])
+    def encode_arrays(self, arrays, n_workers, device):
+        emb = np.array([[[1.0, 3.0], [5.0, 7.0]]], dtype=np.float32)
+        mask = np.zeros((1, 2, 2), dtype=bool)
+        return SimpleNamespace(embeddings=emb, embeddings_masked=mask)
 
-    encoder2 = make_birdnet_encoder_with_logits(model=FakeModel())
-    emb, logits = encoder2(np.ones(32000, dtype=np.float32), 32000)
+    def predict_arrays(
+        self,
+        inp,
+        /,
+        *,
+        top_k=5,
+        n_workers=None,
+        batch_size=1,
+        device="CPU",
+        apply_sigmoid=True,
+        sigmoid_sensitivity=1.0,
+        default_confidence_threshold=0.1,
+        apply_softmax=False,
+    ):
+        self.calls.update(
+            top_k=top_k,
+            n_workers=n_workers,
+            device=device,
+            apply_sigmoid=apply_sigmoid,
+            default_confidence_threshold=default_confidence_threshold,
+            sr=inp[0][1],
+        )
+        probs, ids = self._probs, self._ids
+        if top_k is not None:
+            order = np.argsort(-probs, axis=1)[:, :top_k]
+            probs = np.take_along_axis(probs, order, axis=1)
+            ids = np.take_along_axis(ids.astype(np.int64), order, axis=1)
+        return SimpleNamespace(
+            species_probs=np.asarray(probs, dtype=np.float32)[None],
+            species_ids=np.asarray(ids, dtype=np.uint16)[None],
+            species_list=[f"sp{i}" for i in range(_BN_N_SPECIES)],
+            n_species=_BN_N_SPECIES,
+        )
+
+
+def test_birdnet_encoder_with_logits_dense_identity_ids():
+    """The MEASURED happy path: top_k=None yields the full dense matrix with
+    identity ids; recording-level scores are the per-class MAX. A wrapper
+    that leaves top_k at the default 5 gets a truncated result from this
+    honouring mock and the guard fails the test."""
+    model = _MeasuredBirdnetModel()
+    encoder2 = make_birdnet_encoder_with_logits(model=model)
+    emb, scores = encoder2(np.ones(32000, dtype=np.float32), 32000)
     np.testing.assert_allclose(emb, np.array([3.0, 5.0], dtype=np.float32))
-    np.testing.assert_allclose(logits, np.array([0.9, 0.5, 0.8], dtype=np.float32))
-    assert calls["n_workers"] == 1  # Slurm: never one worker per core
-    assert calls["device"] == "GPU"
-    assert calls["sr"] == 32000  # OUR sr; the package resamples internally
+    np.testing.assert_allclose(scores, _BN_DENSE_MAX)
+    assert scores.dtype == np.float32
+    # The measured call contract, knob by knob:
+    assert model.calls["top_k"] is None  # full 6522-wide vector, no truncation
+    assert model.calls["apply_sigmoid"] is True  # probabilities, like the tooling
+    assert model.calls["default_confidence_threshold"] is None  # no zeroing
+    assert model.calls["n_workers"] == 1  # Slurm: never one worker per core
+    assert model.calls["device"] == "GPU"
+    assert model.calls["sr"] == 32000  # OUR sr; the package resamples internally
+    # Max, not mean — BirdSet's convention; the fixture makes them differ.
+    assert not np.allclose(scores, _BN_DENSE_PROBS.mean(axis=0))
+
+
+def test_birdnet_encoder_with_logits_scatters_permuted_ids():
+    """If species_ids come back permuted (confidence-sorted), scores must be
+    scattered to their class indices before pooling; trusting column order
+    gives different numbers (fixture-guaranteed) and fails here."""
+    model = _MeasuredBirdnetModel(ids=_BN_PERMUTED_IDS, probs=_BN_PERMUTED_PROBS)
+    encoder2 = make_birdnet_encoder_with_logits(model=model)
+    _, scores = encoder2(np.ones(32000, dtype=np.float32), 32000)
+    np.testing.assert_allclose(scores, _BN_DENSE_MAX)
+    assert not np.allclose(scores, _BN_PERMUTED_PROBS.max(axis=0))
+
+
+def test_birdnet_encoder_refuses_a_stuck_truncated_result():
+    """A model that IGNORES top_k and returns the default-5 truncation no
+    matter what (k=5 < n_species=7) must be refused — pooling it would write
+    the silently-wrong cache this guard exists for."""
+
+    class StuckTopKModel(_MeasuredBirdnetModel):
+        def predict_arrays(self, inp, /, **kwargs):
+            kwargs["top_k"] = 5  # the package default, immovably
+            return super().predict_arrays(inp, **kwargs)
+
+    encoder2 = make_birdnet_encoder_with_logits(model=StuckTopKModel())
+    with pytest.raises(ValueError, match="top_k"):
+        encoder2(np.ones(32000, dtype=np.float32), 32000)
 
 
 def test_birdnet_with_logits_without_predict_api_raises_naming_it():
-    """birdnet 1.1.1's predict API was NOT measurable locally; if the real
-    package differs, the wrapper must fail naming what it needs — the Task
-    6.4 pilot is the measurement — never guess a call signature."""
+    """A birdnet build without predict_arrays must fail NAMING the API it
+    needs — never guess a call signature."""
 
     class EncodeOnlyModel:
         def encode_arrays(self, arrays, n_workers, device):
@@ -198,42 +359,46 @@ def test_birdnet_with_logits_without_predict_api_raises_naming_it():
         encoder2(np.zeros(32000, dtype=np.float32), 32000)
 
 
-def test_birdnet_with_logits_result_without_predictions_raises():
-    class WeirdModel:
-        def encode_arrays(self, arrays, n_workers, device):
-            return SimpleNamespace(
-                embeddings=np.ones((1, 1, 4), dtype=np.float32),
-                embeddings_masked=np.zeros((1, 1, 4), dtype=bool),
-            )
+def test_birdnet_with_logits_result_without_species_probs_raises():
+    """The OLD mock-pinned `.predictions` contract does not exist on the
+    real package; a result carrying it (and not .species_probs) must be
+    refused loudly, not silently adapted."""
 
-        def predict_arrays(self, arrays, n_workers, device):
-            return SimpleNamespace(scores=np.ones((1, 1, 3)))
+    class OldHypothesisModel(_MeasuredBirdnetModel):
+        def predict_arrays(self, inp, /, **kwargs):
+            return SimpleNamespace(predictions=np.ones((1, 1, 3)))
 
-    encoder2 = make_birdnet_encoder_with_logits(model=WeirdModel())
-    with pytest.raises(NotImplementedError, match="predictions"):
+    encoder2 = make_birdnet_encoder_with_logits(model=OldHypothesisModel())
+    with pytest.raises(NotImplementedError, match="species_probs"):
         encoder2(np.zeros(32000, dtype=np.float32), 32000)
 
 
-def test_birdnet_with_logits_surprise_prediction_shape_raises():
-    """A (n_segments, n_classes) return without the batch axis, or a batch
-    of 2, must be refused, never squeezed blind."""
+def test_birdnet_with_logits_surprise_shapes_raise():
+    """A missing batch axis, a batch of 2, or ids/probs disagreeing must be
+    refused, never squeezed blind."""
 
-    class BadShapeModel:
-        def __init__(self, shape):
-            self.shape = shape
+    class BadShapeModel(_MeasuredBirdnetModel):
+        def __init__(self, probs_shape, ids_shape):
+            super().__init__()
+            self.probs_shape = probs_shape
+            self.ids_shape = ids_shape
 
-        def encode_arrays(self, arrays, n_workers, device):
+        def predict_arrays(self, inp, /, **kwargs):
             return SimpleNamespace(
-                embeddings=np.ones((1, 1, 4), dtype=np.float32),
-                embeddings_masked=np.zeros((1, 1, 4), dtype=bool),
+                species_probs=np.ones(self.probs_shape, dtype=np.float32),
+                species_ids=np.zeros(self.ids_shape, dtype=np.uint16),
+                n_species=_BN_N_SPECIES,
             )
 
-        def predict_arrays(self, arrays, n_workers, device):
-            return SimpleNamespace(predictions=np.ones(self.shape, dtype=np.float32))
-
-    for shape in ((3, 4), (2, 3, 4)):
-        encoder2 = make_birdnet_encoder_with_logits(model=BadShapeModel(shape))
-        with pytest.raises(ValueError, match="unexpected birdnet predictions shape"):
+    for probs_shape, ids_shape in (
+        ((3, 4), (3, 4)),  # no batch axis
+        ((2, 3, 4), (2, 3, 4)),  # two recordings
+        ((1, 3, 4), (1, 3, 5)),  # ids/probs disagree
+    ):
+        encoder2 = make_birdnet_encoder_with_logits(
+            model=BadShapeModel(probs_shape, ids_shape)
+        )
+        with pytest.raises(ValueError, match="species_probs/species_ids"):
             encoder2(np.zeros(32000, dtype=np.float32), 32000)
 
 
@@ -333,6 +498,44 @@ def test_with_logits_roundtrips_the_logits_schema(tmp_path):
     np.testing.assert_allclose(
         row0["logits"], np.arange(_LOGITS_WIDTH, dtype=np.float32) + n_samples
     )
+
+
+def test_perch_raw_uncalibrated_flag_lands_in_the_parquet_metadata(tmp_path):
+    """The falsified reconnaissance claim ('hoplite applies the perch_v2
+    calibration') means the cached logits are RAW; that fact must travel in
+    the parquet schema metadata so no consumer can assume calibrated
+    values. Built with the REAL perch wrapper (mocked model) through a REAL
+    parquet roundtrip."""
+
+    def fake_model(batch):
+        return {
+            "embedding": np.zeros(8, dtype=np.float32),
+            "logits": _PERCH_LOGITS_2D,
+        }
+
+    encoder2 = make_perch_encoder_with_logits(model=fake_model)
+    p = _shard(tmp_path, [("a/XC1.ogg", _ogg_bytes(sr=PERCH_SR))])
+    out = tmp_path / "emb"
+    res = embed_shard(
+        p, _manifest(["a/XC1.ogg"]), encoder2, out_dir=out, with_logits=True
+    )
+    assert res.schema_variant == "embedding+logits"
+    t = pq.read_table(out / "shard_0001.parquet")
+    assert t.schema.metadata[b"perch_logits_are_raw_uncalibrated"] == b"true"
+    # And the logits in the file are the RAW pooled values — no affine map.
+    np.testing.assert_allclose(
+        t.to_pylist()[0]["logits"], np.array([3.0, 5.0, 0.0], dtype=np.float32)
+    )
+
+
+def test_non_perch_encoders_write_no_raw_uncalibrated_flag(tmp_path):
+    """The flag is a perch-specific measured fact, not boilerplate: a plain
+    encoder's parquet must NOT carry it."""
+    p = _shard(tmp_path, [("a/XC1.ogg", _ogg_bytes())])
+    out = tmp_path / "emb"
+    embed_shard(p, _manifest(["a/XC1.ogg"]), _encoder2(), out_dir=out, with_logits=True)
+    t = pq.read_table(out / "shard_0001.parquet")
+    assert b"perch_logits_are_raw_uncalibrated" not in (t.schema.metadata or {})
 
 
 def test_without_logits_stays_on_the_default_schema(tmp_path):

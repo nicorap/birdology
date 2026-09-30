@@ -278,8 +278,20 @@ def embed_shard(
 
     # An explicit schema: from_pylist([]) is a ZERO-COLUMN table, and a
     # schema-less parquet for an all-failed shard would break Phase B.
+    # Encoder-declared facts about its own output (e.g. perch's
+    # 'perch_logits_are_raw_uncalibrated: true' — hoplite does NOT apply
+    # the *0.97-10 calibration, measured 2026-09-30) ride in the schema
+    # metadata beside the variant, so no consumer can assume calibrated
+    # values from the file alone.
+    metadata: dict[bytes, bytes] = {SCHEMA_VARIANT_KEY: variant.encode()}
+    declared = getattr(encoder, "parquet_metadata", None)
+    if declared:
+        for k, v in declared.items():
+            metadata[k.encode() if isinstance(k, str) else k] = (
+                v.encode() if isinstance(v, str) else v
+            )
     table = pa.Table.from_pylist(rows, schema=schema).replace_schema_metadata(
-        {SCHEMA_VARIANT_KEY: variant.encode()}
+        metadata
     )
     table_tmp = table_path.with_name(table_path.name + ".tmp")
     pq.write_table(table, table_tmp)
