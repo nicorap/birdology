@@ -110,6 +110,37 @@ def species_tag(genus: str, filepath: str) -> tuple[str, str]:
     return genus, parts[-2].split("_")[-1]
 
 
+def species_tag_from_code(
+    ebird_code: str | None, mapping: dict[str, str]
+) -> tuple[str, str]:
+    """Derive the XC query tag from an eBird code via the KNOWLEDGE GRAPH's
+    code->scientificName mapping (taxon:species/{code} dwc:scientificName,
+    exported from output/birdology_reasoned.ttl — the graph this project
+    exists to build; no redundant API pull).
+
+    XCL is the case that needs this: its metadata has NO genus column and
+    every filepath is a bare `XC208209.ogg` (measured 2026-09-30, all 528422
+    rows), so `species_tag` has nothing to work with. It DOES carry
+    ebird_code, and the graph knows 'gretit1' -> 'Parus major' -> the
+    well-formed query `gen:parus sp:major`.
+
+    Raises ValueError for a missing/unknown code or a mononomial sciName
+    (genus-only entries can't form a `sp:` tag) — callers skip and count,
+    same contract as species_tag.
+    """
+    if not ebird_code:
+        raise ValueError("row has no ebird_code to derive a species from")
+    sci = mapping.get(ebird_code)
+    if not sci:
+        raise ValueError(f"ebird_code {ebird_code!r} not in the species map")
+    parts = sci.strip().lower().split()
+    if len(parts) < 2:
+        raise ValueError(
+            f"ebird_code {ebird_code!r} maps to mononomial {sci!r}; no epithet"
+        )
+    return parts[0], parts[1]
+
+
 def _load_progress(path: Path) -> dict[str, dict[str, str]]:
     """`{"genus species": {xc_id: iso_date}}` for species already fetched."""
     if not path.exists():
@@ -198,6 +229,7 @@ def build_all(
     out_dir: Path,
     min_coverage: float = DEFAULT_MIN_COVERAGE,
     split: str | None = None,
+    species_map_path: Path | None = None,
 ) -> Path:
     """Metadata in, manifest parquet out. Returns the written path."""
     meta_path = _metadata_path(Path(corpus_dir), config, split)
@@ -222,19 +254,32 @@ def build_all(
         # read_key(path), NEVER an env var or a raw argv value: argv shows in
         # `ps`, env leaks into sbatch exports.
         key = read_key(Path(key_file))
+        species_map: dict[str, str] = {}
+        if species_map_path is not None:
+            species_map = json.loads(Path(species_map_path).read_text())
+            log.info("species map loaded: %d eBird codes", len(species_map))
+        cols = [c for c in ("genus", "filepath", "ebird_code") if c in metadata.schema.names]
         species_set = set()
         underivable = 0
-        for row in metadata.select(["genus", "filepath"]).to_pylist():
-            if not row.get("genus"):
-                continue
+        for row in metadata.select(cols).to_pylist():
+            # Per-row: directory derivation first (XCM shape), else the
+            # knowledge-graph ebird_code mapping (XCL shape: no genus column,
+            # bare filepaths — measured on all 528422 XCL rows).
             try:
-                species_set.add(species_tag(row["genus"], row["filepath"] or ""))
+                if row.get("genus"):
+                    species_set.add(species_tag(row["genus"], row.get("filepath") or ""))
+                    continue
+                raise ValueError("no genus column/value")
+            except ValueError:
+                pass
+            try:
+                species_set.add(species_tag_from_code(row.get("ebird_code"), species_map))
             except ValueError:
                 underivable += 1
         if underivable:
             log.warning(
-                "%d rows have no parent directory in filepath -- species "
-                "underivable; they will fall out as counted no_date drops",
+                "%d rows underivable by both directory and ebird_code map -- "
+                "they will fall out as counted no_date drops",
                 underivable,
             )
         species = sorted(species_set)
@@ -301,6 +346,15 @@ def main() -> None:
         help="named metadata split (train/test/test_5s) for configs that ship "
         "several parquets, e.g. HSN; omit for single-parquet configs like XCM",
     )
+    ap.add_argument(
+        "--species-map",
+        type=Path,
+        default=None,
+        help="JSON {ebird_code: scientificName} exported from the birdology "
+        "knowledge graph; enables XC dating for metadata with no genus "
+        "column and bare filepaths (XCL). Rows underivable by BOTH the "
+        "directory convention and this map fall out as counted no_date drops.",
+    )
     args = ap.parse_args()
 
     logging.basicConfig(
@@ -315,6 +369,7 @@ def main() -> None:
             out_dir=args.out,
             min_coverage=args.min_coverage,
             split=args.split,
+            species_map_path=args.species_map,
         )
     )
 

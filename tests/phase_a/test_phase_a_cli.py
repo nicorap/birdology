@@ -29,6 +29,7 @@ from phase_a_manifest import (
     collapsed_cells,
     date_focal_species,
     species_tag,
+    species_tag_from_code,
 )
 
 from birdology.phase_a.embed import ShardResult
@@ -140,6 +141,33 @@ def test_species_tag_trinomial_directory_yields_the_last_epithet():
 def test_species_tag_sp_style_directory_yields_sp():
     """`tinamus_sp` -> `sp`: well-formed, matches XC's undetermined records."""
     assert species_tag("tinamus", "data/xc/tinamus_sp/XC2.ogg") == ("tinamus", "sp")
+
+
+def test_species_tag_from_code_maps_via_the_knowledge_graph():
+    """XCL shape: no genus column, bare filepaths — the eBird code and the
+    graph's code->sciName mapping are the only route to an XC query tag."""
+    mapping = {"gretit1": "Parus major", "watrai1": "Rallus aquaticus"}
+    assert species_tag_from_code("gretit1", mapping) == ("parus", "major")
+    assert species_tag_from_code("watrai1", mapping) == ("rallus", "aquaticus")
+
+
+def test_species_tag_from_code_unknown_code_raises():
+    with pytest.raises(ValueError, match="not in the species map"):
+        species_tag_from_code("nosuch1", {"gretit1": "Parus major"})
+
+
+def test_species_tag_from_code_missing_code_raises():
+    with pytest.raises(ValueError, match="no ebird_code"):
+        species_tag_from_code(None, {"gretit1": "Parus major"})
+    with pytest.raises(ValueError, match="no ebird_code"):
+        species_tag_from_code("", {"gretit1": "Parus major"})
+
+
+def test_species_tag_from_code_mononomial_sciname_raises():
+    """A genus-only mapping ('Struthio') cannot form a sp: tag; a malformed
+    tag would silently match zero recordings and date the species 0/N."""
+    with pytest.raises(ValueError, match="mononomial"):
+        species_tag_from_code("weird1", {"weird1": "Struthio"})
 
 
 def test_species_tag_empty_species_part_yields_empty_string():
