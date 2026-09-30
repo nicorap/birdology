@@ -26,7 +26,21 @@ jobs:
         uses: astral-sh/setup-uv@v4
 
       - name: Install dependencies
-        run: uv sync
+        # --extra bench pulls h3/pyarrow/numpy/scipy, which tests/prior/ needs.
+        # Without it those ~850 tests fail COLLECTION rather than being skipped,
+        # so a plain `uv sync` turns the prior suite into a red build (and, if
+        # the imports were ever made optional, into a silently absent one).
+        run: uv sync --extra bench
 
       - name: Run tests
         run: uv run pytest -q
+
+      - name: Assert the prior suite actually ran
+        # A guard against the failure mode this repo has hit before: a suite
+        # that silently stops running looks identical to a passing one. If the
+        # bench extra goes missing, this fails loudly instead of reporting a
+        # green build over ~850 tests that never executed.
+        run: |
+          n=$(uv run pytest tests/prior --collect-only -q | grep -c '::')
+          echo "tests/prior collected $n tests"
+          test "$n" -ge 800 || { echo "expected 800+, collected $n"; exit 1; }
