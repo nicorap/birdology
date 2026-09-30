@@ -18,7 +18,8 @@ Cited facts (2026-09-30 reconnaissance, docs/superpowers/plans/
 - BirdNET V2.4: the `birdnet` pip package resamples internally (scipy FFT),
   so we pass OUR sr through; `encode_arrays` returns embeddings
   (1, n_segments, 1024) plus a boolean mask of the same shape; a segment is
-  VALID when mask.any(axis=-1); recording-level = MEAN over valid segments.
+  VALID when ~mask.any(axis=-1) (True marks PADDING — numpy MaskedArray
+  convention, measured); recording-level = MEAN over valid segments.
   n_workers MUST be 1 under Slurm (the package spawns per-core workers
   otherwise).
 """
@@ -176,12 +177,18 @@ def make_perch_encoder(
 def _masked_mean(embeddings: np.ndarray, mask: np.ndarray) -> np.ndarray:
     """Mean over VALID segments of (n_segments, dim) embeddings.
 
-    `mask` is birdnet's boolean embeddings_masked of the same shape; a segment
-    is valid when mask.any(axis=-1). Invalid segments are excluded — averaging
-    them in would dilute the recording embedding with padding garbage.
+    `mask` is birdnet's boolean embeddings_masked, numpy MaskedArray
+    convention: **True = MASKED-OUT (padding), False = valid data**.
+    MEASURED on the fleet (2026-09-30, bn_mask_probe): a lone 3 s clip's one
+    real segment reads False, and in a mixed-length batch the short clip's
+    padding segments read True with NaN embeddings. (The reconnaissance
+    report had it inverted — "True = valid" — and the wrapper shipped with
+    that inversion; a single-recording call then saw zero valid segments.)
+    A segment is valid when NOT mask.any(axis=-1); padding segments are
+    excluded — averaging them in would inject NaN into the embedding.
     """
     emb = np.asarray(embeddings, dtype=np.float32)
-    valid = np.asarray(mask, dtype=bool).any(axis=-1)
+    valid = ~np.asarray(mask, dtype=bool).any(axis=-1)
     if not valid.any():
         raise ValueError("birdnet returned no valid segments for this recording")
     return emb[valid].mean(axis=0).astype(np.float32)

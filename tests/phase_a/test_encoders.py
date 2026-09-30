@@ -159,20 +159,33 @@ def test_pool_perch_outputs_refuses_unknown_rank():
 # ---------------------------------------------------------------------------
 
 
-def test_masked_mean_excludes_invalid_segments():
-    """Including the invalid segment would change the answer (999s)."""
+def test_masked_mean_excludes_PADDING_segments():
+    """True marks PADDING (numpy MaskedArray convention — MEASURED on the
+    fleet: a mixed-length batch pads the short clip with True-masked NaN
+    segments). Including the padding segment would change the answer (999s);
+    with NaN padding it would poison the whole mean."""
     emb = np.array(
         [[1.0, 3.0], [3.0, 5.0], [999.0, 999.0]],
         dtype=np.float32,
     )
-    mask = np.array([[True, True], [True, False], [False, False]])
+    # Segments 0,1 valid (False); segment 2 is padding (True on any feature).
+    mask = np.array([[False, False], [False, True], [True, True]])
     pooled = _masked_mean(emb, mask)
-    np.testing.assert_allclose(pooled, np.array([2.0, 4.0], dtype=np.float32))
+    np.testing.assert_allclose(pooled, np.array([1.0, 3.0], dtype=np.float32))
 
 
-def test_masked_mean_all_invalid_raises():
+def test_masked_mean_with_nan_padding_matches_the_measured_failure():
+    """The real shape of the bug: padding embeddings are NaN. Under the
+    inverted convention the mean was NaN or the call raised no-valid."""
+    emb = np.array([[2.0, 6.0], [np.nan, np.nan]], dtype=np.float32)
+    mask = np.array([[False, False], [True, True]])
+    pooled = _masked_mean(emb, mask)
+    np.testing.assert_allclose(pooled, np.array([2.0, 6.0], dtype=np.float32))
+
+
+def test_masked_mean_all_padding_raises():
     emb = np.ones((2, 4), dtype=np.float32)
-    mask = np.zeros((2, 4), dtype=bool)
+    mask = np.ones((2, 4), dtype=bool)  # every segment marked padding
     with pytest.raises(ValueError, match="valid segments"):
         _masked_mean(emb, mask)
 
@@ -186,7 +199,7 @@ def test_birdnet_encoder_passes_sr_through_and_pins_workers():
             calls["n_workers"] = n_workers
             calls["device"] = device
             emb = np.array([[[1.0, 3.0], [5.0, 7.0], [999.0, 999.0]]], dtype=np.float32)
-            mask = np.array([[[True, True], [True, True], [False, False]]])
+            mask = np.array([[[False, False], [False, False], [True, True]]])
             return SimpleNamespace(embeddings=emb, embeddings_masked=mask)
 
     encoder = make_birdnet_encoder(model=FakeModel())
@@ -213,7 +226,7 @@ def test_birdnet_encoder_forwards_device_explicitly():
         def encode_arrays(self, arrays, *, n_workers, device):
             seen.append(device)
             emb = np.ones((1, 1, 4), dtype=np.float32)
-            mask = np.ones((1, 1, 4), dtype=bool)
+            mask = np.zeros((1, 1, 4), dtype=bool)  # False = valid (measured)
             return SimpleNamespace(embeddings=emb, embeddings_masked=mask)
 
     fake = FakeModel()
@@ -306,7 +319,7 @@ def test_factories_return_callables_with_mocked_runtime():
         def encode_arrays(self, arrays, n_workers, device):
             return SimpleNamespace(
                 embeddings=np.ones((1, 1, 1024), dtype=np.float32),
-                embeddings_masked=np.ones((1, 1, 1024), dtype=bool),
+                embeddings_masked=np.zeros((1, 1, 1024), dtype=bool),
             )
 
     birdnet = make_birdnet_encoder(model=FakeModel())
