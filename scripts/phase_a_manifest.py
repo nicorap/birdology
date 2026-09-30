@@ -51,8 +51,24 @@ DEFAULT_MIN_COVERAGE = 0.5
 MIN_CELL_RECORDINGS_FOR_SPREAD_CHECK = 50
 
 
-def _metadata_path(corpus_dir: Path, config: str) -> Path:
+def _metadata_path(corpus_dir: Path, config: str, split: str | None = None) -> Path:
+    """The metadata parquet for one config, optionally for one named split.
+
+    Found on WEKA (measured): HSN ships THREE parquets — `HSN_metadata_train`,
+    `HSN_metadata_test`, `HSN_metadata_test_5s` — and the original fallback
+    chain could only ever reach the train one, making the soundscape splits
+    unreachable from the CLI. `--split` selects them explicitly; without it,
+    the historic default chain applies (single-parquet configs like XCM).
+    """
     d = Path(corpus_dir) / config / config
+    if split is not None:
+        p = d / f"{config}_metadata_{split}.parquet"
+        if p.exists():
+            return p
+        raise FileNotFoundError(
+            f"no metadata parquet for split {split!r} at {p}; available: "
+            f"{sorted(q.name for q in d.glob(f'{config}_metadata*.parquet'))}"
+        )
     for name in (f"{config}_metadata.parquet", f"{config}_metadata_train.parquet"):
         if (d / name).exists():
             return d / name
@@ -172,9 +188,10 @@ def build_all(
     key_file: Path | None,
     out_dir: Path,
     min_coverage: float = DEFAULT_MIN_COVERAGE,
+    split: str | None = None,
 ) -> Path:
     """Metadata in, manifest parquet out. Returns the written path."""
-    meta_path = _metadata_path(Path(corpus_dir), config)
+    meta_path = _metadata_path(Path(corpus_dir), config, split)
     metadata = pq.read_table(meta_path)
     log.info("read %d rows from %s", metadata.num_rows, meta_path)
 
@@ -183,7 +200,11 @@ def build_all(
 
     if _is_soundscape(meta_path):
         dates = None
-        split = "test"
+        # The manifest's split label preserves the REQUESTED granularity:
+        # test and test_5s are different eval sets (whole recordings vs 5 s
+        # segments), and collapsing both to "test" would make them
+        # indistinguishable in every downstream join.
+        split_label = split if split is not None else "test"
     else:
         if key_file is None:
             raise ValueError(
@@ -206,10 +227,10 @@ def build_all(
             progress_path=out_dir / f"{config}_dates_progress.json",
         )
         log.info("dated %d recordings", len(dates))
-        split = "train"
+        split_label = split if split is not None else "train"
 
     table, drops = build_manifest(
-        metadata, dates=dates, resolution=resolution, split=split
+        metadata, dates=dates, resolution=resolution, split=split_label
     )
 
     if table.num_rows == 0:
@@ -225,7 +246,7 @@ def build_all(
             "lower --min-coverage deliberately if this corpus really is that sparse"
         )
 
-    if split == "test":
+    if dates is None:
         # WARNING, not refusal: a genuinely single-week deployment exists
         # (short campaigns). The warning plus the run log is the audit trail
         # for the one-bad-station signature.
@@ -239,7 +260,10 @@ def build_all(
                 MIN_CELL_RECORDINGS_FOR_SPREAD_CHECK,
             )
 
-    path = out_dir / f"{config}_r{resolution}_manifest.parquet"
+    # The split is part of the artifact name: HSN has train AND test AND
+    # test_5s manifests, and a shared name would silently overwrite.
+    suffix = f"_{split}" if split else ""
+    path = out_dir / f"{config}{suffix}_r{resolution}_manifest.parquet"
     pq.write_table(table, path)
     log.info("wrote %s (%d rows, coverage %.3f)", path, table.num_rows, coverage)
     return path
@@ -253,6 +277,12 @@ def main() -> None:
     ap.add_argument("--key-file", type=Path, default=None)
     ap.add_argument("--out", type=Path, default=Path("/mnt/weka/ML/phase_a"))
     ap.add_argument("--min-coverage", type=float, default=DEFAULT_MIN_COVERAGE)
+    ap.add_argument(
+        "--split",
+        default=None,
+        help="named metadata split (train/test/test_5s) for configs that ship "
+        "several parquets, e.g. HSN; omit for single-parquet configs like XCM",
+    )
     args = ap.parse_args()
 
     logging.basicConfig(
@@ -266,6 +296,7 @@ def main() -> None:
             key_file=args.key_file,
             out_dir=args.out,
             min_coverage=args.min_coverage,
+            split=args.split,
         )
     )
 

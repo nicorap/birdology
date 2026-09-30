@@ -612,3 +612,47 @@ def test_zero_shards_is_a_FATAL_exit_2_not_a_silent_success(tmp_path):
     r = _run_guard_block(tmp_path, 0, task_max=0)
     assert r.returncode == 2
     assert "no shards" in r.stdout
+
+
+def test_split_selects_the_named_parquet_and_names_the_artifact(tmp_path):
+    """HSN ships THREE metadata parquets (measured on WEKA); without --split
+    the fallback chain could only ever reach train, and a shared output name
+    would let train and test silently overwrite each other."""
+    corpus = tmp_path / "HSN" / "HSN"
+    corpus.mkdir(parents=True)
+    pq.write_table(
+        pa.table(
+            {
+                "filepath": pa.array(["HSN_001_20150708_061805.ogg"], pa.string()),
+                "lat": pa.array([37.0], pa.float64()),
+                "long": pa.array([-118.5], pa.float64()),
+                "ebird_code": pa.array(["whcspa"], pa.string()),
+            }
+        ),
+        corpus / "HSN_metadata_test_5s.parquet",
+    )
+    # A decoy train parquet the default chain would have picked.
+    pq.write_table(
+        pa.table({"filepath": pa.array(["x.ogg"], pa.string())}),
+        corpus / "HSN_metadata_train.parquet",
+    )
+    out = build_all(
+        tmp_path, config="HSN", resolution=4, key_file=None,
+        out_dir=tmp_path / "out", split="test_5s",
+    )
+    assert out.name == "HSN_test_5s_r4_manifest.parquet"
+    assert pq.read_table(out).num_rows == 1
+
+
+def test_split_that_does_not_exist_fails_loudly_naming_the_alternatives(tmp_path):
+    corpus = tmp_path / "HSN" / "HSN"
+    corpus.mkdir(parents=True)
+    pq.write_table(
+        pa.table({"filepath": pa.array(["x.ogg"], pa.string())}),
+        corpus / "HSN_metadata_train.parquet",
+    )
+    with pytest.raises(FileNotFoundError, match="HSN_metadata_train"):
+        build_all(
+            tmp_path, config="HSN", resolution=4, key_file=None,
+            out_dir=tmp_path / "out", split="nope",
+        )
