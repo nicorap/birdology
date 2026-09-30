@@ -55,6 +55,18 @@ EMBEDDING_SCHEMA = pa.schema(
     ]
 )
 
+#: EMBEDDING_SCHEMA plus the per-recording species posterior. Written only
+#: when `with_logits=True` AND the encoder actually produced logits;
+#: melsummary (no classifier head) falls back to the default schema. The
+#: variant is recorded in table metadata under 'schema_variant' so Phase B
+#: never has to infer it from column presence.
+LOGITS_SCHEMA = pa.schema(
+    list(EMBEDDING_SCHEMA) + [pa.field("logits", pa.list_(pa.float32()))]
+)
+
+#: Table-metadata key naming which schema a shard parquet carries.
+SCHEMA_VARIANT_KEY = b"schema_variant"
+
 log = logging.getLogger(__name__)
 
 
@@ -64,6 +76,7 @@ class ShardResult:
     embedded: int
     expected: int = 0
     failed: dict[str, str] = field(default_factory=dict)
+    schema_variant: str = "embedding"
 
 
 def iter_shard_audio(shard: Path) -> Iterator[tuple[str, bytes]]:
@@ -133,9 +146,10 @@ def _resolve_members(
 def embed_shard(
     shard: Path,
     manifest: pa.Table,
-    encoder: Callable[[np.ndarray, int], np.ndarray],
+    encoder: Callable[[np.ndarray, int], "np.ndarray | tuple[np.ndarray, np.ndarray | None]"],
     *,
     out_dir: Path,
+    with_logits: bool = False,
 ) -> ShardResult:
     """Embed every manifest-listed audio member of *shard*.
 
@@ -143,6 +157,21 @@ def embed_shard(
     despite both being non-empty: zero overlap is a systematic key mismatch
     (a `data/` prefix change, a root move), not a valid no-op, and blessing
     it would embed zero rows fleet-wide at exit 0.
+
+    With `with_logits=True` the encoder must return
+    `(embedding, logits_or_None)` (see `load_encoder_with_logits`) and the
+    parquet gains a `logits list_(float32)` column — the per-recording
+    species posterior cached NOW because re-reading 581 GB of audio later to
+    recover it would cost days of fleet time while the column costs ~31 GB.
+    An encoder that yields logits=None for EVERY file (melsummary — no
+    classifier head) falls back to the default schema; a MIXED shard (some
+    rows with logits, some without) raises, because it means the encoder is
+    inconsistent and half the posterior would be silently missing. Every
+    logits vector in a shard must have one length: a mismatch is a
+    systematic encoder bug, not a per-file failure, and is raised, not
+    recorded. The variant actually written is recorded in the parquet
+    metadata under 'schema_variant' ('embedding' | 'embedding+logits') so
+    Phase B reads a declaration, not an inference.
     """
     shard = Path(shard)
     out_dir = Path(out_dir)
@@ -166,6 +195,7 @@ def embed_shard(
 
     rows: list[dict] = []
     failed: dict[str, str] = {}
+    logits_width: int | None = None  # pinned by the first row that has logits
 
     for name, payload in iter_shard_audio(shard):
         canonical = resolved.get(name)
@@ -181,23 +211,58 @@ def embed_shard(
                 # WITHOUT raising (measured); embedding it writes a garbage
                 # row that counts toward completion.
                 raise ValueError("decoded to 0 samples (truncated file?)")
-            vector = np.asarray(encoder(samples, sr), dtype=np.float32)
+            logits_vec: np.ndarray | None = None
+            if with_logits:
+                vector, logits_vec = encoder(samples, sr)
+                vector = np.asarray(vector, dtype=np.float32)
+            else:
+                vector = np.asarray(encoder(samples, sr), dtype=np.float32)
         except Exception as exc:  # one bad file must not lose the shard
             # Keyed by the CANONICAL manifest path: completion compares
             # done against expected in manifest-path space.
             failed[canonical] = f"{type(exc).__name__}: {exc}"
             log.warning("shard %s: %s failed: %s", shard.name, name, exc)
             continue
-        rows.append(
-            {
-                "filepath": canonical,
-                "cell": context["cell"],
-                "week": context["week"],
-                "ebird_code": context["ebird_code"],
-                "split": context["split"],
-                "embedding": vector.tolist(),
-            }
+        row = {
+            "filepath": canonical,
+            "cell": context["cell"],
+            "week": context["week"],
+            "ebird_code": context["ebird_code"],
+            "split": context["split"],
+            "embedding": vector.tolist(),
+        }
+        if with_logits and logits_vec is not None:
+            logits_vec = np.asarray(logits_vec, dtype=np.float32).reshape(-1)
+            if logits_width is None:
+                logits_width = logits_vec.size
+            elif logits_vec.size != logits_width:
+                # A wrong-length posterior is a systematic encoder bug --
+                # Phase B would silently misalign every class index.
+                raise ValueError(
+                    f"shard {shard.name}: {canonical} produced logits of "
+                    f"length {logits_vec.size}, but this shard's logits "
+                    f"width is pinned to {logits_width} -- inconsistent "
+                    "encoder output, refusing to write a misaligned posterior"
+                )
+            row["logits"] = logits_vec.tolist()
+        rows.append(row)
+
+    # The variant reflects what the ENCODER produced, not what was asked:
+    # melsummary under --with-logits has no classifier head and honestly
+    # writes the default schema. A MIXED shard is an inconsistent encoder
+    # and must not ship half a posterior. Zero embedded rows keep the
+    # REQUESTED variant so an all-failed logits shard still round-trips
+    # through the schema Phase B expects for that out_dir.
+    rows_with_logits = sum(1 for r in rows if "logits" in r)
+    if with_logits and rows and 0 < rows_with_logits < len(rows):
+        raise ValueError(
+            f"shard {shard.name}: encoder returned logits for "
+            f"{rows_with_logits}/{len(rows)} rows -- an inconsistent "
+            "posterior is worse than none; refusing to write a mixed shard"
         )
+    use_logits_schema = with_logits and (rows_with_logits > 0 or not rows)
+    schema = LOGITS_SCHEMA if use_logits_schema else EMBEDDING_SCHEMA
+    variant = "embedding+logits" if use_logits_schema else "embedding"
 
     # Both outputs are atomic (tmp + os.replace) so a preempted task can never
     # leave a torn file a reader half-trusts. Failures json goes FIRST: after
@@ -213,8 +278,11 @@ def embed_shard(
 
     # An explicit schema: from_pylist([]) is a ZERO-COLUMN table, and a
     # schema-less parquet for an all-failed shard would break Phase B.
+    table = pa.Table.from_pylist(rows, schema=schema).replace_schema_metadata(
+        {SCHEMA_VARIANT_KEY: variant.encode()}
+    )
     table_tmp = table_path.with_name(table_path.name + ".tmp")
-    pq.write_table(pa.Table.from_pylist(rows, schema=EMBEDDING_SCHEMA), table_tmp)
+    pq.write_table(table, table_tmp)
     os.replace(table_tmp, table_path)
 
     return ShardResult(
@@ -222,6 +290,7 @@ def embed_shard(
         embedded=len(rows),
         expected=len(resolved),
         failed=failed,
+        schema_variant=variant,
     )
 
 

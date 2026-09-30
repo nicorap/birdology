@@ -32,7 +32,7 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from .embed import _audio_member_names, embed_shard, shard_is_complete
-from .encoders import load_encoder
+from .encoders import load_encoder, load_encoder_with_logits
 
 log = logging.getLogger("phase_a.embed")
 
@@ -75,6 +75,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--manifest", required=True, type=Path)
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--encoder", default="perch")
+    ap.add_argument(
+        "--with-logits",
+        action="store_true",
+        help="also cache the per-recording species posterior (logits column); "
+        "cheap to write now (~31 GB for XCL), absurd to recompute later "
+        "(a second 581 GB pass). melsummary has no classifier head and "
+        "writes the default schema even under this flag.",
+    )
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args(argv)
 
@@ -111,15 +119,25 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    encoder = load_encoder(args.encoder)
-    result = embed_shard(args.shard, shard_manifest, encoder, out_dir=args.out)
+    if args.with_logits:
+        encoder = load_encoder_with_logits(args.encoder)
+    else:
+        encoder = load_encoder(args.encoder)
+    result = embed_shard(
+        args.shard,
+        shard_manifest,
+        encoder,
+        out_dir=args.out,
+        with_logits=args.with_logits,
+    )
 
     log.info(
-        "%s: embedded=%d/expected=%d failed=%d",
+        "%s: embedded=%d/expected=%d failed=%d schema=%s",
         result.shard,
         result.embedded,
         result.expected,
         len(result.failed),
+        result.schema_variant,
     )
     # A shard where EVERY expected file failed is a failure, not a completed
     # task: it would otherwise leave a valid empty parquet that
