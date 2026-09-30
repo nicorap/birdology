@@ -79,3 +79,14 @@ def test_window_is_configurable_for_a_corpus_that_needs_it():
     assert parse_filename_date(
         "OLD_19500101_0600.ogg", window=(date(1940, 1, 1), date(1960, 1, 1))
     ) == date(1950, 1, 1)
+
+
+def test_a_malformed_candidate_before_the_real_date_is_skipped_not_fatal():
+    """Kills the continue->break mutant the review found (M-D).
+
+    The scan runs right-to-left, so 99999999 (month 99) is tried FIRST and
+    must be skipped -- not abort the scan -- so the real date behind it wins.
+    """
+    assert parse_filename_date(
+        "HSN_001_20150708_99999999.ogg"
+    ) == date(2015, 7, 8)
