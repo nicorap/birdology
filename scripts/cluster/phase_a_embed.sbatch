@@ -43,14 +43,25 @@ RESOLUTION=${2:-4}
 # SPLIT: for configs shipping several metadata parquets (HSN: train/test/test_5s).
 # It is part of the manifest artifact name and of OUT, matching the driver.
 SPLIT=${3:-}
-# ENCODER: melsummary until Task 6 wires perch/birdnet (which raise loudly).
+# ENCODER: melsummary (pytorch.sif) or perch/birdnet (tf.sif, golden-gated
+# 2026-09-30 at exact-zero diff vs the official tooling).
 ENCODER=${4:-melsummary}
+# WITH_LOGITS: "logits" as $5 adds the species-posterior column (perch: raw
+# uncalibrated logits + metadata flag; birdnet: dense sigmoid scores).
+WITH_LOGITS=${5:-}
 
 SUFFIX=${SPLIT:+_${SPLIT}}
 CORPUS=/mnt/weka/ML/birdset/${CONFIG}/${CONFIG}
-OUT=/mnt/weka/ML/phase_a/embeddings/${CONFIG}${SUFFIX}
+# The encoder is part of OUT: caches from different encoders must never
+# share a directory (indistinguishable rows, and shard_is_complete would
+# skip real work).
+OUT=/mnt/weka/ML/phase_a/embeddings/${CONFIG}${SUFFIX}_${ENCODER}
 MANIFEST=/mnt/weka/ML/phase_a/${CONFIG}${SUFFIX}_r${RESOLUTION}_manifest.parquet
-SIF=/shared/apps/ML/containers/pytorch.sif
+# tf.sif for the TF encoders; pytorch.sif for the checkpoint-free stand-in.
+case "$ENCODER" in
+    perch|birdnet) SIF=/shared/apps/ML/containers/tf.sif ;;
+    *)             SIF=/shared/apps/ML/containers/pytorch.sif ;;
+esac
 # The SIF does NOT carry this repo (verified on the fleet, 2026-09-30): the
 # code must be bind-mounted in and put on PYTHONPATH, and $HOME redirected --
 # jobs run with an unreadable $HOME, and python's site machinery touches it.
@@ -89,8 +100,14 @@ SHARD=${SHARDS[$IDX]}
 
 echo "host=$(hostname -s) task=$IDX/$N shard=$(basename "$SHARD")"
 
-apptainer exec --nv --bind /mnt/weka:/mnt/weka,"$REPO":/opt/birdology "$SIF" \
+LOGITS_FLAG=""
+[ "$WITH_LOGITS" = "logits" ] && LOGITS_FLAG="--with-logits"
+
+apptainer exec --nv --bind /mnt/weka:/mnt/weka,"$REPO":/opt/birdology,/shared/apps/ML:/shared/apps/ML "$SIF" \
     env HOME=/tmp PYTHONPATH=/opt/birdology/src \
+        KAGGLEHUB_CACHE=/shared/apps/ML/models/kagglehub \
+        BIRDNET_APP_DATA=/shared/apps/ML/models/birdnet \
+        TF_FORCE_GPU_ALLOW_GROWTH=true \
     python3 -m birdology.phase_a.embed_cli \
         --shard "$SHARD" --manifest "$MANIFEST" --out "$OUT" \
-        --encoder "$ENCODER"
+        --encoder "$ENCODER" $LOGITS_FLAG
