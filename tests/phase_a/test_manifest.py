@@ -241,3 +241,101 @@ def test_a_SINGLE_null_coordinate_is_counted_as_NO_COORDINATES_not_BAD_CELL():
     assert out.num_rows == 0
     assert drops[DropReason.NO_COORDINATES] == 1
     assert DropReason.BAD_CELL not in drops
+
+
+# ---------------------------------------------------------------------------
+# keep_undated (phase_c final review, C2+I5): rows lacking date/coords are
+# RETAINED with null cell/week so (a) the flag-0 null-context path actually
+# trains on XCM's undated rows and (b) POW-val manifests are non-empty.
+# Default behavior (drop) is byte-identical — phase_a/phase_b callers
+# unaffected.
+# ---------------------------------------------------------------------------
+
+
+def test_keep_undated_RETAINS_undated_rows_with_null_cell_week():
+    t = _focal([
+        ("a.ogg", 55.0, 12.0, "gretit", 1),
+        ("b.ogg", 55.0, 12.0, "gretit", 2),  # no date in the map
+    ])
+    out, drops = build_manifest(
+        t, dates={1: date(2021, 1, 4)}, resolution=4, split="train",
+        keep_undated=True,
+    )
+    assert out.num_rows == 2
+    rows = {r["filepath"]: r for r in out.to_pylist()}
+    assert rows["b.ogg"]["cell"] is None
+    assert rows["b.ogg"]["week"] is None
+    assert rows["a.ogg"]["cell"] is not None
+    assert rows["a.ogg"]["week"] == 1
+    # kept-null rows are NOT drops
+    assert DropReason.NO_DATE not in drops
+
+
+def test_keep_undated_RETAINS_uncoordinated_rows_with_null_cell_week():
+    t = _focal([("a.ogg", None, None, "gretit", 1)])
+    out, drops = build_manifest(
+        t, dates={1: date(2021, 1, 4)}, resolution=4, split="train",
+        keep_undated=True,
+    )
+    assert out.num_rows == 1
+    row = out.to_pylist()[0]
+    assert row["cell"] is None
+    assert row["week"] is None
+    assert row["lat"] is None
+    assert row["lon"] is None
+    assert DropReason.NO_COORDINATES not in drops
+
+
+def test_keep_undated_default_is_False_and_still_drops():
+    t = _focal([
+        ("a.ogg", 55.0, 12.0, "gretit", 1),
+        ("b.ogg", 55.0, 12.0, "gretit", 2),
+    ])
+    out, drops = build_manifest(
+        t, dates={1: date(2021, 1, 4)}, resolution=4, split="train"
+    )
+    assert out.num_rows == 1
+    assert drops[DropReason.NO_DATE] == 1
+
+
+def test_keep_undated_bookkeeping_is_consistent():
+    """input_rows == kept_rows + sum(drops); kept-null rows are counted
+    under kept_null_* metadata keys, not dropped_*."""
+    t = _focal([
+        ("a.ogg", 55.0, 12.0, "gretit", 1),
+        ("b.ogg", 55.0, 12.0, "gretit", 2),   # undated -> kept null
+        ("c.ogg", None, None, "gretit", 3),   # uncoordinated -> kept null
+    ])
+    out, drops = build_manifest(
+        t, dates={1: date(2021, 1, 4), 3: date(2021, 1, 5)},
+        resolution=4, split="train", keep_undated=True,
+    )
+    meta = {k.decode(): v.decode() for k, v in out.schema.metadata.items()}
+    assert meta["input_rows"] == "3"
+    assert meta["kept_rows"] == "3"
+    assert int(meta["kept_rows"]) + sum(drops.values()) == 3
+    assert meta["kept_null_no_date"] == "1"
+    assert meta["kept_null_no_coordinates"] == "1"
+    assert meta["dropped_no_date"] == "0"
+    assert meta["dropped_no_coordinates"] == "0"
+    # distinct_weeks counts non-null weeks only
+    assert meta["distinct_weeks"] == "1"
+
+
+def test_keep_undated_soundscape_undatable_filename_kept_null():
+    t = pa.table(
+        {
+            "filepath": pa.array(["NODATE_station.ogg"], pa.string()),
+            "lat": pa.array([55.0], pa.float64()),
+            "long": pa.array([12.0], pa.float64()),
+            "ebird_code": pa.array([""], pa.string()),
+            "id": pa.array([1], pa.int64()),
+        }
+    )
+    out, drops = build_manifest(
+        t, dates=None, resolution=4, split="test_5s", keep_undated=True
+    )
+    assert out.num_rows == 1
+    row = out.to_pylist()[0]
+    assert row["cell"] is None and row["week"] is None
+    assert DropReason.UNDATABLE_FILENAME not in drops
