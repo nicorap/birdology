@@ -139,6 +139,72 @@ def test_load_cache_mixed_raw_flags_across_shards_raise(tmp_path):
         load_cache(tmp_path)
 
 
+def test_load_cache_mixed_schema_variants_raise(tmp_path):
+    """An 'embedding' shard beside an 'embedding+logits' shard must refuse:
+    concatenation would null-fill logits, and if the embedding-only shard
+    sorts first, n_classes reads 0 while real logits rows exist."""
+    _write_shard(tmp_path / "shard_0001.parquet", ["a.ogg"])  # embedding only
+    _write_shard(
+        tmp_path / "shard_0002.parquet",
+        ["b.ogg"],
+        logits=[[1.0, 2.0]],
+    )
+    with pytest.raises(ValueError, match="schema_variant"):
+        load_cache(tmp_path)
+
+
+def test_load_cache_cross_shard_logits_width_mismatch_raises(tmp_path):
+    """Two logits shards with different class-axis widths are two different
+    model heads — refuse in load_cache, not at later np materialization."""
+    _write_shard(
+        tmp_path / "shard_0001.parquet",
+        ["a.ogg"],
+        logits=[[1.0, 2.0]],
+    )
+    _write_shard(
+        tmp_path / "shard_0002.parquet",
+        ["b.ogg"],
+        logits=[[1.0, 2.0, 3.0]],
+    )
+    with pytest.raises(ValueError, match="width"):
+        load_cache(tmp_path)
+
+
+def test_load_cache_true_and_false_raw_flags_raise_as_unrecognized(tmp_path):
+    """Flagged-'true' beside flagged-'false': the writer never emits
+    'false', so the second shard is corruption or a foreign writer and is
+    refused as an unrecognized value (not merely as heterogeneity)."""
+    _write_shard(
+        tmp_path / "shard_0001.parquet",
+        ["a.ogg"],
+        logits=[[1.0, 2.0]],
+        raw_flag=b"true",
+    )
+    _write_shard(
+        tmp_path / "shard_0002.parquet",
+        ["b.ogg"],
+        logits=[[0.1, 0.2]],
+        raw_flag=b"false",
+    )
+    with pytest.raises(ValueError, match="unrecognized"):
+        load_cache(tmp_path)
+
+
+@pytest.mark.parametrize("bad_flag", [b"false", b"True", b"TRUE"])
+def test_load_cache_unrecognized_raw_flag_value_raises(tmp_path, bad_flag):
+    """The phase_a writer only ever emits b'true'. Any other present value
+    (wrong case, 'false', anything) is corruption or a foreign writer —
+    never silently coerced to a bool."""
+    _write_shard(
+        tmp_path / "shard_0001.parquet",
+        ["a.ogg"],
+        logits=[[1.0, 2.0]],
+        raw_flag=bad_flag,
+    )
+    with pytest.raises(ValueError, match="unrecognized"):
+        load_cache(tmp_path)
+
+
 def test_load_cache_empty_dir_raises(tmp_path):
     """Zero shards is a wrong path or an unfinished fleet, never a valid
     empty cache."""

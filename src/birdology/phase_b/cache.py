@@ -25,6 +25,9 @@ import pyarrow.parquet as pq
 #: phase_a/embed.py); its PRESENCE with value b"true" is the raw signal.
 RAW_LOGITS_KEY = b"perch_logits_are_raw_uncalibrated"
 
+#: Metadata key naming which columns a shard carries (see phase_a/embed.py).
+SCHEMA_VARIANT_KEY = b"schema_variant"
+
 
 @dataclass(frozen=True)
 class CacheView:
@@ -41,8 +44,10 @@ def load_cache(cache_dir: Path) -> CacheView:
 
     Raises ValueError when the dir holds no parquet files (a wrong path or
     an unfinished fleet, never a valid empty cache) and when shards
-    disagree on the raw-logits flag (a heterogeneous cache is the
-    cache-poisoning class — refuse, don't concatenate).
+    disagree — on the raw-logits flag, on `schema_variant`, or on the
+    logits width (a heterogeneous cache is the cache-poisoning class —
+    refuse, don't concatenate). A present raw flag with any value other
+    than b"true" is corruption or a foreign writer and also raises.
     """
     cache_dir = Path(cache_dir)
     paths = sorted(cache_dir.glob("*.parquet"))
@@ -51,10 +56,25 @@ def load_cache(cache_dir: Path) -> CacheView:
 
     tables: list[pa.Table] = []
     flags: set[bool] = set()
+    variants: set[bytes | None] = set()
+    widths: set[int] = set()
     for path in paths:
         table = pq.read_table(path)
         metadata = table.schema.metadata or {}
-        flags.add(metadata.get(RAW_LOGITS_KEY) == b"true")
+        raw_value = metadata.get(RAW_LOGITS_KEY)
+        if raw_value is not None and raw_value != b"true":
+            raise ValueError(
+                f"shard {path} carries unrecognized "
+                f"{RAW_LOGITS_KEY.decode()} value {raw_value!r} -- the "
+                "phase_a writer only ever emits b'true'; this shard is "
+                "corrupt or from a foreign writer"
+            )
+        flags.add(raw_value == b"true")
+        variants.add(metadata.get(SCHEMA_VARIANT_KEY))
+        if "logits" in table.column_names and table.num_rows > 0:
+            first = table.column("logits")[0].as_py()
+            if first is not None:
+                widths.add(len(first))
         tables.append(table)
 
     if len(flags) > 1:
@@ -63,6 +83,19 @@ def load_cache(cache_dir: Path) -> CacheView:
             f"{RAW_LOGITS_KEY.decode()}=true -- a heterogeneous cache "
             "puts raw and calibrated logits on one class axis; refusing "
             "to concatenate"
+        )
+    if len(variants) > 1:
+        raise ValueError(
+            f"cache dir {cache_dir} mixes schema_variant values "
+            f"{sorted(v.decode() if v else 'absent' for v in variants)} -- "
+            "concatenating would null-fill logits for embedding-only rows; "
+            "refusing to concatenate"
+        )
+    if len(widths) > 1:
+        raise ValueError(
+            f"cache dir {cache_dir} mixes logits widths {sorted(widths)} "
+            "-- two class-axis widths means two different model heads; "
+            "refusing to concatenate"
         )
 
     combined = pa.concat_tables(tables, promote_options="default")
