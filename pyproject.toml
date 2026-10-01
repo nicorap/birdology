@@ -35,6 +35,11 @@ bench = [
     "soundfile>=0.12",
     "librosa>=0.11.0",
 ]
+phase_c = [
+    "torch>=2.4",
+    "torchaudio>=2.4",
+    "transformers>=4.44",
+]
 
 [dependency-groups]
 dev = [
