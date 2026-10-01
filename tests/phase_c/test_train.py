@@ -63,6 +63,16 @@ D_CTX = 8
 CONVNEXT_SHAPE = (1, 32, 32)
 AST_SHAPE = (24, 16)
 
+#: Drop-path rate for the RNG-consuming model variants. The default tiny
+#: models consume ZERO global torch RNG per training step (no dropout, no
+#: drop_path), which makes RNG-restore and generator-isolation tests
+#: vacuously green. Stochastic depth draws ``torch.rand`` from the GLOBAL
+#: generator every training forward, so tests built with this rate are
+#: actually load-bearing on the RNG save point and on shuffle isolation.
+#: (With depths=[1,1] HF linspaces the rate over layers as [0.0, 0.3] —
+#: the second stage's layer is the active consumer.)
+DROP_PATH = 0.3
+
 
 @pytest.fixture(autouse=True)
 def _deterministic():
@@ -78,7 +88,9 @@ def _deterministic():
 # ---------------------------------------------------------------------------
 
 
-def tiny_convnext() -> ConvNextForImageClassification:
+def tiny_convnext(
+    drop_path_rate: float = 0.0,
+) -> ConvNextForImageClassification:
     config = ConvNextConfig(
         num_channels=1,
         num_stages=2,
@@ -86,6 +98,7 @@ def tiny_convnext() -> ConvNextForImageClassification:
         depths=[1, 1],
         num_labels=N_CLASSES,
         image_size=32,
+        drop_path_rate=drop_path_rate,
     )
     return ConvNextForImageClassification(config)
 
@@ -103,9 +116,11 @@ def tiny_ast(n_layers: int = 2) -> ASTForAudioClassification:
     return ASTForAudioClassification(config)
 
 
-def film_convnext(seed: int = 0) -> FiLMConvNext:
+def film_convnext(seed: int = 0, drop_path_rate: float = 0.0) -> FiLMConvNext:
     torch.manual_seed(seed)
-    return FiLMConvNext(tiny_convnext(), ContextEncoder(N_CLASSES, d_ctx=D_CTX))
+    return FiLMConvNext(
+        tiny_convnext(drop_path_rate), ContextEncoder(N_CLASSES, d_ctx=D_CTX)
+    )
 
 
 def token_ast(seed: int = 0) -> TokenAST:
@@ -113,9 +128,11 @@ def token_ast(seed: int = 0) -> TokenAST:
     return TokenAST(tiny_ast(), ContextEncoder(N_CLASSES, d_ctx=D_CTX))
 
 
-def bare_convnext(seed: int = 0) -> ConvNextForImageClassification:
+def bare_convnext(
+    seed: int = 0, drop_path_rate: float = 0.0
+) -> ConvNextForImageClassification:
     torch.manual_seed(seed)
-    return tiny_convnext()
+    return tiny_convnext(drop_path_rate)
 
 
 class SyntheticDataset(torch.utils.data.Dataset):
@@ -258,7 +275,19 @@ class TestOptimizerGroups:
 
 
 class TestBatchOrderParity:
-    def test_twin_and_film_same_seed_same_epoch0_order(self, tmp_path):
+    def test_twin_and_film_same_seed_same_order_across_epochs(self, tmp_path):
+        """Multi-epoch parity with a global-RNG consumer in ONE arm only.
+
+        The film model carries active drop_path (consumes global torch
+        RNG every training step); the twin consumes none. If the shuffle
+        leaked onto the global RNG the two arms' generators would be in
+        DIFFERENT states by the time the epoch-1 permutation is drawn
+        (film burned extra draws during epoch 0), so epoch-1 orders would
+        diverge — epoch 0 alone could never catch this, because both arms
+        enter it from the same ``torch.manual_seed(cfg.seed)``. Verified
+        discriminating: with ``generator=None`` (global RNG) in the
+        train DataLoader, this test fails on epoch 1.
+        """
         film_rec: list = []
         twin_rec: list = []
         film_train = SyntheticDataset(record=film_rec)
@@ -267,28 +296,37 @@ class TestBatchOrderParity:
         twin_val = SyntheticDataset(n_rows=16, seed=99)
 
         train_arm(
-            film_convnext(seed=1),
+            film_convnext(seed=1, drop_path_rate=DROP_PATH),
             film_train,
             film_val,
-            _cfg(arm="film", seed=7, max_epochs=1),
+            _cfg(arm="film", seed=7, max_epochs=2, patience=10),
             tmp_path / "film",
         )
         train_arm(
             bare_convnext(seed=1),
             twin_train,
             twin_val,
-            _cfg(arm="twin", seed=7, max_epochs=1),
+            _cfg(arm="twin", seed=7, max_epochs=2, patience=10),
             tmp_path / "twin",
         )
 
-        film_order = [i for (e, i) in film_rec if e == 0]
-        twin_order = [i for (e, i) in twin_rec if e == 0]
-        assert film_order == twin_order, (
-            "twin and conditioned run with the same seed saw DIFFERENT "
-            "batch orders — the twin is no longer a controlled comparison"
-        )
-        # And the order is actually shuffled, not an unshuffled range.
-        assert film_order != sorted(film_order)
+        orders = {}
+        for epoch in (0, 1):
+            film_order = [i for (e, i) in film_rec if e == epoch]
+            twin_order = [i for (e, i) in twin_rec if e == epoch]
+            assert film_order, f"epoch {epoch} never ran for the film arm"
+            assert film_order == twin_order, (
+                f"twin and conditioned run with the same seed saw DIFFERENT "
+                f"batch orders in epoch {epoch} — the shuffle is reading "
+                "the global RNG and the twin is no longer a controlled "
+                "comparison"
+            )
+            # And the order is actually shuffled, not an unshuffled range.
+            assert film_order != sorted(film_order)
+            orders[epoch] = film_order
+        # Different epochs reshuffle: the order is (seed, epoch)-keyed,
+        # not frozen at epoch 0.
+        assert orders[0] != orders[1]
 
 
 # ---------------------------------------------------------------------------
@@ -405,42 +443,88 @@ class TestLoudVal:
 
 
 # ---------------------------------------------------------------------------
-# Review Focus 5: preemption resume is bit-exact.
+# Review Focus 5: preemption resume is bit-exact — and provably so.
+#
+# All resume tests use drop_path-active models: stochastic depth draws from
+# the GLOBAL torch RNG every training step, so the checkpoint's RNG save
+# point is load-bearing — a wrong save/restore point breaks bit-equality
+# instead of passing vacuously (the plain tiny models consume zero RNG).
 # ---------------------------------------------------------------------------
 
 
-class TestResume:
-    def test_resumed_run_bit_equal_to_uninterrupted(self, tmp_path):
-        """Train 2 epochs straight vs train 1 epoch, 'die', re-call
-        train_arm (resumes from last.pt): every state_dict entry of model
-        AND optimizer must be torch.equal."""
-        cfg2 = _cfg(arm="film", seed=3, max_epochs=2)
-        cfg1 = _cfg(arm="film", seed=3, max_epochs=1)
+def _resume_train(model, cfg, ckpt_dir):
+    """One train_arm call on the shared synthetic data used by TestResume."""
+    return train_arm(
+        model,
+        SyntheticDataset(),
+        SyntheticDataset(n_rows=16, seed=99),
+        cfg,
+        ckpt_dir,
+    )
 
-        # Uninterrupted reference run.
-        straight = film_convnext(seed=5)
-        res_straight = train_arm(
-            straight,
-            SyntheticDataset(),
-            SyntheticDataset(n_rows=16, seed=99),
-            cfg2,
+
+def _differing_keys(model_a: nn.Module, model_b: nn.Module) -> list[str]:
+    a, b = model_a.state_dict(), model_b.state_dict()
+    assert a.keys() == b.keys()
+    return [k for k in a if not torch.equal(a[k], b[k])]
+
+
+class TestResume:
+    #: The run seed (batch order, global RNG at fresh start) and the two
+    #: init seeds. Leg 2 constructs a FRESH model from INIT_SEED_OTHER —
+    #: a different init than the reference — so the checkpoint is the
+    #: ONLY path back to the uninterrupted run's weights: if model-state
+    #: restore (or the RNG restore, with drop_path active) were broken,
+    #: bit-equality could not hold by accident of object reuse.
+    RUN_SEED = 3
+    INIT_SEED = 5
+    INIT_SEED_OTHER = 11
+
+    def _straight(self, tmp_path):
+        """The uninterrupted 2-epoch reference run."""
+        model = film_convnext(seed=self.INIT_SEED, drop_path_rate=DROP_PATH)
+        result = _resume_train(
+            model,
+            _cfg(arm="film", seed=self.RUN_SEED, max_epochs=2),
             tmp_path / "straight",
         )
+        return model, result
 
-        # Preempted run: identical init, dies after epoch 0, resumes.
-        resumed = film_convnext(seed=5)
-        res_leg1 = train_arm(
-            resumed,
-            SyntheticDataset(),
-            SyntheticDataset(n_rows=16, seed=99),
-            cfg1,
+    def _leg1(self, tmp_path):
+        """Epoch 0 of the preempted run; the model object then 'dies'."""
+        model = film_convnext(seed=self.INIT_SEED, drop_path_rate=DROP_PATH)
+        result = _resume_train(
+            model,
+            _cfg(arm="film", seed=self.RUN_SEED, max_epochs=1),
             tmp_path / "preempt",
         )
-        res_leg2 = train_arm(
-            resumed,
-            SyntheticDataset(),
-            SyntheticDataset(n_rows=16, seed=99),
-            cfg2,
+        return result
+
+    def test_resumed_fresh_model_bit_equal_to_uninterrupted(self, tmp_path):
+        """Train 2 epochs straight vs: train 1 epoch, DIE (the model
+        object is gone), construct a FRESH model from a DIFFERENT init
+        seed, re-call train_arm on the same ckpt_dir. Every state_dict
+        entry must be torch.equal — which can only happen if the
+        checkpoint's model, optimizer AND RNG states were all restored
+        (drop_path consumes global RNG each step, so a wrong RNG save
+        point alone breaks this). The two companion tests below prove
+        this assertion can fail.
+        """
+        straight, res_straight = self._straight(tmp_path)
+        res_leg1 = self._leg1(tmp_path)
+
+        # A fresh process: new model, different init — nothing survives
+        # from leg 1 except ckpt_dir.
+        fresh = film_convnext(
+            seed=self.INIT_SEED_OTHER, drop_path_rate=DROP_PATH
+        )
+        assert _differing_keys(fresh, straight), (
+            "the fresh leg-2 model accidentally matches the reference "
+            "init — the test would prove nothing"
+        )
+        res_leg2 = _resume_train(
+            fresh,
+            _cfg(arm="film", seed=self.RUN_SEED, max_epochs=2),
             tmp_path / "preempt",
         )
 
@@ -451,13 +535,77 @@ class TestResume:
         assert res_leg2.epochs_ran == res_straight.epochs_ran
         assert res_leg2.val_cmap_history == res_straight.val_cmap_history
 
-        a, b = straight.state_dict(), resumed.state_dict()
-        assert a.keys() == b.keys()
-        for key in a:
-            assert torch.equal(a[key], b[key]), (
-                f"state_dict entry {key!r} differs after resume — the "
-                "resumed run is NOT bit-equal to the uninterrupted one"
-            )
+        diffs = _differing_keys(straight, fresh)
+        assert not diffs, (
+            f"state_dict entries {diffs[:5]!r} differ after resume — the "
+            "resumed run is NOT bit-equal to the uninterrupted one"
+        )
+
+    def test_without_the_checkpoint_the_fresh_model_diverges(self, tmp_path):
+        """Discriminating-power control for the headline test: the SAME
+        fresh model (different init seed) trained in an EMPTY ckpt_dir —
+        identical config, data and run seed, no resume — must NOT end
+        bit-equal to the reference. So when the headline test observes
+        equality, the checkpoint restore is the only possible cause; the
+        assertion is shown capable of failing.
+        """
+        straight, _ = self._straight(tmp_path)
+        fresh = film_convnext(
+            seed=self.INIT_SEED_OTHER, drop_path_rate=DROP_PATH
+        )
+        result = _resume_train(
+            fresh,
+            _cfg(arm="film", seed=self.RUN_SEED, max_epochs=2),
+            tmp_path / "no-ckpt",  # empty: nothing to resume from
+        )
+        assert result.resumed is False
+        assert _differing_keys(straight, fresh), (
+            "a differently-initialised, never-resumed run ended bit-equal "
+            "to the reference — the bit-equality assertion has no "
+            "discriminating power"
+        )
+
+    def test_noop_rng_restore_breaks_bit_equality(self, tmp_path, monkeypatch):
+        """Sabotage pin: with _rng_restore no-op'd, leg 2 draws its
+        drop_path masks from whatever global RNG state model construction
+        left behind instead of the checkpointed state — so the final
+        weights must differ from the reference. Proves the RNG save
+        point is genuinely load-bearing in the headline test (it was not
+        before drop_path: the old tiny models consumed zero RNG and this
+        sabotage passed unnoticed).
+        """
+        import birdology.phase_c.train as train_mod
+
+        straight, _ = self._straight(tmp_path)
+        self._leg1(tmp_path)
+
+        monkeypatch.setattr(train_mod, "_rng_restore", lambda ckpt: None)
+        fresh = film_convnext(
+            seed=self.INIT_SEED_OTHER, drop_path_rate=DROP_PATH
+        )
+        _resume_train(
+            fresh,
+            _cfg(arm="film", seed=self.RUN_SEED, max_epochs=2),
+            tmp_path / "preempt",
+        )
+        assert _differing_keys(straight, fresh), (
+            "resume stayed bit-equal with RNG restore disabled — the "
+            "resume test is not actually exercising the RNG save point"
+        )
+
+    def test_resume_past_max_epochs_is_a_silent_noop(self, tmp_path):
+        """MINOR-3 pin for Task 6: resuming a checkpoint that already
+        covers max_epochs trains nothing and raises nothing — it returns
+        resumed=True with epochs_ran == the checkpointed epoch count and
+        an unchanged val history.
+        """
+        model = film_convnext(seed=self.INIT_SEED, drop_path_rate=DROP_PATH)
+        cfg = _cfg(arm="film", seed=self.RUN_SEED, max_epochs=1)
+        first = _resume_train(model, cfg, tmp_path)
+        again = _resume_train(model, cfg, tmp_path)  # must not raise
+        assert again.resumed is True
+        assert again.epochs_ran == first.epochs_ran == 1
+        assert again.val_cmap_history == first.val_cmap_history
 
     def test_checkpoint_carries_the_full_resume_contract(self, tmp_path):
         train_arm(

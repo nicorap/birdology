@@ -265,6 +265,13 @@ def train_arm(
     was never interrupted (Review Focus 5; see module docstring for the
     three facts this stands on).
 
+    No-op resume: if the checkpoint already covers ``cfg.max_epochs``
+    (i.e. ``start_epoch >= cfg.max_epochs``, e.g. a requeue that lands
+    after the final epoch), no training or validation runs and the call
+    returns silently with ``resumed=True``, ``epochs_ran == start_epoch``
+    and the checkpointed ``val_cmap_history`` — callers (Task 6) can
+    treat the call as idempotent rather than an error.
+
     ``epochs_ran`` counts epochs completed over the WHOLE run (both legs
     of a preempted run), not just this call.
     """
@@ -331,6 +338,10 @@ def train_arm(
             num_workers=cfg.num_workers,
         )
 
+        # Training steps. Note: a NaN training loss still executes its
+        # optimizer.step() (poisoning the weights) before validation
+        # below aborts the epoch — harmless, because the abort happens
+        # BEFORE checkpointing, so nothing poisoned is ever persisted.
         for batch in train_loader:
             inputs, context, present, labels = _unpack(batch, device)
             logits = _forward(model_or_wrapper, cfg.arm, inputs, context, present)
