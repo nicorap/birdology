@@ -273,6 +273,7 @@ def _fake_row(cell: SweepCell, cmap_per_seed: list[float]) -> dict:
         "n_scored": 3,
         "prior_coverage_failures_train": None,
         "prior_coverage_failures_eval": 0,
+        "species_coverage": 1.0,
         "cmap_by_freq_decile": "{}",
         "cmap_by_prior_expectation": "{}",
         "cmap_per_seed": [float(v) for v in cmap_per_seed],
@@ -399,7 +400,8 @@ def test_shuffle_variant_seeds_produce_genuinely_differing_cmaps():
 def test_write_rows_skips_duplicate_hash_loudly_and_versions_schema(tmp_path):
     """A row whose config_hash already exists is SKIPPED (counted in the
     returned sidecar, logged) and never duplicated on disk; every parquet
-    file carries results_schema_version=1 in its metadata."""
+    file carries results_schema_version=2 in its metadata (bumped from 1
+    when species_coverage was added for the encoder-score fallback)."""
     out = tmp_path / "results"
     r1 = _fake_row(_cell(tau=0.25), [0.5] * 5)
     r2 = _fake_row(_cell(tau=0.5), [0.6] * 5)
@@ -422,7 +424,7 @@ def test_write_rows_skips_duplicate_hash_loudly_and_versions_schema(tmp_path):
     assert sorted(hashes) == sorted([r1["config_hash"], r2["config_hash"]])
     for path in files:
         meta = pq.read_schema(path).metadata or {}
-        assert meta[b"results_schema_version"] == b"1"
+        assert meta[b"results_schema_version"] == b"2"
 
 
 # ---------------------------------------------------------------------------
@@ -533,6 +535,10 @@ def test_micro_sweep_four_cells_end_to_end(tmp_path):
     assert "prior_coverage_failures_train" in on_disk.column_names
     assert "prior_coverage_failures_eval" in on_disk.column_names
     assert "prior_coverage_failures" not in on_disk.column_names
+    # Ruling (b): every row reports the fitted-species fraction; the
+    # full-coverage fixtures here are all 1.0.
+    assert "species_coverage" in on_disk.column_names
+    assert on_disk.column("species_coverage").to_pylist() == [1.0] * 4
     # I1: the strata columns land on disk too.
     assert "cmap_by_freq_decile" in on_disk.column_names
     assert "cmap_by_prior_expectation" in on_disk.column_names

@@ -156,24 +156,53 @@ def test_main_runs_one_cell_on_real_schema_caches(cli_workspace):
     assert row["prior_coverage_failures_eval"] == 0
     assert json.loads(row["cmap_by_freq_decile"])
     assert json.loads(row["cmap_by_prior_expectation"])
+    assert row["species_coverage"] == 1.0
+    # Per-shard failures files (shard 0 here): no failures, no file —
+    # and never the old shared failures.json that last-shard-wins
+    # clobbered on the fleet.
+    assert not (out / "failures_shard00.json").exists()
     assert not (out / "failures.json").exists()
 
 
 def test_main_records_failure_when_metadata_misses_a_recording(cli_workspace):
     """Truncate the metadata so one cache filepath has no labels: the
-    cell FAILS (C1's refusal, surfaced through the CLI), failures.json
-    names it, exit code 1 — never a silently shrunken test set."""
+    cell FAILS (C1's refusal, surfaced through the CLI), the PER-SHARD
+    failures file names it, exit code 1 — never a silently shrunken test
+    set, and never a shared failures.json two shards overwrite."""
     meta = pq.read_table(cli_workspace["metadata_path"])
     pq.write_table(
         meta.slice(0, meta.num_rows - 1), cli_workspace["metadata_path"]
     )
     assert cli.main(cli_workspace["argv"]) == 1
+    out = cli_workspace["tmp"] / "results"
+    assert not (out / "failures.json").exists()
     failures = json.loads(
-        (cli_workspace["tmp"] / "results" / "failures.json").read_text(
-            encoding="utf-8"
-        )
+        (out / "failures_shard00.json").read_text(encoding="utf-8")
     )
     assert len(failures) == 1
     assert "missing from" in failures[0]["error"]
     # No results row was written for the failed cell.
     assert not list((cli_workspace["tmp"] / "results").glob("*.parquet"))
+
+
+def test_failures_filename_carries_the_grid_shard_index(cli_workspace):
+    """Shard 3 of 4 writes failures_shard03.json: each shard owns its
+    own failures file, so a 5-shard fleet keeps 5 failure reports
+    instead of whichever shard finished last."""
+    meta = pq.read_table(cli_workspace["metadata_path"])
+    pq.write_table(
+        meta.slice(0, meta.num_rows - 1), cli_workspace["metadata_path"]
+    )
+    argv_base = cli_workspace["argv"]
+    # One cell in the restricted grid: it lands in exactly one shard.
+    # Run all four shards; only the owning shard fails and writes.
+    codes = [
+        cli.main(argv_base + ["--grid-shard", str(k), "--n-shards", "4"])
+        for k in range(4)
+    ]
+    assert codes.count(1) == 1
+    owner = codes.index(1)
+    out = cli_workspace["tmp"] / "results"
+    shard_files = sorted(out.glob("failures_shard*.json"))
+    assert [p.name for p in shard_files] == [f"failures_shard{owner:02d}.json"]
+    assert not (out / "failures.json").exists()

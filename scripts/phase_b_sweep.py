@@ -23,10 +23,13 @@ and refuses any cache recording the metadata does not cover.
 
 EXIT CODE: 0 iff every attempted cell either wrote its row or was
 skipped-existing. A FAILED CELL NEVER KILLS THE SHARD: its error is
-recorded in `failures.json` under `--out` (one entry per failed cell,
-naming the cell and the error), a per-cell summary is printed, and the
-process exits 1 — so one bad cache path costs one cell, not a night of
-compute, while the failure stays loud enough to block a merge.
+recorded in `failures_shard{NN}.json` under `--out` (one file PER
+GRID SHARD — a single shared failures.json would be overwritten by
+whichever shard finished last; the fleet lost 4 of 5 shards' reports
+that way), one entry per failed cell naming the cell and the error, a
+per-cell summary is printed, and the process exits 1 — so one bad cache
+path costs one cell, not a night of compute, while the failure stays
+loud enough to block a merge.
 
 The results rows carry full provenance (git SHA, cache dirs, prior path,
 prior DOI). The DOI comes FROM THE PRIOR SIDECAR — `run_cell` refuses an
@@ -136,7 +139,7 @@ def _git_sha(override: str | None) -> str:
 
 
 def _cell_key(cell: SweepCell) -> dict:
-    """The cell's config fields, for logs and failures.json."""
+    """The cell's config fields, for logs and the per-shard failures file."""
     return {
         "config_hash": config_hash(cell),
         "encoder": cell.encoder,
@@ -260,7 +263,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if failures:
         out_dir.mkdir(parents=True, exist_ok=True)
-        (out_dir / "failures.json").write_text(
+        # Per-shard filename: shards share --out, and a single
+        # failures.json is last-writer-wins — the fleet kept only one
+        # of five shards' failure reports before this was per-shard.
+        failures_path = out_dir / f"failures_shard{args.grid_shard:02d}.json"
+        failures_path.write_text(
             json.dumps(failures, indent=2), encoding="utf-8"
         )
         logger.error(
@@ -269,7 +276,7 @@ def main(argv: list[str] | None = None) -> int:
             len(cells),
             n_written,
             n_skipped,
-            out_dir / "failures.json",
+            failures_path,
         )
         for failure in failures:
             logger.error("  %s: %s", failure["cell"]["config_hash"][:12], failure["error"])

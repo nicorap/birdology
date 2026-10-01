@@ -103,7 +103,7 @@ _LEARNED_METHODS = ("offset_global", "offset_per_species", "mlp")
 #: Parquet schema of the results dataset, fixed and versioned. A row dict
 #: missing a column, or carrying an extra one, fails the table build
 #: loudly rather than writing a file other readers cannot join.
-RESULTS_SCHEMA_VERSION = "1"
+RESULTS_SCHEMA_VERSION = "2"
 _RESULTS_SCHEMA = pa.schema(
     [
         pa.field("config_hash", pa.string()),
@@ -127,6 +127,12 @@ _RESULTS_SCHEMA = pa.schema(
         # methods.
         pa.field("prior_coverage_failures_train", pa.int64()),
         pa.field("prior_coverage_failures_eval", pa.int64()),
+        # Ruling (b), schema v2: fraction of eval-scoreable species the
+        # learned arm actually FIT (1.0 for rescoring/offset_global and
+        # for learned cells with full coverage). Below 1.0, the missing
+        # species' scores are the ENCODER's raw eval scores (deployed-
+        # system fallback), never another species' column.
+        pa.field("species_coverage", pa.float64()),
         # I1 (spec §4 stratification): JSON-encoded
         # ``{stratum: [cmap_or_null, n_scored]}`` dicts. Deciles key the
         # frequency-decile stratification of the eval label prevalence
@@ -351,7 +357,9 @@ def _map_columns(
 ) -> list[int]:
     """Train-axis column index per eval-scoreable code; refuses a code
     the model never saw — predicting it would silently hand back another
-    species' column or an invented value."""
+    species' column or an invented value. This STRICT form stays the
+    default for any caller not explicitly opting into the encoder-score
+    fallback (:func:`_map_columns_with_fallback`)."""
     col_of = {code: j for j, code in enumerate(train_scoreable)}
     missing = [code for code in eval_scoreable if code not in col_of]
     if missing:
@@ -362,6 +370,26 @@ def _map_columns(
             "every one of its scores"
         )
     return [col_of[code] for code in eval_scoreable]
+
+
+def _map_columns_with_fallback(
+    train_scoreable: list[str], eval_scoreable: list[str]
+) -> tuple[np.ndarray, np.ndarray]:
+    """Ruling (b): per-eval-species train column with ``-1`` for a
+    species the model never fit, plus the boolean fitted mask.
+
+    Returns ``(cols, fitted)`` — ``cols`` int64 ``(n_eval_scoreable,)``,
+    ``fitted = cols >= 0``. Callers keep the model's column for fitted
+    species and fall back to the ENCODER's raw eval score for the rest
+    (the deployed-system behavior); nothing here ever substitutes
+    another species' column. The strict refusal (:func:`_map_columns`)
+    remains the default elsewhere.
+    """
+    col_of = {code: j for j, code in enumerate(train_scoreable)}
+    cols = np.asarray(
+        [col_of.get(code, -1) for code in eval_scoreable], dtype=np.int64
+    )
+    return cols, cols >= 0
 
 
 def _guard_eval_split(table: pa.Table) -> None:
@@ -541,6 +569,16 @@ def run_cell(
             scored.T, Y.T, strata, lambda s, yy: cmap(s.T, yy.T)
         )
 
+    # Ruling (b): the per-species learned arms (mlp, offset_per_species)
+    # map eval columns onto the TRAIN class axis; an eval species the fit
+    # group's training rows never carried keeps the ENCODER's raw eval
+    # score instead of refusing the whole cell (the fleet lost ~60 cells
+    # across 5 shards to the strict refusal — e.g. NES's warvir/yelwar,
+    # PER's goeant1/scbwoo5). species_coverage reports the fitted
+    # fraction; 1.0 for rescoring/offset_global (no per-column mapping).
+    species_coverage = 1.0
+    fallback_cols = np.empty(0, dtype=np.int64)
+    fitted_mask = np.empty(0, dtype=np.bool_)
     if cell.method in _LEARNED_METHODS:
         # prepare_training's arrays are row-parallel to the train table,
         # so the table's cell/week columns zip against them directly.
@@ -556,6 +594,32 @@ def run_cell(
             if cell.method == "mlp"
             else None
         )
+        if cell.method in ("mlp", "offset_per_species"):
+            fallback_cols, fitted_mask = _map_columns_with_fallback(
+                train_scoreable, scoreable
+            )
+            if scoreable:
+                species_coverage = float(fitted_mask.mean())
+            unfitted = [
+                code for code, ok in zip(scoreable, fitted_mask) if not ok
+            ]
+            if unfitted:
+                # ONE warning per cell, naming it and every missing code
+                # — not one line per species, not one per seed.
+                logger.warning(
+                    "cell %s (%s/%s/%s res%d %s): %d eval species absent "
+                    "from the training class axis %s; falling back to raw "
+                    "encoder scores for them (species_coverage=%.4f)",
+                    config_hash(cell)[:12],
+                    cell.encoder,
+                    cell.method,
+                    cell.prior_variant,
+                    cell.resolution,
+                    cell.test_set,
+                    len(unfitted),
+                    unfitted,
+                    species_coverage,
+                )
 
     def _seed_metrics(seed: int) -> dict:
         """One seed's metrics: cmap/n_scored/auroc/top1, the SPLIT
@@ -605,7 +669,13 @@ def run_cell(
                     tensor, eval_cells, eval_weeks, train_scoreable, code_to_gbif
                 )
                 proba = model.predict(eval_embeddings, eval_lookup.probs)
-                scored = proba[:, _map_columns(train_scoreable, scoreable)]
+                # Ruling (b): fitted species carry the model's column;
+                # unfitted ones KEEP the encoder's raw eval score (the
+                # deployed-system fallback) — never another column.
+                scored = eval_scores.copy()
+                scored[:, fitted_mask] = proba[
+                    :, fallback_cols[fitted_mask]
+                ]
             else:
                 per_species = cell.method == "offset_per_species"
                 _fk = (fit_group_key(cell), seed)
@@ -624,8 +694,16 @@ def run_cell(
                     tensor, eval_cells, eval_weeks, scoreable, code_to_gbif
                 )
                 if per_species:
-                    lam_eval = np.asarray(model.lam, dtype=np.float64)[
-                        _map_columns(train_scoreable, scoreable)
+                    # Ruling (b): unfitted species get lam=0 — the
+                    # prior term vanishes EXACTLY (0 * finite log of
+                    # the FLOORed prior), so predict returns
+                    # log(max(encoder score, FLOOR)) for them: the
+                    # encoder score passed through the arm's fixed log
+                    # transform, scale-consistent with fitted columns.
+                    lam_full = np.asarray(model.lam, dtype=np.float64)
+                    lam_eval = np.zeros(len(scoreable), dtype=np.float64)
+                    lam_eval[fitted_mask] = lam_full[
+                        fallback_cols[fitted_mask]
                     ]
                     model = OffsetModel(lam=lam_eval, per_species=True)
                 scored = model.predict(eval_scores, eval_lookup.probs)
@@ -685,6 +763,7 @@ def run_cell(
             else int(last["coverage_train"])
         ),
         "prior_coverage_failures_eval": int(last["coverage_eval"]),
+        "species_coverage": species_coverage,
         "cmap_by_freq_decile": json.dumps(
             _merge_strata([m["by_decile"] for m in per_seed]),
             sort_keys=True,
