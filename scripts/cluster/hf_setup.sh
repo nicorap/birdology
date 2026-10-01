@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # One-time setup: a venv with the HF stack, on /shared/apps/ML so it is visible
-# from every node (not on /mnt/weka, which today exists only on dgx171).
+# from every node (not on /faic/weka, which today exists only on dgx171).
 #
 # The Apptainer image has soundfile but NOT huggingface_hub or datasets, so the
 # download tooling has to come from PyPI. PyPI is reachable from compute nodes.

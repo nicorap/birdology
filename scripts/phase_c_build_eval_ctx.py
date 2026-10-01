@@ -22,9 +22,9 @@ they are the measured degradation path, and dropping them would change
 the eval population between the conditioned run and its twin.
 
     python scripts/phase_c_build_eval_ctx.py \
-        --metadata /mnt/weka/ML/birdset/HSN/HSN/HSN_metadata_test_5s.parquet \
+        --metadata /faic/weka/ML/birdset/HSN/HSN/HSN_metadata_test_5s.parquet \
         --resolution 4 \
-        --out /mnt/weka/ML/phase_c/eval_ctx/HSN_eval_ctx.parquet
+        --out /faic/weka/ML/phase_c/eval_ctx/HSN_eval_ctx.parquet
 
 Column names are configurable (``--filepath-col`` etc.) because the
 BirdSet parquets are not perfectly uniform; the OUTPUT shape is fixed:

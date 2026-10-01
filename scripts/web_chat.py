@@ -217,6 +217,139 @@ def _extract_thumbnails(tool_result: str, out: list) -> None:
                 out.append((name, thumb))
 
 
+def _extract_name_registry(tool_result: str, out: dict) -> None:
+    """Collect {scientificName: {fr, en, da}} from tool JSON results.
+
+    Ground truth for _correct_common_names: the model can misreport a common
+    name it already has correct in a tool result (see module docstring in
+    tests/test_answer_grounding.py), so the fix is a mechanical cross-check
+    against what the tools actually returned this turn, not a prompt tweak.
+    """
+    try:
+        data = json.loads(tool_result)
+    except (json.JSONDecodeError, TypeError):
+        return
+    if not isinstance(data, list):
+        return
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        sci = item.get("scientificName")
+        if not sci:
+            continue
+        entry = out.setdefault(sci, {})
+        for lang, field in (("fr", "commonNameFr"), ("en", "commonNameEn"), ("da", "commonNameDa")):
+            val = item.get(field)
+            if val:
+                entry[lang] = val
+
+
+# *Scientific name* followed by the rest of its parenthetical/line (up to `)` or newline)
+_SCI_NAME_RE = re.compile(r'\*([A-Z][a-zà-öø-ÿ]+ [a-zà-öø-ÿ-]+)\*([^)\n]*)')
+_LANG_NAME_RE = re.compile(r'\b(fr|en|da)\s*:\s*([^·\n)]+)')
+
+
+def _correct_common_names(text: str, registry: dict) -> str:
+    """Replace fr:/en:/da: common names that contradict this turn's tool data.
+
+    Only touches names attributed next to a scientific name the tools actually
+    returned this turn — a species never looked up has nothing to verify against
+    and is left alone.
+    """
+    def _fix_header(m):
+        sci, tail = m.group(1), m.group(2)
+        truth = registry.get(sci)
+        if not truth:
+            return m.group(0)
+
+        def _fix_lang(lm):
+            lang, name = lm.group(1), lm.group(2)
+            correct = truth.get(lang)
+            if correct and name.strip().lower() != correct.lower():
+                return f'{lang}: {correct}'
+            return lm.group(0)
+
+        return f'*{sci}*' + _LANG_NAME_RE.sub(_fix_lang, tail)
+
+    return _SCI_NAME_RE.sub(_fix_header, text)
+
+
+_VALIDATOR_SYSTEM_PROMPT = """\
+You check ONE specific failure mode in a birding assistant's answers: a fabricated \
+distinct species, subspecies, regional form, or named "variant"/"version" that the \
+tools never actually found — even when the answer supports that fabricated identity \
+with real facts about a different, broader species (e.g. inventing a "maritime \
+version" of a raven, then describing real raven habitat facts as if specific to it).
+
+You will see: the user's question, the tool results (the assistant's ONLY verified \
+data), and the assistant's drafted answer.
+
+Flag ONLY this pattern: the answer treats something as a real, distinct taxonomic \
+entity (a name, qualifier, or "version" the user asked about) when no tool result \
+ever matched or confirmed that distinct entity — the tools only ever found a \
+different, broader species.
+
+Do NOT flag:
+- Natural-language paraphrases of a structured field (e.g. "resident in Denmark" \
+for migrationStatus="Resident" in a Denmark-focused graph, or "threatened" for an \
+IUCN status of VU/EN/CR).
+- Missing detail, stylistic choices, or incomplete coverage of the tool data.
+- General facts about the one real species the tools did confirm, even if stated \
+confidently.
+- A refusal that correctly says no matching or distinct species was found.
+
+Respond with ONLY a JSON object, no other text: \
+{"grounded": true|false, "reason": "<one sentence naming the fabricated entity, or empty if grounded>"}\
+"""
+
+
+def _build_validator_messages(question: str, answer: str, tool_results: list) -> list:
+    """Build the chat messages for the LLM-as-validator pass (tier 2)."""
+    user_content = (
+        f"User's question:\n{question}\n\n"
+        f"Tool results (verified data):\n{json.dumps(tool_results, ensure_ascii=False)}\n\n"
+        f"Assistant's drafted answer:\n{answer}"
+    )
+    return [
+        {"role": "system", "content": _VALIDATOR_SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
+
+
+_JSON_FENCE_RE = re.compile(r'```(?:json)?\s*(.*?)\s*```', re.DOTALL)
+
+
+def _parse_validator_response(content: str) -> tuple:
+    """Parse the validator's JSON verdict. Fails open (grounded=True) on any
+    parse problem — a broken validator must never block an otherwise-fine answer.
+    """
+    fenced = _JSON_FENCE_RE.search(content)
+    if fenced:
+        content = fenced.group(1)
+    try:
+        data = json.loads(content)
+        return bool(data.get("grounded", True)), str(data.get("reason", ""))
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        return True, ""
+
+
+def _validate_answer(client, model: str, question: str, answer: str, tool_results: list) -> tuple:
+    """Run the LLM-as-validator pass. Returns (grounded, reason).
+
+    No temperature override: this looked like the obvious fix for false positives
+    (the model's default temperature=1 produced ~40% false positives on a clean,
+    correct answer across 5 runs) but manual testing showed it isn't a smooth
+    reliability dial for this model — temperature=0 was *deterministically wrong*
+    on the same clean answer (0/5), temperature=0.2 was right 3/3, temperature=0.3
+    was wrong 3/3. That's seed-locked/brittle behavior, not "lower = more careful."
+    Left at the model's default pending a real fix (see [[birdology-llm-model-choice]]).
+    """
+    messages = _build_validator_messages(question, answer, tool_results)
+    response = client.chat.completions.create(model=model, messages=messages)
+    content = response.choices[0].message.content or ""
+    return _parse_validator_response(content)
+
+
 # Supports parentheses inside URLs (e.g. DBpedia FilePath with species names)
 _IMG_RE = re.compile(r'!\[([^\]]*)\]\(((?:[^()]|\([^()]*\))+)\)')
 
@@ -311,8 +444,10 @@ def api_chat():
     messages = list(history)
 
     tool_calls_log = []
+    tool_results_raw = []  # raw tool result JSON strings, for the tier-2 validator
     thumbnails_seen = []  # collect thumbnail URLs from tool results
     phenology_tags = []   # collect <bird-phenology> tags from phenology tool results
+    name_registry = {}    # collect verified {scientificName: {fr, en, da}} from tool results
     wiki_calls = 0  # enforce at-most-once for search_wikipedia
     max_rounds = 8
 
@@ -344,6 +479,22 @@ def api_chat():
                 answer = _strip_hallucinated_images(answer, allowed_urls)
                 answer = _strip_padding_sections(answer)
                 answer = _strip_emojis(answer)
+                answer = _correct_common_names(answer, name_registry)
+                # Tier-2: LLM-as-validator pass, log-only. It reliably catches real
+                # fabricated-entity cases but also has a real false-positive rate on
+                # correct answers that temperature tuning didn't fix cleanly (see
+                # _validate_answer's docstring) — so it logs for review rather than
+                # ever overriding what the user sees. Only worth the extra round-trip
+                # when tool calls actually happened this turn.
+                if tool_calls_log:
+                    try:
+                        grounded, reason = _validate_answer(
+                            client, model, question, answer, tool_results_raw
+                        )
+                        if not grounded:
+                            print(f"Validator flagged answer (not blocked): {reason}")
+                    except Exception as e:
+                        print(f"Validator pass failed: {e}")
                 # Append photo gallery only for thumbnails NOT already in the answer
                 if thumbnails_seen:
                     new_thumbs = [
@@ -387,9 +538,11 @@ def api_chat():
                     tool_calls_log.append({"name": fn_name, "args": fn_args})
                     result = _run_tool(fn_name, fn_args, GRAPH)
 
-                # Extract thumbnails and phenology tags from tool results
+                # Extract thumbnails, phenology tags, and verified names from tool results
                 _extract_thumbnails(result, thumbnails_seen)
                 _extract_phenology_tag(result, phenology_tags)
+                _extract_name_registry(result, name_registry)
+                tool_results_raw.append(result)
 
                 messages.append({
                     "role": "tool",
@@ -459,8 +612,10 @@ def api_chat_stream():
         history.append({"role": "user", "content": question})
         messages = list(history)
         tool_calls_log = []
+        tool_results_raw = []
         thumbnails_seen = []
         phenology_tags = []
+        name_registry = {}
         wiki_calls = [0]  # mutable ref
         max_rounds = 8
 
@@ -481,6 +636,17 @@ def api_chat_stream():
                     text = _strip_hallucinated_images(text, allowed_urls)
                     text = _strip_padding_sections(text)
                     text = _strip_emojis(text)
+                    text = _correct_common_names(text, name_registry)
+                    # Tier-2: LLM-as-validator pass, log-only — see api_chat() for why.
+                    if tool_calls_log:
+                        try:
+                            grounded, reason = _validate_answer(
+                                client, model, question, text, tool_results_raw
+                            )
+                            if not grounded:
+                                print(f"Validator flagged answer (not blocked): {reason}")
+                        except Exception as e:
+                            print(f"Validator pass failed: {e}")
                     if thumbnails_seen:
                         new_thumbs = [
                             (tname, url) for tname, url in thumbnails_seen[:4]
@@ -519,6 +685,8 @@ def api_chat_stream():
 
                     _extract_thumbnails(result, thumbnails_seen)
                     _extract_phenology_tag(result, phenology_tags)
+                    _extract_name_registry(result, name_registry)
+                    tool_results_raw.append(result)
                     messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
             answer = "(max tool rounds reached)"

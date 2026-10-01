@@ -20,7 +20,7 @@
 set -uo pipefail
 
 VENV=/shared/apps/ML/venvs/hf
-DEST=${DEST:-/mnt/weka/ML/birdset}
+DEST=${DEST:-/faic/weka/ML/birdset}
 CONFIG=${CONFIG:-HSN}
 
 [ -d "$VENV" ] || { echo "venv missing: $VENV"; exit 2; }

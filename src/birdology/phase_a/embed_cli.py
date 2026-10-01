@@ -2,9 +2,9 @@
 """Embed ONE shard. The entry point a Slurm array task runs in the container.
 
     python3 -m birdology.phase_a.embed_cli \
-        --shard /mnt/weka/ML/birdset/XCM/XCM/XCM_shard_0001.tar.gz \
-        --manifest /mnt/weka/ML/phase_a/XCM_r4_manifest.parquet \
-        --out /mnt/weka/ML/phase_a/embeddings/XCM
+        --shard /faic/weka/ML/birdset/XCM/XCM/XCM_shard_0001.tar.gz \
+        --manifest /faic/weka/ML/phase_a/XCM_r4_manifest.parquet \
+        --out /faic/weka/ML/phase_a/embeddings/XCM
 
 Lives in the package, not in `scripts/`, because the container has the repo on
 its `PYTHONPATH` but no notion of the script directory.

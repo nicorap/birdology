@@ -418,7 +418,7 @@ def main(argv: list[str] | None = None) -> int:
         required=True,
         help="Per-test-set eval table path template containing "
         "'{test_set}', e.g. "
-        "/mnt/weka/ML/phase_c/eval_ctx/{test_set}_eval_ctx.parquet — "
+        "/faic/weka/ML/phase_c/eval_ctx/{test_set}_eval_ctx.parquet — "
         "the CONTEXT-JOINED tables from phase_c_build_eval_ctx.py "
         "(finding C1), never the raw BirdSet metadata parquets.",
     )

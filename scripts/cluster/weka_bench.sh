@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# WEKA vs NFS vs node-local RAID on dgx171 — the only node with /mnt/weka today.
+# WEKA vs NFS vs node-local RAID on dgx171 — the only node with /faic/weka today.
 #
 # Aimed at Phase A of the bioacoustics sweep, whose real pattern is:
 #   read a large audio corpus (many medium files, concurrent readers)
@@ -11,7 +11,7 @@
 # differ from a vendor sheet.
 set -u
 
-WEKA=${WEKA_DIR:-/mnt/weka/ML/bench}
+WEKA=${WEKA_DIR:-/faic/weka/ML/bench}
 NFS=/shared/apps/ML/_bench
 RAID=/raid/scratch/_bench
 

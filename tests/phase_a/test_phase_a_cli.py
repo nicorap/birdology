@@ -510,7 +510,7 @@ def test_the_active_apptainer_line_passes_nv_and_the_weka_bind():
     ]
     assert len(apptainer) == 1
     assert "--nv" in apptainer[0]
-    assert "--bind /mnt/weka:/mnt/weka" in apptainer[0]
+    assert "--bind /faic/weka:/faic/weka" in apptainer[0]
 
 
 def test_the_sbatch_script_is_fleet_wide():
@@ -523,7 +523,7 @@ def test_the_sbatch_script_fails_if_weka_is_not_mounted():
     an empty corpus on that node only. The guard must be an ACTIVE line — a
     comment about the guard satisfied the old whole-file grep."""
     assert any(
-        "mountpoint -q /mnt/weka" in ln for ln in _active_lines(_sbatch_text())
+        "mountpoint -q /faic/weka" in ln for ln in _active_lines(_sbatch_text())
     )
 
 
@@ -548,7 +548,7 @@ def _makefile_recipe(target):
 
 def test_the_manifest_make_target_precreates_the_slurm_log_dir():
     assert any(
-        "mkdir -p /mnt/weka/ML/phase_a/logs" in ln
+        "mkdir -p /faic/weka/ML/phase_a/logs" in ln
         for ln in _makefile_recipe("phase-a-manifest")
     )
 
@@ -559,7 +559,7 @@ def test_the_sbatch_header_documents_the_log_dir_precreation():
         for ln in _sbatch_text().splitlines()
         if ln.startswith("#") and not ln.startswith("#SBATCH")
     ]
-    assert any("mkdir -p /mnt/weka/ML/phase_a/logs" in ln for ln in header)
+    assert any("mkdir -p /faic/weka/ML/phase_a/logs" in ln for ln in header)
 
 
 # ── array-range coverage and the zero-shard guard (I3 / P1) ─────────────────

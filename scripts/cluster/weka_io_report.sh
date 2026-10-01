@@ -18,7 +18,7 @@
 #   ./weka_io_report.sh --since 2026-09-30      # every job since a date
 #
 # Measured baseline (2026-09-30 night, the XCL production run): 11.3 TB read
-# + 7.1 TB written through /mnt/weka by 396 tasks, zero I/O errors.
+# + 7.1 TB written through /faic/weka by 396 tasks, zero I/O errors.
 set -euo pipefail
 
 if [ "${1:-}" = "--since" ]; then

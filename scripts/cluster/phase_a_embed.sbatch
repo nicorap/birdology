@@ -5,14 +5,14 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
 #SBATCH --time=02:00:00
-#SBATCH --output=/mnt/weka/ML/phase_a/logs/embed_%A_%a.out
+#SBATCH --output=/faic/weka/ML/phase_a/logs/embed_%A_%a.out
 #
 # One array task per shard, one GPU each. Deliberately 1 GPU per task so a
 # flaky node kills one shard rather than the run.
 #
 #   sbatch --array=0-181 scripts/cluster/phase_a_embed.sbatch XCM 4
 #
-# FIRST SUBMISSION on a fresh tree: run `mkdir -p /mnt/weka/ML/phase_a/logs`
+# FIRST SUBMISSION on a fresh tree: run `mkdir -p /faic/weka/ML/phase_a/logs`
 # beforehand (`make phase-a-manifest` does it) -- Slurm opens the
 # #SBATCH --output path BEFORE this script runs, so the in-job mkdir below
 # is too late for the very first array.
@@ -21,7 +21,7 @@
 #   --gres=gpu:1            without it, torch.cuda.is_available() is False
 #                           INSIDE the container even with --nv
 #   --nv                    without it, the container has no CUDA driver
-#   --bind /mnt/weka        without it, /mnt/weka is an EMPTY DIRECTORY in the
+#   --bind /faic/weka        without it, /faic/weka is an EMPTY DIRECTORY in the
 #                           container -- the shard loop finds 0 files, exit 0
 # WEKA is fleet-wide (verified across all 20 schedulable nodes, 2026-09-30),
 # so the array spreads over the whole fleet; the mountpoint guard below still
@@ -51,12 +51,12 @@ ENCODER=${4:-melsummary}
 WITH_LOGITS=${5:-}
 
 SUFFIX=${SPLIT:+_${SPLIT}}
-CORPUS=/mnt/weka/ML/birdset/${CONFIG}/${CONFIG}
+CORPUS=/faic/weka/ML/birdset/${CONFIG}/${CONFIG}
 # The encoder is part of OUT: caches from different encoders must never
 # share a directory (indistinguishable rows, and shard_is_complete would
 # skip real work).
-OUT=/mnt/weka/ML/phase_a/embeddings/${CONFIG}${SUFFIX}_${ENCODER}
-MANIFEST=/mnt/weka/ML/phase_a/${CONFIG}${SUFFIX}_r${RESOLUTION}_manifest.parquet
+OUT=/faic/weka/ML/phase_a/embeddings/${CONFIG}${SUFFIX}_${ENCODER}
+MANIFEST=/faic/weka/ML/phase_a/${CONFIG}${SUFFIX}_r${RESOLUTION}_manifest.parquet
 # tf.sif for the TF encoders; pytorch.sif for the checkpoint-free stand-in.
 case "$ENCODER" in
     perch|birdnet) SIF=/shared/apps/ML/containers/tf.sif ;;
@@ -68,10 +68,10 @@ esac
 REPO=/shared/apps/ML/birdology
 
 # Fail loudly rather than writing to a local directory of the same name.
-mountpoint -q /mnt/weka || { echo "FATAL: /mnt/weka is not a mountpoint on $(hostname -s)"; exit 2; }
+mountpoint -q /faic/weka || { echo "FATAL: /faic/weka is not a mountpoint on $(hostname -s)"; exit 2; }
 [ -f "$MANIFEST" ] || { echo "FATAL: no manifest at $MANIFEST"; exit 2; }
 
-mkdir -p "$OUT" /mnt/weka/ML/phase_a/logs
+mkdir -p "$OUT" /faic/weka/ML/phase_a/logs
 
 if [ -n "$SPLIT" ]; then
     # Split-sharded configs name shards WITHOUT the split's underscores:
@@ -103,7 +103,7 @@ echo "host=$(hostname -s) task=$IDX/$N shard=$(basename "$SHARD")"
 LOGITS_FLAG=""
 [ "$WITH_LOGITS" = "logits" ] && LOGITS_FLAG="--with-logits"
 
-apptainer exec --nv --bind /mnt/weka:/mnt/weka,"$REPO":/opt/birdology,/shared/apps/ML:/shared/apps/ML "$SIF" \
+apptainer exec --nv --bind /faic/weka:/faic/weka,"$REPO":/opt/birdology,/shared/apps/ML:/shared/apps/ML "$SIF" \
     env HOME=/tmp PYTHONPATH=/opt/birdology/src \
         KAGGLEHUB_CACHE=/shared/apps/ML/models/kagglehub \
         BIRDNET_APP_DATA=/shared/apps/ML/models/birdnet \

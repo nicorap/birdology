@@ -30,7 +30,7 @@ echo
 
 # 16 jobs x 40G = 640 GB working set. Cannot be cached in 2 TB alongside
 # everything else, and each job's file alone (40G) exceeds any readahead.
-for spec in "raid:/raid/scratch/_v" "weka:/mnt/weka/ML/_v"; do
+for spec in "raid:/raid/scratch/_v" "weka:/faic/weka/ML/_v"; do
   name=${spec%%:*}; dir=${spec#*:}
   mkdir -p "$dir" || { echo "$name: cannot mkdir"; continue; }
   echo "=== $name  16 jobs x 40G = 640 GB working set, O_DIRECT"

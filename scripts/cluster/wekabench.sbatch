@@ -22,17 +22,17 @@
 #   - /raid/scratch local staging: ~5.3 GB/s (the node-local anchor)
 # WEKA on NDR fabric should deliver GB/s-class per node, not hundreds of MB/s.
 set -uo pipefail
-mountpoint -q /mnt/weka || { echo "FATAL: /mnt/weka not mounted on $(hostname -s)"; exit 2; }
+mountpoint -q /faic/weka || { echo "FATAL: /faic/weka not mounted on $(hostname -s)"; exit 2; }
 
 IDX=${SLURM_ARRAY_TASK_ID:-solo}
 HOST=$(hostname -s)
-D=/mnt/weka/ML/bench/${SLURM_JOB_ID}_${IDX}_${HOST}
+D=/faic/weka/ML/bench/${SLURM_JOB_ID}_${IDX}_${HOST}
 mkdir -p "$D" /shared/apps/ML/logs
 trap 'rm -rf "$D"' EXIT
 
 echo "=== wekabench $HOST task=$IDX job=${SLURM_JOB_ID} $(date -u +%FT%TZ) ==="
 echo "--- mount options ---"
-grep -m1 ' /mnt/weka ' /proc/mounts || mount | grep -m1 weka
+grep -m1 ' /faic/weka ' /proc/mounts || mount | grep -m1 weka
 command -v weka >/dev/null 2>&1 && weka status 2>/dev/null | head -5
 
 bw() { # bw <bytes> <seconds>

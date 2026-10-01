@@ -261,12 +261,16 @@ TOOLS_OPENAI = [
         "function": {
             "name": "observations_by_month",
             "description": (
-                "Return bird species historically observed in Denmark during a given month, "
-                "based on DOF data. Defaults to the current month if month is omitted. "
+                "Return bird species historically observed **nationwide in Denmark** during a "
+                "given month, based on DOF data. Defaults to the current month if month is omitted. "
                 "Use this for questions like 'quels oiseaux en mars ?', "
                 "'which birds can I see in winter ?', 'oiseaux de printemps', "
                 "or 'quels oiseaux voit-on en ce moment ?' (omit month). "
-                "Returns species sorted by observation count with migration status."
+                "Returns species sorted by observation count with migration status. "
+                "This tool has NO locality parameter — it cannot filter by place. "
+                "If the question also names a specific place (e.g. 'à Skagen en avril', "
+                "'at Utterslev Mose in March'), use `recent_observations` instead, with "
+                "`locality` set to that place and `date_from`/`date_to` covering the month."
             ),
             "parameters": {
                 "type": "object",
@@ -558,6 +562,14 @@ tells you nothing about the current question — the graph is rebuilt and tools 
 sessions, so data that was missing before may be present now. **Always call the appropriate tool \
 again for the current question and answer from its fresh result.** Never repeat or justify a \
 past refusal without re-running the tool.
+11. **A short follow-up that changes only one detail is still a tool call, never a memory \
+answer.** Messages like "et à Aarhus ?", "et en juin ?", "et pour les rapaces ?", or "revenons \
+au [sujet] de tout à l'heure" reuse the intent of an earlier turn with one parameter swapped in \
+(a place, a month, a species, a category) — they are NOT a signal to answer conversationally. \
+Find the most recent turn with that same intent, take its tool call, replace only the parameter \
+the user just changed (or resolve which earlier subject "revenons à" points to), and call the \
+tool again with the merged arguments. If you cannot tell what earlier turn a short follow-up \
+refers to, ask for clarification — do not guess and do not answer without a tool call.
 
 ## Data available in the graph
 - eBird/Clements taxonomy: 45 orders, 251 families, ~11 000 species
@@ -630,7 +642,11 @@ Always call `find_species` first to resolve the name, then call `migration_timin
 resolved scientific name. Present the result as: arrival month, departure month, months present, \
 and (if available) the earliest date ever recorded and a table of yearly first/last dates.
 - Use `observations_by_month` for questions about which birds are present in a specific month \
-("oiseaux en mars", "birds in winter", etc.).
+**nationwide, with no place named** ("oiseaux en mars", "birds in winter", etc.). \
+**If the question names both a place and a month/date** ("oiseaux à Skagen en avril", \
+"birds at Utterslev Mose this month"), that is a `recent_observations` call, not \
+`observations_by_month` — `observations_by_month` cannot filter by locality and would silently \
+drop the place. Pass `locality` plus `date_from`/`date_to` covering that month (see date rules above).
 - **Use `where_seen`** when the user asks where a **specific species** has been observed \
 ("où a-t-il été vu ?", "où observer le chardonneret ?", "where was it seen?"). This is the \
 species-first question and is answered from the graph's observation localities. Do not say you \
