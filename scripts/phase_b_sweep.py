@@ -54,7 +54,7 @@ from birdology.phase_b.sweep import (
     load_existing_hashes,
     plan_grid,
     run_cell,
-    shard_cells,
+    shard_cells_grouped,
     write_rows,
 )
 from birdology.prior.tensor import PriorTensor, load_prior
@@ -167,7 +167,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         if value is not None
     }
-    cells = shard_cells(plan_grid(**grid_kwargs), args.grid_shard, args.n_shards)
+    # Grouped sharding: one shard owns ALL test sets of a fit group, so the
+    # per-shard fit_cache turns 6 refits into 1 (the sweep's dominant cost).
+    cells = shard_cells_grouped(
+        plan_grid(**grid_kwargs), args.grid_shard, args.n_shards
+    )
+    fit_cache: dict = {}
     existing = load_existing_hashes(out_dir)
 
     # Inputs are loaded ONCE per shard, memoised by resolved path.
@@ -228,6 +233,7 @@ def main(argv: list[str] | None = None) -> int:
                     prior_path=prior_path,
                     prior_doi=prior.gbif_doi,
                 ),
+                fit_cache=fit_cache,
             )
             write_rows([row], out_dir)
             existing.add(h)

@@ -242,6 +242,51 @@ def shard_cells(cells: list[SweepCell], shard: int, n_shards: int) -> list[Sweep
     return cells[shard::n_shards]
 
 
+def fit_group_key(cell: SweepCell) -> tuple:
+    """The axes a learned-arm FIT depends on — everything except test_set
+    and tau. Cells sharing this key refit the identical model, so the
+    sweep's dominant cost (150 distinct MLP fits vs 6x that when every
+    test set refits) is shared through run_cell's fit_cache. Rescoring
+    cells fit nothing; their key still groups them harmlessly."""
+    return (
+        cell.encoder,
+        cell.method,
+        cell.prior_variant,
+        cell.resolution,
+        cell.seeds,
+    )
+
+
+def shard_cells_grouped(
+    cells: list[SweepCell], shard: int, n_shards: int
+) -> list[SweepCell]:
+    """Partition the grid by FIT GROUP, not by cell: all cells sharing a
+    fit_group_key land in the same shard (groups assigned k::n in first-
+    appearance order). Plain per-cell sharding would scatter one fit's six
+    test sets across shards and refit the same model on each — 6x the
+    sweep's dominant cost. Same disjoint-cover guarantee as shard_cells.
+    """
+    if n_shards < 1:
+        raise ValueError(f"n_shards must be >= 1, got {n_shards}")
+    if not 0 <= shard < n_shards:
+        raise ValueError(
+            f"shard {shard} out of range for n_shards={n_shards}; shards "
+            "are numbered 0..n_shards-1"
+        )
+    groups: dict[tuple, list[SweepCell]] = {}
+    order: list[tuple] = []
+    for cell in cells:
+        key = fit_group_key(cell)
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(cell)
+    mine: list[SweepCell] = []
+    for key in order[shard::n_shards]:
+        mine.extend(groups[key])
+    return mine
+
+
 def _validate_cell(cell: SweepCell, provenance: Provenance) -> None:
     """The row contract's refusals, checked before any work."""
     if not provenance.prior_doi or not provenance.prior_doi.strip():
@@ -423,6 +468,7 @@ def run_cell(
     provenance: Provenance,
     mlp_hidden: int = 256,
     mlp_max_iter: int = 200,
+    fit_cache: dict | None = None,
 ) -> dict:
     """Execute *cell* for ALL its seeds and return ONE results row.
 
@@ -536,14 +582,23 @@ def run_cell(
                 tensor, train_cells, train_weeks, train_scoreable, code_to_gbif
             )
             if cell.method == "mlp":
-                model = fit_mlp_head(
-                    embeddings,
-                    train_lookup.probs,
-                    y_train,
-                    seed=seed,
-                    hidden=mlp_hidden,
-                    max_iter=mlp_max_iter,
-                )
+                # Fit shared across test sets: the fit depends only on
+                # fit_group_key(cell) + seed (train side), never on the
+                # eval cache. With shard_cells_grouped, one shard owns a
+                # group's six test sets and pays for ONE fit.
+                _fk = (fit_group_key(cell), seed)
+                model = fit_cache.get(_fk) if fit_cache is not None else None
+                if model is None:
+                    model = fit_mlp_head(
+                        embeddings,
+                        train_lookup.probs,
+                        y_train,
+                        seed=seed,
+                        hidden=mlp_hidden,
+                        max_iter=mlp_max_iter,
+                    )
+                    if fit_cache is not None:
+                        fit_cache[_fk] = model
                 # MLP features need the prior on the TRAIN class axis
                 # (the feature width is fixed by the fit).
                 eval_lookup = prior_for_rows(
@@ -553,13 +608,18 @@ def run_cell(
                 scored = proba[:, _map_columns(train_scoreable, scoreable)]
             else:
                 per_species = cell.method == "offset_per_species"
-                model = fit_logit_offset(
-                    train_scores,
-                    train_lookup.probs,
-                    y_train,
-                    per_species=per_species,
-                    seed=seed,
-                )
+                _fk = (fit_group_key(cell), seed)
+                model = fit_cache.get(_fk) if fit_cache is not None else None
+                if model is None:
+                    model = fit_logit_offset(
+                        train_scores,
+                        train_lookup.probs,
+                        y_train,
+                        per_species=per_species,
+                        seed=seed,
+                    )
+                    if fit_cache is not None:
+                        fit_cache[_fk] = model
                 eval_lookup = prior_for_rows(
                     tensor, eval_cells, eval_weeks, scoreable, code_to_gbif
                 )

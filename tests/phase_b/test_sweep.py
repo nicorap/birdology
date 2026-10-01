@@ -38,9 +38,11 @@ from birdology.phase_b.sweep import (
     config_hash,
     load_existing_hashes,
     paired_delta,
+    fit_group_key,
     plan_grid,
     run_cell,
     shard_cells,
+    shard_cells_grouped,
     write_rows,
 )
 from birdology.prior.indexing import WEEKS_PER_YEAR
@@ -765,3 +767,67 @@ def test_strata_columns_are_deterministic_and_well_formed():
     assert expectation  # never empty: every class lands in one stratum
     total = sum(n_sc for _v, n_sc in expectation.values())
     assert total == row_a["n_scored"]
+
+
+def test_fit_group_key_excludes_test_set_and_tau():
+    """Cells differing ONLY in test_set/tau share a fit group — one fit
+    serves six test sets; a resolution change does not."""
+    assert fit_group_key(_cell(method="mlp", test_set="HSN", tau=None)) == \
+        fit_group_key(_cell(method="mlp", test_set="NES", tau=None))
+    assert fit_group_key(_cell(tau=0.5)) == fit_group_key(_cell(tau=2.0))
+    assert fit_group_key(_cell(method="mlp")) != \
+        fit_group_key(_cell(method="mlp", resolution=5))
+
+
+def test_shard_cells_grouped_disjoint_cover_and_group_integrity():
+    """Every cell lands in exactly one shard AND every fit group lives in
+    exactly one shard — a split group would refit the same model twice."""
+    cells = []
+    for ts in ("HSN", "NES", "PER"):
+        for res in (3, 4, 5):
+            cells.append(_cell(method="mlp", test_set=ts, resolution=res,
+                               tau=None))
+            cells.append(_cell(method="rescoring", test_set=ts,
+                               resolution=res, tau=1.0))
+    n_shards = 4
+    shards = [shard_cells_grouped(cells, k, n_shards) for k in range(n_shards)]
+    seen = [config_hash(c) for sh in shards for c in sh]
+    assert sorted(seen) == sorted(config_hash(c) for c in cells)
+    assert len(seen) == len(set(seen))
+    for key in {fit_group_key(c) for c in cells}:
+        owners = [
+            k for k, sh in enumerate(shards)
+            if any(fit_group_key(c) == key for c in sh)
+        ]
+        assert len(owners) == 1, f"group split across shards {owners}"
+
+
+def test_run_cell_fit_cache_shares_mlp_fit_across_test_sets(monkeypatch):
+    """Two cells differing only in test_set fit ONCE per seed through a
+    shared fit_cache — pinned by counting fit_mlp_head calls."""
+    import birdology.phase_b.sweep as sweep_mod
+
+    calls = {"n": 0}
+    real_fit = sweep_mod.fit_mlp_head
+
+    def counting_fit(*a, **k):
+        calls["n"] += 1
+        return real_fit(*a, **k)
+
+    monkeypatch.setattr(sweep_mod, "fit_mlp_head", counting_fit)
+    eval_cache, metadata = _eval_fixture()
+    cache: dict = {}
+    for ts in ("HSN", "NES"):
+        _run(
+            _cell(method="mlp", test_set=ts, tau=None),
+            eval_cache=eval_cache,
+            eval_metadata=metadata,
+            mlp_hidden=4,
+            mlp_max_iter=20,
+            fit_cache=cache,
+        )
+    n_seeds = len(_cell().seeds)
+    assert calls["n"] == n_seeds, (
+        f"expected {n_seeds} fits (one per seed, shared across test sets), "
+        f"got {calls['n']}"
+    )
