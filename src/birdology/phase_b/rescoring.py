@@ -37,13 +37,19 @@ from birdology.prior.tensor import FLOOR, PriorTensor
 
 #: spec.variant value carried by each control, matching PriorSpec's
 #: documented vocabulary ("uniform" | "marginal" | "shuffle_space" |
-#: "shuffle_time").
-_CONTROL_VARIANTS = {
+#: "shuffle_time"). EXPORTED on purpose: downstream filters (Tasks 5/6)
+#: that key off ``spec.variant`` must import THIS mapping rather than
+#: re-spell the strings — a hand-typed "shuffled_space" would silently
+#: match nothing.
+CONTROL_VARIANTS = {
     "uniform": "uniform",
     "marginal": "marginal",
     "space_shuffled": "shuffle_space",
     "time_shuffled": "shuffle_time",
 }
+
+#: Backwards-compatible alias for the pre-export private name.
+_CONTROL_VARIANTS = CONTROL_VARIANTS
 
 
 @dataclass(frozen=True)
@@ -81,6 +87,11 @@ def prior_for_rows(
     cell is expected (a recording outside the prior's spatial support) and
     the no-evidence answer is exactly the floor. Every floored cell is
     COUNTED, never silently dropped.
+
+    *weeks* should be pre-folded via :func:`birdology.prior.indexing.iso_week`
+    (which maps ISO week 53 -> 52); a defensive fold is applied here too,
+    so a late-December recording in one of the 71-in-400-years week-53
+    years cannot crash a whole sweep batch mid-flight.
     """
     if len(cells) != len(weeks):
         raise ValueError(
@@ -88,6 +99,9 @@ def prior_for_rows(
             "per-row parallel arrays and a length mismatch would silently "
             "misalign every row after the shorter one"
         )
+    # Defensive fold of ISO week 53 -> 52 (71 of every 400 years have a
+    # week 53; prior.vector would raise and sink the whole batch).
+    weeks = [52 if w == 53 else w for w in weeks]
     species_index = {int(k): i for i, k in enumerate(prior.species_keys)}
     known_cells = set(prior.cells)
 
@@ -132,6 +146,8 @@ def rescore(
     tau=0 column must be bit-identical to the raw encoder scores (dtype
     included), not a log/exp round-trip of them, or the baseline the gains
     are measured against would differ from the baseline that was run.
+    Because that return ALIASES the input array, callers must treat both
+    the input and the returned array as read-only.
 
     Both *p* and *m* are floored with the imported ``FLOOR`` BEFORE the
     log, so a hard 0.0 — which the artifact itself can never store but a

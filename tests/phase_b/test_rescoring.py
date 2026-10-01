@@ -317,6 +317,57 @@ def test_rescore_log_space_formula_hand_worked_two_by_two():
     )
 
 
+def test_rescore_tau_scopes_the_whole_log_ratio_hand_worked_at_tau_two():
+    """tau must scope the WHOLE bracket (log p - log m), not log p alone.
+
+    The mutant ``log s + tau*log p - log m`` is identical at tau=1,
+    bypassed by the tau=0 short-circuit, and invisible under constant
+    p/m (argsort preserved) — so this test uses tau=2.0 with NON-constant
+    p and m and asserts elementwise VALUES, hand-worked:
+
+        s = [[0.5, 0.25],   p = [[0.2, 0.4],   m = [0.25, 0.2]
+             [0.1, 0.8 ]]        [0.5, 0.1]]
+
+    correct = log s + 2*(log p - log m) = ln(s * (p/m)^2):
+        (0,0): 0.5  * (0.2/0.25)^2 = 0.5  * 0.64 = 0.32 -> ln 0.32
+        (0,1): 0.25 * (0.4/0.2 )^2 = 0.25 * 4    = 1.0  -> ln 1.0
+        (1,0): 0.1  * (0.5/0.25)^2 = 0.1  * 4    = 0.4  -> ln 0.4
+        (1,1): 0.8  * (0.1/0.2 )^2 = 0.8  * 0.25 = 0.2  -> ln 0.2
+
+    The mutant would give e.g. (0,0): ln(0.5 * 0.2^2 / 0.25) = ln 0.08
+    != ln 0.32 — elementwise equality kills it.
+    """
+    scores = np.array([[0.5, 0.25], [0.1, 0.8]])
+    prior_probs = np.array([[0.2, 0.4], [0.5, 0.1]])
+    marginal = np.array([0.25, 0.2])
+    out = rescore(scores, prior_probs, 2.0, marginal)
+    np.testing.assert_allclose(
+        out, np.log([[0.32, 1.0], [0.4, 0.2]]), rtol=1e-12
+    )
+
+
+def test_prior_for_rows_folds_iso_week_53_into_52_no_raise():
+    """A late-December recording can carry ISO week 53 (71 of every 400
+    years have one). ``prior.vector`` raises for week 53 — the tensor's
+    axis is 52 weeks — so prior_for_rows must FOLD 53 -> 52 (the same
+    convention as ``birdology.prior.indexing.iso_week``) rather than let
+    one recording crash a whole sweep batch: no raise, and the week-53
+    row reads EXACTLY the week-52 vector.
+    """
+    prior = _asymmetric_prior()
+    scoreable = ["sp1", "sp2", "sp3"]
+    code_to_gbif = {"sp1": 111, "sp2": 222, "sp3": 333}
+    lookup = prior_for_rows(
+        prior,
+        cells=["cella", "cella"],
+        weeks=[53, 52],
+        scoreable=scoreable,
+        code_to_gbif=code_to_gbif,
+    )
+    np.testing.assert_array_equal(lookup.probs[0], lookup.probs[1])
+    np.testing.assert_allclose(lookup.probs[1], prior.vector("cella", 52))
+
+
 # ---------------------------------------------------------------------------
 # 7. uniform control end-to-end: rank-identical to raw scores
 # ---------------------------------------------------------------------------
