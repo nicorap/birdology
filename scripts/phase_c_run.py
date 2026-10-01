@@ -111,6 +111,32 @@ _RESULTS_SCHEMA = pa.schema(
 )
 
 
+def _stack_provenance(args, resolved_revision: str) -> dict:
+    """The provenance dict for this invocation's rows.
+
+    CPU-only stacks carry ``torch.version.cuda = None`` — that is REAL
+    provenance (the run had no CUDA), not missing provenance; mapping it
+    to ``""`` would trip build_row's refusal and lock GPU-less runs (Mac
+    probes, CPU smoke tests) out of writing rows entirely. Measured: the
+    2026-10-01 Mac end-to-end probe refused after 49 minutes of successful
+    training at exactly this seam. Recorded as ``"cpu"``.
+    """
+    import torch
+
+    return {
+        "git_sha": args.git_sha,
+        "checkpoint_revision": resolved_revision,
+        "prior_doi": args.prior_doi,
+        "prior_variant": args.prior_variant,
+        "manifest_path": str(args.manifest),
+        "torch_version": torch.__version__,
+        "cuda_version": torch.version.cuda or "cpu",
+        "arm": args.arm,
+        "model_id": args.checkpoint,
+        "context_source": args.context_source,
+    }
+
+
 def build_row(
     *,
     provenance: dict,
@@ -324,18 +350,7 @@ def _run_cell(args) -> int:
 
     from birdology.phase_b.metrics import cmap as _cmap
 
-    provenance = {
-        "git_sha": args.git_sha,
-        "checkpoint_revision": resolved_revision,
-        "prior_doi": args.prior_doi,
-        "prior_variant": args.prior_variant,
-        "manifest_path": str(args.manifest),
-        "torch_version": torch.__version__,
-        "cuda_version": torch.version.cuda or "",
-        "arm": args.arm,
-        "model_id": args.checkpoint,
-        "context_source": args.context_source,
-    }
+    provenance = _stack_provenance(args, resolved_revision)
 
     # Finding I2: training is test-set-independent, so the cell trains
     # ONCE (above) and loops EVAL over every requested test set — one

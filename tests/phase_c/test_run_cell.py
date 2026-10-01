@@ -324,3 +324,47 @@ def test_conditioned_arm_allow_null_context_escape_hatch(
 def test_twin_arm_never_requires_context(tmp_path, fleet_stubs):
     args = _cell_args(tmp_path, arm="twin", eval_with_context=False)
     assert phase_c_run._run_cell(args) == 0
+
+
+def test_provenance_cuda_version_is_cpu_on_gpuless_stack(monkeypatch):
+    """torch.version.cuda is None on CPU-only builds — that is REAL provenance
+    (the run had no CUDA) and is recorded as "cpu", never "" (which would trip
+    build_row's refusal and lock GPU-less probes out of writing rows).
+    Measured: the 2026-10-01 Mac end-to-end run refused after 49 minutes of
+    successful training at exactly this seam."""
+    import argparse
+
+    import torch
+
+    import phase_c_run as pcr
+
+    monkeypatch.setattr(torch.version, "cuda", None)
+    args = argparse.Namespace(
+        git_sha="abc1234",
+        prior_doi="10.1/x",
+        prior_variant="full",
+        manifest="m.parquet",
+        checkpoint="org/model",
+        context_source="p.npz",
+        arm="twin",
+    )
+    prov = pcr._stack_provenance(args, resolved_revision="deadbeef")
+    assert prov["cuda_version"] == "cpu"
+    for v in prov.values():
+        assert isinstance(v, str) and v.strip()
+
+
+def test_provenance_cuda_version_passes_through_when_present(monkeypatch):
+    import argparse
+
+    import torch
+
+    import phase_c_run as pcr
+
+    monkeypatch.setattr(torch.version, "cuda", "12.8")
+    args = argparse.Namespace(
+        git_sha="abc1234", prior_doi="10.1/x", prior_variant="full",
+        manifest="m.parquet", checkpoint="org/model",
+        context_source="p.npz", arm="film",
+    )
+    assert pcr._stack_provenance(args, "deadbeef")["cuda_version"] == "12.8"
