@@ -22,7 +22,10 @@ We have both halves: a national occurrence knowledge graph (birdology: DOF/DOFba
 
 ## Contribution
 
-1. **A spatiotemporal occurrence prior**, released CC BY 4.0 — `P(species | H3 cell, ISO week)`,
+1. **A spatiotemporal occurrence prior** — `P(species | H3 cell, ISO week)`, global (EOD)
+   released CC BY 4.0; Denmark (DOF) released CC BY-NC 4.0 (MEASURED 2026-10-01: the GBIF
+   download API returns BY-NC for the DOF archive, not the CC BY this table first claimed —
+   licence follows the source),
    built from eBird EOD (global) and DOF (Denmark, dense case study), with effort correction,
    hierarchical smoothing, and explicit leakage guards.
 2. **A comparison of five fusion methods** for combining that prior with a frozen acoustic
@@ -131,7 +134,7 @@ thing a sharp reviewer will probe.
 |---|---|---|---|
 | eBird EOD | GBIF dataset `4fa7b334-ce0d-4e88-aaae-2e0c138d049e` | CC BY 4.0 | none |
 | eBird EBD | Cornell request form | restricted redistribution | days–weeks |
-| DOF/DOFbasen | GBIF dataset `95db4db8-f762-11e1-a439-00145eb45e9a` | CC BY | none |
+| DOF/DOFbasen | GBIF dataset `95db4db8-f762-11e1-a439-00145eb45e9a` | CC BY-NC 4.0 (measured from download 10.15468/dl.3j4czw; was wrongly listed CC BY) | none |
 
 EOD is the dependency; the EBD request is filed in parallel as a **bonus, not a prerequisite**.
 Both GBIF routes reuse the existing `src/birdology/ingestion/gbif_dof.py` client.
@@ -250,7 +253,11 @@ and, conveniently, it is also the experiment nobody without 192 GPUs can run.
 ### Splits
 
 Inherit BirdSet's exactly: XCL/XCM focal recordings for training, held-out soundscape test sets
-(HSN, NES, PER, POW, SSW, SNE, UHH) for evaluation. Not renegotiating them is the point — identical
+for evaluation. BirdSet's seven test sets are HSN, NBP, NES, PER, SSW, SNE, UHH (this spec first
+wrote POW here — POW is BirdSet's VALIDATION set, Table 5). Prior-fusion evaluation runs on SIX:
+{HSN, NES, PER, SSW, SNE, UHH}. NBP is excluded — MEASURED 2026-10-01: all 539 NBP test_5s
+filenames carry no recording date, and a prior conditioned on ISO week is undefined without one
+(POW's 4,560 filenames have the same defect). Not renegotiating the splits is the point — identical
 splits give direct comparability with the published ICLR 2025 table. Any deviation is flagged
 loudly.
 
