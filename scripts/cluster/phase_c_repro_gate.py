@@ -266,8 +266,9 @@ def _run_gate_subcommand(args) -> int:
     """Fleet side of the repro gate: score each ``--pair`` spec
     ``MODEL:TESTSET:SCORES_NPZ`` where the npz carries ``scores`` (raw
     logits on the model axis, from evaluate_model) and ``y`` (the
-    EvalDataset's aligned label matrix) — produced on-fleet by the eval
-    runner so the gate exercises the exact pipeline the arms will use.
+    EvalDataset's aligned label matrix) — produced on-fleet by the
+    ``score`` subcommand below so the gate exercises the exact pipeline
+    the arms will use.
     """
     scored: list[tuple[str, str, float]] = []
     for spec in args.pairs:
@@ -292,8 +293,97 @@ def _run_gate_subcommand(args) -> int:
     return 0 if ok else 1
 
 
+def _run_score_subcommand(args) -> int:
+    """Produce the scores npz the ``gate`` subcommand consumes (finding
+    I3: the gate's input format had no in-tree producer).
+
+    Loads a checkpoint (local path or hub id), builds the eval dataset
+    through ``evaluate.build_eval_dataset`` — CONTEXT-FREE: the frozen
+    gate compares the bare checkpoint to the published LT rows, so
+    every row takes the provider's absent-context path — runs
+    ``evaluate_model`` with ``arm="twin"`` (the bare-model dispatch),
+    and writes ``np.savez(out, scores=..., y=...)``: exactly the two
+    arrays ``_run_gate_subcommand`` reads back.
+    """
+    import pyarrow.parquet as _pq
+    import soundfile as sf
+    from transformers import (
+        ASTForAudioClassification,
+        ConvNextForImageClassification,
+    )
+
+    from birdology.phase_c.data import SAMPLE_RATE, convnext_frontend
+    from birdology.phase_c.evaluate import build_eval_dataset, evaluate_model
+
+    cls = {
+        "convnext": ConvNextForImageClassification,
+        "ast": ASTForAudioClassification,
+    }[args.model]
+    kwargs = {"revision": args.revision} if args.revision else {}
+    model = cls.from_pretrained(args.checkpoint, **kwargs)
+    class_codes = [
+        model.config.id2label[i]
+        for i in sorted(map(int, model.config.id2label))
+    ]
+
+    def load_audio(filepath: str):
+        samples, sr = sf.read(
+            str(Path(args.audio_root) / filepath),
+            dtype="float32",
+            always_2d=False,
+        )
+        if getattr(samples, "ndim", 1) > 1:
+            samples = samples.mean(axis=1)
+        if samples.size == 0:
+            raise ValueError(f"{filepath}: decoded to 0 samples")
+        if sr != SAMPLE_RATE:
+            import librosa
+
+            samples = librosa.resample(
+                samples, orig_sr=sr, target_sr=SAMPLE_RATE
+            )
+        return np.asarray(samples, dtype=np.float32)
+
+    class _NullProvider:
+        """Context-free gate: zeros + flag 0 for every row."""
+
+        def __init__(self, n: int) -> None:
+            self.n = n
+
+        def vector(self, cell, week):
+            return np.zeros(self.n, dtype=np.float32), 0.0
+
+    if args.model == "ast":
+        # Same refusal as phase_c_run._run_cell: convnext_frontend's
+        # (1, 128, 501) mel is not AST's input contract, and the gap
+        # must not be discovered at GPU cost (task-6-report concern 1).
+        raise NotImplementedError(
+            "ast_frontend not yet wired — BirdSet AST uses "
+            "mel→resize-1024 with sign-flip std; refusing rather than "
+            "feeding convnext_frontend output to AST."
+        )
+
+    eval_meta = _pq.read_table(args.eval_metadata)
+    eval_ds = build_eval_dataset(
+        eval_meta,
+        load_audio,
+        _NullProvider(len(class_codes)),
+        class_codes,
+        frontend=convnext_frontend,
+    )
+    scores = evaluate_model(model, eval_ds, arm="twin")
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(out, scores=scores, y=eval_ds.y)
+    print(
+        f"PHASE_C_SCORE {args.model} rows={scores.shape[0]} "
+        f"classes={scores.shape[1]} -> {out}"
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
-    """Entry point: ``gate`` and ``film-identity`` subcommands.
+    """Entry point: ``gate``, ``score`` and ``film-identity`` subcommands.
 
     Argparse lives here, under main — importing the module for its pure
     functions never parses argv (the repro_gate.py import-safety
@@ -315,6 +405,18 @@ def main(argv: list[str] | None = None) -> int:
         dest="pairs",
     )
 
+    score = sub.add_parser(
+        "score",
+        help="run a checkpoint over an eval parquet and write the "
+        "scores+y npz the gate consumes (finding I3)",
+    )
+    score.add_argument("--model", choices=("convnext", "ast"), required=True)
+    score.add_argument("--checkpoint", required=True)
+    score.add_argument("--revision", default=None)
+    score.add_argument("--eval-metadata", required=True)
+    score.add_argument("--audio-root", required=True)
+    score.add_argument("--out", required=True)
+
     identity = sub.add_parser(
         "film-identity", help="step-0 bit-equality on a real checkpoint"
     )
@@ -327,6 +429,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "gate":
             return _run_gate_subcommand(args)
+        if args.command == "score":
+            return _run_score_subcommand(args)
         return _run_identity_subcommand(args)
     except Exception:
         traceback.print_exc(file=sys.stderr)
