@@ -75,49 +75,82 @@ def build_manifest(
     dates: dict[int, date] | None,
     resolution: int,
     split: str,
+    keep_undated: bool = False,
 ) -> tuple[pa.Table, dict[DropReason, int]]:
     """Join BirdSet metadata to (cell, week).
 
     `dates` is the XC id -> date map for a FOCAL split. Pass None for a
     SOUNDSCAPE split, whose dates come from the filename.
+
+    `keep_undated=True` (phase_c final review, C2+I5): rows lacking a
+    date or coordinates are RETAINED with null cell/week (and null
+    lat/lon when the coordinates are what's missing) instead of being
+    dropped. Phase C needs them: the 7.5% undated XCM rows are the only
+    thing that TRAINS the flag-0 null-context path (TokenAST's
+    null_token learns only from flag-0 rows), and POW — all undated —
+    must still yield a non-empty validation manifest. Kept-null rows
+    are counted under `kept_null_{reason}` metadata keys, NEVER under
+    `dropped_{reason}`: the bookkeeping invariant stays
+    input_rows == kept_rows + sum(drops). The default is unchanged —
+    phase_a/phase_b callers see byte-identical behavior.
     """
     cols: dict[str, list] = {name: [] for name in MANIFEST_COLUMNS}
     drops: Counter[DropReason] = Counter()
+    kept_null: Counter[DropReason] = Counter()
 
     for row in metadata.to_pylist():
         path = row.get("filepath") or ""
+        null_reason: DropReason | None = None
 
+        when: date | None = None
         if dates is None:
             try:
                 when = parse_filename_date(path)
             except UndatableFilename:
-                drops[DropReason.UNDATABLE_FILENAME] += 1
-                continue
+                null_reason = DropReason.UNDATABLE_FILENAME
         else:
             xc = _xc_id(row)
             when = dates.get(xc) if xc is not None else None
             if when is None:
-                drops[DropReason.NO_DATE] += 1
-                continue
+                null_reason = DropReason.NO_DATE
 
         lat, lon = row.get("lat"), row.get("long")
         if lat is None or lon is None:
-            drops[DropReason.NO_COORDINATES] += 1
-            continue
+            lat_f: float | None = None
+            lon_f: float | None = None
+            if null_reason is None:
+                null_reason = DropReason.NO_COORDINATES
+        else:
+            try:
+                lat_f, lon_f = float(lat), float(lon)
+            except (ValueError, TypeError):
+                lat_f = lon_f = None
+                if null_reason is None:
+                    null_reason = DropReason.BAD_CELL
 
-        try:
-            cell = h3.latlng_to_cell(float(lat), float(lon), resolution)
-        except (ValueError, TypeError):
-            drops[DropReason.BAD_CELL] += 1
-            continue
+        cell: str | None = None
+        if null_reason is None and lat_f is not None and lon_f is not None:
+            try:
+                cell = h3.latlng_to_cell(lat_f, lon_f, resolution)
+            except (ValueError, TypeError):
+                null_reason = DropReason.BAD_CELL
+
+        if null_reason is not None:
+            if not keep_undated:
+                drops[null_reason] += 1
+                continue
+            kept_null[null_reason] += 1
+            cell = None
 
         cols["filepath"].append(path)
         cols["cell"].append(cell)
-        cols["week"].append(iso_week(when))
+        cols["week"].append(
+            iso_week(when) if cell is not None and when is not None else None
+        )
         cols["ebird_code"].append(row.get("ebird_code") or "")
         cols["split"].append(split)
-        cols["lat"].append(float(lat))
-        cols["lon"].append(float(lon))
+        cols["lat"].append(lat_f)
+        cols["lon"].append(lon_f)
 
     table = pa.table([cols[n] for n in MANIFEST_COLUMNS], schema=_SCHEMA)
 
@@ -129,10 +162,13 @@ def build_manifest(
         "coverage": f"{(n_out / n_in) if n_in else 0.0:.6f}",
         "resolution": str(resolution),
         "split": split,
-        "distinct_weeks": str(len(set(cols["week"]))),
+        "distinct_weeks": str(
+            len({w for w in cols["week"] if w is not None})
+        ),
     }
     for reason in DropReason:
         meta[f"dropped_{reason.value}"] = str(drops.get(reason, 0))
+        meta[f"kept_null_{reason.value}"] = str(kept_null.get(reason, 0))
 
     log.info(
         "manifest %s: kept %d/%d (%.1f%%), drops=%s",

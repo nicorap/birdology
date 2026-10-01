@@ -66,7 +66,11 @@ applied by thin wrapper modules around HF checkpoints.
   the phase_a shard machinery (basename resolver, failures-json witnesses).
   5 s random crops, label from `ebird_code` (single-label focal), context from
   the XCM r4 manifest join (filepath → cell/week; the r3/r5 axes re-join from
-  their manifests).
+  their manifests). The XCM train manifests and the POW-val manifest are
+  built with `--keep-undated` (phase_a_manifest.py): rows lacking date/coords
+  are RETAINED with null cell/week — they are what trains the flag-0
+  null-context path §1 relies on, and POW (all undated) would otherwise
+  yield an empty validation manifest.
 - **Staging:** every GPU task stages its shards to `/raid/scratch` before
   decode (measured: 5.3 GB/s local vs ~300 MB/s shared at contention).
 - **Frontends:** each model's own preprocessing from its HF config (ConvNext
@@ -75,9 +79,14 @@ applied by thin wrapper modules around HF checkpoints.
 - **Eval:** the six evaluable soundscape test sets {HSN, NES, PER, SSW, SNE,
   UHH}, segment-level (test_5s), labels from the metadata parquet joined BY
   FILEPATH (phase_b seam, already fixed), metrics via `phase_b.metrics`
-  (sklearn-exact cmAP). POW serves as validation only; its missing dates put
-  it on the null-context path, which is the degradation mode we want measured
-  anyway.
+  (sklearn-exact cmAP). Conditioned evals read CONTEXT-JOINED eval tables
+  produced by `scripts/phase_c_build_eval_ctx.py` from the dated test-set
+  metadata (H3 cell + ISO week derived through phase_a's own functions) —
+  the raw BirdSet metadata parquets carry no cell/week columns, and a
+  conditioned eval fed one would silently run the whole set null-context
+  (refused by name in `build_eval_dataset(require_context=True)`). POW
+  serves as validation only; its missing dates put it on the null-context
+  path, which is the degradation mode we want measured anyway.
 - **Val/early-stop:** POW-val cmAP, patience 1 epoch, max 2 epochs.
 
 ## 3. Reproduction gate (hard, like Phase B's)
@@ -101,15 +110,22 @@ runs  = 3 combos × 3 resolutions × 5 seeds                    =  45 conditione
       ≈ 195 runs × ~3 GPU-h ≈ 600 GPU-h ≈ <4 h of the 192-GPU fleet
 ```
 
-One GPU per task (`--gres=gpu:1`), one results row per run through
-`phase_b.sweep.write_rows`' provenance contract (git SHA, checkpoint revision,
-prior DOI, manifest paths; refusal on absence). Controls reuse
+The ~600 GPU-h holds because each cell trains ONCE and loops evaluation
+over all six test sets (train-once/eval-six — the checkpoint dir is keyed
+without test_set); retraining per test set would ×6 the training budget.
+
+One GPU per task (`--gres=gpu:1`), one results row per (run, test set)
+through `phase_b.sweep.write_rows`' provenance contract (git SHA,
+checkpoint revision, prior DOI, prior variant, manifest paths; refusal on
+absence). Controls reuse
 `rescoring.control_prior` tensors — the context input is the only thing that
 changes between a conditioned run and its control twin.
 
 - Seeds: (0,1,2,3,4), full-cell granularity (the Phase B ruling carries over).
-- Paired statistics via `phase_b.sweep.paired_delta`, per-row only (the
-  documented multi-row df caveat).
+- Paired statistics: conditioned−twin paired per seed at ANALYSIS time over
+  the per-seed rows (keyed model, resolution, seed); a
+  `phase_b.sweep.paired_delta` adapter is a ledgered follow-up — phase_c
+  rows do not satisfy its phase_b-shaped contract.
 - Stratified reporting (frequency decile, expected-under-prior) via the same
   phase_b strata columns.
 
@@ -123,9 +139,11 @@ changes between a conditioned run and its control twin.
   gate before new rows join the table.
 - Vacuous gates — zero-gated-pairs refusal inherited; the FiLM identity gate
   must FAIL when γ,β are randomly initialized (tested mutation).
-- Fabricated spreads — seeds_degenerate logic carries over; a twin's five
-  seeds genuinely differ (SGD noise), so no degenerate path is expected, and
-  a zero std raises a flag rather than passing silently.
+- Fabricated spreads — the per-seed rows carry `seed`; degenerate-spread
+  checks (seeds_degenerate's logic) run at ANALYSIS time over the per-seed
+  rows. A twin's five seeds genuinely differ (SGD noise), so no degenerate
+  path is expected, and a zero std raises a flag rather than passing
+  silently.
 
 ## 6. Deliverables
 

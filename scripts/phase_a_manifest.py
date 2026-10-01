@@ -230,6 +230,7 @@ def build_all(
     min_coverage: float = DEFAULT_MIN_COVERAGE,
     split: str | None = None,
     species_map_path: Path | None = None,
+    keep_undated: bool = False,
 ) -> Path:
     """Metadata in, manifest parquet out. Returns the written path."""
     meta_path = _metadata_path(Path(corpus_dir), config, split)
@@ -293,7 +294,8 @@ def build_all(
         split_label = split if split is not None else "train"
 
     table, drops = build_manifest(
-        metadata, dates=dates, resolution=resolution, split=split_label
+        metadata, dates=dates, resolution=resolution, split=split_label,
+        keep_undated=keep_undated,
     )
 
     if table.num_rows == 0:
@@ -355,6 +357,14 @@ def main() -> None:
         "column and bare filepaths (XCL). Rows underivable by BOTH the "
         "directory convention and this map fall out as counted no_date drops.",
     )
+    ap.add_argument(
+        "--keep-undated",
+        action="store_true",
+        help="RETAIN rows lacking date/coords with null cell/week instead "
+        "of dropping them (phase_c manifests: the undated XCM rows train "
+        "the flag-0 null-context path, and POW-val is all-undated). "
+        "Kept-null rows are counted under kept_null_* metadata keys.",
+    )
     args = ap.parse_args()
 
     logging.basicConfig(
@@ -370,6 +380,7 @@ def main() -> None:
             min_coverage=args.min_coverage,
             split=args.split,
             species_map_path=args.species_map,
+            keep_undated=args.keep_undated,
         )
     )
 
