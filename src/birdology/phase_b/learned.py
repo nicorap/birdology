@@ -29,8 +29,16 @@ from birdology.phase_b.rescoring import FLOOR
 #: lam search interval for the 1-D BCE minimization. The objective is
 #: convex in lam (it is a logistic regression in the single feature
 #: log p with fixed offset log s), so any bracket containing the minimum
-#: finds it; +/-10 is far beyond any plausible prior exponent.
+#: finds it; +/-10 is far beyond any plausible prior exponent. A fit
+#: that PINS at a bound is refused loudly (see _fit_one): silently
+#: returning the truncated lam would poison every downstream cache.
 _LAM_BOUNDS = (-10.0, 10.0)
+
+#: |fitted lam - bound| below this means the minimizer pinned at the
+#: bound rather than finding an interior minimum. The minimizer runs
+#: with xatol well below this tolerance so a genuine interior optimum
+#: near (but not at) the bound is not misflagged.
+_LAM_BOUND_TOL = 1e-6
 
 
 def _checked_log_scores(scores: np.ndarray) -> np.ndarray:
@@ -107,6 +115,16 @@ def fit_logit_offset(
     feature log p with fixed offset log s), so bounded scalar
     minimization needs no random initialization — *seed* is accepted for
     interface uniformity with :func:`fit_mlp_head` and enters nothing.
+
+    TRUST BOUNDARY: array inputs are trusted and unguarded — derive
+    training arrays via :func:`prepare_training`, which enforces
+    :func:`guard_training_split`; a direct-array call bypasses that
+    guard by design.
+
+    A fitted lam within ``_LAM_BOUND_TOL`` of the ``_LAM_BOUNDS`` edge
+    raises ValueError: the true optimum lies at or beyond the bracket,
+    and silently returning the truncated value would poison every cache
+    built from it.
     """
     del seed  # convex 1-D objective: no stochastic init to seed.
     log_s = _checked_log_scores(scores)
@@ -118,8 +136,21 @@ def fit_logit_offset(
             lambda lam: _bce(ls, lp, lam, yy),
             bounds=_LAM_BOUNDS,
             method="bounded",
+            # xatol far below _LAM_BOUND_TOL: a pinned fit lands within
+            # the tolerance of the bound instead of stopping ~1e-5 away
+            # (scipy's default xatol) and slipping past the check.
+            options={"xatol": 1e-8},
         )
-        return float(result.x)
+        lam = float(result.x)
+        if min(abs(lam - b) for b in _LAM_BOUNDS) < _LAM_BOUND_TOL:
+            raise ValueError(
+                f"fitted lam {lam!r} is pinned at the search bound "
+                f"{_LAM_BOUNDS}; the optimum lies outside the bracket, "
+                "and silently truncating it would poison every cache "
+                "built from this fit — widen _LAM_BOUNDS or inspect the "
+                "degenerate scores/prior that produced it"
+            )
+        return lam
 
     if per_species:
         lam = np.array(
@@ -191,7 +222,13 @@ def fit_mlp_head(
     natively (measured fact — see :class:`MLPModel`). ``random_state=
     seed`` makes the fit deterministic given (data, seed): the seed
     enters the weight initialization and the minibatch shuffling.
+
+    TRUST BOUNDARY: array inputs are trusted and unguarded — derive
+    training arrays via :func:`prepare_training`, which enforces
+    :func:`guard_training_split`; a direct-array call bypasses that
+    guard by design.
     """
+    from sklearn.exceptions import ConvergenceWarning
     from sklearn.neural_network import MLPClassifier
 
     features = _mlp_features(embeddings, prior_probs)
@@ -205,8 +242,10 @@ def fit_mlp_head(
 
     with warnings.catch_warnings():
         # A small max_iter stopping before convergence is a caller
-        # choice, not a defect worth polluting sweep logs over.
-        warnings.simplefilter("ignore", category=UserWarning)
+        # choice, not a defect worth polluting sweep logs over. ONLY
+        # ConvergenceWarning is suppressed — anything else sklearn
+        # emits must stay visible.
+        warnings.simplefilter("ignore", category=ConvergenceWarning)
         clf.fit(features, y_arr)
     return MLPModel(clf=clf, n_classes=y_arr.shape[1])
 
@@ -238,14 +277,31 @@ def guard_training_split(table: pa.Table) -> None:
         )
 
 
+@dataclass(frozen=True)
+class TrainingStats:
+    """What prepare_training coerced or set aside, reported instead of
+    silently absorbed.
+
+    - ``n_unlabeled``: rows whose *label_col* was None. Each becomes an
+      ALL-NEGATIVE y row (a negative example for every scoreable
+      species), NOT a dropped row — the row count is preserved.
+    - ``unscoreable``: sorted label codes present in the cache but
+      absent from *class_idx*; their rows also end up all-negative for
+      the scoreable columns.
+    """
+
+    n_unlabeled: int
+    unscoreable: list[str]
+
+
 def prepare_training(
     cache_view: CacheView,
     class_idx: dict[str, int],
     label_col: str = "ebird_code",
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str], TrainingStats]:
     """Guard + gather in one place: training arrays from a CacheView.
 
-    Returns ``(embeddings, scores, y, scoreable)``:
+    Returns ``(embeddings, scores, y, scoreable, stats)``:
 
     - ``embeddings``: ``(n, d)`` float64 from the cache embedding column.
     - ``scores``: ``(n, k)`` float64 probabilities gathered BY CODE in
@@ -254,12 +310,23 @@ def prepare_training(
     - ``y``: ``(n, k)`` uint8 built from the SINGLE-label *label_col*
       (focal caches carry one label per recording in ``ebird_code``, NOT
       ``ebird_code_multilabel``) via the same by-code alignment as
-      :func:`birdology.phase_b.cache.align_labels`.
+      :func:`birdology.phase_b.cache.align_labels`. A None label makes
+      an ALL-NEGATIVE row (see :class:`TrainingStats`), never a dropped
+      row.
     - ``scoreable``: the sorted species codes forming the column axis.
+    - ``stats``: a :class:`TrainingStats` counting None-label rows and
+      naming unscoreable codes, so callers can log what was coerced.
 
-    Runs :func:`guard_training_split` first — both learned arms call
-    through here when given a CacheView, so no training fit can ever see
-    a non-train row.
+    ROW ORDER: all row-indexed outputs (``embeddings``, ``scores``,
+    ``y``) are row-parallel to ``cache_view.table`` order — row i of
+    each array is row i of the table. Task 6 relies on this to zip the
+    table's ``cell`` / ``week`` columns against these arrays for
+    ``prior_for_rows``.
+
+    Runs :func:`guard_training_split` first — a fit prepared THROUGH
+    THIS FUNCTION can never see a non-train row. Direct-array calls to
+    ``fit_logit_offset`` / ``fit_mlp_head`` bypass the guard by design
+    (arrays carry no split column to check).
     """
     table = cache_view.table
     guard_training_split(table)
@@ -276,8 +343,12 @@ def prepare_training(
         pa.list_(pa.string()),
     )
     labeled = table.append_column("_single_label_as_list", as_lists)
-    y, scoreable, _unscoreable = align_labels(
+    y, scoreable, unscoreable = align_labels(
         labeled, class_idx, label_col="_single_label_as_list"
+    )
+    stats = TrainingStats(
+        n_unlabeled=sum(1 for code in singles if code is None),
+        unscoreable=list(unscoreable),
     )
 
     logits = np.asarray(
@@ -291,4 +362,4 @@ def prepare_training(
     embeddings = np.asarray(
         table.column("embedding").to_pylist(), dtype=np.float64
     )
-    return embeddings, gathered, y, scoreable
+    return embeddings, gathered, y, scoreable, stats

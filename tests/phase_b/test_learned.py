@@ -168,6 +168,31 @@ def test_per_species_fit_separates_helpful_and_noise_species():
 
 
 # ---------------------------------------------------------------------------
+# lam at the search bound must raise, never truncate silently
+# ---------------------------------------------------------------------------
+
+
+def test_fit_logit_offset_raises_when_lam_hits_search_bound():
+    """A fixture engineered to want a huge |lam| — near-constant scores
+    with an extremely informative (anti-correlated, near-unit) prior —
+    drives the bounded minimizer into the ±10 bound. Returning the
+    truncated lam silently would poison every cache built from it, so
+    the fit must refuse loudly instead."""
+    n = 60
+    y = np.concatenate([np.ones(30), np.zeros(30)])[:, None]
+    scores = np.full((n, 1), 0.5)
+    # Prior is LOWER on positives by a factor e^0.7 and near 1 on
+    # negatives: log p is tiny in magnitude, so BCE keeps improving as
+    # lam -> -inf and the minimizer pins at the -10 bound.
+    prior = np.where(y == 1, np.exp(-0.7), 0.999)
+    with pytest.raises(ValueError, match="bound"):
+        fit_logit_offset(scores, prior, y, per_species=False, seed=0)
+    # Per-species mode guards each column's fit the same way.
+    with pytest.raises(ValueError, match="bound"):
+        fit_logit_offset(scores, prior, y, per_species=True, seed=0)
+
+
+# ---------------------------------------------------------------------------
 # raw-logits guard — scores entering log must be probabilities
 # ---------------------------------------------------------------------------
 
@@ -268,7 +293,7 @@ def test_prepare_training_end_to_end_on_train_cache_view():
     """prepare_training runs the guard, builds Y from the SINGLE-label
     ebird_code column (focal caches carry one label per recording, not
     ebird_code_multilabel), gathers scores by code, and returns
-    parallel (embeddings, scores, y, rows) arrays."""
+    parallel (embeddings, scores, y, rows, stats) arrays."""
     table = _cache_table(
         ["train", "train", "train"],
         ["spB", "spA", "spB"],
@@ -279,7 +304,7 @@ def test_prepare_training_end_to_end_on_train_cache_view():
     view = CacheView(table=table, logits_are_raw=False, n_classes=3)
     class_idx = {"spA": 0, "spB": 1, "spC": 2}
 
-    embeddings, scores, y, rows = prepare_training(view, class_idx)
+    embeddings, scores, y, rows, stats = prepare_training(view, class_idx)
 
     assert embeddings.shape == (3, 4)
     assert embeddings.dtype == np.float64
@@ -290,10 +315,37 @@ def test_prepare_training_end_to_end_on_train_cache_view():
     # Row labels: spB, spA, spB against columns [spA, spB].
     assert y.tolist() == [[0, 1], [1, 0], [0, 1]]
     assert rows == ["spA", "spB"]
+    # Fully labeled, fully scoreable: stats report zeros.
+    assert stats.n_unlabeled == 0
+    assert stats.unscoreable == []
     # Gather is by code: scores column j is logits column class_idx[code].
     logits = np.asarray(table.column("logits").to_pylist())
     np.testing.assert_allclose(scores[:, 0], logits[:, 0], rtol=1e-6)
     np.testing.assert_allclose(scores[:, 1], logits[:, 1], rtol=1e-6)
+
+
+def test_prepare_training_reports_unlabeled_and_unscoreable_rows():
+    """A None in ebird_code becomes an ALL-NEGATIVE y row (a negative,
+    never a dropped row) and is COUNTED in stats.n_unlabeled; a labeled
+    code absent from class_idx is reported in stats.unscoreable instead
+    of being silently discarded."""
+    table = _cache_table(
+        ["train", "train", "train"],
+        ["spA", None, "spZ"],  # spZ not in class_idx
+        n_classes=3,
+    )
+    view = CacheView(table=table, logits_are_raw=False, n_classes=3)
+    class_idx = {"spA": 0, "spB": 1}
+
+    embeddings, scores, y, rows, stats = prepare_training(view, class_idx)
+
+    assert rows == ["spA"]
+    # Row 1 (None label) and row 2 (unscoreable spZ) are all-negative,
+    # present, not dropped: n rows preserved.
+    assert y.shape == (3, 1)
+    assert y.tolist() == [[1], [0], [0]]
+    assert stats.n_unlabeled == 1
+    assert stats.unscoreable == ["spZ"]
 
 
 def test_prepare_training_rejects_non_train_cache_view():
@@ -336,6 +388,46 @@ def test_sklearn_mlpclassifier_supports_multilabel_indicator_y():
     # NOT sum to 1 (that would be the multiclass softmax head).
     assert clf.out_activation_ == "logistic"
     assert np.all((proba >= 0.0) & (proba <= 1.0))
+
+
+def test_sklearn_mlpclassifier_proba_columns_track_their_own_y_columns():
+    """Column-correspondence pin: fit on 2 label columns with DISJOINT
+    signal (y column 0 depends only on features 0-1, column 1 only on
+    features 2-3) and assert each predict_proba column separates ITS OWN
+    y column far better than the other. A swapped column order in
+    predict_proba collapses both own-column margins and fails loudly.
+    (Simulated swap check: running these asserts on proba[:, ::-1]
+    fails — the swapped own-column margins collapse to ~0.11, far
+    below the 0.5 threshold.)"""
+    from sklearn.neural_network import MLPClassifier
+
+    rng = np.random.default_rng(42)
+    n = 80
+    X = rng.normal(size=(n, 4))
+    Y = np.stack(
+        [(X[:, 0] + X[:, 1] > 0), (X[:, 2] + X[:, 3] > 0)], axis=1
+    ).astype(np.uint8)
+    clf = MLPClassifier(
+        hidden_layer_sizes=(16,), max_iter=400, random_state=0
+    )
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        clf.fit(X, Y)
+    proba = clf.predict_proba(X)
+
+    def margin(col: np.ndarray, y: np.ndarray) -> float:
+        """Mean proba on positives minus mean on negatives."""
+        return float(col[y == 1].mean() - col[y == 0].mean())
+
+    # Each proba column must track its own label column...
+    assert margin(proba[:, 0], Y[:, 0]) > 0.5
+    assert margin(proba[:, 1], Y[:, 1]) > 0.5
+    # ...and carry (near) no signal for the OTHER column — the strict
+    # inequality pair is what a column swap cannot satisfy.
+    assert margin(proba[:, 0], Y[:, 0]) > margin(proba[:, 1], Y[:, 0]) + 0.3
+    assert margin(proba[:, 1], Y[:, 1]) > margin(proba[:, 0], Y[:, 1]) + 0.3
 
 
 # ---------------------------------------------------------------------------
