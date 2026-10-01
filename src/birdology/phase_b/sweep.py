@@ -23,9 +23,19 @@ carried obligations:
   the table's `cell`/`week` columns zip directly into `prior_for_rows`.
 * Nothing gates on cross-machine bit-identity of MLP outputs; the
   determinism contract is same-machine only.
-* `prior_coverage_failures` counts COVERAGE failures (cells/species the
-  prior could not answer, i.e. `PriorLookup.n_floored`), not values that
-  happen to equal FLOOR — hence the column name.
+* `prior_coverage_failures_train` / `prior_coverage_failures_eval`
+  count COVERAGE failures (cells/species the prior could not answer,
+  i.e. `PriorLookup.n_floored`) on the training and eval lookups
+  SEPARATELY — rescoring performs no training lookup, so its train
+  column is null, and the two columns are never summed into one number
+  that would compare different quantities across methods.
+* EVAL LABELS NEVER COME FROM THE CACHE TABLE. A real Phase A cache
+  carries `filepath/cell/week/ebird_code/split/embedding[/logits]` and
+  NO `ebird_code_multilabel` column; the multilabel ground truth lives
+  in the test set's metadata parquet and is joined to cache rows BY
+  FILEPATH (the exact contract of `repro_gate.score_pair`), refusing —
+  with named examples — any cache recording the metadata does not
+  cover.
 * `rescore` at tau=0 ALIASES its input; score arrays are treated as
   read-only everywhere in this module.
 """
@@ -53,7 +63,13 @@ from birdology.phase_b.learned import (
     fit_mlp_head,
     prepare_training,
 )
-from birdology.phase_b.metrics import auroc_macro, cmap, gather_scores, top1
+from birdology.phase_b.metrics import (
+    auroc_macro,
+    cmap,
+    gather_scores,
+    stratified,
+    top1,
+)
 from birdology.phase_b.rescoring import (
     CONTROL_VARIANTS,
     control_prior,
@@ -61,7 +77,7 @@ from birdology.phase_b.rescoring import (
     rescore,
     train_marginal_from_prior,
 )
-from birdology.prior.tensor import PriorTensor
+from birdology.prior.tensor import FLOOR, PriorTensor
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +121,20 @@ _RESULTS_SCHEMA = pa.schema(
         pa.field("top1_mean", pa.float64()),
         pa.field("top1_std", pa.float64()),
         pa.field("n_scored", pa.int64()),
-        pa.field("prior_coverage_failures", pa.int64()),
+        # I2: coverage failures split by lookup — train is NULL for
+        # rescoring (which performs no training lookup); summing them
+        # into one column would compare different quantities across
+        # methods.
+        pa.field("prior_coverage_failures_train", pa.int64()),
+        pa.field("prior_coverage_failures_eval", pa.int64()),
+        # I1 (spec §4 stratification): JSON-encoded
+        # ``{stratum: [cmap_or_null, n_scored]}`` dicts. Deciles key the
+        # frequency-decile stratification of the eval label prevalence
+        # (the rarity curve's data path); expectation keys are
+        # 'expected'/'unexpected' under the FULL prior at each row's
+        # cell-week (prior prob > FLOOR for >=1 positive label).
+        pa.field("cmap_by_freq_decile", pa.string()),
+        pa.field("cmap_by_prior_expectation", pa.string()),
         pa.field("cmap_per_seed", pa.list_(pa.float64())),
         pa.field("seeds_degenerate", pa.bool_()),
         pa.field("git_sha", pa.string()),
@@ -290,11 +319,104 @@ def _map_columns(
     return [col_of[code] for code in eval_scoreable]
 
 
+def _guard_eval_split(table: pa.Table) -> None:
+    """Refuse an eval table carrying training rows — the symmetric twin
+    of :func:`birdology.phase_b.learned.guard_training_split`.
+
+    Raises ValueError when any ``split`` value starts with ``"train"``
+    (or when the column is absent and the rows cannot be proven eval
+    rows): a focal/training cache handed to the eval slot would
+    'evaluate' on training data and silently void the train/test shift.
+    The error NAMES the offending split values.
+    """
+    if "split" not in table.column_names:
+        raise ValueError(
+            "eval table has no 'split' column; cannot prove these rows "
+            f"are eval rows (columns: {table.column_names})"
+        )
+    splits = table.column("split").to_pylist()
+    offending = sorted(
+        {s for s in splits if s is not None and s.startswith("train")}
+    )
+    if offending:
+        raise ValueError(
+            f"eval cache carries training split values {offending}; "
+            "run_cell evaluates on test/soundscape rows only — a train-"
+            "split cache in the eval slot would score the training data "
+            "and silently void the train/test shift"
+        )
+
+
+def _align_eval_labels(
+    eval_table: pa.Table,
+    eval_metadata: pa.Table,
+    class_idx: dict[str, int],
+) -> tuple[np.ndarray, list[str], list[str]]:
+    """Eval label matrix from the SEPARATE metadata table, joined to the
+    cache rows BY FILEPATH — the exact contract of
+    ``repro_gate.score_pair``.
+
+    Real Phase A caches carry NO ``ebird_code_multilabel`` column (see
+    ``phase_a/embed.py``'s EMBEDDING_SCHEMA); the multilabel ground
+    truth lives only in the test set's metadata parquet. The join is
+    never positional, and a cache recording whose filepath is absent
+    from the metadata raises NAMING examples — a silent inner join would
+    quietly shrink the test set.
+    """
+    cache_files: list[str] = eval_table.column("filepath").to_pylist()
+    labels_by_file = dict(
+        zip(
+            eval_metadata.column("filepath").to_pylist(),
+            eval_metadata.column("ebird_code_multilabel").to_pylist(),
+        )
+    )
+    missing = [f for f in cache_files if f not in labels_by_file]
+    if missing:
+        raise ValueError(
+            f"{len(missing)} eval cache recording(s) missing from the "
+            f"eval-labels metadata: {missing[:5]} -- a silent inner join "
+            "would shrink the test set; refusing (the same contract as "
+            "repro_gate.score_pair)"
+        )
+    # Re-emit the metadata rows IN CACHE ROW ORDER so Y rows align with
+    # the logits rows, then let align_labels build the matrix by code.
+    aligned = pa.table(
+        {
+            "ebird_code_multilabel": pa.array(
+                [labels_by_file[f] for f in cache_files],
+                pa.list_(pa.string()),
+            )
+        }
+    )
+    return align_labels(aligned, class_idx)
+
+
+def _merge_strata(dicts: list[dict]) -> dict[str, list]:
+    """Mean the per-seed stratified cmap tuples into one JSON-ready
+    dict ``{stratum: [cmap_or_null, n_scored]}``.
+
+    ``n_scored`` per stratum is seed-invariant (it depends only on the
+    labels and the stratum mask), so the first seed's count is THE
+    count; a stratum every seed scored as NaN becomes null, never a
+    fabricated number."""
+    merged: dict[str, list] = {}
+    for key in dicts[0]:
+        values = [d[key][0] for d in dicts]
+        n_scored = int(dicts[0][key][1])
+        finite = [float(v) for v in values if np.isfinite(v)]
+        merged[str(key)] = [
+            float(np.mean(finite)) if finite else None,
+            n_scored,
+        ]
+    return merged
+
+
 def run_cell(
     cell: SweepCell,
     *,
     train_cache: CacheView,
     eval_cache: CacheView,
+    eval_metadata: pa.Table,
     prior: PriorTensor,
     class_idx: dict[str, int],
     code_to_gbif: dict[str, int],
@@ -304,6 +426,13 @@ def run_cell(
 ) -> dict:
     """Execute *cell* for ALL its seeds and return ONE results row.
 
+    *eval_metadata* is the test set's metadata table (``filepath`` +
+    ``ebird_code_multilabel``): real Phase A caches carry no label
+    column, so the eval labels are joined to the cache rows BY FILEPATH
+    (see :func:`_align_eval_labels`), refusing any cache recording the
+    metadata does not cover. The eval table itself is refused when it
+    carries training-split rows (:func:`_guard_eval_split`).
+
     Learned arms fit on *train_cache* per seed and evaluate on
     *eval_cache*; rescoring fits nothing — seeds enter only the control
     shuffles. For seed-free configurations (variant in 'full' / 'uniform'
@@ -311,16 +440,60 @@ def run_cell(
     IDENTICAL by construction: the metrics are computed once, replicated
     per seed, std set to 0.0 and the row flagged ``seeds_degenerate`` —
     a fake spread is never reported.
+
+    MARGINAL-CONTROL CANCELLATION (documented, not a defect): under the
+    default marginal ``m = train_marginal_from_prior(tensor, ...)`` the
+    rescoring arm's correction ``tau * (log p - log m)`` cancels EXACTLY
+    for the 'marginal' control — that control's prior IS the global
+    marginal, so ``log p == log m`` cell-wise and the scores pass
+    through unchanged at every tau. The marginal row therefore cannot
+    carry the frequency-exploitation check for rescoring; that check is
+    carried by the LEARNED arms (whose fits can exploit the marginal as
+    a feature). The control row stays in the grid on purpose: it is the
+    documented tau-invariant baseline, equal to the raw-encoder row by
+    construction.
     """
     _validate_cell(cell, provenance)
     t0 = time.perf_counter()
 
     eval_table = eval_cache.table
-    Y, scoreable, _unscoreable = align_labels(eval_table, class_idx)
+    _guard_eval_split(eval_table)
+    Y, scoreable, _unscoreable = _align_eval_labels(
+        eval_table, eval_metadata, class_idx
+    )
     eval_scores = _eval_probabilities(eval_cache, class_idx, scoreable)
     # Obligation: weeks come ONLY off the cache's `week` column.
     eval_cells = eval_table.column("cell").to_pylist()
     eval_weeks = eval_table.column("week").to_pylist()
+
+    # I1 — class-level strata, fixed across seeds (they derive from the
+    # labels and the FULL prior, never from the per-seed scores).
+    # Frequency deciles: rank classes by eval label prevalence
+    # (ties broken by code — deterministic), decile k = rank*10//n.
+    prevalence = Y.mean(axis=0) if Y.size else np.zeros(len(scoreable))
+    rank_order = sorted(
+        range(len(scoreable)),
+        key=lambda j: (float(prevalence[j]), scoreable[j]),
+    )
+    freq_decile = np.zeros(len(scoreable), dtype=np.int64)
+    for pos, j in enumerate(rank_order):
+        freq_decile[j] = pos * 10 // max(len(scoreable), 1)
+    # Expected-under-prior: a class is 'expected' iff the FULL prior
+    # answers above FLOOR for it at >=1 eval row's cell-week.
+    full_lookup = prior_for_rows(
+        prior, eval_cells, eval_weeks, scoreable, code_to_gbif
+    )
+    prior_expectation = np.where(
+        (full_lookup.probs > FLOOR).any(axis=0), "expected", "unexpected"
+    )
+
+    def _class_strata(scored: np.ndarray, strata: np.ndarray) -> dict:
+        """cmap per CLASS stratum via metrics.stratified — arrays are
+        transposed so the stratum mask selects classes, and the metric
+        transposes back before scoring."""
+        return stratified(
+            scored.T, Y.T, strata, lambda s, yy: cmap(s.T, yy.T)
+        )
 
     if cell.method in _LEARNED_METHODS:
         # prepare_training's arrays are row-parallel to the train table,
@@ -338,18 +511,26 @@ def run_cell(
             else None
         )
 
-    def _seed_metrics(seed: int) -> tuple[float, int, float, float, int]:
-        """(cmap, n_scored, auroc, top1, coverage_failures) for one seed."""
+    def _seed_metrics(seed: int) -> dict:
+        """One seed's metrics: cmap/n_scored/auroc/top1, the SPLIT
+        coverage counts (train None for rescoring — no training
+        lookup), and the two class-stratified cmap dicts."""
         tensor = _variant_tensor(cell.prior_variant, prior, seed)
         if cell.method == "rescoring":
             lookup = prior_for_rows(
                 tensor, eval_cells, eval_weeks, scoreable, code_to_gbif
             )
+            # M2: for the 'marginal' control this marginal equals the
+            # control's own prior, so log p - log m == 0 and `scored`
+            # is the raw encoder ranking at every tau (see the run_cell
+            # docstring) — correct, documented, kept as the
+            # tau-invariant baseline row.
             marginal = train_marginal_from_prior(
                 tensor, scoreable, code_to_gbif
             )
             scored = rescore(eval_scores, lookup.probs, cell.tau, marginal)
-            coverage = lookup.n_floored
+            coverage_train: int | None = None
+            coverage_eval = lookup.n_floored
         else:
             train_lookup = prior_for_rows(
                 tensor, train_cells, train_weeks, train_scoreable, code_to_gbif
@@ -388,34 +569,39 @@ def run_cell(
                     ]
                     model = OffsetModel(lam=lam_eval, per_species=True)
                 scored = model.predict(eval_scores, eval_lookup.probs)
-            coverage = train_lookup.n_floored + eval_lookup.n_floored
+            coverage_train = train_lookup.n_floored
+            coverage_eval = eval_lookup.n_floored
         cmap_v, n_scored = cmap(scored, Y)
         auroc_v, _n_auroc = auroc_macro(scored, Y)
         top1_v = top1(scored, Y)
-        return cmap_v, n_scored, auroc_v, top1_v, coverage
+        return {
+            "cmap": cmap_v,
+            "n_scored": n_scored,
+            "auroc": auroc_v,
+            "top1": top1_v,
+            "coverage_train": coverage_train,
+            "coverage_eval": coverage_eval,
+            "by_decile": _class_strata(scored, freq_decile),
+            "by_expectation": _class_strata(scored, prior_expectation),
+        }
 
     degenerate = (
         cell.method != "mlp" and cell.prior_variant in _SEED_FREE_VARIANTS
     )
     if degenerate:
         # Identical by construction: compute once, replicate, std 0.0.
-        cmap_v, n_scored, auroc_v, top1_v, coverage = _seed_metrics(
-            cell.seeds[0]
-        )
-        cmaps = [cmap_v] * len(cell.seeds)
-        aurocs = [auroc_v] * len(cell.seeds)
-        top1s = [top1_v] * len(cell.seeds)
+        m = _seed_metrics(cell.seeds[0])
+        per_seed = [m] * len(cell.seeds)
         cmap_std = auroc_std = top1_std = 0.0
     else:
-        cmaps, aurocs, top1s = [], [], []
-        for seed in cell.seeds:
-            cmap_v, n_scored, auroc_v, top1_v, coverage = _seed_metrics(seed)
-            cmaps.append(cmap_v)
-            aurocs.append(auroc_v)
-            top1s.append(top1_v)
-        cmap_std = float(np.std(cmaps))
-        auroc_std = float(np.std(aurocs))
-        top1_std = float(np.std(top1s))
+        per_seed = [_seed_metrics(seed) for seed in cell.seeds]
+        cmap_std = float(np.std([m["cmap"] for m in per_seed]))
+        auroc_std = float(np.std([m["auroc"] for m in per_seed]))
+        top1_std = float(np.std([m["top1"] for m in per_seed]))
+    cmaps = [m["cmap"] for m in per_seed]
+    aurocs = [m["auroc"] for m in per_seed]
+    top1s = [m["top1"] for m in per_seed]
+    last = per_seed[-1]
 
     return {
         "config_hash": config_hash(cell),
@@ -432,8 +618,21 @@ def run_cell(
         "auroc_std": auroc_std,
         "top1_mean": float(np.mean(top1s)),
         "top1_std": top1_std,
-        "n_scored": int(n_scored),
-        "prior_coverage_failures": int(coverage),
+        "n_scored": int(last["n_scored"]),
+        "prior_coverage_failures_train": (
+            None
+            if last["coverage_train"] is None
+            else int(last["coverage_train"])
+        ),
+        "prior_coverage_failures_eval": int(last["coverage_eval"]),
+        "cmap_by_freq_decile": json.dumps(
+            _merge_strata([m["by_decile"] for m in per_seed]),
+            sort_keys=True,
+        ),
+        "cmap_by_prior_expectation": json.dumps(
+            _merge_strata([m["by_expectation"] for m in per_seed]),
+            sort_keys=True,
+        ),
         "cmap_per_seed": [float(v) for v in cmaps],
         "seeds_degenerate": degenerate,
         "git_sha": provenance.git_sha,
@@ -470,6 +669,17 @@ def write_rows(rows: list[dict], out_dir: Path) -> Path:
     file in the fixed versioned schema plus a JSON sidecar
     ``{git_sha, written_at, n_rows, n_skipped_existing}``; the sidecar
     path is returned.
+
+    CONCURRENCY CONTRACT (honest statement): the dedupe above is
+    PER-PROCESS ONLY. ``load_existing_hashes`` is read once at entry and
+    the check-then-write is not atomic, so two writers appending the
+    same hash concurrently can BOTH write it — nothing here locks the
+    directory. Cross-writer uniqueness is guaranteed solely by
+    ``shard_cells``' disjoint partition of the grid: two correctly
+    sharded processes never carry the same config_hash, so the race is
+    unreachable under the intended deployment. Running two writers on
+    OVERLAPPING cell sets voids the no-duplicates property; readers who
+    cannot assume disjoint shards must dedupe on config_hash.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -537,6 +747,16 @@ def paired_delta(
     config axis is not a paired comparison and is refused; so is a pair
     with non-identical seed tuples (the deltas would subtract different
     draws).
+
+    MULTI-ROW POOLING CAVEAT: when more than one row pair is passed,
+    every pair's per-seed deltas are POOLED into one sample — the CI is
+    computed on n_pairs x 5 deltas with df = n-1 AS IF they were
+    independent draws. Deltas from different test sets (or other config
+    axes) are not exchangeable: pooling them inflates df and narrows
+    the CI relative to a per-row (or per-test-set) analysis. Headline
+    claims should therefore be made PER ROW PAIR (one test set, one
+    axis contrast, df=4); the multi-row form is a convenience summary,
+    not a substitute for per-row inference.
     """
     if not rows_a or len(rows_a) != len(rows_b):
         raise ValueError(

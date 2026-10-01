@@ -148,36 +148,59 @@ def _train_cache(n: int = 24) -> CacheView:
     return CacheView(table=table, logits_are_raw=False, n_classes=3)
 
 
-def _eval_cache(n: int = 20) -> CacheView:
+def _metadata_for(table: pa.Table, multilabels: list[list[str]]) -> pa.Table:
+    """The SEPARATE eval-label metadata table (filepath +
+    ebird_code_multilabel) — real Phase A caches carry NO label column,
+    so eval labels can only arrive through a table like this one."""
+    return pa.table(
+        {
+            "filepath": table.column("filepath"),
+            "ebird_code_multilabel": pa.array(
+                multilabels, pa.list_(pa.string())
+            ),
+        }
+    )
+
+
+def _eval_multilabels(n: int = 20) -> list[list[str]]:
     labels: list[list[str]] = [[_CODES[i % 3]] for i in range(n)]
     labels[0] = ["amecro", "blujay"]
     labels[5] = ["blujay", "carwre"]
+    return labels
+
+
+def _eval_fixture(n: int = 20) -> tuple[CacheView, pa.Table]:
+    """A REAL-schema eval cache (filepath/cell/week/ebird_code/split/
+    embedding/logits — NO multilabel column) plus its label metadata."""
+    multilabels = _eval_multilabels(n)
     table = _cache_table(
         n=n,
-        label_col="ebird_code_multilabel",
-        labels=labels,
+        label_col="ebird_code",
+        labels=[item[0] for item in multilabels],
         splits=["test_hsn"] * n,
-        logits=_correlated_logits(labels, 3, seed=23),
+        logits=_correlated_logits(multilabels, 3, seed=23),
         seed=2,
     )
-    return CacheView(table=table, logits_are_raw=False, n_classes=3)
+    view = CacheView(table=table, logits_are_raw=False, n_classes=3)
+    return view, _metadata_for(table, multilabels)
 
 
-def _flat_eval_cache(n: int = 20) -> CacheView:
+def _flat_eval_fixture(n: int = 20) -> tuple[CacheView, pa.Table]:
     """Every score identical (0.5): the ranking is decided ENTIRELY by
     the prior. Labels cycle i%3 against the i%4 cell cycle, so labels
     VARY within each cell block — a week shuffle (which reorders rows
     only within a cell) must therefore move the metrics."""
-    labels: list[list[str]] = [[_CODES[i % 3]] for i in range(n)]
+    multilabels: list[list[str]] = [[_CODES[i % 3]] for i in range(n)]
     table = _cache_table(
         n=n,
-        label_col="ebird_code_multilabel",
-        labels=labels,
+        label_col="ebird_code",
+        labels=[item[0] for item in multilabels],
         splits=["test_hsn"] * n,
         logits=np.full((n, 3), 0.5),
         seed=3,
     )
-    return CacheView(table=table, logits_are_raw=False, n_classes=3)
+    view = CacheView(table=table, logits_are_raw=False, n_classes=3)
+    return view, _metadata_for(table, multilabels)
 
 
 def _cell(**overrides) -> SweepCell:
@@ -194,11 +217,20 @@ def _cell(**overrides) -> SweepCell:
     return SweepCell(**base)
 
 
-def _run(cell: SweepCell, *, eval_cache: CacheView | None = None, **kwargs) -> dict:
+def _run(
+    cell: SweepCell,
+    *,
+    eval_cache: CacheView | None = None,
+    eval_metadata: pa.Table | None = None,
+    **kwargs,
+) -> dict:
+    if eval_cache is None and eval_metadata is None:
+        eval_cache, eval_metadata = _eval_fixture()
     return run_cell(
         cell,
         train_cache=_train_cache(),
-        eval_cache=eval_cache if eval_cache is not None else _eval_cache(),
+        eval_cache=eval_cache,
+        eval_metadata=eval_metadata,
         prior=_prior(),
         class_idx=_CLASS_IDX,
         code_to_gbif=_CODE_TO_GBIF,
@@ -237,7 +269,10 @@ def _fake_row(cell: SweepCell, cmap_per_seed: list[float]) -> dict:
         "top1_mean": 0.7,
         "top1_std": 0.0,
         "n_scored": 3,
-        "prior_coverage_failures": 0,
+        "prior_coverage_failures_train": None,
+        "prior_coverage_failures_eval": 0,
+        "cmap_by_freq_decile": "{}",
+        "cmap_by_prior_expectation": "{}",
         "cmap_per_seed": [float(v) for v in cmap_per_seed],
         "seeds_degenerate": False,
         "git_sha": _PROV.git_sha,
@@ -290,11 +325,13 @@ def test_run_cell_refuses_empty_prior_doi():
     DOI is an uncitable row and is refused before any work."""
     for bad in ("", "   "):
         prov = dataclasses.replace(_PROV, prior_doi=bad)
+        eval_cache, eval_metadata = _eval_fixture()
         with pytest.raises(ValueError, match="doi|DOI"):
             run_cell(
                 _cell(),
                 train_cache=_train_cache(),
-                eval_cache=_eval_cache(),
+                eval_cache=eval_cache,
+                eval_metadata=eval_metadata,
                 prior=_prior(),
                 class_idx=_CLASS_IDX,
                 code_to_gbif=_CODE_TO_GBIF,
@@ -341,9 +378,11 @@ def test_shuffle_variant_seeds_produce_genuinely_differing_cmaps():
     prior, so different shuffle draws (rng seeded per seed) must land
     different per-seed cmaps — a constant list would mean the seeds never
     reached the shuffle."""
+    flat_cache, flat_meta = _flat_eval_fixture()
     row = _run(
         _cell(prior_variant=CONTROL_VARIANTS["time_shuffled"]),
-        eval_cache=_flat_eval_cache(),
+        eval_cache=flat_cache,
+        eval_metadata=flat_meta,
     )
     assert row["seeds_degenerate"] is False
     assert len(set(row["cmap_per_seed"])) > 1
@@ -487,6 +526,14 @@ def test_micro_sweep_four_cells_end_to_end(tmp_path):
     assert set(on_disk.column("config_hash").to_pylist()) == {
         config_hash(c) for c in cells
     }
+    # I2: the parquet schema carries the SPLIT coverage columns (train
+    # nullable — null for rescoring) and never the old merged column.
+    assert "prior_coverage_failures_train" in on_disk.column_names
+    assert "prior_coverage_failures_eval" in on_disk.column_names
+    assert "prior_coverage_failures" not in on_disk.column_names
+    # I1: the strata columns land on disk too.
+    assert "cmap_by_freq_decile" in on_disk.column_names
+    assert "cmap_by_prior_expectation" in on_disk.column_names
 
     for cell, row in zip(cells, rows):
         assert row["config_hash"] == config_hash(cell)
@@ -495,7 +542,22 @@ def test_micro_sweep_four_cells_end_to_end(tmp_path):
         assert len(row["cmap_per_seed"]) == 5
         assert all(np.isfinite(v) for v in row["cmap_per_seed"])
         assert row["n_scored"] > 0
-        assert row["prior_coverage_failures"] == 0
+        # I2: coverage split — train is None (no training lookup) for
+        # rescoring, an int for learned arms; eval is always counted.
+        if cell.method == "rescoring":
+            assert row["prior_coverage_failures_train"] is None
+        else:
+            assert row["prior_coverage_failures_train"] == 0
+        assert row["prior_coverage_failures_eval"] == 0
+        # I1: every row carries both strata, JSON-encoded, with finite
+        # cmap values wherever a stratum could be scored.
+        for col in ("cmap_by_freq_decile", "cmap_by_prior_expectation"):
+            strata = json.loads(row[col])
+            assert strata, (cell.method, col)
+            for key, (value, n_sc) in strata.items():
+                assert n_sc >= 0
+                if value is not None:
+                    assert np.isfinite(value), (cell.method, col, key)
         assert row["seeds"] == list(cell.seeds)
         assert row["wall_s"] > 0.0
         assert row["git_sha"] == _PROV.git_sha
@@ -509,7 +571,7 @@ def test_sigmoid_applied_exactly_once_iff_cache_declares_raw_logits():
     """A raw-logits eval cache and a pre-sigmoided one describing the
     same scores must produce the SAME row metrics: sigmoid exactly once,
     decided by the cache's declared flag, never by value inspection."""
-    calibrated = _eval_cache()
+    calibrated, metadata = _eval_fixture()
     probs = np.asarray(calibrated.table.column("logits").to_pylist())
     raw_logits = np.log(probs / (1.0 - probs))
     raw_table = calibrated.table.set_column(
@@ -518,8 +580,8 @@ def test_sigmoid_applied_exactly_once_iff_cache_declares_raw_logits():
         pa.array(raw_logits.tolist(), pa.list_(pa.float64())),
     )
     raw = CacheView(table=raw_table, logits_are_raw=True, n_classes=3)
-    row_cal = _run(_cell(), eval_cache=calibrated)
-    row_raw = _run(_cell(), eval_cache=raw)
+    row_cal = _run(_cell(), eval_cache=calibrated, eval_metadata=metadata)
+    row_raw = _run(_cell(), eval_cache=raw, eval_metadata=metadata)
     assert row_raw["cmap_mean"] == pytest.approx(row_cal["cmap_mean"])
     assert row_raw["auroc_mean"] == pytest.approx(row_cal["auroc_mean"])
 
@@ -596,3 +658,110 @@ def test_shard_cells_is_a_stable_partition():
         shard_cells(grid, 3, 3)
     with pytest.raises(ValueError):
         shard_cells(grid, -1, 3)
+
+
+# ---------------------------------------------------------------------------
+# 9. C1 — the eval-label seam: labels come from SEPARATE metadata, joined
+#    by filepath, with repro_gate's missing-recording refusal
+# ---------------------------------------------------------------------------
+
+
+def test_run_cell_works_on_real_schema_cache_without_label_column():
+    """Real Phase A caches carry filepath/cell/week/ebird_code/split/
+    embedding[/logits] and NO ebird_code_multilabel column; the eval
+    labels arrive in a separate metadata table joined BY FILEPATH. A
+    run_cell that reads labels off the cache table itself fails on every
+    real cell — this fixture has no label column to read."""
+    eval_cache, metadata = _eval_fixture()
+    assert (
+        "ebird_code_multilabel" not in eval_cache.table.column_names
+    ), "fixture must mirror the REAL Phase A schema (labels only in metadata)"
+    row = _run(_cell(), eval_cache=eval_cache, eval_metadata=metadata)
+    assert np.isfinite(row["cmap_mean"])
+    assert row["n_scored"] > 0
+
+
+def test_run_cell_joins_labels_by_filepath_not_position():
+    """Shuffling the metadata table's row order must not change the row
+    metrics: the join is BY FILEPATH, never positional."""
+    eval_cache, metadata = _eval_fixture()
+    perm = np.random.default_rng(7).permutation(metadata.num_rows)
+    shuffled = metadata.take(pa.array(perm))
+    row_a = _run(_cell(), eval_cache=eval_cache, eval_metadata=metadata)
+    row_b = _run(_cell(), eval_cache=eval_cache, eval_metadata=shuffled)
+    assert row_a["cmap_mean"] == pytest.approx(row_b["cmap_mean"])
+    assert row_a["auroc_mean"] == pytest.approx(row_b["auroc_mean"])
+
+
+def test_run_cell_refuses_cache_recording_missing_from_metadata():
+    """repro_gate.score_pair's refusal, carried over: a cache row whose
+    filepath is absent from the metadata raises NAMING examples — a
+    silent inner join would quietly shrink the test set."""
+    eval_cache, metadata = _eval_fixture()
+    truncated = metadata.slice(0, metadata.num_rows - 2)
+    with pytest.raises(ValueError, match=r"missing from.*metadata|metadata"):
+        _run(_cell(), eval_cache=eval_cache, eval_metadata=truncated)
+    # The error names at least one offending filepath.
+    try:
+        _run(_cell(), eval_cache=eval_cache, eval_metadata=truncated)
+    except ValueError as exc:
+        assert "r18.ogg" in str(exc) or "r19.ogg" in str(exc)
+
+
+# ---------------------------------------------------------------------------
+# 10. M1 — symmetric eval-side split guard
+# ---------------------------------------------------------------------------
+
+
+def test_run_cell_refuses_train_split_rows_in_eval_cache():
+    """Symmetric to guard_training_split: an eval table whose split
+    values start with 'train' is a focal/training cache handed to the
+    eval slot — scoring it would 'evaluate' on training data."""
+    multilabels = _eval_multilabels()
+    n = len(multilabels)
+    table = _cache_table(
+        n=n,
+        label_col="ebird_code",
+        labels=[item[0] for item in multilabels],
+        splits=["train_xc"] * n,
+        logits=_correlated_logits(multilabels, 3, seed=23),
+        seed=2,
+    )
+    bad_eval = CacheView(table=table, logits_are_raw=False, n_classes=3)
+    metadata = _metadata_for(table, multilabels)
+    with pytest.raises(ValueError, match="train"):
+        _run(_cell(), eval_cache=bad_eval, eval_metadata=metadata)
+
+
+# ---------------------------------------------------------------------------
+# 11. I1 — stratified columns: frequency deciles + expected-under-prior
+# ---------------------------------------------------------------------------
+
+
+def test_strata_columns_are_deterministic_and_well_formed():
+    """The decile boundaries derive from eval label prevalence alone, so
+    two identical runs must produce byte-identical strata JSON; the
+    expected-under-prior stratum keys are exactly the two booleans (or a
+    subset when one side is empty)."""
+    eval_cache, metadata = _eval_fixture()
+    row_a = _run(_cell(), eval_cache=eval_cache, eval_metadata=metadata)
+    row_b = _run(_cell(), eval_cache=eval_cache, eval_metadata=metadata)
+    assert row_a["cmap_by_freq_decile"] == row_b["cmap_by_freq_decile"]
+    assert (
+        row_a["cmap_by_prior_expectation"]
+        == row_b["cmap_by_prior_expectation"]
+    )
+
+    deciles = json.loads(row_a["cmap_by_freq_decile"])
+    assert deciles  # at least one populated decile
+    for key, (value, n_sc) in deciles.items():
+        assert int(key) in range(10)
+        if value is not None:
+            assert np.isfinite(value)
+            assert n_sc > 0
+
+    expectation = json.loads(row_a["cmap_by_prior_expectation"])
+    assert set(expectation) <= {"expected", "unexpected"}
+    assert expectation  # never empty: every class lands in one stratum
+    total = sum(n_sc for _v, n_sc in expectation.values())
+    assert total == row_a["n_scored"]

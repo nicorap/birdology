@@ -4,6 +4,7 @@
     python scripts/phase_b_sweep.py \
         --train-cache 'caches/train/{encoder}' \
         --eval-cache 'caches/eval/{encoder}/{test_set}' \
+        --eval-labels 'metadata/{test_set}_metadata.parquet' \
         --prior 'output/priors/prior_{source}_res{resolution}.npz' \
         --labels labels/perch_labels.txt \
         --bridge bridges/ebird_to_gbif.json \
@@ -13,6 +14,12 @@
 The `{encoder}` / `{test_set}` / `{resolution}` placeholders are filled per
 cell; inputs are loaded ONCE per shard (memoised by resolved path), then
 every cell in the shard runs, skipping hashes already on disk.
+
+EVAL LABELS: real Phase A caches carry NO ebird_code_multilabel column —
+the ground truth lives in each test set's metadata parquet (`filepath` +
+`ebird_code_multilabel`). `--eval-labels` is a per-test-set path template
+({test_set} placeholder); `run_cell` joins it to the cache BY FILEPATH
+and refuses any cache recording the metadata does not cover.
 
 EXIT CODE: 0 iff every attempted cell either wrote its row or was
 skipped-existing. A FAILED CELL NEVER KILLS THE SHARD: its error is
@@ -33,6 +40,9 @@ import logging
 import subprocess
 import sys
 from pathlib import Path
+
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
@@ -65,6 +75,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="eval cache dir template; may contain {encoder} and {test_set}",
     )
     parser.add_argument(
+        "--eval-labels",
+        required=True,
+        help=(
+            "eval-label metadata parquet path template (filepath + "
+            "ebird_code_multilabel), one per test set; may contain "
+            "{test_set}. Real Phase A caches carry no label column — "
+            "labels are joined to cache rows by filepath."
+        ),
+    )
+    parser.add_argument(
         "--prior",
         required=True,
         help="prior .npz path template; may contain {resolution}",
@@ -80,6 +100,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--out", required=True, help="results dataset dir")
     parser.add_argument("--grid-shard", type=int, default=0)
     parser.add_argument("--n-shards", type=int, default=1)
+    # Grid-restriction axes (defaults: the full factorial grid). Useful
+    # for pilot runs and exercised by the main()-level tests.
+    parser.add_argument("--encoders", nargs="+", default=None)
+    parser.add_argument("--methods", nargs="+", default=None)
+    parser.add_argument("--prior-variants", nargs="+", default=None)
+    parser.add_argument("--resolutions", nargs="+", type=int, default=None)
+    parser.add_argument("--taus", nargs="+", type=float, default=None)
+    parser.add_argument("--test-sets", nargs="+", default=None)
     parser.add_argument(
         "--git-sha",
         default=None,
@@ -127,18 +155,39 @@ def main(argv: list[str] | None = None) -> int:
     }
     git_sha = _git_sha(args.git_sha)
 
-    cells = shard_cells(plan_grid(), args.grid_shard, args.n_shards)
+    grid_kwargs = {
+        key: tuple(value)
+        for key, value in (
+            ("encoders", args.encoders),
+            ("methods", args.methods),
+            ("prior_variants", args.prior_variants),
+            ("resolutions", args.resolutions),
+            ("taus", args.taus),
+            ("test_sets", args.test_sets),
+        )
+        if value is not None
+    }
+    cells = shard_cells(plan_grid(**grid_kwargs), args.grid_shard, args.n_shards)
     existing = load_existing_hashes(out_dir)
 
     # Inputs are loaded ONCE per shard, memoised by resolved path.
     caches: dict[str, CacheView] = {}
     priors: dict[str, PriorTensor] = {}
+    metadata_tables: dict[str, pa.Table] = {}
 
     def _cache(template: str, **fields) -> CacheView:
         path = template.format(**fields)
         if path not in caches:
             caches[path] = load_cache(Path(path))
         return caches[path]
+
+    def _eval_metadata(test_set: str) -> pa.Table:
+        path = args.eval_labels.format(test_set=test_set)
+        if path not in metadata_tables:
+            metadata_tables[path] = pq.read_table(
+                path, columns=["filepath", "ebird_code_multilabel"]
+            )
+        return metadata_tables[path]
 
     def _prior(resolution: int) -> tuple[str, PriorTensor]:
         path = args.prior.format(resolution=resolution)
@@ -168,6 +217,7 @@ def main(argv: list[str] | None = None) -> int:
                     encoder=cell.encoder,
                     test_set=cell.test_set,
                 ),
+                eval_metadata=_eval_metadata(cell.test_set),
                 prior=prior,
                 class_idx=class_idx,
                 code_to_gbif=code_to_gbif,
