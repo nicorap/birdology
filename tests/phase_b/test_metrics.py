@@ -347,3 +347,186 @@ def test_empty_label_rows_are_ap_auroc_negatives_but_not_top1_rows(tmp_path):
     assert n_scored == 1
     assert auroc == pytest.approx(0.75, rel=1e-12)
     assert top1(scores, Y) == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# ties — AP must be sklearn-exact and row-order invariant (fix F1)
+# ---------------------------------------------------------------------------
+
+
+def test_cmap_ap_under_tied_scores_is_sklearn_exact_and_order_invariant():
+    """Exactly tied scores are plausible in production (saturated BirdNET
+    sigmoids, prior floors) and cmAP is the paper's primary number, so AP
+    under ties must be THRESHOLD-based like sklearn: all rows sharing a
+    score form one tie group, precision is defined only at group
+    boundaries, and each positive credits its group's precision. A
+    stable-sort AP instead breaks ties by input row order — the metric
+    silently depends on dataframe ordering.
+
+    Minimal demonstration: scores [0.5, 0.5], y [1, 0]. The tie group
+    holds 1 positive / 2 rows -> precision 1/2 -> AP = 0.5, REGARDLESS of
+    which row comes first (sklearn gives 0.5 both ways; stable-sort AP
+    gives 1.0 for y=[1,0] and 0.5 for y=[0,1]).
+
+    Larger fixture: scores [0.9, 0.7, 0.7, 0.7, 0.3, 0.3],
+                    y      [0,   1,   0,   1,   1,   0  ]
+    mixes positives and negatives INSIDE both tie groups:
+      threshold 0.9: tp=0, n=1 -> precision 0   (no positive credits it)
+      threshold 0.7: tp=2, n=4 -> precision 1/2 (2 positives credit it)
+      threshold 0.3: tp=3, n=6 -> precision 1/2 (1 positive credits it)
+      AP = (2*(1/2) + 1*(1/2)) / 3 = 1/2.
+    """
+    from sklearn.metrics import average_precision_score
+
+    # Minimal two-row tie, both label orders.
+    tied = np.array([[0.5], [0.5]])
+    for y_rows in ([1, 0], [0, 1]):
+        y = np.array(y_rows, dtype=np.uint8).reshape(2, 1)
+        ours, n_scored = cmap(tied, y)
+        assert n_scored == 1
+        theirs = average_precision_score(y[:, 0], tied[:, 0])
+        np.testing.assert_allclose(ours, theirs, atol=1e-12)
+        np.testing.assert_allclose(ours, 0.5, atol=1e-12)
+
+    # Larger mixed-tie fixture + row-order permutation invariance.
+    scores = np.array([0.9, 0.7, 0.7, 0.7, 0.3, 0.3])
+    y = np.array([0, 1, 0, 1, 1, 0], dtype=np.uint8)
+    ours, n_scored = cmap(scores.reshape(-1, 1), y.reshape(-1, 1))
+    assert n_scored == 1
+    theirs = average_precision_score(y, scores)
+    np.testing.assert_allclose(ours, theirs, atol=1e-12)
+    np.testing.assert_allclose(ours, 0.5, atol=1e-12)
+
+    rng = np.random.default_rng(20261001)
+    for _ in range(5):
+        perm = rng.permutation(scores.size)
+        permuted, _ = cmap(
+            scores[perm].reshape(-1, 1), y[perm].reshape(-1, 1)
+        )
+        # Same AP in every row order, and always the sklearn value.
+        np.testing.assert_allclose(permuted, ours, atol=1e-12)
+        np.testing.assert_allclose(permuted, theirs, atol=1e-12)
+
+
+def test_auroc_macro_under_tied_scores_matches_sklearn():
+    """Tie coverage for AUROC's rank-averaging branch (fix F2): every
+    other fixture has distinct scores, so without this test the
+    tie-averaging loop could be deleted unnoticed. Tie groups here mix
+    positives and negatives, making the branch load-bearing: without
+    rank averaging, 'first-come' ranks inside the 0.5 and 0.2 groups
+    shift the U statistic away from sklearn's trapezoidal area.
+
+    scores [0.9, 0.5, 0.5, 0.5, 0.2, 0.2], y [1, 0, 1, 0, 0, 1]: the
+    expected value is pinned numerically against sklearn rather than by
+    hand — what matters is tie-group equivalence at atol 1e-12.
+    """
+    from sklearn.metrics import roc_auc_score
+
+    scores = np.array([0.9, 0.5, 0.5, 0.5, 0.2, 0.2])
+    y = np.array([1, 0, 1, 0, 0, 1], dtype=np.uint8)
+    ours, n_scored = auroc_macro(scores.reshape(-1, 1), y.reshape(-1, 1))
+    assert n_scored == 1
+    theirs = roc_auc_score(y, scores)
+    np.testing.assert_allclose(ours, theirs, atol=1e-12)
+
+    # Two-class matrix, both columns tied differently, macro mean checked.
+    scores2 = np.column_stack([scores, scores[::-1]])
+    y2 = np.column_stack([y, 1 - y]).astype(np.uint8)
+    macro, n_scored = auroc_macro(scores2, y2)
+    assert n_scored == 2
+    expected = np.mean(
+        [roc_auc_score(y2[:, j], scores2[:, j]) for j in range(2)]
+    )
+    np.testing.assert_allclose(macro, expected, atol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# stratified accepts bare-float metrics (fix F3)
+# ---------------------------------------------------------------------------
+
+
+def test_stratified_passes_top1_through_as_bare_floats():
+    """stratified's metric slot must also take top1, which returns a bare
+    float rather than (value, n_scored). Stratum 'a' (rows 0-1): row 0
+    argmax col 0 is a positive (hit), row 1 argmax col 1 is a negative
+    (miss) -> 1/2. Stratum 'b' (rows 2-3): row 2 argmax col 0 hit, row 3
+    has NO positives -> excluded from the denominator -> 1/1 = 1.0.
+    """
+    scores = np.array(
+        [
+            [0.9, 0.1],
+            [0.2, 0.8],
+            [0.7, 0.3],
+            [0.1, 0.6],
+        ]
+    )
+    y = np.array(
+        [
+            [1, 0],
+            [1, 0],
+            [1, 0],
+            [0, 0],
+        ],
+        dtype=np.uint8,
+    )
+    strata = np.array(["a", "a", "b", "b"])
+    result = stratified(scores, y, strata, top1)
+    assert set(result.keys()) == {"a", "b"}
+    assert result["a"] == pytest.approx(0.5)
+    assert result["b"] == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# unscoreable species surfaced, never in cmAP's denominator (Review Focus 1)
+# ---------------------------------------------------------------------------
+
+
+def test_unscoreable_species_surfaced_and_excluded_from_cmap(tmp_path):
+    """align_labels on a table containing a species the model head cannot
+    score ('mystery1' absent from the labels file) must SURFACE it in the
+    unscoreable list — never silently drop it — while Y carries only the
+    scoreable columns, so cmAP's denominator (n_scored) counts scoreable
+    classes only.
+
+    Scoreable APs: eurrob scores [0.9, 0.5, 0.2, 0.1], y [1, 0, 0, 0]
+    -> AP = 1. gretit scores [0.4, 0.6, 0.5, 0.1], y [0, 0, 1, 0] ->
+    desc 0.6(-) 0.5(+) 0.4(-) 0.1(-) -> AP = 1/2. cmAP = 3/4 over
+    n_scored = 2 — NOT 3: 'mystery1' is reported, not averaged in.
+    """
+    from birdology.phase_b.cache import align_labels, class_index
+
+    labels_path = tmp_path / "labels.txt"
+    labels_path.write_text("eurrob\ngretit\n", encoding="utf-8")
+    idx = class_index(labels_path)
+    multilabel = [["eurrob"], ["mystery1"], ["gretit", "mystery1"], []]
+    table = pa.table(
+        {
+            "filepath": pa.array(
+                [f"s{i}.ogg" for i in range(4)], pa.string()
+            ),
+            "ebird_code_multilabel": pa.array(
+                multilabel, pa.list_(pa.string())
+            ),
+        }
+    )
+    Y, scoreable, unscoreable = align_labels(table, idx)
+
+    # Surfaced: the unscoreable species is counted and reported by name.
+    assert unscoreable == ["mystery1"]
+    assert len(unscoreable) == 1
+    assert scoreable == ["eurrob", "gretit"]
+    # Y covers scoreable classes ONLY.
+    assert Y.shape == (4, len(scoreable))
+
+    scores = np.array(
+        [
+            [0.9, 0.4],
+            [0.5, 0.6],
+            [0.2, 0.5],
+            [0.1, 0.1],
+        ]
+    )
+    value, n_scored = cmap(scores, Y)
+    # Denominator reflects scoreable classes only — not the unscoreable.
+    assert n_scored == len(scoreable) == 2
+    assert value == pytest.approx(0.75, rel=1e-12)

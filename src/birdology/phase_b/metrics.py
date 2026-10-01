@@ -31,18 +31,29 @@ def gather_scores(
 
 
 def _average_precision(scores: np.ndarray, y: np.ndarray) -> float:
-    """Rank-based AP for one class (sklearn-equivalent definition).
+    """Threshold-based AP for one class (sklearn-exact, tie-safe).
 
-    Mean over positives of precision at each positive's rank, with ties
-    broken by stable ordering of the descending sort.
+    All rows sharing a score form one tie group; precision is defined
+    only at group boundaries (every member of the group is either in or
+    out at a given threshold), and each positive credits its own group's
+    boundary precision. Equivalent to sklearn's
+    sum((R_k - R_{k-1}) * P_k) over distinct thresholds, and — unlike a
+    stable-sort AP — invariant to the input row order under exact ties
+    (saturated sigmoids and prior floors make exact ties plausible).
     """
+    scores = scores.astype(np.float64)
     order = np.argsort(-scores, kind="stable")
+    s_sorted = scores[order]
     y_sorted = y[order].astype(np.float64)
     cum_pos = np.cumsum(y_sorted)
-    ranks = np.arange(1, y_sorted.size + 1, dtype=np.float64)
-    precision_at = cum_pos / ranks
+    counts = np.arange(1, y_sorted.size + 1, dtype=np.float64)
+    # Last index of each tie group (distinct-score boundary).
+    group_end = np.r_[s_sorted[1:] != s_sorted[:-1], True]
+    tp_at_end = cum_pos[group_end]
+    precision_at_end = tp_at_end / counts[group_end]
+    pos_in_group = np.diff(np.r_[0.0, tp_at_end])
     n_pos = cum_pos[-1]
-    return float(precision_at[y_sorted == 1].sum() / n_pos)
+    return float((pos_in_group * precision_at_end).sum() / n_pos)
 
 
 def _auroc(scores: np.ndarray, y: np.ndarray) -> float:
@@ -127,20 +138,24 @@ def stratified(
     scores: np.ndarray,
     y: np.ndarray,
     strata: np.ndarray,
-    metric: Callable[[np.ndarray, np.ndarray], tuple[float, int]],
-) -> dict[object, tuple[float, int]]:
+    metric: Callable[
+        [np.ndarray, np.ndarray], tuple[float, int] | float
+    ],
+) -> dict[object, tuple[float, int] | float]:
     """Re-compute *metric* on each stratum's row subset.
 
     *strata* is a ``(n_rows,)`` array of arbitrary hashable labels
     (frequency decile ints, bool expected-under-prior, test-set strings);
-    keys are preserved as-is in the returned dict. A stratum where the
-    metric can score nothing returns the metric's own degenerate value
-    (``(nan, 0)``), never an exception.
+    keys are preserved as-is in the returned dict. The metric's return
+    shape passes through untouched: ``(value, n_scored)`` tuples from
+    :func:`cmap`/:func:`auroc_macro`, a bare float from :func:`top1`.
+    A stratum where the metric can score nothing returns the metric's
+    own degenerate value (``(nan, 0)`` or ``nan``), never an exception.
     """
     scores = np.asarray(scores)
     y = np.asarray(y)
     strata = np.asarray(strata)
-    result: dict[object, tuple[float, int]] = {}
+    result: dict[object, tuple[float, int] | float] = {}
     for key in dict.fromkeys(strata.tolist()):  # first-appearance order
         mask = strata == key
         result[key] = metric(scores[mask], y[mask])
