@@ -32,24 +32,24 @@ from birdology.phase_b.metrics import cmap
 
 
 def test_compare_within_tolerance_passes():
-    """Published Perch NBP cmAP is 0.63; 0.60 is within ±0.05."""
-    ok, published, delta = repro_gate.compare_to_published("NBP", 0.60)
+    """Published Perch 2.0 NBP cmAP is 0.661; 0.62 is within ±0.05."""
+    ok, published, delta = repro_gate.compare_to_published("NBP", 0.62)
     assert ok is True
-    assert published == pytest.approx(0.63)
-    assert delta == pytest.approx(-0.03)
+    assert published == pytest.approx(0.661)
+    assert delta == pytest.approx(-0.041)
 
 
 def test_compare_out_of_tolerance_fails():
-    """0.50 vs published 0.63 is a -0.13 delta -- stack-level breakage."""
+    """0.50 vs published 0.661 is a -0.16 delta -- stack-level breakage."""
     ok, published, delta = repro_gate.compare_to_published("NBP", 0.50)
     assert ok is False
-    assert published == pytest.approx(0.63)
-    assert delta == pytest.approx(-0.13)
+    assert published == pytest.approx(0.661)
+    assert delta == pytest.approx(-0.161)
 
 
 def test_compare_exactly_at_tolerance_boundary_passes():
     """±0.05 is INclusive: the tolerance text says 'within ±0.05'."""
-    ok, _, _ = repro_gate.compare_to_published("PER", 0.18 + 0.05)
+    ok, _, _ = repro_gate.compare_to_published("PER", 0.232 + 0.05)
     assert ok is True
 
 
@@ -65,7 +65,7 @@ def test_compare_nan_cmap_is_never_ok():
         "NBP", float("nan")
     )
     assert ok is False
-    assert published == pytest.approx(0.63)
+    assert published == pytest.approx(0.661)
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +111,7 @@ LINE_RE = re.compile(
 
 
 def test_pair_line_is_parseable_ok_case():
-    line = repro_gate.format_pair_line("perch", "NBP", 0.60)
+    line = repro_gate.format_pair_line("perch", "NBP", 0.65)
     m = LINE_RE.match(line)
     assert m, f"unparseable line: {line!r}"
     assert m.group(1) == "ok"
@@ -124,12 +124,12 @@ def test_pair_line_is_parseable_fail_case_with_signed_delta():
     m = LINE_RE.match(line)
     assert m, f"unparseable line: {line!r}"
     assert m.group(1) == "FAIL"
-    assert "delta=-0.130" in line
+    assert "delta=-0.161" in line
 
 
 def test_verdict_ok_iff_all_pairs_pass():
-    all_pass = [("perch", "NBP", 0.63, 0.91), ("perch", "HSN", 0.44, 0.86)]
-    one_fail = [("perch", "NBP", 0.63, 0.91), ("perch", "HSN", 0.20, 0.86)]
+    all_pass = [("perch", "NBP", 0.63, 0.91), ("perch", "HSN", 0.52, 0.86)]
+    one_fail = [("perch", "NBP", 0.63, 0.91), ("perch", "HSN", 0.20, 0.86)]  # 0.20 vs 0.533 fails
     text_ok, ok = repro_gate.render_report(all_pass)
     text_fail, fail_ok = repro_gate.render_report(one_fail)
     assert ok is True and "REPRO_GATE_OK" in text_ok

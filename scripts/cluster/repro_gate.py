@@ -43,31 +43,42 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "src"))
 from birdology.phase_b.cache import align_labels, class_index, load_cache
 from birdology.phase_b.metrics import auroc_macro, cmap, gather_scores
 
-#: BirdSet Table 5 (arXiv:2403.10380v3, p. 9), Perch inference row, LT.
-#: Keys are BirdSet test-set codes in the paper's column order
-#: POW PER NES UHH HSN NBP SSW SNE. Verified against the pdftotext
-#: interleaving 2026-10-01 (agrees with the controller's provisional
-#: reading). cmAP is the gate metric; AUROC rides along for the report.
+#: Perch 2.0 paper (arXiv:2508.04665v2), Table 4 "BirdSet per-dataset
+#: results", row "Perch 2.0 - Random", cmAP block — measured from the PDF
+#: 2026-10-01. The cache's encoder IS Perch 2.0 (kagglehub perch_v2), so
+#: THIS row is the reproduction target; BirdSet's own Table 5 Perch row
+#: (arXiv:2403.10380v3: POW .30 PER .18 NES .39 UHH .27 HSN .45 NBP .63
+#: SSW .28 SNE .29) is Perch 1.0 and comparing against it failed the
+#: first fleet gate run with uniform POSITIVE deltas up to +0.189 — our
+#: pipeline was reproducing the newer, stronger model. Against this row
+#: the 2026-10-01 run matches to ≤0.001 on all six evaluable test sets
+#: (PER/NES/HSN/SSW/SNE exact, UHH 0.381 vs 0.380). POW is absent from
+#: Table 4; its Perch 1.0 value is retained (report-only: POW is not in
+#: the evaluable roster).
 PUBLISHED_PERCH_CMAP: dict[str, float] = {
-    "POW": 0.30,
-    "PER": 0.18,
-    "NES": 0.39,
-    "UHH": 0.27,
-    "HSN": 0.45,
-    "NBP": 0.63,
-    "SSW": 0.28,
-    "SNE": 0.29,
+    "POW": 0.30,  # Perch 1.0 (Table 4 has no POW row; report-only)
+    "PER": 0.232,
+    "NES": 0.403,
+    "UHH": 0.380,
+    "HSN": 0.533,
+    "NBP": 0.661,
+    "SSW": 0.469,
+    "SNE": 0.341,
 }
 
+#: Same source/row as PUBLISHED_PERCH_CMAP (Perch 2.0 Table 4, ROC-AUC
+#: block, "Random" row); report-only. 2026-10-01 fleet run agreement:
+#: PER .786/.786 NES .953/.953 UHH .912/.912 HSN .915/.915 SSW .973/.973
+#: SNE .883/.883 — exact on all six.
 PUBLISHED_PERCH_AUROC: dict[str, float] = {
-    "POW": 0.84,
-    "PER": 0.70,
-    "NES": 0.90,
-    "UHH": 0.76,
-    "HSN": 0.86,
-    "NBP": 0.91,
-    "SSW": 0.91,
-    "SNE": 0.83,
+    "POW": 0.84,  # Perch 1.0 (no POW row in Table 4; report-only)
+    "PER": 0.786,
+    "NES": 0.953,
+    "UHH": 0.912,
+    "HSN": 0.915,
+    "NBP": 0.933,
+    "SSW": 0.973,
+    "SNE": 0.883,
 }
 
 #: Absolute cmAP tolerance — see module docstring for the justification.
@@ -127,7 +138,12 @@ def compare_to_published(
     if np.isnan(cmap_value):
         return False, published, float("nan")
     delta = cmap_value - published
-    return abs(delta) <= CMAP_TOLERANCE, published, delta
+    # Round |delta| to 12 decimals before the boundary compare: published
+    # values like 0.232 carry float dust, so `published + 0.05` can exceed
+    # the tolerance by ~2e-17 and fail a boundary the docstring declares
+    # inclusive. cmAP granularity on finite test sets is >> 1e-12, so no
+    # real miss can slip through (same fix as phase_c_repro_gate).
+    return round(abs(delta), 12) <= CMAP_TOLERANCE, published, delta
 
 
 def calibrate_scores(
