@@ -1,21 +1,24 @@
 """Training data pipeline — XCM crops with context.
 
-THE FRONTEND IS THE MODEL CARD, VERBATIM
-----------------------------------------
+THE FRONTEND IS THE CARD'S RECIPE — AND THE MEASURED OUTPUT SHAPE
+-----------------------------------------------------------------
 ``convnext_frontend`` reproduces the BirdSet ConvNext card's recipe with
 the card's own numbers, spelled once as module constants: sr 32000,
 n_fft 1024, hop 320, n_mels 128, power 2.0, PowerToDB top_db 80,
-normalize mean -4.268 std 4.569, output (1, 128, 334) for a 5 s clip.
+normalize mean -4.268 std 4.569 — output (1, 128, 501) for a 5 s clip.
 
-THE 334-FRAME RECONCILIATION (measured, then pinned): torchaudio's
-centered ``Spectrogram`` yields ``160000 // 320 + 1 = 501`` frames for a
-5 s crop — more than the card's 334. The card's (B, 1, 128, 334) input
-shape is the BINDING contract (the checkpoint's embedding was trained on
-it), so the frontend RIGHT-TRIMS the time axis to 334 frames and
-zero-pads right when a shorter wave yields fewer. Right-trim, not
-center-crop: it keeps frame t aligned to sample t*hop from the clip
-start, so the retained window is a deterministic prefix of the crop the
-dataset already randomized — no second randomness source.
+THE 501-FRAME RULING (controller, binding): the card's (1, 128, 334)
+example shape is internally inconsistent and FALSIFIED by the measured
+authority — BirdSet's own training transform
+(birdset/datamodule/components/transforms.py in
+DBD-research-group/BirdSet) applies torchaudio
+``Spectrogram(n_fft=1024, hop_length=320)`` to full 5 s clips, which
+yields ``160000 // 320 + 1 = 501`` centered frames. The checkpoint was
+trained on (1, 128, 501) inputs, so the frontend emits the NATURAL
+frame count of whatever wave it receives — no trimming, and no padding
+either: padding in normalized-dB space would inject fake energy floors.
+ALL padding lives in ``CropDataset``, in the waveform domain, where a
+zero sample is honestly silence.
 
 CROP OFFSETS ARE A PURE FUNCTION OF (seed, epoch, index)
 --------------------------------------------------------
@@ -63,8 +66,10 @@ POWER = 2.0
 TOP_DB = 80.0
 NORM_MEAN = -4.268
 NORM_STD = 4.569
-#: The card's binding time-axis length for a 5 s clip: (B, 1, 128, 334).
-N_FRAMES = 334
+#: Natural frame count for a 5 s clip: 160000 // 320 + 1 (centered STFT).
+#: Measured from BirdSet's own transforms.py — the checkpoint's true input
+#: time axis (the card's 334 example is falsified; see module docstring).
+N_FRAMES = 501
 
 #: 5 s @ 32 kHz.
 _CROP_SECONDS_DEFAULT = 5.0
@@ -75,7 +80,9 @@ class PowerToDB(torch.nn.Module):
 
     ``10*log10(max(S, amin)) - 10*log10(max(ref, amin))``, then floored
     at ``(max - top_db)`` — the floor is taken over the whole input, as
-    librosa does.
+    librosa does. NOTE: the top_db floor references the global max of
+    THIS tensor — correct for the per-item call path used here; calling
+    it on a BATCH would couple items through the shared max.
     """
 
     def __init__(
@@ -112,11 +119,17 @@ _POWER_TO_DB = PowerToDB(ref=1.0, amin=1e-10, top_db=TOP_DB)
 
 
 def convnext_frontend(wave: torch.Tensor) -> torch.Tensor:
-    """Mono waveform @32 kHz → the card's (1, 128, 334) normalized mel.
+    """Mono waveform @32 kHz → (1, 128, n_frames) normalized mel.
 
-    Time axis reconciliation (measured): 160,000 samples yield 501
-    centered STFT frames; the card's 334 is binding, so the output is
-    right-trimmed to 334 frames (zero-padded right when shorter).
+    Emits the NATURAL frame count: ``len(wave) // 320 + 1`` centered
+    STFT frames — (1, 128, 501) for a 5 s / 160,000-sample crop.
+    Controller ruling: the card's (1, 128, 334) example shape is
+    falsified by the measured BirdSet training transform
+    (transforms.py: Spectrogram(n_fft=1024, hop_length=320) on full 5 s
+    clips → 501 frames); the checkpoint saw 501-frame inputs. The
+    frontend never trims and never pads — padding in normalized-dB
+    space would fake energy floors; CropDataset owns all padding, in
+    the waveform domain.
     """
     if wave.dim() != 1:
         raise ValueError(f"expected mono 1-D waveform, got shape {tuple(wave.shape)}")
@@ -124,12 +137,6 @@ def convnext_frontend(wave: torch.Tensor) -> torch.Tensor:
     mel = _MEL_SCALE(spec)
     db = _POWER_TO_DB(mel)
     normed = (db - NORM_MEAN) / NORM_STD
-
-    n_frames = normed.shape[-1]
-    if n_frames >= N_FRAMES:
-        normed = normed[..., :N_FRAMES]
-    else:
-        normed = torch.nn.functional.pad(normed, (0, N_FRAMES - n_frames))
     return normed.unsqueeze(0)
 
 
@@ -145,7 +152,7 @@ def make_label_map(id2label: dict) -> dict[str, int]:
 class CropDataset(torch.utils.data.Dataset):
     """XCM manifest rows → 5 s crops with context, labels on the model axis.
 
-    Yields ``{"inputs": (1,128,334) f32, "context": (n_classes,) f32,
+    Yields ``{"inputs": (1,128,501) f32, "context": (n_classes,) f32,
     "present": float, "label": int}``.
 
     ``skipped_codes`` names every manifest ebird_code absent from

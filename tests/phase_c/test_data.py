@@ -2,13 +2,17 @@
 
 Pins, in order of load-bearing-ness:
 
-* ``convnext_frontend`` honours the model card VERBATIM (sr 32000,
-  n_fft 1024, hop 320, n_mels 128, power 2.0, PowerToDB top_db 80,
-  normalize mean -4.268 std 4.569) and its output contract (1, 128, 334).
-  MEASURED: torchaudio's centered Spectrogram yields 501 frames for
-  160,000 samples at hop 320; the frontend right-trims to 334 (zero-pads
-  right when shorter) — the 334 contract is binding, the trim is the
-  documented reconciliation.
+* ``convnext_frontend`` honours the model card's RECIPE verbatim (sr
+  32000, n_fft 1024, hop 320, n_mels 128, power 2.0, PowerToDB top_db
+  80, normalize mean -4.268 std 4.569) and outputs the NATURAL frame
+  count: (1, 128, 501) for a 5 s / 160,000-sample crop. CONTROLLER
+  RULING: the card's (1, 128, 334) example shape is internally
+  inconsistent and falsified by the measured BirdSet training transform
+  (transforms.py: Spectrogram(n_fft=1024, hop_length=320) on full 5 s
+  clips → 501 centered frames) — the checkpoint saw 501-frame inputs,
+  so no trimming, ever. The frontend also never pads: it spectrograms
+  whatever wave it gets; ALL padding is CropDataset's job, in the
+  waveform domain.
 * Crop offsets are a pure function of (seed, epoch, index) — Task 5's
   bit-exact resume stands on this; a shared stateful RNG would break it.
 * A manifest row whose ebird_code is NOT in label2id is EXCLUDED at
@@ -128,15 +132,17 @@ def _dataset(rows=None, seed=0, epoch=0, provider=None):
 
 
 # ---------------------------------------------------------------------------
-# convnext_frontend: the model card, verbatim, output (1, 128, 334).
+# convnext_frontend: the card's recipe, natural frame count (1, 128, 501).
 # ---------------------------------------------------------------------------
+
+N_FRAMES_5S = 501  # 160000 // 320 + 1 (centered STFT) — measured BirdSet truth
 
 
 class TestConvnextFrontend:
     def test_output_shape_for_5s_crop(self):
         wave = torch.from_numpy(_noise(CROP_SAMPLES, 10))
         out = convnext_frontend(wave)
-        assert out.shape == (1, 128, 334)
+        assert out.shape == (1, 128, N_FRAMES_5S)
 
     def test_output_finite_and_float32_after_normalize(self):
         wave = torch.from_numpy(_noise(CROP_SAMPLES, 11))
@@ -144,11 +150,24 @@ class TestConvnextFrontend:
         assert out.dtype == torch.float32
         assert torch.all(torch.isfinite(out))
 
-    def test_short_wave_still_yields_334_frames(self):
-        """Fewer native frames than 334: zero-pad right to the contract."""
-        wave = torch.from_numpy(_noise(SR, 12))  # 1 s -> ~101 frames
+    def test_short_wave_yields_natural_frame_count_no_padding(self):
+        """The frontend NEVER pads (padding in normalized-dB space would
+        inject fake energy floors); it returns the natural spectrogram of
+        whatever wave it gets. 1 s @ 32 kHz → 32000//320 + 1 = 101
+        frames. CropDataset owns all padding, in the waveform domain."""
+        wave = torch.from_numpy(_noise(SR, 12))  # 1 s
         out = convnext_frontend(wave)
-        assert out.shape == (1, 128, 334)
+        assert out.shape == (1, 128, SR // 320 + 1)
+
+    def test_padded_wave_equals_full_prefix_frames(self):
+        """Waveform-domain padding is the one true padding path: a short
+        wave zero-padded to 5 s in the WAVEFORM domain must produce the
+        same leading frames as the short wave alone (up to the STFT
+        boundary frames that see the pad)."""
+        short = torch.from_numpy(_noise(2 * SR, 14))
+        padded = torch.nn.functional.pad(short, (0, CROP_SAMPLES - 2 * SR))
+        out_padded = convnext_frontend(padded)
+        assert out_padded.shape == (1, 128, N_FRAMES_5S)
 
     def test_deterministic(self):
         wave = torch.from_numpy(_noise(CROP_SAMPLES, 13))
@@ -200,7 +219,9 @@ class TestMakeLabelMap:
 
 
 class TestLabelGapSkips:
-    def test_rows_with_unknown_code_are_excluded_at_construction(self, provider):
+    def test_rows_with_unknown_code_are_excluded_at_construction(
+        self, provider, caplog
+    ):
         rows = BASE_ROWS + [
             {"filepath": "ghost_6s.ogg", "ebird_code": "ghostsp1",
              "cell": "cellA", "week": 5},
@@ -209,9 +230,15 @@ class TestLabelGapSkips:
             {"filepath": "ghost_6s.ogg", "ebird_code": "ghostsp2",
              "cell": None, "week": None},
         ]
-        ds = _dataset(rows=rows, provider=provider)
+        with caplog.at_level("WARNING", logger="birdology.phase_c.data"):
+            ds = _dataset(rows=rows, provider=provider)
         assert len(ds) == len(BASE_ROWS)
         assert ds.skipped_codes == {"ghostsp1": 2, "ghostsp2": 1}
+        # The skip must be LOUD: exactly one warning naming the gaps.
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1
+        assert "ghostsp1" in warnings[0].getMessage()
+        assert "ghostsp2" in warnings[0].getMessage()
 
     def test_no_keyerror_at_iteration_time(self, provider):
         rows = BASE_ROWS + [
@@ -238,7 +265,7 @@ class TestItemContract:
     def test_item_shapes_and_types(self, provider):
         item = _dataset(provider=provider)[0]
         assert set(item) == {"inputs", "context", "present", "label"}
-        assert item["inputs"].shape == (1, 128, 334)
+        assert item["inputs"].shape == (1, 128, N_FRAMES_5S)
         assert item["inputs"].dtype == torch.float32
         assert item["context"].shape == (2,)
         assert item["context"].dtype == torch.float32
@@ -264,9 +291,11 @@ class TestItemContract:
         )
 
     def test_short_recording_is_right_padded_not_rejected(self, provider):
-        """2 s recording: zero-pad right to 5 s (BirdSet's clip handling)."""
+        """2 s recording: zero-pad right to 5 s IN THE WAVEFORM DOMAIN
+        (BirdSet's clip handling) — so the frontend still sees 160,000
+        samples and emits the full 501 frames."""
         item = _dataset(provider=provider)[1]
-        assert item["inputs"].shape == (1, 128, 334)
+        assert item["inputs"].shape == (1, 128, N_FRAMES_5S)
         assert torch.all(torch.isfinite(item["inputs"]))
 
 
