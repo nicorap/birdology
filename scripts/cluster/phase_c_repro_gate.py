@@ -312,7 +312,13 @@ def _run_score_subcommand(args) -> int:
         ConvNextForImageClassification,
     )
 
-    from birdology.phase_c.data import SAMPLE_RATE, convnext_frontend
+    from birdology.phase_c.data import (
+        AST_N_FRAMES,
+        N_MELS,
+        SAMPLE_RATE,
+        ast_frontend,
+        convnext_frontend,
+    )
     from birdology.phase_c.evaluate import build_eval_dataset, evaluate_model
 
     cls = {
@@ -353,15 +359,29 @@ def _run_score_subcommand(args) -> int:
         def vector(self, cell, week):
             return np.zeros(self.n, dtype=np.float32), 0.0
 
+    # Frontend selection mirrors phase_c_run._run_cell: the frontend is
+    # the MODEL's contract. ast_frontend is BirdSet's measured
+    # mel→resize-1024 pipeline with the negative-std normalization
+    # (data.py provenance block) — golden-gated in
+    # tests/phase_c/test_data.py::TestAstFrontend.
+    frontend = {
+        "convnext": convnext_frontend,
+        "ast": ast_frontend,
+    }[args.model]
     if args.model == "ast":
-        # Same refusal as phase_c_run._run_cell: convnext_frontend's
-        # (1, 128, 501) mel is not AST's input contract, and the gap
-        # must not be discovered at GPU cost (task-6-report concern 1).
-        raise NotImplementedError(
-            "ast_frontend not yet wired — BirdSet AST uses "
-            "mel→resize-1024 with sign-flip std; refusing rather than "
-            "feeding convnext_frontend output to AST."
-        )
+        # Same guard as _run_cell: the checkpoint's config must expect
+        # exactly ast_frontend's (AST_N_FRAMES, N_MELS) — refuse by
+        # name before any scoring spend.
+        cfg_len = int(getattr(model.config, "max_length", -1))
+        cfg_mels = int(getattr(model.config, "num_mel_bins", -1))
+        if cfg_len != AST_N_FRAMES or cfg_mels != N_MELS:
+            raise ValueError(
+                f"AST checkpoint {args.checkpoint!r} expects inputs "
+                f"(max_length={cfg_len}, num_mel_bins={cfg_mels}) but "
+                f"ast_frontend emits ({AST_N_FRAMES}, {N_MELS}) — "
+                "refusing to score a checkpoint that was not trained "
+                "on the BirdSet mel\u2192resize-1024 pipeline"
+            )
 
     eval_meta = _pq.read_table(args.eval_metadata)
     eval_ds = build_eval_dataset(
@@ -369,7 +389,7 @@ def _run_score_subcommand(args) -> int:
         load_audio,
         _NullProvider(len(class_codes)),
         class_codes,
-        frontend=convnext_frontend,
+        frontend=frontend,
     )
     scores = evaluate_model(model, eval_ds, arm="twin")
     out = Path(args.out)

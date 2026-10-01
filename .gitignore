@@ -36,3 +36,8 @@ output/.birdology*_oxi/
 *.swp
 *.swo
 *~
+
+# Dev-time downloads of BirdSet/HF sources for AST golden generation
+# (tests/phase_c/make_ast_goldens.py --birdset-src). Never committed:
+# the committed .npz goldens are the offline ground truth.
+.dev_ast_golden/

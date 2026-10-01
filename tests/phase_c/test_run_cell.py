@@ -18,11 +18,11 @@ differ. The checkpoint is saved from the TRAINEE's own perspective
 the object it received — the bare HF model for the twin, the wrapper
 for conditioned arms), so both arms are pinned: twin AND film.
 
-Also here: the loud AST refusal. ``_run_cell`` hard-wires
-``convnext_frontend``; feeding its (1, 128, 501) mel into AST would
-shape-crash or garbage-score at GPU cost, so ``--model ast`` must
-refuse by name until an ``ast_frontend`` is wired and golden-gated
-(task-6-report concern 1).
+Also here: the AST cell wiring. ``_run_cell`` selects the frontend with
+the model (convnext → ``convnext_frontend``, ast → ``ast_frontend``,
+golden-gated in test_data.py) and guards the AST input contract against
+the checkpoint's own config (max_length/num_mel_bins) at load — a
+mismatch refuses by name before any training spend.
 
 Heavy fleet dependencies (from_pretrained, the prior, the context
 matrix) are monkeypatched at their source modules — ``_run_cell``
@@ -207,6 +207,7 @@ def fleet_stubs(monkeypatch):
             k: v.detach().clone()
             for k, v in model_or_wrapper.state_dict().items()
         }
+        captured["eval_ds"] = eval_ds
         rng = np.random.default_rng(1)
         return rng.standard_normal(
             (len(eval_ds), len(eval_ds.class_codes))
@@ -251,14 +252,114 @@ def test_run_cell_evaluates_best_checkpoint_not_last_epoch(
     assert not _states_equal(seen, last)
 
 
-def test_run_cell_refuses_ast_until_frontend_is_wired(tmp_path):
-    """--model ast must refuse LOUDLY: the hard-wired convnext_frontend
-    (1, 128, 501) mel is not AST's input contract (BirdSet AST uses
-    mel→resize-1024 with sign-flip std), and the gap must not be
-    discovered at GPU cost."""
+def test_run_cell_refuses_ast_until_frontend_is_wired(tmp_path, monkeypatch):
+    """SUPERSEDED, kept as the historical RED anchor: --model ast used
+    to refuse with NotImplementedError before ANY checkpoint load.
+    ast_frontend is now wired and golden-gated
+    (tests/phase_c/test_data.py::TestAstFrontend), so the NEW pinned
+    behavior lives in TestAstCell below — this name stays only so a
+    grep for the old refusal finds the story, and it now asserts the
+    blanket refusal is GONE: the cell proceeds to checkpoint
+    resolution, whose failure (stubbed offline here) propagates
+    instead."""
+    from transformers import ASTForAudioClassification
+
+    def unresolvable(cls, *a, **k):
+        raise OSError("tiny/checkpoint is not a local folder (stubbed)")
+
+    monkeypatch.setattr(
+        ASTForAudioClassification,
+        "from_pretrained",
+        classmethod(unresolvable),
+    )
     args = _cell_args(tmp_path, arm="twin", model="ast")
-    with pytest.raises(NotImplementedError, match="ast_frontend not yet wired"):
+    with pytest.raises(OSError, match="tiny/checkpoint"):
         phase_c_run._run_cell(args)
+
+
+# ---------------------------------------------------------------------------
+# The AST cell: ast_frontend wired end-to-end, input-contract guard at load.
+# ---------------------------------------------------------------------------
+
+
+def tiny_ast(
+    seed: int = 0, *, max_length: int = 1024, num_mel_bins: int = 128
+):
+    from transformers import ASTConfig, ASTForAudioClassification
+
+    torch.manual_seed(seed)
+    config = ASTConfig(
+        hidden_size=24,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        intermediate_size=32,
+        patch_size=16,
+        frequency_stride=10,
+        time_stride=10,
+        max_length=max_length,
+        num_mel_bins=num_mel_bins,
+        num_labels=N_CLASSES,
+    )
+    return ASTForAudioClassification(config)
+
+
+class TestAstCell:
+    def test_ast_twin_runs_with_ast_frontend(
+        self, tmp_path, fleet_stubs, monkeypatch
+    ):
+        """--model ast trains and writes a row; both the train dataset
+        and the eval dataset carry ast_frontend — never the convnext
+        mel."""
+        from transformers import ASTForAudioClassification
+
+        from birdology.phase_c.data import ast_frontend
+
+        monkeypatch.setattr(
+            ASTForAudioClassification,
+            "from_pretrained",
+            classmethod(lambda cls, *a, **k: tiny_ast()),
+        )
+        args = _cell_args(tmp_path, arm="twin", model="ast")
+        assert phase_c_run._run_cell(args) == 0
+
+        files = sorted(Path(args.out).glob("*.parquet"))
+        assert len(files) == 1
+        row = pq.read_table(files[0]).to_pylist()[0]
+        assert row["model_id"] == "tiny/checkpoint"
+
+        eval_ds = fleet_stubs["eval_ds"]
+        assert eval_ds.frontend is ast_frontend, (
+            "the eval dataset was built with a frontend other than "
+            "ast_frontend — AST would be scored on convnext mels"
+        )
+
+    @pytest.mark.parametrize(
+        "bad_kwargs, fragment",
+        [
+            ({"max_length": 512}, "max_length"),
+            ({"num_mel_bins": 64}, "num_mel_bins"),
+        ],
+    )
+    def test_ast_refuses_on_input_contract_mismatch(
+        self, tmp_path, fleet_stubs, monkeypatch, bad_kwargs, fragment
+    ):
+        """The checkpoint's own config is the input contract:
+        ast_frontend emits (1024, 128), so a checkpoint expecting a
+        different (max_length, num_mel_bins) must refuse BY NAME at
+        load — before any training spend — not shape-crash mid-epoch."""
+        from transformers import ASTForAudioClassification
+
+        monkeypatch.setattr(
+            ASTForAudioClassification,
+            "from_pretrained",
+            classmethod(lambda cls, *a, **k: tiny_ast(**bad_kwargs)),
+        )
+        args = _cell_args(tmp_path, arm="twin", model="ast")
+        with pytest.raises(ValueError, match=fragment):
+            phase_c_run._run_cell(args)
+        # Refused before training: no checkpoints, no rows.
+        assert not list(Path(args.out).glob("*.parquet"))
+        assert not (Path(args.ckpt_dir) / "best.pt").exists()
 
 
 # ---------------------------------------------------------------------------

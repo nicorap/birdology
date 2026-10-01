@@ -224,18 +224,6 @@ def _run_cell(args) -> int:
     """Fleet side: wire CropDataset + wrapper + train_arm + evaluate_model
     for one cell, then write the one row. Imports live here so the module
     stays importable without torch for the row-contract tests."""
-    if args.model == "ast":
-        # Refused BEFORE any download or GPU time: the only frontend
-        # wired below is convnext_frontend, whose (1, 128, 501) mel is
-        # not AST's input contract — it would shape-crash or
-        # garbage-score at GPU cost.
-        raise NotImplementedError(
-            "ast_frontend not yet wired — BirdSet AST uses "
-            "mel→resize-1024 with sign-flip std; see task-6-report "
-            "concern 1. Refusing rather than feeding convnext_frontend "
-            "output to AST."
-        )
-
     import json
 
     import numpy as np
@@ -248,8 +236,11 @@ def _run_cell(args) -> int:
 
     from birdology.phase_c.context import ContextEncoder, build_context_matrix
     from birdology.phase_c.data import (
+        AST_N_FRAMES,
+        N_MELS,
         SAMPLE_RATE,
         CropDataset,
+        ast_frontend,
         convnext_frontend,
         make_label_map,
     )
@@ -266,6 +257,31 @@ def _run_cell(args) -> int:
     model = model_cls.from_pretrained(
         args.checkpoint, revision=args.checkpoint_revision
     )
+    # The frontend is the MODEL's contract, selected with the model class:
+    # convnext gets the card-recipe (1, 128, 501) mel; ast gets BirdSet's
+    # vision pipeline padded/truncated to (1024, 128) with the measured
+    # negative-std normalization (data.py: ast_frontend provenance block).
+    frontend = {
+        "convnext": convnext_frontend,
+        "ast": ast_frontend,
+    }[args.model]
+    if args.model == "ast":
+        # The checkpoint's OWN config is the input contract — refuse BY
+        # NAME at load (before any training spend) when it does not
+        # expect exactly ast_frontend's (AST_N_FRAMES, N_MELS). A
+        # mismatch would otherwise shape-crash mid-epoch or, worse,
+        # silently garbage-score at GPU cost.
+        cfg_len = int(getattr(model.config, "max_length", -1))
+        cfg_mels = int(getattr(model.config, "num_mel_bins", -1))
+        if cfg_len != AST_N_FRAMES or cfg_mels != N_MELS:
+            raise ValueError(
+                f"AST checkpoint {args.checkpoint!r} expects inputs "
+                f"(max_length={cfg_len}, num_mel_bins={cfg_mels}) but "
+                f"ast_frontend emits ({AST_N_FRAMES}, {N_MELS}) — "
+                "refusing before training; this checkpoint was not "
+                "trained on the BirdSet mel\u2192resize-1024 pipeline "
+                "ast_frontend reproduces"
+            )
     # Resolve the revision REF to the commit SHA when transformers
     # exposes it (final-review minor): from_pretrained records the
     # resolved hub commit on config._commit_hash for hub downloads.
@@ -313,11 +329,13 @@ def _run_cell(args) -> int:
 
     manifest = _pq.read_table(args.manifest)
     train_ds = CropDataset(
-        manifest, load_audio, provider, label2id, seed=args.seed
+        manifest, load_audio, provider, label2id, seed=args.seed,
+        frontend=frontend,
     )
     val_meta = _pq.read_table(args.val_metadata)
     val_ds = CropDataset(
-        val_meta, load_audio, provider, label2id, seed=args.seed
+        val_meta, load_audio, provider, label2id, seed=args.seed,
+        frontend=frontend,
     )
 
     if args.arm == "twin":
@@ -367,7 +385,7 @@ def _run_cell(args) -> int:
             load_audio,
             provider,
             class_codes,
-            frontend=convnext_frontend,
+            frontend=frontend,
             require_context=require_context,
         )
         scores = evaluate_model(trainee, eval_ds, arm=args.arm)

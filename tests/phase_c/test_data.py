@@ -28,6 +28,8 @@ column names, the prior is a tiny real PriorTensor.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pyarrow as pa
 import pytest
@@ -39,8 +41,13 @@ from birdology.prior.tensor import PriorSpec, PriorTensor
 
 from birdology.phase_c.context import build_context_matrix
 from birdology.phase_c.data import (
+    AST_N_FRAMES,
+    AST_NORM_MEAN,
+    AST_NORM_STD,
+    AST_PAD_DB,
     CropDataset,
     PowerToDB,
+    ast_frontend,
     convnext_frontend,
     make_label_map,
 )
@@ -172,6 +179,85 @@ class TestConvnextFrontend:
     def test_deterministic(self):
         wave = torch.from_numpy(_noise(CROP_SAMPLES, 13))
         assert torch.equal(convnext_frontend(wave), convnext_frontend(wave))
+
+
+# ---------------------------------------------------------------------------
+# ast_frontend: BirdSet's vision pipeline + pad/truncate-to-1024 + the
+# MEASURED negative-std normalization — golden-gated against the real
+# BirdSet transform (tests/phase_c/make_ast_goldens.py ran BirdSet's own
+# Resizer + PowerToDB sources; the .npz is the committed ground truth).
+# ---------------------------------------------------------------------------
+
+_GOLDENS_PATH = Path(__file__).parent / "ast_goldens.npz"
+
+
+class TestAstFrontend:
+    def test_output_shape_for_5s_crop(self):
+        """(1024, 128) time×mel — AST's input_values contract: 501
+        natural frames padded right to AST_N_FRAMES=1024."""
+        wave = torch.from_numpy(_noise(CROP_SAMPLES, 20))
+        out = ast_frontend(wave)
+        assert out.shape == (AST_N_FRAMES, 128)
+
+    def test_output_finite_and_float32(self):
+        wave = torch.from_numpy(_noise(CROP_SAMPLES, 21))
+        out = ast_frontend(wave)
+        assert out.dtype == torch.float32
+        assert torch.all(torch.isfinite(out))
+
+    def test_deterministic(self):
+        wave = torch.from_numpy(_noise(CROP_SAMPLES, 22))
+        assert torch.equal(ast_frontend(wave), ast_frontend(wave))
+
+    def test_mono_only(self):
+        with pytest.raises(ValueError, match="mono"):
+            ast_frontend(torch.zeros(2, CROP_SAMPLES))
+
+    def test_pad_region_is_birdset_pad_value(self):
+        """BirdSet's Resizer pads the time axis with CONSTANT -80.0 dB
+        (resize.py: db_scale=True → padding_value=-80.0) BEFORE
+        normalization — the padded frames therefore carry
+        (-80 - mean)/std exactly, not zeros."""
+        wave = torch.from_numpy(_noise(CROP_SAMPLES, 23))  # 501 frames
+        out = ast_frontend(wave)
+        expected_pad = (AST_PAD_DB - AST_NORM_MEAN) / AST_NORM_STD
+        pad_region = out[501:, :]
+        assert pad_region.shape[0] == AST_N_FRAMES - 501
+        torch.testing.assert_close(
+            pad_region,
+            torch.full_like(pad_region, expected_pad),
+        )
+
+    def test_long_wave_truncates_to_1024_frames(self):
+        """>1024 natural frames: BirdSet TRUNCATES the width (resize.py
+        truncate_spectrogram_width) — never interpolates."""
+        wave = torch.from_numpy(_noise(11 * SR, 24))  # 1101 frames
+        out = ast_frontend(wave)
+        assert out.shape == (AST_N_FRAMES, 128)
+
+    def test_normalization_std_is_negative(self):
+        """The measured BirdSet quirk, pinned: std = -4.569 (NEGATIVE, as
+        in BirdSet transforms.py PreprocessingConfig line 64) — naive
+        (x-mean)/|std| would flip every value's sign relative to what
+        the checkpoint saw."""
+        assert AST_NORM_STD == -4.569
+        assert AST_NORM_MEAN == -4.268
+
+    @pytest.mark.parametrize("name", ["noise_1s", "chirp_2s", "silence_1s"])
+    def test_golden_gate_matches_real_birdset_transform(self, name):
+        """ast_frontend must reproduce the REAL BirdSet preprocessing
+        (Spectrogram→MelScale→PowerToDB→Resizer(1024, pad -80 dB)→
+        (x-(-4.268))/(-4.569)→transpose), captured offline by running
+        BirdSet's own Resizer/PowerToDB sources on these exact waves
+        (make_ast_goldens.py). Bit-exact equality is asserted: both
+        sides run the same torchaudio ops in the same order on the same
+        float32 inputs."""
+        goldens = np.load(_GOLDENS_PATH)
+        waves = __import__(
+            "tests.phase_c.make_ast_goldens", fromlist=["golden_waves"]
+        ).golden_waves()
+        out = ast_frontend(torch.from_numpy(waves[name]))
+        np.testing.assert_array_equal(out.numpy(), goldens[name])
 
 
 class TestPowerToDB:
@@ -353,3 +439,53 @@ class TestCropDeterminism:
         a = _dataset(seed=7, epoch=0, provider=provider)[2]
         b = _dataset(seed=7, epoch=1, provider=provider)[2]
         assert torch.equal(a["inputs"], b["inputs"])
+
+
+# ---------------------------------------------------------------------------
+# The frontend is INJECTABLE (default: convnext_frontend) — the AST cell
+# trains on ast_frontend inputs through the SAME dataset.
+# ---------------------------------------------------------------------------
+
+
+class TestFrontendInjection:
+    def test_default_frontend_is_convnext(self, provider):
+        item = _dataset(provider=provider)[0]
+        assert item["inputs"].shape == (1, 128, N_FRAMES_5S)
+
+    def test_ast_frontend_flows_through_getitem(self, provider):
+        ds = CropDataset(
+            _manifest(BASE_ROWS),
+            fake_load_audio,
+            provider,
+            LABEL2ID,
+            seed=0,
+            epoch=0,
+            frontend=ast_frontend,
+        )
+        item = ds[0]
+        assert item["inputs"].shape == (AST_N_FRAMES, 128)
+        assert item["inputs"].dtype == torch.float32
+
+    def test_injected_frontend_sees_the_same_crop(self, provider):
+        """The frontend swap changes ONLY the feature map, never the
+        (seed, epoch, idx)-keyed crop underneath."""
+        kwargs = dict(seed=7, epoch=3)
+        ds_conv = _dataset(provider=provider, **kwargs)
+        ds_ast = CropDataset(
+            _manifest(BASE_ROWS),
+            fake_load_audio,
+            provider,
+            LABEL2ID,
+            frontend=ast_frontend,
+            **kwargs,
+        )
+        conv = ds_conv[0]["inputs"]
+        ast = ds_ast[0]["inputs"]
+        # Same crop → the ast natural 501 frames are the conv mel,
+        # re-normalized with the AST constants and transposed.
+        expected = (
+            (conv[0] * 4.569 + (-4.268)) - AST_NORM_MEAN
+        ) / AST_NORM_STD
+        torch.testing.assert_close(
+            ast[:N_FRAMES_5S, :].transpose(0, 1), expected
+        )
