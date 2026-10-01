@@ -1,0 +1,598 @@
+"""The sweep driver + results contract (Task 6).
+
+Every number the paper reports flows through `run_cell`'s row contract, so
+these tests pin the contract rather than the arithmetic (the arithmetic is
+Tasks 2-5's, already pinned there). Fixtures are tiny in-memory CacheViews
+and PriorTensors — no file caches, no network, no WEKA.
+
+Carried obligations exercised here:
+
+* resume granularity is the FULL 5-seed cell (refusals on 4/duplicate seeds;
+  rows only ever carry complete 5-seed metrics);
+* variant vocabulary is IMPORTED from `rescoring.CONTROL_VARIANTS`;
+* weeks come off the cache's `week` column, never recomputed;
+* `prior_coverage_failures` names a coverage-failure count;
+* degenerate seed sets report std 0.0 + `seeds_degenerate=True`, never a
+  fake spread.
+"""
+from __future__ import annotations
+
+import dataclasses
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pytest
+from scipy import sparse
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
+
+from birdology.phase_b.rescoring import CONTROL_VARIANTS
+from birdology.phase_b.cache import CacheView
+from birdology.phase_b.sweep import (
+    Provenance,
+    SweepCell,
+    config_hash,
+    load_existing_hashes,
+    paired_delta,
+    plan_grid,
+    run_cell,
+    shard_cells,
+    write_rows,
+)
+from birdology.prior.indexing import WEEKS_PER_YEAR
+from birdology.prior.tensor import PriorSpec, PriorTensor
+
+
+# ---------------------------------------------------------------------------
+# fixtures — tiny in-memory caches, prior, bridge, provenance
+# ---------------------------------------------------------------------------
+
+_CODES = ["amecro", "blujay", "carwre"]
+_CLASS_IDX = {code: i for i, code in enumerate(_CODES)}
+_CODE_TO_GBIF = {"amecro": 111, "blujay": 222, "carwre": 333}
+_CELLS = ["cella", "cellb", "cellc", "celld"]
+_DOI = "10.15468/dl.test00"
+
+_PROV = Provenance(
+    git_sha="deadbeefcafe",
+    train_cache_dir="/caches/train",
+    eval_cache_dir="/caches/eval/HSN",
+    prior_path="/priors/prior_res4.npz",
+    prior_doi=_DOI,
+)
+
+
+def _prior() -> PriorTensor:
+    """3 species x 4 cells, every (species, cell, week) value DISTINCT —
+    the asymmetric design from the rescoring tests: shuffling cells or
+    weeks cannot silently reproduce the original."""
+    n_species, n_cols = 3, len(_CELLS) * WEEKS_PER_YEAR
+    dense = (1.0 + np.arange(n_species * n_cols, dtype=np.float64)).reshape(
+        n_species, n_cols
+    ) / (n_species * n_cols + 1.0)
+    return PriorTensor(
+        spec=PriorSpec(resolution=4, source="eod", variant="full"),
+        species_keys=np.asarray([111, 222, 333], dtype=np.int64),
+        cells=list(_CELLS),
+        values=sparse.csr_matrix(dense),
+        gbif_doi=_DOI,
+    )
+
+
+def _cache_table(
+    *,
+    n: int,
+    label_col: str,
+    labels: list,
+    splits: list[str],
+    logits: np.ndarray,
+    seed: int = 0,
+    d: int = 6,
+) -> pa.Table:
+    """A table with the cache column contract (cell / week / split /
+    labels / embedding / logits). Weeks cycle 1..13 — already folded, as
+    the manifest guarantees; the driver must read them off this column."""
+    rng = np.random.default_rng(seed)
+    embeddings = rng.normal(size=(n, d))
+    # A little class signal in the embeddings so the MLP has something
+    # to learn without being able to saturate.
+    for i in range(n):
+        first = labels[i][0] if isinstance(labels[i], list) and labels[i] else labels[i]
+        if first is not None:
+            embeddings[i, _CLASS_IDX[first] % d] += 1.5
+    if label_col == "ebird_code":
+        label_arr = pa.array(labels, pa.string())
+    else:
+        label_arr = pa.array(labels, pa.list_(pa.string()))
+    return pa.table(
+        {
+            "filepath": pa.array([f"r{i}.ogg" for i in range(n)], pa.string()),
+            "cell": pa.array([_CELLS[i % len(_CELLS)] for i in range(n)], pa.string()),
+            "week": pa.array([1 + (i % 13) for i in range(n)], pa.int8()),
+            "split": pa.array(splits, pa.string()),
+            label_col: label_arr,
+            "embedding": pa.array(embeddings.tolist(), pa.list_(pa.float64())),
+            "logits": pa.array(logits.tolist(), pa.list_(pa.float64())),
+        }
+    )
+
+
+def _correlated_logits(labels: list, n_classes: int, seed: int) -> np.ndarray:
+    """Probabilities correlated with the labels but noisy enough that a
+    prior can move the ranking."""
+    rng = np.random.default_rng(seed)
+    n = len(labels)
+    logits = rng.uniform(0.15, 0.45, size=(n, n_classes))
+    for i, item in enumerate(labels):
+        members = item if isinstance(item, list) else [item]
+        for code in members:
+            if code is not None:
+                logits[i, _CLASS_IDX[code]] = rng.uniform(0.55, 0.9)
+    return logits
+
+
+def _train_cache(n: int = 24) -> CacheView:
+    labels = [_CODES[i % 3] for i in range(n)]
+    table = _cache_table(
+        n=n,
+        label_col="ebird_code",
+        labels=labels,
+        splits=["train_xc"] * n,
+        logits=_correlated_logits(labels, 3, seed=11),
+        seed=1,
+    )
+    return CacheView(table=table, logits_are_raw=False, n_classes=3)
+
+
+def _eval_cache(n: int = 20) -> CacheView:
+    labels: list[list[str]] = [[_CODES[i % 3]] for i in range(n)]
+    labels[0] = ["amecro", "blujay"]
+    labels[5] = ["blujay", "carwre"]
+    table = _cache_table(
+        n=n,
+        label_col="ebird_code_multilabel",
+        labels=labels,
+        splits=["test_hsn"] * n,
+        logits=_correlated_logits(labels, 3, seed=23),
+        seed=2,
+    )
+    return CacheView(table=table, logits_are_raw=False, n_classes=3)
+
+
+def _flat_eval_cache(n: int = 20) -> CacheView:
+    """Every score identical (0.5): the ranking is decided ENTIRELY by
+    the prior. Labels cycle i%3 against the i%4 cell cycle, so labels
+    VARY within each cell block — a week shuffle (which reorders rows
+    only within a cell) must therefore move the metrics."""
+    labels: list[list[str]] = [[_CODES[i % 3]] for i in range(n)]
+    table = _cache_table(
+        n=n,
+        label_col="ebird_code_multilabel",
+        labels=labels,
+        splits=["test_hsn"] * n,
+        logits=np.full((n, 3), 0.5),
+        seed=3,
+    )
+    return CacheView(table=table, logits_are_raw=False, n_classes=3)
+
+
+def _cell(**overrides) -> SweepCell:
+    base = dict(
+        encoder="perch",
+        method="rescoring",
+        prior_variant="full",
+        resolution=4,
+        tau=1.0,
+        test_set="HSN",
+        seeds=(0, 1, 2, 3, 4),
+    )
+    base.update(overrides)
+    return SweepCell(**base)
+
+
+def _run(cell: SweepCell, *, eval_cache: CacheView | None = None, **kwargs) -> dict:
+    return run_cell(
+        cell,
+        train_cache=_train_cache(),
+        eval_cache=eval_cache if eval_cache is not None else _eval_cache(),
+        prior=_prior(),
+        class_idx=_CLASS_IDX,
+        code_to_gbif=_CODE_TO_GBIF,
+        provenance=_PROV,
+        **kwargs,
+    )
+
+
+_ROW_FLOATS = [
+    "cmap_mean",
+    "cmap_std",
+    "auroc_mean",
+    "auroc_std",
+    "top1_mean",
+    "top1_std",
+    "wall_s",
+]
+
+
+def _fake_row(cell: SweepCell, cmap_per_seed: list[float]) -> dict:
+    """A schema-complete row for write/paired_delta tests that do not
+    need run_cell's arithmetic."""
+    row = {
+        "config_hash": config_hash(cell),
+        "encoder": cell.encoder,
+        "method": cell.method,
+        "prior_variant": cell.prior_variant,
+        "resolution": cell.resolution,
+        "tau": cell.tau,
+        "test_set": cell.test_set,
+        "seeds": list(cell.seeds),
+        "cmap_mean": float(np.mean(cmap_per_seed)),
+        "cmap_std": float(np.std(cmap_per_seed)),
+        "auroc_mean": 0.8,
+        "auroc_std": 0.0,
+        "top1_mean": 0.7,
+        "top1_std": 0.0,
+        "n_scored": 3,
+        "prior_coverage_failures": 0,
+        "cmap_per_seed": [float(v) for v in cmap_per_seed],
+        "seeds_degenerate": False,
+        "git_sha": _PROV.git_sha,
+        "train_cache_dir": _PROV.train_cache_dir,
+        "eval_cache_dir": _PROV.eval_cache_dir,
+        "prior_path": _PROV.prior_path,
+        "prior_doi": _PROV.prior_doi,
+        "wall_s": 1.0,
+    }
+    return row
+
+
+# ---------------------------------------------------------------------------
+# 1. config_hash — stable across runs, sensitive to EVERY field
+# ---------------------------------------------------------------------------
+
+
+def test_config_hash_is_stable_and_sensitive_to_every_field():
+    """The hash keys the resume logic: two calls on the same cell must
+    agree, and perturbing ANY single field must change it — a field the
+    hash ignores would let resume skip a cell that was never run."""
+    cell = _cell()
+    assert config_hash(cell) == config_hash(_cell())
+
+    perturbations = {
+        "encoder": "birdnet",
+        "method": "mlp",
+        "prior_variant": CONTROL_VARIANTS["uniform"],
+        "resolution": 5,
+        "tau": 2.0,
+        "test_set": "NES",
+        "seeds": (5, 6, 7, 8, 9),
+    }
+    # Every declared field must be perturbed — a new SweepCell field
+    # added without a perturbation here fails loudly.
+    assert set(perturbations) == {f.name for f in dataclasses.fields(SweepCell)}
+    base_hash = config_hash(cell)
+    for field, value in perturbations.items():
+        changed = dataclasses.replace(cell, **{field: value})
+        assert config_hash(changed) != base_hash, field
+
+
+# ---------------------------------------------------------------------------
+# 2. run_cell refusals — provenance and the 5-seed contract
+# ---------------------------------------------------------------------------
+
+
+def test_run_cell_refuses_empty_prior_doi():
+    """Every results artifact names its inputs; an empty (or whitespace)
+    DOI is an uncitable row and is refused before any work."""
+    for bad in ("", "   "):
+        prov = dataclasses.replace(_PROV, prior_doi=bad)
+        with pytest.raises(ValueError, match="doi|DOI"):
+            run_cell(
+                _cell(),
+                train_cache=_train_cache(),
+                eval_cache=_eval_cache(),
+                prior=_prior(),
+                class_idx=_CLASS_IDX,
+                code_to_gbif=_CODE_TO_GBIF,
+                provenance=prov,
+            )
+
+
+def test_run_cell_refuses_four_seeds_and_duplicate_seeds():
+    """Resume granularity is the FULL 5-seed cell: a 4-seed or
+    duplicated-seed cell could manufacture a 4-seed mean, which the
+    pre-flight ruling forbids persisting."""
+    with pytest.raises(ValueError, match="seed"):
+        _run(_cell(seeds=(0, 1, 2, 3)))
+    with pytest.raises(ValueError, match="seed"):
+        _run(_cell(seeds=(0, 1, 2, 3, 3)))
+
+
+# ---------------------------------------------------------------------------
+# 3. degenerate seeds — std 0.0 + flag; shuffles genuinely vary
+# ---------------------------------------------------------------------------
+
+
+def test_full_variant_rescoring_row_is_degenerate_with_zero_std():
+    """Seeds only enter the control shuffles; for variant 'full' the five
+    seeds are IDENTICAL by construction, so the row must say so (std 0.0,
+    seeds_degenerate=True) rather than report a fake spread."""
+    row = _run(_cell(prior_variant="full"))
+    assert row["seeds_degenerate"] is True
+    assert row["cmap_std"] == 0.0
+    assert row["auroc_std"] == 0.0
+    assert row["top1_std"] == 0.0
+    assert len(set(row["cmap_per_seed"])) == 1
+    assert len(row["cmap_per_seed"]) == 5
+
+
+def test_uniform_variant_rescoring_row_is_degenerate_too():
+    row = _run(_cell(prior_variant=CONTROL_VARIANTS["uniform"]))
+    assert row["seeds_degenerate"] is True
+    assert row["cmap_std"] == 0.0
+
+
+def test_shuffle_variant_seeds_produce_genuinely_differing_cmaps():
+    """On the flat-score fixture the ranking is decided entirely by the
+    prior, so different shuffle draws (rng seeded per seed) must land
+    different per-seed cmaps — a constant list would mean the seeds never
+    reached the shuffle."""
+    row = _run(
+        _cell(prior_variant=CONTROL_VARIANTS["time_shuffled"]),
+        eval_cache=_flat_eval_cache(),
+    )
+    assert row["seeds_degenerate"] is False
+    assert len(set(row["cmap_per_seed"])) > 1
+    assert row["cmap_std"] > 0.0
+
+
+# ---------------------------------------------------------------------------
+# 4. write_rows — loud duplicate skip, schema version, sidecar
+# ---------------------------------------------------------------------------
+
+
+def test_write_rows_skips_duplicate_hash_loudly_and_versions_schema(tmp_path):
+    """A row whose config_hash already exists is SKIPPED (counted in the
+    returned sidecar, logged) and never duplicated on disk; every parquet
+    file carries results_schema_version=1 in its metadata."""
+    out = tmp_path / "results"
+    r1 = _fake_row(_cell(tau=0.25), [0.5] * 5)
+    r2 = _fake_row(_cell(tau=0.5), [0.6] * 5)
+
+    sidecar1 = write_rows([r1], out)
+    meta1 = json.loads(sidecar1.read_text(encoding="utf-8"))
+    assert meta1["n_rows"] == 1
+    assert meta1["n_skipped_existing"] == 0
+    assert meta1["git_sha"] == _PROV.git_sha
+    assert "written_at" in meta1
+
+    sidecar2 = write_rows([r1, r2], out)
+    meta2 = json.loads(sidecar2.read_text(encoding="utf-8"))
+    assert meta2["n_rows"] == 1
+    assert meta2["n_skipped_existing"] == 1
+
+    files = sorted(out.glob("*.parquet"))
+    tables = [pq.read_table(p) for p in files]
+    hashes = [h for t in tables for h in t.column("config_hash").to_pylist()]
+    assert sorted(hashes) == sorted([r1["config_hash"], r2["config_hash"]])
+    for path in files:
+        meta = pq.read_schema(path).metadata or {}
+        assert meta[b"results_schema_version"] == b"1"
+
+
+# ---------------------------------------------------------------------------
+# 5. resume — only missing hashes are attempted
+# ---------------------------------------------------------------------------
+
+
+def test_resume_attempts_only_missing_hashes(tmp_path):
+    """Write a grid subset, then re-plan the full grid: the cells left to
+    attempt are exactly the ones whose hashes are not on disk."""
+    out = tmp_path / "results"
+    grid = plan_grid(
+        encoders=("perch",),
+        methods=("rescoring",),
+        prior_variants=("full",),
+        resolutions=(4,),
+        taus=(0.25, 0.5, 1.0, 2.0),
+        test_sets=("HSN",),
+    )
+    assert len(grid) == 4
+    done, missing = grid[:2], grid[2:]
+    write_rows([_fake_row(c, [0.5] * 5) for c in done], out)
+
+    existing = load_existing_hashes(out)
+    attempted = [c for c in plan_grid(
+        encoders=("perch",),
+        methods=("rescoring",),
+        prior_variants=("full",),
+        resolutions=(4,),
+        taus=(0.25, 0.5, 1.0, 2.0),
+        test_sets=("HSN",),
+    ) if config_hash(c) not in existing]
+    assert attempted == missing
+
+
+def test_load_existing_hashes_of_absent_dir_is_empty(tmp_path):
+    assert load_existing_hashes(tmp_path / "nope") == set()
+
+
+# ---------------------------------------------------------------------------
+# 6. paired_delta — hand-computed fixture + refusals
+# ---------------------------------------------------------------------------
+
+
+def test_paired_delta_matches_hand_computed_ci():
+    """Hand-computed: a=[.50,.60,.55,.45,.65], b=[.40,.50,.50,.40,.55]
+    -> deltas [.10,.10,.05,.05,.10], mean .08,
+    sd(ddof=1) = sqrt(0.003/4) = 0.0273861,
+    half-width = t_{0.975,4} * sd/sqrt(5) = 2.7764 * 0.0122474 = 0.0340050,
+    CI = (0.0459950, 0.1140050)."""
+    a = _fake_row(_cell(tau=1.0), [0.50, 0.60, 0.55, 0.45, 0.65])
+    b = _fake_row(_cell(tau=0.5), [0.40, 0.50, 0.50, 0.40, 0.55])
+    mean, (lo, hi) = paired_delta([a], [b])
+    assert mean == pytest.approx(0.08)
+    assert lo == pytest.approx(0.0459950, abs=1e-4)
+    assert hi == pytest.approx(0.1140050, abs=1e-4)
+
+
+def test_paired_delta_refuses_mismatched_axes():
+    """Rows differing on MORE than the one axis under comparison are not
+    a paired comparison at all."""
+    a = _fake_row(_cell(tau=1.0, test_set="HSN"), [0.5] * 5)
+    b = _fake_row(_cell(tau=0.5, test_set="NES"), [0.4] * 5)
+    with pytest.raises(ValueError, match="ax"):
+        paired_delta([a], [b])
+
+
+def test_paired_delta_refuses_non_identical_seed_tuples():
+    a = _fake_row(_cell(tau=1.0), [0.5] * 5)
+    b = _fake_row(_cell(tau=0.5, seeds=(1, 2, 3, 4, 5)), [0.4] * 5)
+    with pytest.raises(ValueError, match="seed"):
+        paired_delta([a], [b])
+
+
+# ---------------------------------------------------------------------------
+# 7. end-to-end micro-sweep — 4 cells through the real run_cell
+# ---------------------------------------------------------------------------
+
+
+def test_micro_sweep_four_cells_end_to_end(tmp_path):
+    """Tiny caches + tiny prior -> four real cells (rescoring tau=1
+    full + uniform, offset_global full, mlp full), rows land on disk,
+    every metric finite, provenance populated. This is the test that
+    catches interface drift between Tasks 1-5 and the driver."""
+    cells = [
+        _cell(method="rescoring", prior_variant="full", tau=1.0),
+        _cell(
+            method="rescoring",
+            prior_variant=CONTROL_VARIANTS["uniform"],
+            tau=1.0,
+        ),
+        _cell(method="offset_global", prior_variant="full", tau=None),
+        _cell(method="mlp", prior_variant="full", tau=None),
+    ]
+    rows = [_run(c, mlp_hidden=8, mlp_max_iter=40) for c in cells]
+
+    out = tmp_path / "results"
+    write_rows(rows, out)
+    on_disk = pa.concat_tables(
+        [pq.read_table(p) for p in sorted(out.glob("*.parquet"))]
+    )
+    assert on_disk.num_rows == 4
+    assert set(on_disk.column("config_hash").to_pylist()) == {
+        config_hash(c) for c in cells
+    }
+
+    for cell, row in zip(cells, rows):
+        assert row["config_hash"] == config_hash(cell)
+        for key in _ROW_FLOATS:
+            assert np.isfinite(row[key]), (cell.method, key)
+        assert len(row["cmap_per_seed"]) == 5
+        assert all(np.isfinite(v) for v in row["cmap_per_seed"])
+        assert row["n_scored"] > 0
+        assert row["prior_coverage_failures"] == 0
+        assert row["seeds"] == list(cell.seeds)
+        assert row["wall_s"] > 0.0
+        assert row["git_sha"] == _PROV.git_sha
+        assert row["train_cache_dir"] == _PROV.train_cache_dir
+        assert row["eval_cache_dir"] == _PROV.eval_cache_dir
+        assert row["prior_path"] == _PROV.prior_path
+        assert row["prior_doi"] == _DOI
+
+
+def test_sigmoid_applied_exactly_once_iff_cache_declares_raw_logits():
+    """A raw-logits eval cache and a pre-sigmoided one describing the
+    same scores must produce the SAME row metrics: sigmoid exactly once,
+    decided by the cache's declared flag, never by value inspection."""
+    calibrated = _eval_cache()
+    probs = np.asarray(calibrated.table.column("logits").to_pylist())
+    raw_logits = np.log(probs / (1.0 - probs))
+    raw_table = calibrated.table.set_column(
+        calibrated.table.column_names.index("logits"),
+        "logits",
+        pa.array(raw_logits.tolist(), pa.list_(pa.float64())),
+    )
+    raw = CacheView(table=raw_table, logits_are_raw=True, n_classes=3)
+    row_cal = _run(_cell(), eval_cache=calibrated)
+    row_raw = _run(_cell(), eval_cache=raw)
+    assert row_raw["cmap_mean"] == pytest.approx(row_cal["cmap_mean"])
+    assert row_raw["auroc_mean"] == pytest.approx(row_cal["auroc_mean"])
+
+
+# ---------------------------------------------------------------------------
+# 8. learned-arm seeding — MLP varies by seed, offset does not
+# ---------------------------------------------------------------------------
+
+
+def test_mlp_rows_differ_across_seeds_same_machine():
+    """The seed enters the MLP's weight init and batch shuffling, so two
+    seeds must produce different per-seed metrics on the same machine —
+    identical values would mean the seed never reached the fit. (The
+    determinism contract is same-machine only; nothing here compares
+    across platforms.)"""
+    row = _run(
+        _cell(method="mlp", prior_variant="full", tau=None),
+        mlp_hidden=8,
+        mlp_max_iter=15,
+    )
+    assert row["seeds_degenerate"] is False
+    assert len(set(row["cmap_per_seed"])) > 1
+    assert row["cmap_std"] > 0.0
+
+
+def test_offset_rows_identical_across_seeds_degenerate_flagged():
+    """The offset fit is a convex 1-D minimization with no randomness:
+    on variant 'full' every seed is the same fit, so the row must report
+    std 0.0 + seeds_degenerate=True, never a fake spread."""
+    row = _run(_cell(method="offset_global", prior_variant="full", tau=None))
+    assert row["seeds_degenerate"] is True
+    assert row["cmap_std"] == 0.0
+    assert len(set(row["cmap_per_seed"])) == 1
+
+
+# ---------------------------------------------------------------------------
+# plan_grid + sharding — deterministic, deduplicated, stable partition
+# ---------------------------------------------------------------------------
+
+
+def test_plan_grid_default_shape_vocabulary_and_determinism():
+    """2 encoders x [rescoring x 5 variants x 3 res x 4 taus + 3 learned
+    methods x 5 variants x 3 res] x 6 test sets = 1260 cells, no
+    duplicates, same order on every call, variant vocabulary IMPORTED
+    from CONTROL_VARIANTS."""
+    grid = plan_grid()
+    assert len(grid) == 1260
+    assert len(set(grid)) == len(grid)
+    assert grid == plan_grid()
+
+    variants = {c.prior_variant for c in grid}
+    assert variants == {"full"} | set(CONTROL_VARIANTS.values())
+    for cell in grid:
+        if cell.method == "rescoring":
+            assert cell.tau in (0.25, 0.5, 1.0, 2.0)
+        else:
+            assert cell.tau is None
+        assert cell.seeds == (0, 1, 2, 3, 4)
+
+
+def test_shard_cells_is_a_stable_partition():
+    grid = plan_grid(
+        encoders=("perch",),
+        methods=("rescoring",),
+        resolutions=(4,),
+        test_sets=("HSN", "NES"),
+    )
+    shards = [shard_cells(grid, k, 3) for k in range(3)]
+    combined = [c for shard in shards for c in shard]
+    assert sorted(combined, key=config_hash) == sorted(grid, key=config_hash)
+    assert len(combined) == len(grid)
+    assert shards[0] == shard_cells(grid, 0, 3)
+    with pytest.raises(ValueError):
+        shard_cells(grid, 3, 3)
+    with pytest.raises(ValueError):
+        shard_cells(grid, -1, 3)
