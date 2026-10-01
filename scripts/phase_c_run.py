@@ -164,6 +164,18 @@ def _run_cell(args) -> int:
     """Fleet side: wire CropDataset + wrapper + train_arm + evaluate_model
     for one cell, then write the one row. Imports live here so the module
     stays importable without torch for the row-contract tests."""
+    if args.model == "ast":
+        # Refused BEFORE any download or GPU time: the only frontend
+        # wired below is convnext_frontend, whose (1, 128, 501) mel is
+        # not AST's input contract — it would shape-crash or
+        # garbage-score at GPU cost.
+        raise NotImplementedError(
+            "ast_frontend not yet wired — BirdSet AST uses "
+            "mel→resize-1024 with sign-flip std; see task-6-report "
+            "concern 1. Refusing rather than feeding convnext_frontend "
+            "output to AST."
+        )
+
     import json
 
     import numpy as np
@@ -255,6 +267,17 @@ def _run_cell(args) -> int:
 
     cfg = TrainConfig(arm=args.arm, seed=args.seed)
     result = train_arm(trainee, train_ds, val_ds, cfg, args.ckpt_dir)
+
+    # Restore the VAL-BEST weights before evaluating: early stopping
+    # leaves the trainee ≥patience epochs past its best, so evaluating
+    # the loop's final state would silently degrade every fleet row —
+    # and the frozen-checkpoint repro gate cannot catch it (no training
+    # happens there). best.pt was saved from the TRAINEE's own
+    # perspective (train_arm checkpoints the state_dict of exactly the
+    # object it received: the bare model for the twin, the wrapper for
+    # conditioned arms), so it loads back into the trainee.
+    best_ckpt = torch.load(result.best_state_path, weights_only=True)
+    trainee.load_state_dict(best_ckpt["model_state"])
 
     eval_meta = _pq.read_table(args.eval_metadata)
     eval_ds = build_eval_dataset(

@@ -387,7 +387,7 @@ def test_sbatch_pins_the_three_measured_constraints():
     ).read_text()
     assert "--gres=gpu:1" in sbatch
     assert "/raid/scratch" in sbatch
-    assert "/mnt/weka" in sbatch
+    assert "--bind /mnt/weka" in sbatch
 
 
 def test_sbatch_binds_weka_and_guards_the_mountpoint():

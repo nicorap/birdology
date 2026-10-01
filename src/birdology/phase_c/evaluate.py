@@ -56,8 +56,10 @@ import pyarrow as pa
 import torch
 from torch.utils.data import DataLoader
 
-#: 5 s @ 32 kHz — the segment window every BirdSet test row represents.
-SAMPLE_RATE = 32000
+from birdology.phase_c.data import SAMPLE_RATE
+
+#: 5 s — the segment window every BirdSet test row represents
+#: (SAMPLE_RATE comes from data.py, the model card's single source).
 _CROP_SECONDS_DEFAULT = 5.0
 
 
