@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -75,6 +76,36 @@ CMAP_TOLERANCE = 0.05
 #: The one encoder with a published row; everything else is report-only.
 GATED_ENCODER = "perch"
 
+#: Every encoder token the gate knows. An unknown token (typo, case
+#: mismatch like 'Perch', 'perch_v2') must RAISE, never silently become
+#: a report-only pair — that would be a vacuous pass vector.
+KNOWN_ENCODERS = frozenset({"perch", "birdnet"})
+
+
+def parse_pair_spec(spec: str) -> tuple[str, str, str, str, str]:
+    """Parse one ``ENCODER:TESTSET:CACHE_DIR:METADATA:LABELS`` spec.
+
+    The encoder token is validated against :data:`KNOWN_ENCODERS` at
+    parse time (exact, case-sensitive): a typo'd encoder would otherwise
+    silently fall into the report-only branch and the gate could print
+    REPRO_GATE_OK with zero published comparisons gated.
+    """
+    fields = spec.split(":", 4)
+    if len(fields) != 5:
+        raise ValueError(
+            f"--pair spec needs 5 colon-separated fields "
+            f"ENCODER:TESTSET:CACHE_DIR:METADATA:LABELS, got "
+            f"{len(fields)}: {spec!r}"
+        )
+    encoder = fields[0]
+    if encoder not in KNOWN_ENCODERS:
+        raise ValueError(
+            f"unknown encoder {encoder!r}; known: {sorted(KNOWN_ENCODERS)} "
+            "(exact, case-sensitive — a typo must never become a "
+            "report-only pair)"
+        )
+    return encoder, fields[1], fields[2], fields[3], fields[4]
+
 
 def compare_to_published(
     test_set: str, cmap_value: float
@@ -84,7 +115,8 @@ def compare_to_published(
     Returns ``(ok, published, delta)`` with ``delta = ours - published``
     and ``ok`` iff ``|delta| <= CMAP_TOLERANCE`` (inclusive). An unknown
     test set raises ValueError naming it — a typo'd split must never
-    silently pass the gate.
+    silently pass the gate. A NaN cmAP (no scoreable classes) is an
+    EXPLICIT failure, not a float-comparison accident.
     """
     if test_set not in PUBLISHED_PERCH_CMAP:
         raise ValueError(
@@ -92,6 +124,8 @@ def compare_to_published(
             f"{sorted(PUBLISHED_PERCH_CMAP)}"
         )
     published = PUBLISHED_PERCH_CMAP[test_set]
+    if np.isnan(cmap_value):
+        return False, published, float("nan")
     delta = cmap_value - published
     return abs(delta) <= CMAP_TOLERANCE, published, delta
 
@@ -103,10 +137,12 @@ def calibrate_scores(
 
     BirdNET caches already hold sigmoid probabilities; Perch caches hold
     raw logits (CacheView.logits_are_raw, read from writer metadata).
-    Sigmoid is strictly monotone, so this CANNOT change cmAP/AUROC (rank
-    metrics are monotone-invariant — pinned by test); it is applied
-    anyway so thresholds mean the same thing across encoders in the
-    gate's printed numbers.
+    DISPLAY-ONLY: sigmoid is monotone in exact arithmetic, but in finite
+    precision logits beyond ~17 (float32) saturate to exactly 1.0 and
+    collapse distinct ranks into ties — so the gate's cmAP/AUROC are
+    computed on the PRE-calibration scores (see score_pair), and these
+    probabilities exist only so thresholds mean the same thing across
+    encoders in printed numbers.
     """
     if not logits_are_raw:
         return scores
@@ -116,35 +152,85 @@ def calibrate_scores(
 
 
 def format_pair_line(encoder: str, test_set: str, cmap_value: float) -> str:
-    """One parseable gate line:
+    """One parseable GATED line:
     ``ok|FAIL <encoder>/<testset>: cmap=X.XXX published=Y.YY delta=+Z.ZZZ``.
+
+    A NaN cmAP (no scoreable classes) gets a distinguishable FAIL line —
+    ``FAIL ... cmap=nan (no scoreable classes)`` — rather than silently
+    breaking the line grammar; it can never render ``ok``.
     """
     ok, published, delta = compare_to_published(test_set, cmap_value)
+    if np.isnan(cmap_value):
+        return (
+            f"FAIL {encoder}/{test_set}: cmap=nan (no scoreable classes) "
+            f"published={published:.2f}"
+        )
     return (
         f"{'ok' if ok else 'FAIL'} {encoder}/{test_set}: "
         f"cmap={cmap_value:.3f} published={published:.2f} delta={delta:+.3f}"
     )
 
 
-def render_report(
-    pairs: list[tuple[str, str, float]]
-) -> tuple[str, bool]:
-    """Render the gate's full output for ``(encoder, test_set, cmap)``
-    pairs: one line per pair, then the verdict line.
+def format_report_line(
+    encoder: str, test_set: str, cmap_value: float, auroc_value: float
+) -> str:
+    """One NON-GATED (report-only) line — a distinct form with no
+    ``ok|FAIL`` token and no ``published=`` value, so BirdNET's numbers
+    can never read as a contradictory comparison against Perch's row:
+    ``report <encoder>/<testset>: cmap=X.XXX auroc=X.XXX (no published row)``.
 
-    Returns ``(text, ok)``. The verdict considers ONLY ``perch`` pairs:
-    BirdNET has no published BirdSet row (test-data leakage, §4.1), so
-    its lines are printed for the record but can never flip the gate.
-    The final line is ``REPRO_GATE_OK`` iff every gated pair passes,
-    else ``REPRO_GATE_FAIL``.
+    Never consults the published dict, so a test set absent from it
+    (BirdNET on a split Perch has no row for) renders fine.
+    """
+    return (
+        f"report {encoder}/{test_set}: cmap={cmap_value:.3f} "
+        f"auroc={auroc_value:.3f} (no published row)"
+    )
+
+
+def render_report(
+    pairs: list[tuple[str, str, float, float]]
+) -> tuple[str, bool]:
+    """Render the gate's full output for ``(encoder, test_set, cmap,
+    auroc)`` pairs: one line per pair, then the verdict line.
+
+    Returns ``(text, ok)``. Only ``perch`` pairs are GATED (compared to
+    the published row); other known encoders (BirdNET — no published
+    BirdSet row, test-data leakage §4.1) render report-only lines that
+    can never flip the verdict. An encoder outside KNOWN_ENCODERS raises
+    (defense in depth below parse_pair_spec).
+
+    ZERO gated pairs is itself a failure: a birdnet-only invocation or
+    an empty pair list gates nothing, and printing REPRO_GATE_OK with no
+    published comparison performed would be a vacuous pass. The final
+    line is ``REPRO_GATE_OK`` iff at least one gated pair exists and
+    every gated pair passes, else ``REPRO_GATE_FAIL``.
     """
     lines: list[str] = []
     ok = True
-    for encoder, test_set, value in pairs:
-        line = format_pair_line(encoder, test_set, value)
+    n_gated = 0
+    for encoder, test_set, cmap_value, auroc_value in pairs:
+        if encoder not in KNOWN_ENCODERS:
+            raise ValueError(
+                f"unknown encoder {encoder!r}; known: "
+                f"{sorted(KNOWN_ENCODERS)}"
+            )
+        if encoder == GATED_ENCODER:
+            n_gated += 1
+            line = format_pair_line(encoder, test_set, cmap_value)
+            if line.startswith("FAIL"):
+                ok = False
+        else:
+            line = format_report_line(
+                encoder, test_set, cmap_value, auroc_value
+            )
         lines.append(line)
-        if encoder == GATED_ENCODER and line.startswith("FAIL"):
-            ok = False
+    if n_gated == 0:
+        ok = False
+        lines.append(
+            "FAIL zero gated pairs: no perch pair was compared to the "
+            "published table -- the gate cannot pass vacuously"
+        )
     lines.append("REPRO_GATE_OK" if ok else "REPRO_GATE_FAIL")
     return "\n".join(lines), ok
 
@@ -176,8 +262,11 @@ def score_pair(
     3. ``class_index`` + ``align_labels`` — labels from
        ``ebird_code_multilabel`` keyed by eBird code.
     4. ``gather_scores`` — by-code column selection.
-    5. ``calibrate_scores`` — sigmoid iff the cache says raw.
-    6. ``cmap`` + ``auroc_macro``.
+    5. ``cmap`` + ``auroc_macro`` on the PRE-calibration scores — rank
+       metrics on calibrated probabilities would collapse ranks where
+       sigmoid saturates (logits > ~17 all become exactly 1.0).
+    6. ``calibrate_scores`` — sigmoid iff the cache says raw; the
+       calibrated probabilities ride along for DISPLAY only.
     """
     view = load_cache(Path(cache_dir))
     cache_files: list[str] = view.table.column("filepath").to_pylist()
@@ -216,16 +305,22 @@ def score_pair(
         view.table.column("logits").to_pylist(), dtype=np.float32
     )
     scores = gather_scores(logits, class_idx, scoreable)
-    scores = calibrate_scores(scores, logits_are_raw=view.logits_are_raw)
 
+    # Metrics on PRE-calibration scores: sigmoid saturation (float32
+    # logits > ~17 all map to exactly 1.0) would collapse distinct ranks
+    # into ties and corrupt cmAP/AUROC in the saturation regime.
     cmap_value, n_scored = cmap(scores, Y)
     auroc_value, n_auroc = auroc_macro(scores, Y)
+
+    # Calibrated probabilities are for DISPLAY/threshold comparability
+    # only — they never feed the gate's metrics.
+    calibrated = calibrate_scores(scores, logits_are_raw=view.logits_are_raw)
     return PairResult(
         cmap=cmap_value,
         n_scored=n_scored,
         auroc=auroc_value,
         n_auroc=n_auroc,
-        scores=scores,
+        scores=calibrated,
         unscoreable=unscoreable,
     )
 
@@ -233,9 +328,14 @@ def score_pair(
 def main(argv: list[str] | None = None) -> int:
     """Fleet entry point.
 
-    Each ``--pair`` is ``encoder:testset:cache_dir:metadata_parquet:labels``;
-    prints one gate line per pair plus the verdict, exits 0 iff
-    REPRO_GATE_OK (perch pairs only gate — BirdNET is report-only).
+    Each ``--pair`` is ``encoder:testset:cache_dir:metadata_parquet:labels``
+    (encoder validated against KNOWN_ENCODERS at parse time); prints one
+    gate line per pair plus the verdict.
+
+    Exit codes — a crash must never masquerade as a measured failure:
+      0  REPRO_GATE_OK (>=1 perch pair, all within tolerance)
+      1  REPRO_GATE_FAIL (a measured miss, or zero gated pairs)
+      2  crash (bad spec, unreadable cache, ...) — traceback on stderr
     """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -247,24 +347,28 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    scored: list[tuple[str, str, float]] = []
-    for spec in args.pairs:
-        encoder, test_set, cache_dir, metadata_path, labels_path = spec.split(
-            ":", 4
-        )
-        result = score_pair(
-            Path(cache_dir), Path(metadata_path), Path(labels_path)
-        )
-        print(
-            f"# {encoder}/{test_set}: auroc={result.auroc:.3f} "
-            f"(n={result.n_auroc}) n_scored={result.n_scored} "
-            f"unscoreable={len(result.unscoreable)}"
-        )
-        scored.append((encoder, test_set, result.cmap))
+    try:
+        scored: list[tuple[str, str, float, float]] = []
+        for spec in args.pairs:
+            encoder, test_set, cache_dir, metadata_path, labels_path = (
+                parse_pair_spec(spec)
+            )
+            result = score_pair(
+                Path(cache_dir), Path(metadata_path), Path(labels_path)
+            )
+            print(
+                f"# {encoder}/{test_set}: auroc={result.auroc:.3f} "
+                f"(n={result.n_auroc}) n_scored={result.n_scored} "
+                f"unscoreable={len(result.unscoreable)}"
+            )
+            scored.append((encoder, test_set, result.cmap, result.auroc))
 
-    text, ok = render_report(scored)
-    print(text)
-    return 0 if ok else 1
+        text, ok = render_report(scored)
+        print(text)
+        return 0 if ok else 1
+    except Exception:
+        traceback.print_exc(file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
