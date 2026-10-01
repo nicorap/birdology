@@ -346,3 +346,61 @@ def test_evaluate_model_empty_dataset_returns_zero_rows():
     )
     scores = evaluate_model(tiny_convnext(), ds, arm="twin")
     assert scores.shape == (0, N_CLASSES)
+
+
+# ---------------------------------------------------------------------------
+# C1 (final review): require_context — a conditioned eval fed a table where
+# EVERY row lacks (cell, week) would silently run present=0 throughout and
+# the conditioned−twin headline would measure training-side noise only.
+# ---------------------------------------------------------------------------
+
+
+def test_require_context_all_null_raises_named_error():
+    from birdology.phase_c.evaluate import AllNullContextError
+
+    meta = make_metadata(["a.ogg"], [["amecro"]])  # no cell/week columns
+    with pytest.raises(AllNullContextError, match="C1"):
+        build_eval_dataset(
+            meta,
+            audio_lookup({}),
+            FakeProvider(),
+            CLASS_CODES,
+            frontend=tiny_frontend,
+            require_context=True,
+        )
+
+
+def test_require_context_all_null_values_also_refused():
+    from birdology.phase_c.evaluate import AllNullContextError
+
+    meta = make_metadata(
+        ["a.ogg", "b.ogg"], [["amecro"], ["blujay"]],
+        cells=[None, None], weeks=[None, None],
+    )
+    with pytest.raises(AllNullContextError, match="C1"):
+        build_eval_dataset(
+            meta, audio_lookup({}), FakeProvider(), CLASS_CODES,
+            frontend=tiny_frontend, require_context=True,
+        )
+
+
+def test_require_context_partial_null_passes():
+    meta = make_metadata(
+        ["a.ogg", "b.ogg"], [["amecro"], ["blujay"]],
+        cells=["8428309ffffffff", None], weeks=[12, None],
+    )
+    ds = build_eval_dataset(
+        meta, audio_lookup({"a.ogg": sine_audio(), "b.ogg": sine_audio()}),
+        FakeProvider(), CLASS_CODES,
+        frontend=tiny_frontend, require_context=True,
+    )
+    assert len(ds) == 2
+
+
+def test_require_context_defaults_False_for_POW_shape():
+    meta = make_metadata(["a.ogg"], [["amecro"]])
+    ds = build_eval_dataset(
+        meta, audio_lookup({"a.ogg": sine_audio()}), FakeProvider(),
+        CLASS_CODES, frontend=tiny_frontend,
+    )
+    assert len(ds) == 1

@@ -63,6 +63,19 @@ from birdology.phase_c.data import SAMPLE_RATE
 _CROP_SECONDS_DEFAULT = 5.0
 
 
+class AllNullContextError(ValueError):
+    """EVERY eval row lacks (cell, week) under require_context=True.
+
+    Final-review finding C1: the sbatch originally fed raw BirdSet
+    metadata parquets, which NEVER carry cell/week — so every
+    conditioned eval would silently run present=0 throughout and the
+    conditioned−twin headline would measure training-side noise only.
+    A whole-set-null conditioned eval must refuse by name, never
+    degrade silently; POW-val and deliberate no-context ablations pass
+    require_context=False (the --allow-null-context escape hatch).
+    """
+
+
 @dataclass
 class EvalDataset(torch.utils.data.Dataset):
     """Test-set segments: ``{inputs, context, present}`` per item, plus
@@ -113,6 +126,7 @@ def build_eval_dataset(
     class_codes: Sequence[str],
     frontend: Callable[[torch.Tensor], torch.Tensor],
     crop_s: float = _CROP_SECONDS_DEFAULT,
+    require_context: bool = False,
 ) -> EvalDataset:
     """One EvalDataset from a test-set metadata parquet table.
 
@@ -120,6 +134,14 @@ def build_eval_dataset(
     and ``week`` are optional (absent columns = the whole set is
     null-context, POW's shape). A duplicate filepath REFUSES naming the
     offenders (Review Focus 3).
+
+    ``require_context=True`` (finding C1): a conditioned eval must see
+    at least ONE row with real (cell, week) — SOME null rows are fine
+    (that's the measured degradation path), but ALL-null raises
+    :class:`AllNullContextError`: it means the eval table was never
+    context-joined (raw BirdSet metadata has no cell/week columns) and
+    the conditioned−twin delta would be noise. Twin arms and POW-val
+    never set it.
     """
     filepaths = metadata.column("filepath").to_pylist()
     counts = Counter(filepaths)
@@ -145,6 +167,20 @@ def build_eval_dataset(
         if "week" in columns
         else [None] * len(filepaths)
     )
+
+    if require_context and filepaths and not any(
+        c is not None and w is not None for c, w in zip(cells, weeks)
+    ):
+        raise AllNullContextError(
+            "require_context=True but EVERY row lacks (cell, week) — "
+            "this eval table was never context-joined (finding C1: raw "
+            "BirdSet metadata parquets carry no cell/week columns), so "
+            "a conditioned eval would silently run present=0 throughout "
+            "and the conditioned-twin headline would measure "
+            "training-side noise only. Point --eval-metadata at the "
+            "context-joined table from phase_c_build_eval_ctx.py, or "
+            "pass --allow-null-context for a deliberate ablation."
+        )
 
     # Label matrix on the model's axis, by code; gaps counted and named.
     class_codes = list(class_codes)
