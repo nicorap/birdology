@@ -1,0 +1,294 @@
+"""The two learned cheap arms of Phase B: logit offset and MLP head.
+
+Both arms train on CACHED arrays (CPU, seconds-to-minutes) — no audio, no
+encoder weights, no network. They consume the same gathered scores /
+prior probabilities / label matrices the rescoring arm consumes, and obey
+the same carried obligations:
+
+- Scores entering any ``log()`` are un-thresholded sigmoid/softmax
+  outputs — never clipped or thresholded first. Hard zeros are floored
+  with ``FLOOR`` IMPORTED from ``birdology.prior.tensor`` (via the
+  rescoring module's re-export), never a re-defined constant.
+- Weeks, where consumed, arrive pre-folded through
+  ``birdology.prior.indexing.iso_week`` (the cache's ``week`` column is
+  already folded by the Phase A writer).
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+import numpy as np
+import pyarrow as pa
+from scipy.optimize import minimize_scalar
+
+from birdology.phase_b.cache import CacheView, align_labels
+from birdology.phase_b.metrics import gather_scores
+from birdology.phase_b.rescoring import FLOOR
+
+#: lam search interval for the 1-D BCE minimization. The objective is
+#: convex in lam (it is a logistic regression in the single feature
+#: log p with fixed offset log s), so any bracket containing the minimum
+#: finds it; +/-10 is far beyond any plausible prior exponent.
+_LAM_BOUNDS = (-10.0, 10.0)
+
+
+def _checked_log_scores(scores: np.ndarray) -> np.ndarray:
+    """log(scores) after verifying scores are probabilities.
+
+    A value outside [0, 1] is a raw uncalibrated logit — logging it
+    would violate the carried obligation that only un-thresholded
+    sigmoid/softmax outputs enter a log. Hard zeros (which a saturated
+    sigmoid can emit) are floored with the imported FLOOR, never
+    clipped away.
+    """
+    s = np.asarray(scores, dtype=np.float64)
+    if s.size and (s.min() < 0.0 or s.max() > 1.0):
+        raise ValueError(
+            f"scores outside [0, 1] (min={s.min()}, max={s.max()}) look "
+            "like raw uncalibrated logits; the learned arms require "
+            "sigmoid/softmax probabilities before any log()"
+        )
+    return np.log(np.maximum(s, FLOOR))
+
+
+def _log_floored(probs: np.ndarray) -> np.ndarray:
+    """log of probabilities floored with the imported FLOOR — a hard 0.0
+    can never produce a -inf that vetoes a detection."""
+    return np.log(
+        np.maximum(np.asarray(probs, dtype=np.float64), FLOOR)
+    )
+
+
+@dataclass(frozen=True)
+class OffsetModel:
+    """The fitted logit-offset arm: ``log s + lam * log(floored p)``.
+
+    ``lam`` is a shape-() float64 array in scalar mode or
+    ``(n_scoreable,)`` in per-species mode (broadcast over columns).
+    """
+
+    lam: np.ndarray
+    per_species: bool
+
+    def predict(
+        self, scores: np.ndarray, prior_probs: np.ndarray
+    ) -> np.ndarray:
+        """``log scores + lam * log(floored prior)`` — float64 out, same
+        float discipline as :func:`birdology.phase_b.rescoring.rescore`:
+        prior floored with the imported FLOOR before the log."""
+        return _checked_log_scores(scores) + np.asarray(
+            self.lam, dtype=np.float64
+        ) * _log_floored(prior_probs)
+
+
+def _bce(log_s: np.ndarray, log_p: np.ndarray, lam: float, y: np.ndarray) -> float:
+    """Mean binary cross-entropy of ``sigmoid(log_s + lam * log_p)``
+    against *y*, computed via the numerically stable logits form
+    ``softplus(z) - y*z``."""
+    z = log_s + lam * log_p
+    return float(np.mean(np.logaddexp(0.0, z) - y * z))
+
+
+def fit_logit_offset(
+    scores: np.ndarray,
+    prior_probs: np.ndarray,
+    y: np.ndarray,
+    per_species: bool,
+    seed: int,
+) -> OffsetModel:
+    """Fit lam by minimizing BCE of ``sigmoid(log s + lam * log p)``.
+
+    Scalar mode: one bounded 1-D minimization over all (row, species)
+    cells. Per-species mode: an independent 1-D fit per column.
+
+    DETERMINISM: the fit is deterministic given the data alone. The 1-D
+    objective is convex in lam (a logistic regression in the single
+    feature log p with fixed offset log s), so bounded scalar
+    minimization needs no random initialization — *seed* is accepted for
+    interface uniformity with :func:`fit_mlp_head` and enters nothing.
+    """
+    del seed  # convex 1-D objective: no stochastic init to seed.
+    log_s = _checked_log_scores(scores)
+    log_p = _log_floored(prior_probs)
+    y_f = np.asarray(y, dtype=np.float64)
+
+    def _fit_one(ls: np.ndarray, lp: np.ndarray, yy: np.ndarray) -> float:
+        result = minimize_scalar(
+            lambda lam: _bce(ls, lp, lam, yy),
+            bounds=_LAM_BOUNDS,
+            method="bounded",
+        )
+        return float(result.x)
+
+    if per_species:
+        lam = np.array(
+            [
+                _fit_one(log_s[:, j], log_p[:, j], y_f[:, j])
+                for j in range(log_s.shape[1])
+            ],
+            dtype=np.float64,
+        )
+    else:
+        lam = np.float64(_fit_one(log_s, log_p, y_f))
+    return OffsetModel(lam=np.asarray(lam, dtype=np.float64), per_species=per_species)
+
+
+@dataclass(frozen=True)
+class MLPModel:
+    """The fitted MLP arm: an sklearn MLPClassifier over the feature
+    block ``[embeddings ‖ log(floored prior_probs)]``.
+
+    MEASURED FACT (sklearn 1.9.1, pinned by
+    ``test_sklearn_mlpclassifier_supports_multilabel_indicator_y``):
+    MLPClassifier accepts a binary indicator matrix as multilabel y and
+    its ``predict_proba`` returns ONE ``(n, k)`` float64 ndarray of
+    independent per-class logistic probabilities (``out_activation_ ==
+    "logistic"``) — no one-vs-rest column loop needed.
+    """
+
+    clf: Any  # sklearn MLPClassifier; untyped to keep sklearn optional
+    n_classes: int
+
+    def predict(
+        self, embeddings: np.ndarray, prior_probs: np.ndarray
+    ) -> np.ndarray:
+        """Per-class probabilities ``(n, k)`` float64 for new rows,
+        built from the same feature block as training."""
+        features = _mlp_features(embeddings, prior_probs)
+        proba = self.clf.predict_proba(features)
+        out = np.asarray(proba, dtype=np.float64)
+        if out.shape != (features.shape[0], self.n_classes):
+            raise ValueError(
+                f"predict_proba returned shape {out.shape}, expected "
+                f"({features.shape[0]}, {self.n_classes}) — the sklearn "
+                "multilabel contract this model was built on has changed"
+            )
+        return out
+
+
+def _mlp_features(
+    embeddings: np.ndarray, prior_probs: np.ndarray
+) -> np.ndarray:
+    """``[embeddings ‖ log(floored prior_probs)]`` as float64 — the
+    prior enters as log probabilities, floored with the imported FLOOR
+    so a hard 0.0 cannot inject a -inf feature."""
+    emb = np.asarray(embeddings, dtype=np.float64)
+    return np.hstack([emb, _log_floored(prior_probs)])
+
+
+def fit_mlp_head(
+    embeddings: np.ndarray,
+    prior_probs: np.ndarray,
+    y: np.ndarray,
+    seed: int,
+    hidden: int = 256,
+    max_iter: int = 200,
+) -> MLPModel:
+    """Fit the MLP arm on cached arrays (CPU, sklearn).
+
+    sklearn's MLPClassifier handles the multilabel indicator *y*
+    natively (measured fact — see :class:`MLPModel`). ``random_state=
+    seed`` makes the fit deterministic given (data, seed): the seed
+    enters the weight initialization and the minibatch shuffling.
+    """
+    from sklearn.neural_network import MLPClassifier
+
+    features = _mlp_features(embeddings, prior_probs)
+    y_arr = np.asarray(y)
+    clf = MLPClassifier(
+        hidden_layer_sizes=(hidden,),
+        max_iter=max_iter,
+        random_state=seed,
+    )
+    import warnings
+
+    with warnings.catch_warnings():
+        # A small max_iter stopping before convergence is a caller
+        # choice, not a defect worth polluting sweep logs over.
+        warnings.simplefilter("ignore", category=UserWarning)
+        clf.fit(features, y_arr)
+    return MLPModel(clf=clf, n_classes=y_arr.shape[1])
+
+
+def guard_training_split(table: pa.Table) -> None:
+    """Refuse any table carrying non-training rows.
+
+    Raises ValueError unless EVERY row's ``split`` value starts with
+    ``"train"`` — the train/test shift is the spec's mechanism, so a
+    soundscape (test) cache must never be fit on. The error NAMES the
+    offending split values so the wrong cache dir is identifiable from
+    the message alone.
+    """
+    if "split" not in table.column_names:
+        raise ValueError(
+            "table has no 'split' column; cannot prove these rows are "
+            f"training rows (columns: {table.column_names})"
+        )
+    splits = table.column("split").to_pylist()
+    offending = sorted(
+        {s if s is not None else "<null>" for s in splits}
+        - {s for s in splits if s is not None and s.startswith("train")}
+    )
+    if offending:
+        raise ValueError(
+            f"non-training split values {offending} in table; learned "
+            "arms fit on train-split focal caches only — a test/"
+            "soundscape row in training would break the train/test shift"
+        )
+
+
+def prepare_training(
+    cache_view: CacheView,
+    class_idx: dict[str, int],
+    label_col: str = "ebird_code",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
+    """Guard + gather in one place: training arrays from a CacheView.
+
+    Returns ``(embeddings, scores, y, scoreable)``:
+
+    - ``embeddings``: ``(n, d)`` float64 from the cache embedding column.
+    - ``scores``: ``(n, k)`` float64 probabilities gathered BY CODE in
+      scoreable order (sigmoid applied iff the cache declares raw
+      logits, so downstream logs always see probabilities).
+    - ``y``: ``(n, k)`` uint8 built from the SINGLE-label *label_col*
+      (focal caches carry one label per recording in ``ebird_code``, NOT
+      ``ebird_code_multilabel``) via the same by-code alignment as
+      :func:`birdology.phase_b.cache.align_labels`.
+    - ``scoreable``: the sorted species codes forming the column axis.
+
+    Runs :func:`guard_training_split` first — both learned arms call
+    through here when given a CacheView, so no training fit can ever see
+    a non-train row.
+    """
+    table = cache_view.table
+    guard_training_split(table)
+    if label_col not in table.column_names:
+        raise ValueError(
+            f"label column {label_col!r} not in table; available "
+            f"columns: {table.column_names}"
+        )
+    # Wrap the single-label column as one-element lists and reuse
+    # align_labels' by-code contract (empty label -> all-zero row).
+    singles = table.column(label_col).to_pylist()
+    as_lists = pa.array(
+        [[code] if code is not None else [] for code in singles],
+        pa.list_(pa.string()),
+    )
+    labeled = table.append_column("_single_label_as_list", as_lists)
+    y, scoreable, _unscoreable = align_labels(
+        labeled, class_idx, label_col="_single_label_as_list"
+    )
+
+    logits = np.asarray(
+        table.column("logits").to_pylist(), dtype=np.float64
+    )
+    gathered = gather_scores(logits, class_idx, scoreable).astype(np.float64)
+    if cache_view.logits_are_raw:
+        # Raw uncalibrated logits -> un-thresholded sigmoid probabilities
+        # (the only form allowed to enter a log downstream).
+        gathered = 1.0 / (1.0 + np.exp(-gathered))
+    embeddings = np.asarray(
+        table.column("embedding").to_pylist(), dtype=np.float64
+    )
+    return embeddings, gathered, y, scoreable
