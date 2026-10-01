@@ -37,6 +37,16 @@ Projection and null token live on the WRAPPER; the embeddings hook is
 registered at the start of ``forward`` and removed in a ``finally``. The
 inner model called directly — the twin / repro-gate path — is byte-for-byte
 the checkpoint.
+
+THE CONTEXT TOKEN BYPASSES THE EMBEDDINGS DROPOUT (ledgered, Task 3)
+--------------------------------------------------------------------
+``ASTEmbeddings.forward`` applies its dropout BEFORE this wrapper's
+forward hook fires, so the inserted context token is never dropped out
+while every patch/CLS/distill embedding is. Accepted asymmetry, not an
+oversight: the context token is the conditioning signal itself and
+dropping it would silently turn conditioned steps into null-context
+steps at a rate the twin never experiences. Ledgered as the Task-3
+follow-up obligation should a regularized variant ever be wanted.
 """
 from __future__ import annotations
 
