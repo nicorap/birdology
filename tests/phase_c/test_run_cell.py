@@ -99,18 +99,17 @@ def _write_manifest(path: Path, filepaths: list[str]) -> None:
     )
 
 
-def _write_eval_metadata(path: Path) -> None:
-    pq.write_table(
-        pa.table(
-            {
-                "filepath": pa.array(["e0.wav", "e1.wav"], pa.string()),
-                "ebird_code_multilabel": pa.array(
-                    [["LABEL_0"], ["LABEL_1"]], pa.list_(pa.string())
-                ),
-            }
+def _write_eval_metadata(path: Path, *, with_context: bool = True) -> None:
+    cols: dict = {
+        "filepath": pa.array(["e0.wav", "e1.wav"], pa.string()),
+        "ebird_code_multilabel": pa.array(
+            [["LABEL_0"], ["LABEL_1"]], pa.list_(pa.string())
         ),
-        path,
-    )
+    }
+    if with_context:
+        cols["cell"] = pa.array(["8428309ffffffff", None], pa.string())
+        cols["week"] = pa.array([12, None], pa.int64())
+    pq.write_table(pa.table(cols), path)
 
 
 def _write_audio(root: Path, names: list[str]) -> None:
@@ -124,14 +123,26 @@ def _write_audio(root: Path, names: list[str]) -> None:
         )
 
 
-def _cell_args(tmp_path: Path, arm: str, model: str = "convnext"):
+def _cell_args(
+    tmp_path: Path,
+    arm: str,
+    model: str = "convnext",
+    test_sets: list[str] | None = None,
+    eval_with_context: bool = True,
+    allow_null_context: bool = False,
+    prior_variant: str = "full",
+):
+    test_sets = test_sets or ["HSN"]
     train_files = [f"t{i}.wav" for i in range(4)]
     val_files = ["v0.wav", "v1.wav"]
     audio_root = tmp_path / "audio"
-    _write_audio(audio_root, train_files + val_files)
+    _write_audio(audio_root, train_files + val_files + ["e0.wav", "e1.wav"])
     _write_manifest(tmp_path / "manifest.parquet", train_files)
     _write_manifest(tmp_path / "val.parquet", val_files)
-    _write_eval_metadata(tmp_path / "eval.parquet")
+    for ts in test_sets:
+        _write_eval_metadata(
+            tmp_path / f"eval_{ts}.parquet", with_context=eval_with_context
+        )
     (tmp_path / "bridge.json").write_text(json.dumps({}))
     return SimpleNamespace(
         arm=arm,
@@ -140,19 +151,21 @@ def _cell_args(tmp_path: Path, arm: str, model: str = "convnext"):
         checkpoint_revision="deadbeef",
         resolution=4,
         seed=0,
-        test_set="HSN",
+        test_sets=test_sets,
         manifest=str(tmp_path / "manifest.parquet"),
         val_metadata=str(tmp_path / "val.parquet"),
-        eval_metadata=str(tmp_path / "eval.parquet"),
+        eval_metadata_template=str(tmp_path / "eval_{test_set}.parquet"),
         audio_root=str(audio_root),
         prior=str(tmp_path / "prior.npz"),
         prior_doi="10.5281/zenodo.0000000",
+        prior_variant=prior_variant,
         bridge=str(tmp_path / "bridge.json"),
         context_source="eod2022",
         git_sha="f" * 40,
         ckpt_dir=str(tmp_path / "ckpt"),
         out=str(tmp_path / "out"),
         d_ctx=8,
+        allow_null_context=allow_null_context,
     )
 
 
@@ -246,3 +259,68 @@ def test_run_cell_refuses_ast_until_frontend_is_wired(tmp_path):
     args = _cell_args(tmp_path, arm="twin", model="ast")
     with pytest.raises(NotImplementedError, match="ast_frontend not yet wired"):
         phase_c_run._run_cell(args)
+
+
+# ---------------------------------------------------------------------------
+# I2 (final review): one invocation trains ONCE and evaluates on EVERY
+# requested test set — one row per test set. Retraining per test set
+# would 6x the training budget (~1080 GPU-h vs the spec's ~600).
+# ---------------------------------------------------------------------------
+
+
+def test_two_test_sets_train_once_two_rows(tmp_path, fleet_stubs, monkeypatch):
+    import birdology.phase_c.train as train_mod
+
+    calls = {"train": 0}
+    real_train_arm = train_mod.train_arm
+
+    def counting_train_arm(*a, **k):
+        calls["train"] += 1
+        return real_train_arm(*a, **k)
+
+    monkeypatch.setattr(train_mod, "train_arm", counting_train_arm)
+
+    args = _cell_args(tmp_path, arm="twin", test_sets=["HSN", "SSW"])
+    assert phase_c_run._run_cell(args) == 0
+
+    assert calls["train"] == 1, (
+        f"train_arm ran {calls['train']} times for 2 test sets — the "
+        "cell must train ONCE and loop eval (finding I2)"
+    )
+    files = sorted(Path(args.out).glob("*.parquet"))
+    assert len(files) == 2
+    rows = [pq.read_table(f).to_pylist()[0] for f in files]
+    assert sorted(r["test_set"] for r in rows) == ["HSN", "SSW"]
+    assert all(r["prior_variant"] == "full" for r in rows)
+
+
+# ---------------------------------------------------------------------------
+# C1 wiring: conditioned arms REQUIRE a context-joined eval table;
+# --allow-null-context is the deliberate escape hatch; the twin never
+# requires context.
+# ---------------------------------------------------------------------------
+
+
+def test_conditioned_arm_refuses_all_null_context_eval(
+    tmp_path, fleet_stubs
+):
+    from birdology.phase_c.evaluate import AllNullContextError
+
+    args = _cell_args(tmp_path, arm="film", eval_with_context=False)
+    with pytest.raises(AllNullContextError, match="C1"):
+        phase_c_run._run_cell(args)
+
+
+def test_conditioned_arm_allow_null_context_escape_hatch(
+    tmp_path, fleet_stubs
+):
+    args = _cell_args(
+        tmp_path, arm="film", eval_with_context=False,
+        allow_null_context=True,
+    )
+    assert phase_c_run._run_cell(args) == 0
+
+
+def test_twin_arm_never_requires_context(tmp_path, fleet_stubs):
+    args = _cell_args(tmp_path, arm="twin", eval_with_context=False)
+    assert phase_c_run._run_cell(args) == 0

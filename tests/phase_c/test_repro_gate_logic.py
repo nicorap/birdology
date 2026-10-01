@@ -307,6 +307,7 @@ def _full_provenance() -> dict:
         "git_sha": "abc123",
         "checkpoint_revision": "deadbeefcafe",
         "prior_doi": "10.5281/zenodo.0000000",
+        "prior_variant": "full",
         "manifest_path": "/mnt/weka/ML/phase_a/XCM_r4_manifest.parquet",
         "torch_version": "2.6.0",
         "cuda_version": "12.4",
@@ -339,7 +340,8 @@ def test_row_refused_when_checkpoint_revision_missing():
 @pytest.mark.parametrize(
     "field",
     [
-        "git_sha", "checkpoint_revision", "prior_doi", "manifest_path",
+        "git_sha", "checkpoint_revision", "prior_doi", "prior_variant",
+        "manifest_path",
         "torch_version", "cuda_version", "arm", "model_id",
         "context_source",
     ],
@@ -397,3 +399,142 @@ def test_sbatch_binds_weka_and_guards_the_mountpoint():
     assert "mountpoint -q /mnt/weka" in sbatch
     assert "--nv" in sbatch
     assert "pytorch.sif" in sbatch
+
+
+# ---------------------------------------------------------------------------
+# I1 (final review): the prior-variant axis. The 135 control runs need a
+# PRIOR_VARIANT column; its vocabulary is the ACTUAL npz suffixes
+# build_prior.py writes ({stem}_full / _marginal / _shuffle_space /
+# _shuffle_time — CONTROLS' own keys), not respelled names.
+# ---------------------------------------------------------------------------
+
+
+def test_prior_variant_vocabulary_matches_build_prior_suffixes():
+    from birdology.prior.controls import CONTROLS
+
+    # uniform ≡ twin (spec decision 4) and separable is not a phase_c
+    # control arm; the three scheduled controls + full must be spelled
+    # exactly as the npz files on disk are.
+    assert set(phase_c_run.PRIOR_VARIANTS) == {
+        "full", "marginal", "shuffle_space", "shuffle_time"
+    }
+    assert {"marginal", "shuffle_space", "shuffle_time"} <= set(CONTROLS)
+
+
+def test_row_carries_prior_variant():
+    provenance = _full_provenance()
+    provenance["prior_variant"] = "shuffle_space"
+    row = _row(provenance)
+    assert row["prior_variant"] == "shuffle_space"
+
+
+def test_row_refused_on_unknown_prior_variant():
+    provenance = _full_provenance()
+    provenance["prior_variant"] = "space_shuffled"  # the respelling trap
+    with pytest.raises(ValueError, match="space_shuffled"):
+        _row(provenance)
+
+
+def test_row_refused_when_prior_variant_missing():
+    provenance = _full_provenance()
+    del provenance["prior_variant"]
+    with pytest.raises(ValueError, match="prior_variant"):
+        _row(provenance)
+
+
+def test_sbatch_derives_prior_path_from_variant_column():
+    """I1: the sbatch must read PRIOR_VARIANT from the TSV and use it in
+    the npz path — a hardcoded _full would make the 135 control runs
+    inexpressible."""
+    sbatch = (
+        _REPO / "scripts" / "cluster" / "phase_c_train.sbatch"
+    ).read_text()
+    assert "PRIOR_VARIANT" in sbatch
+    assert "prior_r${RESOLUTION}_${PRIOR_VARIANT}.npz" in sbatch
+    assert "prior_r${RESOLUTION}_full.npz" not in sbatch
+    assert "--prior-variant" in sbatch
+
+
+def test_sbatch_trains_once_and_loops_test_sets():
+    """I2: CKPT_DIR must not embed a test set, and the run must receive
+    the plural --test-sets."""
+    sbatch = (
+        _REPO / "scripts" / "cluster" / "phase_c_train.sbatch"
+    ).read_text()
+    assert "--test-sets" in sbatch
+    assert "${TEST_SET}" not in sbatch.split("CKPT_DIR=")[1].splitlines()[0]
+
+
+def test_sbatch_eval_path_is_context_joined_not_raw_metadata():
+    """C1: the eval path must be the context-joined table, never the raw
+    BirdSet metadata parquet (which has no cell/week columns)."""
+    sbatch = (
+        _REPO / "scripts" / "cluster" / "phase_c_train.sbatch"
+    ).read_text()
+    assert "eval_ctx" in sbatch
+    assert "_metadata_test_5s.parquet" not in sbatch
+
+
+# ---------------------------------------------------------------------------
+# I3 (final review): `score` subcommand — the gate's npz producer. The
+# pin is the FORMAT round-trip: score writes exactly what gate reads.
+# ---------------------------------------------------------------------------
+
+
+def test_score_then_gate_round_trip(tmp_path, monkeypatch):
+    """score writes scores+y npz from a checkpoint + eval parquet; gate
+    parses that exact file. Verdict is irrelevant — format is the pin."""
+    import pyarrow as pa
+    import soundfile as sf
+
+    # tiny saved model
+    model = tiny_convnext()
+    ckpt = tmp_path / "ckpt"
+    model.save_pretrained(ckpt)
+
+    # tiny eval parquet + audio
+    audio_root = tmp_path / "audio"
+    audio_root.mkdir()
+    rng = np.random.default_rng(0)
+    for name in ("e0.wav", "e1.wav"):
+        sf.write(
+            audio_root / name,
+            rng.standard_normal(16000).astype(np.float32) * 0.1,
+            32000,
+        )
+    eval_pq = tmp_path / "eval.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "filepath": pa.array(["e0.wav", "e1.wav"], pa.string()),
+                "ebird_code_multilabel": pa.array(
+                    [["LABEL_0"], ["LABEL_1"]], pa.list_(pa.string())
+                ),
+            }
+        ),
+        eval_pq,
+    )
+
+    npz_path = tmp_path / "scores.npz"
+    rc = phase_c_repro_gate.main(
+        [
+            "score",
+            "--model", "convnext",
+            "--checkpoint", str(ckpt),
+            "--eval-metadata", str(eval_pq),
+            "--audio-root", str(audio_root),
+            "--out", str(npz_path),
+        ]
+    )
+    assert rc == 0
+    assert npz_path.exists()
+
+    data = np.load(npz_path)
+    assert set(data.files) >= {"scores", "y"}
+    assert data["scores"].shape == data["y"].shape
+
+    # gate parses the npz score just wrote; verdict value irrelevant
+    rc = phase_c_repro_gate.main(
+        ["gate", "--pair", f"convnext:HSN:{npz_path}"]
+    )
+    assert rc in (0, 1)

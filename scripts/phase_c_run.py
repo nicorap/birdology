@@ -1,25 +1,39 @@
 #!/usr/bin/env python3
 """Phase C run CLI — one (arm, model, resolution, seed) cell per invocation.
 
-ONE CELL, ONE ROW, TWIN INCLUDED
---------------------------------
+ONE CELL, ONE TRAINING, ONE ROW PER TEST SET (finding I2)
+---------------------------------------------------------
 Each invocation trains ONE cell — a conditioned run (``--arm film`` /
 ``token``) or its twin (``--arm twin``) — on one (model, resolution,
-seed), evaluates on one test set, and writes exactly ONE results row.
+seed), then loads the val-best checkpoint ONCE and loops evaluation
+over every ``--test-sets`` entry, writing one results row per test set
+(the ``test_set`` column distinguishes them). Training is test-set-
+independent (XCM train, POW val), so retraining per test set would
+multiply the training budget ×6 for identical weights (~1080 GPU-h vs
+the spec §4 budget of ~600). The checkpoint dir is accordingly keyed
+(arm, model, resolution, seed) WITHOUT test_set.
+
 The twin is its own invocation on purpose: Slurm resume granularity is
 the cell (the phase_b ruling), and a conditioned run and its twin are
-separate Slurm tasks that pair later by (model, resolution, seed)
-through ``phase_b.sweep.paired_delta``.
+separate Slurm tasks. Pairing: per-seed rows are aggregated at ANALYSIS
+time over the per-seed rows keyed (model, resolution, seed) — a
+``phase_b.sweep.paired_delta`` adapter is a ledgered follow-up; phase_c
+rows do not satisfy its phase_b-shaped contract (seeds tuples,
+cmap_per_seed, phase_b axis names) and claiming otherwise was finding
+I4.
 
 THE ROW REFUSES WITHOUT PROVENANCE (Global Constraints / phase_b contract)
 --------------------------------------------------------------------------
 Every results artifact names its inputs. ``build_row`` REFUSES — naming
 the field — when any of ``git_sha, checkpoint_revision, prior_doi,
-manifest_path, torch_version, cuda_version, arm, model_id,
-context_source`` is missing or blank: a row that cannot name the
-checkpoint revision or prior DOI it came from cannot be reproduced or
-attributed, and silence here is how heterogeneous-stack rows sneak into
-a table (the project's own ledger, spec §5).
+prior_variant, manifest_path, torch_version, cuda_version, arm,
+model_id, context_source`` is missing or blank: a row that cannot name
+the checkpoint revision or prior DOI it came from cannot be reproduced
+or attributed, and silence here is how heterogeneous-stack rows sneak
+into a table (the project's own ledger, spec §5). ``prior_variant``
+(finding I1) is the controls axis — full/marginal/shuffle_space/
+shuffle_time, spelled EXACTLY as build_prior.py's npz suffixes
+(CONTROLS' own keys) — while ``context_source`` stays path provenance.
 
 SCHEMA: write_rows' DISCIPLINE ON PHASE C'S AXES
 ------------------------------------------------
@@ -49,12 +63,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 #: The arm vocabulary — must agree with train._ARMS.
 _ARMS = ("film", "token", "twin")
 
+#: The prior-variant vocabulary (finding I1) — spelled EXACTLY as the
+#: npz suffixes build_prior.py writes ({stem}_{name}.npz from
+#: birdology.prior.controls.CONTROLS' keys, plus the full prior).
+#: `uniform` is deliberately absent: the uniform-prior control collapses
+#: to the twin by construction (spec decision 4); `separable` is not a
+#: scheduled phase_c control arm.
+PRIOR_VARIANTS = ("full", "marginal", "shuffle_space", "shuffle_time")
+
 #: Provenance columns a row REFUSES to exist without. Order is the
 #: schema's column order for these fields.
 REQUIRED_PROVENANCE = (
     "git_sha",
     "checkpoint_revision",
     "prior_doi",
+    "prior_variant",
     "manifest_path",
     "torch_version",
     "cuda_version",
@@ -63,7 +86,7 @@ REQUIRED_PROVENANCE = (
     "context_source",
 )
 
-RESULTS_SCHEMA_VERSION = "1"
+RESULTS_SCHEMA_VERSION = "2"
 _RESULTS_SCHEMA = pa.schema(
     [
         pa.field("arm", pa.string()),
@@ -78,6 +101,7 @@ _RESULTS_SCHEMA = pa.schema(
         pa.field("git_sha", pa.string()),
         pa.field("checkpoint_revision", pa.string()),
         pa.field("prior_doi", pa.string()),
+        pa.field("prior_variant", pa.string()),
         pa.field("manifest_path", pa.string()),
         pa.field("torch_version", pa.string()),
         pa.field("cuda_version", pa.string()),
@@ -121,6 +145,15 @@ def build_row(
             f"unknown arm {arm!r}; expected one of {_ARMS} — an unknown "
             "arm would silently mis-partition the paired twin analysis"
         )
+    variant = provenance["prior_variant"]
+    if variant not in PRIOR_VARIANTS:
+        raise ValueError(
+            f"unknown prior_variant {variant!r}; expected one of "
+            f"{PRIOR_VARIANTS} — the vocabulary is build_prior.py's own "
+            "npz suffixes (CONTROLS' keys), and a respelling would "
+            "silently detach the 135 control rows from the artifacts "
+            "they ran on (finding I1)"
+        )
     return {
         "arm": arm,
         "model_id": provenance["model_id"],
@@ -134,6 +167,7 @@ def build_row(
         "git_sha": provenance["git_sha"],
         "checkpoint_revision": provenance["checkpoint_revision"],
         "prior_doi": provenance["prior_doi"],
+        "prior_variant": variant,
         "manifest_path": provenance["manifest_path"],
         "torch_version": provenance["torch_version"],
         "cuda_version": provenance["cuda_version"],
@@ -205,6 +239,15 @@ def _run_cell(args) -> int:
     }[args.model]
     model = model_cls.from_pretrained(
         args.checkpoint, revision=args.checkpoint_revision
+    )
+    # Resolve the revision REF to the commit SHA when transformers
+    # exposes it (final-review minor): from_pretrained records the
+    # resolved hub commit on config._commit_hash for hub downloads.
+    # Local paths / stub checkpoints carry None there — then the ref is
+    # recorded as given (still non-blank, so the provenance refusal
+    # stays intact).
+    resolved_revision = (
+        getattr(model.config, "_commit_hash", None) or args.checkpoint_revision
     )
     label2id = make_label_map(model.config.id2label)
     class_codes = [
@@ -279,19 +322,13 @@ def _run_cell(args) -> int:
     best_ckpt = torch.load(result.best_state_path, weights_only=True)
     trainee.load_state_dict(best_ckpt["model_state"])
 
-    eval_meta = _pq.read_table(args.eval_metadata)
-    eval_ds = build_eval_dataset(
-        eval_meta, load_audio, provider, class_codes, frontend=convnext_frontend
-    )
-    scores = evaluate_model(trainee, eval_ds, arm=args.arm)
     from birdology.phase_b.metrics import cmap as _cmap
-
-    cmap_value, n_scored = _cmap(scores, eval_ds.y)
 
     provenance = {
         "git_sha": args.git_sha,
-        "checkpoint_revision": args.checkpoint_revision,
+        "checkpoint_revision": resolved_revision,
         "prior_doi": args.prior_doi,
+        "prior_variant": args.prior_variant,
         "manifest_path": str(args.manifest),
         "torch_version": torch.__version__,
         "cuda_version": torch.version.cuda or "",
@@ -299,21 +336,43 @@ def _run_cell(args) -> int:
         "model_id": args.checkpoint,
         "context_source": args.context_source,
     }
-    row = build_row(
-        provenance=provenance,
-        test_set=args.test_set,
-        resolution=args.resolution,
-        seed=args.seed,
-        cmap_value=cmap_value,
-        n_scored=n_scored,
-        val_cmap_history=result.val_cmap_history,
-        epochs_ran=result.epochs_ran,
-    )
-    path = write_run_row(row, args.out)
-    print(
-        f"PHASE_C_RUN {args.arm} {args.model} r{args.resolution} "
-        f"seed={args.seed} {args.test_set} cmap={cmap_value:.3f} -> {path}"
-    )
+
+    # Finding I2: training is test-set-independent, so the cell trains
+    # ONCE (above) and loops EVAL over every requested test set — one
+    # row per test set. Finding C1: conditioned arms demand a
+    # context-joined eval table (require_context) unless
+    # --allow-null-context deliberately waives it; the twin never
+    # consumes context, so it never requires it.
+    require_context = args.arm != "twin" and not args.allow_null_context
+    for test_set in args.test_sets:
+        eval_path = args.eval_metadata_template.format(test_set=test_set)
+        eval_meta = _pq.read_table(eval_path)
+        eval_ds = build_eval_dataset(
+            eval_meta,
+            load_audio,
+            provider,
+            class_codes,
+            frontend=convnext_frontend,
+            require_context=require_context,
+        )
+        scores = evaluate_model(trainee, eval_ds, arm=args.arm)
+        cmap_value, n_scored = _cmap(scores, eval_ds.y)
+
+        row = build_row(
+            provenance=provenance,
+            test_set=test_set,
+            resolution=args.resolution,
+            seed=args.seed,
+            cmap_value=cmap_value,
+            n_scored=n_scored,
+            val_cmap_history=result.val_cmap_history,
+            epochs_ran=result.epochs_ran,
+        )
+        path = write_run_row(row, args.out)
+        print(
+            f"PHASE_C_RUN {args.arm} {args.model} r{args.resolution} "
+            f"seed={args.seed} {test_set} cmap={cmap_value:.3f} -> {path}"
+        )
     return 0
 
 
@@ -329,20 +388,54 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--checkpoint-revision", required=True)
     parser.add_argument("--resolution", type=int, required=True)
     parser.add_argument("--seed", type=int, required=True)
-    parser.add_argument("--test-set", required=True)
+    parser.add_argument(
+        "--test-sets",
+        required=True,
+        action="append",
+        help="Test sets to evaluate on after the ONE training (finding "
+        "I2): comma-separated and/or repeated. One results row per "
+        "test set.",
+    )
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--val-metadata", required=True)
-    parser.add_argument("--eval-metadata", required=True)
+    parser.add_argument(
+        "--eval-metadata-template",
+        required=True,
+        help="Per-test-set eval table path template containing "
+        "'{test_set}', e.g. "
+        "/mnt/weka/ML/phase_c/eval_ctx/{test_set}_eval_ctx.parquet — "
+        "the CONTEXT-JOINED tables from phase_c_build_eval_ctx.py "
+        "(finding C1), never the raw BirdSet metadata parquets.",
+    )
     parser.add_argument("--audio-root", required=True)
     parser.add_argument("--prior", required=True)
     parser.add_argument("--prior-doi", required=True)
+    parser.add_argument(
+        "--prior-variant",
+        choices=PRIOR_VARIANTS,
+        required=True,
+        help="Which prior artifact this run conditions on (finding I1) "
+        "— recorded as the prior_variant results column; the controls "
+        "axis of the 135 control runs.",
+    )
     parser.add_argument("--bridge", required=True)
     parser.add_argument("--context-source", required=True)
     parser.add_argument("--git-sha", required=True)
     parser.add_argument("--ckpt-dir", required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--d-ctx", type=int, default=256)
+    parser.add_argument(
+        "--allow-null-context",
+        action="store_true",
+        help="Waive the C1 all-null-context refusal for conditioned "
+        "arms — POW-val style tables and DELIBERATE no-context "
+        "ablations only.",
+    )
     args = parser.parse_args(argv)
+    # --test-sets accepts comma-separated and/or repeated flags.
+    args.test_sets = [
+        ts for chunk in args.test_sets for ts in chunk.split(",") if ts
+    ]
 
     try:
         return _run_cell(args)
