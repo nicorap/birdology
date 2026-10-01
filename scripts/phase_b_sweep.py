@@ -90,7 +90,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="prior .npz path template; may contain {resolution}",
     )
     parser.add_argument(
-        "--labels", required=True, help="one-eBird-code-per-line label file"
+        "--labels",
+        required=True,
+        help=(
+            "one-eBird-code-per-line label file template; may contain "
+            "{encoder}. Perch and BirdNET have DIFFERENT class lists "
+            "(14795 vs 6522) — a single file across encoders would gather "
+            "wrong columns for one of them."
+        ),
     )
     parser.add_argument(
         "--bridge",
@@ -146,7 +153,13 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     out_dir = Path(args.out)
 
-    class_idx = class_index(Path(args.labels))
+    _class_idx_cache: dict[str, dict[str, int]] = {}
+
+    def _class_idx(encoder: str) -> dict[str, int]:
+        path = args.labels.format(encoder=encoder)
+        if path not in _class_idx_cache:
+            _class_idx_cache[path] = class_index(Path(path))
+        return _class_idx_cache[path]
     code_to_gbif = {
         code: int(key)
         for code, key in json.loads(
@@ -224,7 +237,7 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 eval_metadata=_eval_metadata(cell.test_set),
                 prior=prior,
-                class_idx=class_idx,
+                class_idx=_class_idx(cell.encoder),
                 code_to_gbif=code_to_gbif,
                 provenance=Provenance(
                     git_sha=git_sha,
