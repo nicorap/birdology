@@ -249,15 +249,20 @@ class TestAstFrontend:
         (Spectrogram→MelScale→PowerToDB→Resizer(1024, pad -80 dB)→
         (x-(-4.268))/(-4.569)→transpose), captured offline by running
         BirdSet's own Resizer/PowerToDB sources on these exact waves
-        (make_ast_goldens.py). Bit-exact equality is asserted: both
-        sides run the same torchaudio ops in the same order on the same
-        float32 inputs."""
+        (make_ast_goldens.py). Bit-exact on the platform that generated
+        the goldens (arm64 Mac); across platforms the FFT backend differs.
+        Measured on the x86 fleet (dgx160, torch 2.13+cu129): noise_1s max
+        abs diff 6.7e-6 on values of order 1; chirp_2s max abs 2.7e-4 on
+        values of order 7, max relative 3.8e-5 (23 of 131,072 elements).
+        The gate is rtol=1e-4 + atol=1e-4: ~2.6x the worst measured
+        relative spread, and orders of magnitude below anything that
+        could move a logit."""
         goldens = np.load(_GOLDENS_PATH)
         waves = __import__(
             "tests.phase_c.make_ast_goldens", fromlist=["golden_waves"]
         ).golden_waves()
         out = ast_frontend(torch.from_numpy(waves[name]))
-        np.testing.assert_array_equal(out.numpy(), goldens[name])
+        np.testing.assert_allclose(out.numpy(), goldens[name], rtol=1e-4, atol=1e-4)
 
 
 class TestPowerToDB:

@@ -783,12 +783,24 @@ def forkserver_workers():
     spawn, each worker is a fresh interpreter that re-imports and
     unpickles the dataset (no inherited parent memory) — and it is
     Python 3.14's Linux default, i.e. the fleet's shape.
+
+    Main-process torch threads are pinned to 1 here, because DataLoader
+    workers run torch single-threaded: the num_workers=0 side must match
+    for the comparison to test value-neutrality rather than float
+    reduction order. Measured on dgx160 (224 cores, torch 2.13+cu129):
+    these tests failed with 16 main-process threads and passed with 1.
+    The twin invariant is unaffected (conditioned and twin cells use the
+    same --num-workers), but a num_workers=0 cell is not bit-comparable
+    to a cell run with workers on a many-core node.
     """
     import multiprocessing
 
     prev = multiprocessing.get_start_method(allow_none=True)
+    prev_threads = torch.get_num_threads()
     multiprocessing.set_start_method("forkserver", force=True)
+    torch.set_num_threads(1)
     yield
+    torch.set_num_threads(prev_threads)
     multiprocessing.set_start_method(prev, force=True)
 
 def _fixture_crop_dataset(seed: int = 0):
