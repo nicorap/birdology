@@ -51,6 +51,7 @@ sys.path.insert(0, str(_REPO / "src"))
 sys.path.insert(0, str(_REPO / "scripts"))
 
 import phase_c_run
+from birdology.phase_c.train import _validate as _REAL_VALIDATE
 
 N_CLASSES = 5
 #: tiny_convnext's default id2label values — the model's class axis.
@@ -112,6 +113,54 @@ def _write_eval_metadata(path: Path, *, with_context: bool = True) -> None:
     pq.write_table(pa.table(cols), path)
 
 
+#: The tiny POW-val soundscape: multi-label, an empty window, null
+#: context throughout — phase_c_build_eval_ctx.py --allow-undated's
+#: output shape (filepath, ebird_code_multilabel, cell, week).
+VAL_FILES = ["v0.wav", "v1.wav", "v2.wav"]
+VAL_LABELS = [["LABEL_0", "LABEL_2"], [], ["LABEL_1"]]
+
+
+def _write_val_soundscape(
+    path: Path, labels: list[list[str]] | None = None
+) -> None:
+    labels = VAL_LABELS if labels is None else labels
+    n = len(labels)
+    pq.write_table(
+        pa.table(
+            {
+                "filepath": pa.array(VAL_FILES[:n], pa.string()),
+                "ebird_code_multilabel": pa.array(
+                    labels, pa.list_(pa.string())
+                ),
+                "cell": pa.array([None] * n, pa.string()),
+                "week": pa.array([None] * n, pa.int8()),
+            }
+        ),
+        path,
+    )
+
+
+def _write_pow_manifest_shape(path: Path, filepaths: list[str]) -> None:
+    """The MEASURED /faic/weka/ML/phase_a/POW_r4_manifest.parquet shape
+    that killed fleet job 5679: every ebird_code == '' and cell/week
+    None (POW is a soundscape set; the focal manifest has no label)."""
+    n = len(filepaths)
+    pq.write_table(
+        pa.table(
+            {
+                "filepath": pa.array(filepaths, pa.string()),
+                "cell": pa.array([None] * n, pa.string()),
+                "week": pa.array([None] * n, pa.int64()),
+                "ebird_code": pa.array([""] * n, pa.string()),
+                "split": pa.array(["test_5s"] * n, pa.string()),
+                "lat": pa.array([None] * n, pa.float64()),
+                "lon": pa.array([None] * n, pa.float64()),
+            }
+        ),
+        path,
+    )
+
+
 def _write_audio(root: Path, names: list[str]) -> None:
     root.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(0)
@@ -134,11 +183,10 @@ def _cell_args(
 ):
     test_sets = test_sets or ["HSN"]
     train_files = [f"t{i}.wav" for i in range(4)]
-    val_files = ["v0.wav", "v1.wav"]
     audio_root = tmp_path / "audio"
-    _write_audio(audio_root, train_files + val_files + ["e0.wav", "e1.wav"])
+    _write_audio(audio_root, train_files + VAL_FILES + ["e0.wav", "e1.wav"])
     _write_manifest(tmp_path / "manifest.parquet", train_files)
-    _write_manifest(tmp_path / "val.parquet", val_files)
+    _write_val_soundscape(tmp_path / "val.parquet")
     for ts in test_sets:
         _write_eval_metadata(
             tmp_path / f"eval_{ts}.parquet", with_context=eval_with_context
@@ -469,3 +517,177 @@ def test_provenance_cuda_version_passes_through_when_present(monkeypatch):
         context_source="p.npz", arm="film",
     )
     assert pcr._stack_provenance(args, "deadbeef")["cuda_version"] == "12.8"
+
+
+# ---------------------------------------------------------------------------
+# Fleet job 5679 (all 10 twin cells): `ValMetricError: val set is empty`.
+# POW is a multi-label SOUNDSCAPE set; the val set was built as the focal
+# single-label CropDataset from POW_r4_manifest.parquet, whose every row
+# has ebird_code == '' — so CropDataset dropped all 4,560 rows. Spec §2:
+# POW-val goes through the soundscape path (build_eval_dataset over an
+# ebird_code_multilabel table, null context) and is scored multi-hot.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def capture_train_arm(monkeypatch):
+    """Spy on train_arm's val_ds (real training underneath)."""
+    import birdology.phase_c.train as train_mod
+
+    seen: dict = {}
+    real = train_mod.train_arm
+
+    def spy(trainee, train_ds, val_ds, cfg, ckpt_dir):
+        seen["val_ds"] = val_ds
+        seen["train_ds"] = train_ds
+        return real(trainee, train_ds, val_ds, cfg, ckpt_dir)
+
+    monkeypatch.setattr(train_mod, "train_arm", spy)
+    return seen
+
+
+def test_old_crop_dataset_path_drops_every_pow_manifest_row(tmp_path):
+    """The bug, reproduced: the POW manifest shape fed to CropDataset
+    (the OLD val wiring) yields an EMPTY val set — every row's
+    ebird_code is '' and '' is on no model axis."""
+    from birdology.phase_c.data import CropDataset
+
+    path = tmp_path / "POW_r4_manifest.parquet"
+    _write_pow_manifest_shape(path, VAL_FILES)
+    ds = CropDataset(
+        pq.read_table(path),
+        lambda f: np.zeros(SR, dtype=np.float32),
+        FakeProvider(N_CLASSES),
+        {code: i for i, code in enumerate(CLASS_CODES)},
+    )
+    assert len(ds) == 0
+    assert ds.skipped_codes == {"": len(VAL_FILES)}
+
+
+def test_val_is_the_multilabel_soundscape_eval_dataset(
+    tmp_path, fleet_stubs, capture_train_arm
+):
+    """The NEW path: --val-metadata (a soundscape table) becomes an
+    EvalDataset with every row kept and multi-hot y on the model axis
+    — incl. the empty window's all-zero row."""
+    from birdology.phase_c.evaluate import EvalDataset
+
+    args = _cell_args(tmp_path, arm="twin")
+    assert phase_c_run._run_cell(args) == 0
+
+    val_ds = capture_train_arm["val_ds"]
+    assert isinstance(val_ds, EvalDataset)
+    assert len(val_ds) == len(VAL_FILES)
+    assert val_ds.y.tolist() == [
+        [1, 0, 1, 0, 0],
+        [0, 0, 0, 0, 0],
+        [0, 1, 0, 0, 0],
+    ]
+    # null context is SPEC'D for POW: the twin never requires it, and
+    # neither may the conditioned arms' val.
+
+
+def test_conditioned_arm_val_accepts_all_null_context(
+    tmp_path, fleet_stubs, capture_train_arm
+):
+    """POW is all-undated (spec §1/§2): even a conditioned arm that
+    REQUIRES context at eval must run POW-val on the null path."""
+    args = _cell_args(tmp_path, arm="film")  # eval table has context
+    assert phase_c_run._run_cell(args) == 0
+    assert len(capture_train_arm["val_ds"]) == len(VAL_FILES)
+
+
+def test_pow_manifest_as_val_metadata_refuses_by_name(tmp_path, fleet_stubs):
+    """Pointing --val-metadata at the focal POW manifest (no
+    ebird_code_multilabel) refuses by name, before training, pointing at
+    the builder — never a bare KeyError, never an empty val set."""
+    args = _cell_args(tmp_path, arm="twin")
+    _write_pow_manifest_shape(Path(args.val_metadata), VAL_FILES)
+    with pytest.raises(ValueError, match="ebird_code_multilabel") as exc:
+        phase_c_run._run_cell(args)
+    assert "phase_c_build_eval_ctx" in str(exc.value)
+    assert args.val_metadata in str(exc.value)
+    assert not (Path(args.ckpt_dir) / "best.pt").exists()
+
+
+def test_val_table_with_no_positive_on_axis_refuses_naming_file(
+    tmp_path, fleet_stubs
+):
+    """A val set with no positive on the model axis cannot rank: refuse
+    with ValMetricError naming the file (labels off-axis count as none)."""
+    from birdology.phase_c.train import ValMetricError
+
+    args = _cell_args(tmp_path, arm="twin")
+    _write_val_soundscape(
+        Path(args.val_metadata), [[], ["NOT_ON_AXIS"], []]
+    )
+    with pytest.raises(ValMetricError, match="positive") as exc:
+        phase_c_run._run_cell(args)
+    assert args.val_metadata in str(exc.value)
+    assert not (Path(args.ckpt_dir) / "best.pt").exists()
+
+
+def test_empty_val_table_refuses_naming_file(tmp_path, fleet_stubs):
+    from birdology.phase_c.train import ValMetricError
+
+    args = _cell_args(tmp_path, arm="twin")
+    _write_val_soundscape(Path(args.val_metadata), [])
+    with pytest.raises(ValMetricError, match="empty") as exc:
+        phase_c_run._run_cell(args)
+    assert args.val_metadata in str(exc.value)
+
+
+def test_ast_frontend_reaches_val_and_eval_datasets(
+    tmp_path, fleet_stubs, capture_train_arm, monkeypatch
+):
+    """model=ast: a SPY wrapping ast_frontend is the frontend of the val
+    dataset AND of the eval dataset, and is actually invoked on val
+    audio during real validation."""
+    import birdology.phase_c.data as data_mod
+    import birdology.phase_c.train as train_mod
+    from transformers import ASTForAudioClassification
+
+    calls = {"n": 0}
+    real_ast_frontend = data_mod.ast_frontend
+
+    def spy_frontend(wave):
+        calls["n"] += 1
+        return real_ast_frontend(wave)
+
+    monkeypatch.setattr(data_mod, "ast_frontend", spy_frontend)
+    monkeypatch.setattr(
+        ASTForAudioClassification,
+        "from_pretrained",
+        classmethod(lambda cls, *a, **k: tiny_ast()),
+    )
+    monkeypatch.setattr(train_mod, "_validate", _REAL_VALIDATE)
+
+    args = _cell_args(tmp_path, arm="twin", model="ast")
+    assert phase_c_run._run_cell(args) == 0
+
+    assert capture_train_arm["val_ds"].frontend is spy_frontend
+    assert capture_train_arm["train_ds"].frontend is spy_frontend
+    assert fleet_stubs["eval_ds"].frontend is spy_frontend
+    # train (4 rows x epochs) + val (3 rows x epochs): the spy ran.
+    assert calls["n"] >= len(VAL_FILES)
+
+
+def test_twin_end_to_end_with_real_multilabel_validation(
+    tmp_path, fleet_stubs, monkeypatch
+):
+    """The job-5679 cell shape, end to end: twin, soundscape POW-val
+    scored by the REAL _validate (multi-hot cmAP), rows written with a
+    finite val history."""
+    import birdology.phase_c.train as train_mod
+
+    monkeypatch.setattr(train_mod, "_validate", _REAL_VALIDATE)
+    args = _cell_args(tmp_path, arm="twin", test_sets=["HSN", "SSW"])
+    assert phase_c_run._run_cell(args) == 0
+
+    files = sorted(Path(args.out).glob("*.parquet"))
+    assert len(files) == 2
+    for f in files:
+        row = pq.read_table(f).to_pylist()[0]
+        hist = row["val_cmap_history"]
+        assert 1 <= len(hist) <= 2
+        assert all(np.isfinite(v) and 0.0 < v <= 1.0 for v in hist)

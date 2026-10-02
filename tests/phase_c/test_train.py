@@ -175,6 +175,11 @@ class SyntheticDataset(torch.utils.data.Dataset):
             ),
             "present": float(idx % 2),
             "label": idx % N_CLASSES,
+            # The VAL contract is multi-hot (EvalDataset's ``labels``);
+            # this dataset doubles as val, so it carries both shapes.
+            "labels": torch.nn.functional.one_hot(
+                torch.tensor(idx % N_CLASSES), N_CLASSES
+            ),
         }
 
 
@@ -440,6 +445,80 @@ class TestLoudVal:
                 _cfg(arm="twin"),
                 tmp_path,
             )
+
+
+# ---------------------------------------------------------------------------
+# POW-val is a MULTI-LABEL soundscape set (fleet job 5679): _validate
+# scores multi-hot ground truth from the val item's "labels" row — zero
+# or more species per 5 s window, all-zero rows legitimate.
+# ---------------------------------------------------------------------------
+
+
+class _MultiHotValDataset(torch.utils.data.Dataset):
+    """EvalDataset's item contract: inputs/context/present + a multi-hot
+    ``labels`` row on the model axis (NO single-int ``label``)."""
+
+    def __init__(self, y: np.ndarray, seed: int = 4) -> None:
+        self.y = y
+        self.seed = seed
+
+    def __len__(self) -> int:
+        return self.y.shape[0]
+
+    def __getitem__(self, idx: int) -> dict:
+        rng = np.random.default_rng((self.seed, idx))
+        return {
+            "inputs": torch.from_numpy(
+                rng.standard_normal(CONVNEXT_SHAPE).astype(np.float32)
+            ),
+            "context": torch.zeros(N_CLASSES),
+            "present": 0.0,
+            "labels": torch.from_numpy(self.y[idx]),
+        }
+
+
+class TestMultiHotValidate:
+    def test_validate_scores_multi_hot_with_all_zero_row_sklearn_exact(self):
+        """Multi-label windows (2 species), a single-species window and an
+        EMPTY window (all-zero row): _validate's cmAP equals sklearn's
+        per-class AP mean over the hand-built matrix (classes with no
+        positive excluded — cmap's n_scored rule)."""
+        from sklearn.metrics import average_precision_score
+        from torch.utils.data import DataLoader
+
+        from birdology.phase_c.train import _validate
+
+        y = np.array(
+            [
+                [1, 1, 0, 0, 0],  # two species in one window
+                [0, 0, 0, 0, 0],  # empty soundscape window
+                [0, 1, 0, 1, 0],
+                [1, 0, 0, 0, 0],
+                [0, 0, 0, 0, 0],  # another empty window
+                [0, 1, 0, 1, 0],
+            ],
+            dtype=np.int64,
+        )
+        ds = _MultiHotValDataset(y)
+        model = bare_convnext(seed=2)
+        cfg = _cfg(arm="twin", batch_size=4)  # 2 batches: concat path
+
+        got = _validate(
+            model, DataLoader(ds, batch_size=4), cfg, torch.device("cpu")
+        )
+
+        model.eval()
+        with torch.no_grad():
+            scores = model(
+                torch.stack([ds[i]["inputs"] for i in range(len(ds))])
+            ).logits.numpy()
+        aps = [
+            average_precision_score(y[:, j], scores[:, j])
+            for j in range(N_CLASSES)
+            if y[:, j].any()
+        ]
+        assert len(aps) == 3
+        assert got == pytest.approx(float(np.mean(aps)), abs=1e-12)
 
 
 # ---------------------------------------------------------------------------

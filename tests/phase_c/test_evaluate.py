@@ -404,3 +404,31 @@ def test_require_context_defaults_False_for_POW_shape():
         CLASS_CODES, frontend=tiny_frontend,
     )
     assert len(ds) == 1
+
+
+# ---------------------------------------------------------------------------
+# POW-val reuses EvalDataset (fleet job 5679): each item carries its
+# multi-hot ``labels`` row on the model axis so train._validate can score
+# multi-label soundscape windows — all-zero rows for empty windows.
+# ---------------------------------------------------------------------------
+
+
+def test_item_carries_multi_hot_labels_row_on_model_axis():
+    meta = make_metadata(
+        ["a.ogg", "b.ogg", "c.ogg"],
+        [["blujay", "easblu"], [], ["amecro"]],
+    )
+    ds = build_eval_dataset(
+        meta,
+        audio_lookup({f: sine_audio() for f in ["a.ogg", "b.ogg", "c.ogg"]}),
+        FakeProvider(),
+        CLASS_CODES,
+        frontend=tiny_frontend,
+    )
+    rows = [ds[i]["labels"] for i in range(3)]
+    for i, row in enumerate(rows):
+        assert isinstance(row, torch.Tensor)
+        assert torch.equal(row, torch.from_numpy(ds.y[i]))
+    assert rows[0].tolist() == [0, 1, 0, 0, 1]
+    assert rows[1].tolist() == [0, 0, 0, 0, 0]  # empty window: all-zero
+    assert rows[2].tolist() == [1, 0, 0, 0, 0]

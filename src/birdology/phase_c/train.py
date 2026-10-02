@@ -166,8 +166,8 @@ def _epoch_seed(seed: int, epoch: int) -> int:
     return seed * 1_000_003 + epoch
 
 
-def _unpack(batch: dict, device: torch.device):
-    """Batch dict → (inputs, context, present (B,1), labels), float32.
+def _unpack_inputs(batch: dict, device: torch.device):
+    """Batch dict → (inputs, context, present (B,1)), float32.
 
     Default collate widens ``present`` (a per-item python float) to a
     float64 tensor; the wrappers' gate arithmetic is float32, so the
@@ -178,6 +178,14 @@ def _unpack(batch: dict, device: torch.device):
     present = (
         batch["present"].to(device=device, dtype=torch.float32).unsqueeze(1)
     )
+    return inputs, context, present
+
+
+def _unpack(batch: dict, device: torch.device):
+    """TRAIN batch → (inputs, context, present (B,1), labels): the focal
+    single-int ``label`` (CropDataset's contract). Val batches are
+    multi-hot and go through :func:`_unpack_inputs` + ``labels``."""
+    inputs, context, present = _unpack_inputs(batch, device)
     labels = batch["label"].to(device=device)
     return inputs, context, present, labels
 
@@ -201,6 +209,14 @@ def _validate(
 ) -> float:
     """POW-val cmAP over the whole val set — finite or ValMetricError.
 
+    POW is a MULTI-LABEL soundscape set (spec §2): each val item carries
+    ``labels``, a multi-hot row on the model's class axis (EvalDataset's
+    item contract) — zero or more species per 5 s window. All-zero rows
+    are legitimate empty windows: they rank as negatives in every class,
+    and classes with no positive are excluded by cmap's n_scored rule.
+    (The original one-hot-from-``label`` path was the focal-train
+    contract and silently mis-scored soundscapes — fleet job 5679.)
+
     Scores are raw logits (cmAP is rank-based; sigmoid is monotone and
     changes nothing). Non-finite logits abort here too: a diverged model
     must kill the run, not feed garbage ranks to early stopping.
@@ -210,10 +226,10 @@ def _validate(
     all_labels: list[np.ndarray] = []
     with torch.no_grad():
         for batch in val_loader:
-            inputs, context, present, labels = _unpack(batch, device)
+            inputs, context, present = _unpack_inputs(batch, device)
             logits = _forward(model, cfg.arm, inputs, context, present)
             all_logits.append(logits.cpu().numpy())
-            all_labels.append(labels.cpu().numpy())
+            all_labels.append(batch["labels"].cpu().numpy())
     model.train()
 
     scores = np.concatenate(all_logits)
@@ -222,9 +238,12 @@ def _validate(
             "validation logits contain non-finite values — the model has "
             "diverged; aborting instead of ranking garbage"
         )
-    labels = np.concatenate(all_labels)
-    y = np.zeros_like(scores, dtype=np.int64)
-    y[np.arange(labels.size), labels] = 1
+    y = np.concatenate(all_labels).astype(np.int64)
+    if y.shape != scores.shape:
+        raise ValMetricError(
+            f"val multi-hot labels {y.shape} do not match logits "
+            f"{scores.shape} — the val set is not on the model's class axis"
+        )
 
     value, n_scored = cmap(scores, y)
     if n_scored == 0 or not np.isfinite(value):

@@ -26,6 +26,22 @@ the eval population between the conditioned run and its twin.
         --resolution 4 \
         --out /faic/weka/ML/phase_c/eval_ctx/HSN_eval_ctx.parquet
 
+ALL-NULL TABLES REFUSE UNLESS --allow-undated
+---------------------------------------------
+Some null rows are the measured degradation path; an ALL-null table
+means the context join never happened for this set — for the six test
+sets that silently voids C1, so it REFUSES by default. POW is the one
+spec'd exception (spec §1/§2: all undated, validation only, the
+null-context path), and its table is emitted only under the explicit
+``--allow-undated`` flag. It is the table ``phase_c_run.py
+--val-metadata`` consumes (fleet job 5679: the focal POW manifest has
+``ebird_code == ''`` on every row and emptied the val set):
+
+    python scripts/phase_c_build_eval_ctx.py \
+        --metadata /faic/weka/ML/birdset/POW/POW/POW_metadata_test_5s.parquet \
+        --resolution 4 --allow-undated \
+        --out /faic/weka/ML/phase_c/eval_ctx/POW_r4_eval_ctx.parquet
+
 Column names are configurable (``--filepath-col`` etc.) because the
 BirdSet parquets are not perfectly uniform; the OUTPUT shape is fixed:
 filepath, ebird_code_multilabel, cell, week — exactly what
@@ -62,6 +78,7 @@ def build_eval_ctx(
     labels_col: str = "ebird_code_multilabel",
     lat_col: str = "lat",
     lon_col: str = "long",
+    allow_undated: bool = False,
 ) -> pa.Table:
     """The context-joined eval table for one test-set metadata table.
 
@@ -70,6 +87,10 @@ def build_eval_ctx(
     manifest row and an eval row for the same file land in the same
     (cell, week) by construction. Undatable/unlocated rows are kept
     with null cell/week.
+
+    An ALL-null result (every row undatable or unlocated) raises
+    ``ValueError`` unless *allow_undated* — the POW-val exception (see
+    module docstring); a partially-null table is always fine.
     """
     filepaths = metadata.column(filepath_col).to_pylist()
     labels = metadata.column(labels_col).to_pylist()
@@ -111,6 +132,15 @@ def build_eval_ctx(
         }
     )
     n = table.num_rows
+    if n and n_null == n and not allow_undated:
+        raise ValueError(
+            f"all {n} rows have null (cell, week) — no row could be dated "
+            "and located, so this table carries NO context and a "
+            "conditioned eval on it would measure noise (finding C1). "
+            "Refusing; pass --allow-undated (allow_undated=True) ONLY for "
+            "a spec'd all-undated set — POW-val — never for the six test "
+            "sets"
+        )
     log.info(
         "eval_ctx: %d rows, %d null-context (%.1f%%) at r%d",
         n, n_null, 100 * (n_null / n if n else 0.0), resolution,
@@ -120,6 +150,7 @@ def build_eval_ctx(
             "input_rows": str(n),
             "null_context_rows": str(n_null),
             "resolution": str(resolution),
+            "allow_undated": "true" if allow_undated else "false",
         }
     )
 
@@ -135,6 +166,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--labels-col", default="ebird_code_multilabel")
     parser.add_argument("--lat-col", default="lat")
     parser.add_argument("--lon-col", default="long")
+    parser.add_argument(
+        "--allow-undated",
+        action="store_true",
+        help="Emit the table even when EVERY row has null cell/week. "
+        "POW-val only (spec: all undated, null-context path); the six "
+        "test sets must refuse (finding C1).",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO)
@@ -146,6 +184,7 @@ def main(argv: list[str] | None = None) -> int:
         labels_col=args.labels_col,
         lat_col=args.lat_col,
         lon_col=args.lon_col,
+        allow_undated=args.allow_undated,
     )
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

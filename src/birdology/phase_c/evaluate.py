@@ -78,7 +78,8 @@ class AllNullContextError(ValueError):
 
 @dataclass
 class EvalDataset(torch.utils.data.Dataset):
-    """Test-set segments: ``{inputs, context, present}`` per item, plus
+    """Test-set segments: ``{inputs, context, present, labels}`` per item
+    (``labels`` = the row of ``y``, multi-hot on the model axis), plus
     the aligned label matrix ``y`` (n_rows, n_classes) and the counted
     ``unscoreable`` codes. Built by :func:`build_eval_dataset`.
     """
@@ -116,6 +117,11 @@ class EvalDataset(torch.utils.data.Dataset):
             "inputs": inputs,
             "context": torch.from_numpy(np.asarray(vector)),
             "present": float(present),
+            # The row's multi-hot ground truth on the model axis — what
+            # train._validate scores when this dataset serves as POW-val
+            # (all-zero for an empty soundscape window). evaluate_model
+            # ignores it; scoring there goes through ``self.y``.
+            "labels": torch.from_numpy(self.y[idx]),
         }
 
 

@@ -220,6 +220,75 @@ def write_run_row(row: dict, out_dir: str | Path) -> Path:
     return path
 
 
+def _build_val_dataset(
+    val_path, load_audio, provider, class_codes, frontend
+):
+    """POW-val as the MULTI-LABEL SOUNDSCAPE set the spec names (§2).
+
+    POW is a soundscape test set: each 5 s window carries zero or more
+    species (``ebird_code_multilabel``) and no date (all null-context,
+    spec §1). It goes through the SAME path as eval —
+    ``build_eval_dataset`` with ``require_context=False`` (null context
+    is spec'd for POW, for every arm) and the model's own frontend — and
+    ``train._validate`` scores the items' multi-hot ``labels``.
+
+    Fleet job 5679: the val set was built as the focal single-label
+    ``CropDataset`` from POW_r4_manifest.parquet, whose every row has
+    ``ebird_code == ''``; all 4,560 rows were dropped and every cell
+    died on "val set is empty". The table now comes from
+    ``phase_c_build_eval_ctx.py --allow-undated``.
+
+    Refusals, each naming *val_path*, all before any training spend:
+    no ``ebird_code_multilabel`` column (the focal manifest was passed),
+    zero rows, or zero rows with a positive ON the model axis — a val
+    set with no positives cannot rank, so early stopping would be blind.
+    """
+    import pyarrow.parquet as _pq
+
+    from birdology.phase_c.evaluate import build_eval_dataset
+    from birdology.phase_c.train import ValMetricError
+
+    val_meta = _pq.read_table(val_path)
+    if "ebird_code_multilabel" not in val_meta.column_names:
+        raise ValueError(
+            f"--val-metadata {val_path} has no 'ebird_code_multilabel' "
+            f"column (columns: {val_meta.column_names}) — POW-val is the "
+            "multi-label soundscape table built by "
+            "scripts/phase_c_build_eval_ctx.py --allow-undated, not the "
+            "focal phase_a manifest (whose POW rows all carry "
+            "ebird_code == '' — fleet job 5679)"
+        )
+    val_ds = build_eval_dataset(
+        val_meta,
+        load_audio,
+        provider,
+        class_codes,
+        frontend=frontend,
+        require_context=False,
+    )
+    if len(val_ds) == 0:
+        raise ValMetricError(
+            f"val set is empty: {val_path} has zero rows — cmAP over zero "
+            "rows is undefined and early stopping would be blind"
+        )
+    n_positive_rows = int(val_ds.y.any(axis=1).sum())
+    if n_positive_rows == 0:
+        raise ValMetricError(
+            f"val set {val_path} has {len(val_ds)} rows but ZERO with a "
+            "positive label on the model's class axis (unscoreable codes: "
+            f"{val_ds.unscoreable[:10]}) — a val set with no positives "
+            "cannot rank; early stopping would be blind"
+        )
+    if val_ds.unscoreable:
+        print(
+            f"PHASE_C_VAL {val_path}: {len(val_ds)} rows, "
+            f"{n_positive_rows} with a positive; codes off the model axis "
+            f"(unscored): {val_ds.unscoreable}",
+            file=sys.stderr,
+        )
+    return val_ds
+
+
 def _run_cell(args) -> int:
     """Fleet side: wire CropDataset + wrapper + train_arm + evaluate_model
     for one cell, then write the one row. Imports live here so the module
@@ -332,10 +401,8 @@ def _run_cell(args) -> int:
         manifest, load_audio, provider, label2id, seed=args.seed,
         frontend=frontend,
     )
-    val_meta = _pq.read_table(args.val_metadata)
-    val_ds = CropDataset(
-        val_meta, load_audio, provider, label2id, seed=args.seed,
-        frontend=frontend,
+    val_ds = _build_val_dataset(
+        args.val_metadata, load_audio, provider, class_codes, frontend
     )
 
     if args.arm == "twin":
@@ -430,7 +497,17 @@ def main(argv: list[str] | None = None) -> int:
         "test set.",
     )
     parser.add_argument("--manifest", required=True)
-    parser.add_argument("--val-metadata", required=True)
+    parser.add_argument(
+        "--val-metadata",
+        required=True,
+        help="POW-val table: the MULTI-LABEL soundscape table "
+        "(filepath, ebird_code_multilabel, cell, week) from "
+        "`phase_c_build_eval_ctx.py --allow-undated`, e.g. "
+        "/faic/weka/ML/phase_c/eval_ctx/POW_r4_eval_ctx.parquet — "
+        "scored as multi-hot cmAP on the null-context path (spec §2). "
+        "NOT the focal phase_a POW manifest (ebird_code == '' on every "
+        "row; refused by name).",
+    )
     parser.add_argument(
         "--eval-metadata-template",
         required=True,
