@@ -311,6 +311,10 @@ def _full_provenance() -> dict:
         "manifest_path": "/faic/weka/ML/phase_a/XCM_r4_manifest.parquet",
         "torch_version": "2.6.0",
         "cuda_version": "12.4",
+        # Schema v3 (job 5730): the device the run actually used —
+        # cuda_version above is only the torch build's CUDA.
+        "device": "cuda:0",
+        "device_name": "NVIDIA H100 80GB HBM3",
         "arm": "film",
         "model_id": "DBD-research-group/ConvNeXT-Base-BirdSet-XCL",
         "context_source": "eod_r4_full",
@@ -342,7 +346,8 @@ def test_row_refused_when_checkpoint_revision_missing():
     [
         "git_sha", "checkpoint_revision", "prior_doi", "prior_variant",
         "manifest_path",
-        "torch_version", "cuda_version", "arm", "model_id",
+        "torch_version", "cuda_version", "device", "device_name",
+        "arm", "model_id",
         "context_source",
     ],
 )

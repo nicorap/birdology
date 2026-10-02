@@ -51,6 +51,11 @@ from transformers import (
 from birdology.phase_c.context import ContextEncoder
 from birdology.phase_c.film import FiLMConvNext
 from birdology.phase_c.token import TokenAST
+from tests.phase_c._loader_fixtures import (
+    FixtureProvider,
+    SyntheticDataset,
+    fixture_audio,
+)
 from birdology.phase_c.train import (
     TrainConfig,
     ValMetricError,
@@ -133,54 +138,6 @@ def bare_convnext(
 ) -> ConvNextForImageClassification:
     torch.manual_seed(seed)
     return tiny_convnext(drop_path_rate)
-
-
-class SyntheticDataset(torch.utils.data.Dataset):
-    """CropDataset's item contract on synthetic rows.
-
-    ``present`` is a PYTHON float (so default collate widens the batch to
-    float64, exactly as with the real dataset — the trainer must cast),
-    ``epoch`` is a plain mutable attribute, and inputs are keyed by
-    (seed, epoch, idx) like data.py's crops. ``record`` (optional list)
-    logs every ``(epoch, idx)`` access — the recording-sampler probe.
-    """
-
-    def __init__(
-        self,
-        n_rows: int = 32,
-        shape: tuple = CONVNEXT_SHAPE,
-        seed: int = 0,
-        epoch: int = 0,
-        record: list | None = None,
-    ) -> None:
-        self.n_rows = n_rows
-        self.shape = shape
-        self.seed = seed
-        self.epoch = epoch
-        self.record = record
-
-    def __len__(self) -> int:
-        return self.n_rows
-
-    def __getitem__(self, idx: int) -> dict:
-        if self.record is not None:
-            self.record.append((self.epoch, idx))
-        rng = np.random.default_rng((self.seed, self.epoch, idx))
-        return {
-            "inputs": torch.from_numpy(
-                rng.standard_normal(self.shape).astype(np.float32)
-            ),
-            "context": torch.from_numpy(
-                rng.standard_normal(N_CLASSES).astype(np.float32)
-            ),
-            "present": float(idx % 2),
-            "label": idx % N_CLASSES,
-            # The VAL contract is multi-hot (EvalDataset's ``labels``);
-            # this dataset doubles as val, so it carries both shapes.
-            "labels": torch.nn.functional.one_hot(
-                torch.tensor(idx % N_CLASSES), N_CLASSES
-            ),
-        }
 
 
 def _cfg(**kw) -> TrainConfig:
@@ -658,7 +615,9 @@ class TestResume:
         straight, _ = self._straight(tmp_path)
         self._leg1(tmp_path)
 
-        monkeypatch.setattr(train_mod, "_rng_restore", lambda ckpt: None)
+        monkeypatch.setattr(
+            train_mod, "_rng_restore", lambda ckpt, device: None
+        )
         fresh = film_convnext(
             seed=self.INIT_SEED_OTHER, drop_path_rate=DROP_PATH
         )
@@ -737,3 +696,306 @@ class TestTokenArm:
         )
         assert result.epochs_ran == 1
         assert np.isfinite(result.val_cmap_history[0])
+
+
+# ---------------------------------------------------------------------------
+# Progress logging (fleet job 5730): the logs held NOTHING after "Loading
+# weights" for 2.5 h, so a CPU-bound run was indistinguishable from a
+# healthy one. train_arm now logs every cfg.log_every steps (epoch,
+# step/total, loss, samples/s, elapsed, device) and brackets validation
+# with start/end lines carrying row counts and wall time.
+# ---------------------------------------------------------------------------
+
+
+class TestProgressLogging:
+    def _run(self, tmp_path, caplog, **cfg_kw):
+        import logging
+
+        caplog.set_level(logging.INFO, logger="birdology.phase_c")
+        train_arm(
+            film_convnext(),
+            SyntheticDataset(n_rows=32),
+            SyntheticDataset(n_rows=16, seed=99),
+            _cfg(**{"max_epochs": 1, "batch_size": 8, **cfg_kw}),
+            tmp_path,
+        )
+        return [
+            r.getMessage()
+            for r in caplog.records
+            if r.name.startswith("birdology.phase_c")
+        ]
+
+    def test_step_lines_at_configured_cadence(self, tmp_path, caplog):
+        """32 rows / batch 8 = 4 steps; log_every=2 → steps 2/4 and 4/4,
+        nothing for steps 1 and 3."""
+        msgs = self._run(tmp_path, caplog, log_every=2)
+        steps = [m for m in msgs if m.startswith("train ")]
+        assert len(steps) == 2, steps
+        assert "step 2/4" in steps[0] and "step 4/4" in steps[1]
+        for m in steps:
+            for token in ("epoch 1/1", "loss=", "samples/s=", "elapsed=",
+                          "device=cpu"):
+                assert token in m, (token, m)
+
+    def test_cadence_is_configurable(self, tmp_path, caplog):
+        msgs = self._run(tmp_path, caplog, log_every=1)
+        assert len([m for m in msgs if m.startswith("train ")]) == 4
+
+    def test_default_cadence_is_50(self):
+        assert TrainConfig(arm="film", seed=0).log_every == 50
+
+    def test_validation_start_and_end_lines(self, tmp_path, caplog):
+        msgs = self._run(tmp_path, caplog, log_every=100)
+        start = [m for m in msgs if m.startswith("val start")]
+        end = [m for m in msgs if m.startswith("val end")]
+        assert len(start) == 1 and "rows=16" in start[0]
+        assert len(end) == 1
+        assert "cmap=" in end[0] and "wall=" in end[0] and "rows=16" in end[0]
+
+    def test_log_every_must_be_positive(self):
+        with pytest.raises(ValueError, match="log_every"):
+            TrainConfig(arm="film", seed=0, log_every=0)
+
+
+# ---------------------------------------------------------------------------
+# DataLoader workers (fleet job 5730): with the model on the GPU, audio
+# decode + the mel frontend in the main process starve it. The module
+# docstring CLAIMED workers cannot change values (crops are (seed, epoch,
+# idx)-keyed); these tests PROVE it on the real CropDataset + real
+# convnext_frontend, and pin the loader policy (pin_memory on CUDA,
+# persistent workers only where the loader is reused, own generators so
+# no loader ever draws from the GLOBAL torch RNG).
+#
+# Everything a worker unpickles lives in tests/phase_c/_loader_fixtures.py
+# (light imports): workers start in a FRESH interpreter and re-import it.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def forkserver_workers():
+    """Run worker pools under ``forkserver`` for these tests.
+
+    Measured on the dev Mac (torch 2.14, Python 3.14): every ``spawn``
+    pool costs ~10.6 s at SHUTDOWN even for a trivial dataset (workers
+    miss DataLoader's 5 s join and are waited out one by one) vs 0.67 s
+    under forkserver — a platform cost, not a correctness issue.
+    forkserver is the STRONGER probe of value-neutrality than fork: like
+    spawn, each worker is a fresh interpreter that re-imports and
+    unpickles the dataset (no inherited parent memory) — and it is
+    Python 3.14's Linux default, i.e. the fleet's shape.
+    """
+    import multiprocessing
+
+    prev = multiprocessing.get_start_method(allow_none=True)
+    multiprocessing.set_start_method("forkserver", force=True)
+    yield
+    multiprocessing.set_start_method(prev, force=True)
+
+def _fixture_crop_dataset(seed: int = 0):
+    import pyarrow as pa
+
+    from birdology.phase_c.data import CropDataset, convnext_frontend
+
+    n = 22  # not a multiple of the batch: a ragged final batch
+    manifest = pa.table(
+        {
+            "filepath": [f"t{i}.wav" for i in range(n)],
+            "ebird_code": [f"LABEL_{i % N_CLASSES}" for i in range(n)],
+            "cell": [None if i % 3 == 0 else f"c{i}" for i in range(n)],
+            "week": [None if i % 3 == 0 else i for i in range(n)],
+        }
+    )
+    return CropDataset(
+        manifest,
+        fixture_audio,
+        FixtureProvider(),
+        {f"LABEL_{i}": i for i in range(N_CLASSES)},
+        crop_s=0.1,  # 3200 samples: small frontend, real random offsets
+        seed=seed,
+        frontend=convnext_frontend,
+    )
+
+
+def _epoch_batches(ds, cfg, epoch):
+    from birdology.phase_c.train import make_train_loader
+
+    ds.epoch = epoch
+    return list(make_train_loader(ds, cfg, epoch, torch.device("cpu")))
+
+
+def _assert_batches_bit_identical(a, b):
+    assert len(a) == len(b)
+    for i, (x, y) in enumerate(zip(a, b)):
+        assert x.keys() == y.keys()
+        for k in x:
+            assert x[k].dtype == y[k].dtype, (i, k, x[k].dtype, y[k].dtype)
+            assert torch.equal(x[k], y[k]), f"batch {i} key {k!r} differs"
+
+
+@pytest.mark.usefixtures("forkserver_workers")
+class TestDataLoaderWorkers:
+    def test_one_epoch_bit_identical_workers_0_vs_2(self):
+        ds = _fixture_crop_dataset()
+        cfg0 = _cfg(arm="film", seed=4, batch_size=4, num_workers=0)
+        cfg2 = _cfg(arm="film", seed=4, batch_size=4, num_workers=2)
+        b0 = _epoch_batches(ds, cfg0, epoch=0)
+        b2 = _epoch_batches(ds, cfg2, epoch=0)
+        _assert_batches_bit_identical(b0, b2)
+        # The probe has teeth: real crops, real context, both flags, and
+        # the collate's float64 `present` widening survives the workers.
+        assert b0[0]["present"].dtype == torch.float64
+        flags = torch.cat([b["present"] for b in b0])
+        assert set(flags.tolist()) == {0.0, 1.0}
+        assert b0[0]["inputs"].shape[1:] == (1, 128, 11)
+
+    def test_epoch_dial_reaches_the_workers(self):
+        """Epoch 1 with workers equals epoch 1 without — the train_ds.epoch
+        the loop sets in the MAIN process reaches every worker (a
+        persistent worker pool would hold a stale copy) — and differs from
+        epoch 0 (crops re-drawn)."""
+        ds = _fixture_crop_dataset()
+        cfg0 = _cfg(arm="film", seed=4, batch_size=4, num_workers=0)
+        cfg2 = _cfg(arm="film", seed=4, batch_size=4, num_workers=2)
+        e1_w0 = _epoch_batches(ds, cfg0, epoch=1)
+        e1_w2 = _epoch_batches(ds, cfg2, epoch=1)
+        _assert_batches_bit_identical(e1_w0, e1_w2)
+        e0 = _epoch_batches(ds, cfg0, epoch=0)
+        assert not torch.equal(e0[0]["inputs"], e1_w0[0]["inputs"])
+
+    def test_loaders_never_touch_the_global_torch_rng(self):
+        """dropout/drop_path draw from the global RNG in the main process;
+        a loader that also draws there would make training depend on
+        loader bookkeeping. Every loader carries its own generator."""
+        from birdology.phase_c.train import make_train_loader, make_val_loader
+
+        ds = _fixture_crop_dataset()
+        val = SyntheticDataset(n_rows=6, seed=99)
+        for nw in (0, 2):
+            cfg = _cfg(batch_size=4, num_workers=nw)
+            torch.manual_seed(123)
+            before = torch.get_rng_state()
+            list(make_train_loader(ds, cfg, 0, torch.device("cpu")))
+            vl = make_val_loader(val, cfg, torch.device("cpu"))
+            list(vl)
+            list(vl)
+            assert torch.equal(before, torch.get_rng_state()), nw
+
+    @pytest.mark.parametrize("device", ["cpu", "cuda"])
+    def test_loader_policy(self, device):
+        """pin_memory iff CUDA; persistent workers only on the REUSED val
+        loader and only with workers (the per-epoch train loader must
+        re-read train_ds.epoch, so it is never persistent)."""
+        from birdology.phase_c.train import make_train_loader, make_val_loader
+
+        dev = torch.device(device)
+        ds = SyntheticDataset(n_rows=8)
+        for nw in (0, 3):
+            cfg = _cfg(batch_size=4, num_workers=nw)
+            tl = make_train_loader(ds, cfg, 0, dev)
+            vl = make_val_loader(ds, cfg, dev)
+            for loader in (tl, vl):
+                assert loader.num_workers == nw
+                assert loader.pin_memory is (device == "cuda")
+            assert tl.persistent_workers is False
+            assert vl.persistent_workers is (nw > 0)
+
+    def test_train_arm_with_workers_bit_equal_to_without(self, tmp_path):
+        """End to end: the same 2-epoch film run (drop_path active, so the
+        global RNG is load-bearing) with num_workers=0 and =2 ends in
+        bit-identical weights and val history."""
+        results, models = {}, {}
+        for nw in (0, 2):
+            models[nw] = film_convnext(seed=5, drop_path_rate=DROP_PATH)
+            results[nw] = train_arm(
+                models[nw],
+                SyntheticDataset(),
+                SyntheticDataset(n_rows=16, seed=99),
+                _cfg(arm="film", seed=3, max_epochs=2, patience=10,
+                     num_workers=nw),
+                tmp_path / f"nw{nw}",
+            )
+        assert results[0].val_cmap_history == results[2].val_cmap_history
+        assert not _differing_keys(models[0], models[2])
+
+
+@pytest.mark.usefixtures("forkserver_workers")
+class TestResumeWithWorkers(TestResume):
+    """Review Focus 5 re-run with DataLoader workers: every TestResume
+    test (headline bit-equality AND both discriminating-power controls)
+    with num_workers=2 instead of 0."""
+
+    @pytest.fixture(autouse=True)
+    def _with_workers(self, monkeypatch):
+        global _cfg
+        base = _cfg
+
+        def cfg_with_workers(**kw):
+            kw.setdefault("num_workers", 2)
+            return base(**kw)
+
+        monkeypatch.setitem(globals(), "_cfg", cfg_with_workers)
+
+
+# ---------------------------------------------------------------------------
+# On CUDA, dropout/drop_path draw from the CUDA generator, not the CPU one
+# _rng_snapshot used to save — a GPU resume would replay different masks.
+# The checkpoint now carries the training device's CUDA RNG state. Tested
+# on CPU by injecting a cuda device and stubbing torch.cuda's RNG I/O.
+# ---------------------------------------------------------------------------
+
+
+class TestCudaRngInResume:
+    def test_snapshot_carries_cuda_rng_on_cuda(self, monkeypatch):
+        from birdology.phase_c.train import _rng_snapshot
+
+        sentinel = torch.tensor([7, 7, 7], dtype=torch.uint8)
+        calls = []
+
+        def fake_get(device=None):
+            calls.append(device)
+            return sentinel
+
+        monkeypatch.setattr(torch.cuda, "get_rng_state", fake_get)
+        snap = _rng_snapshot(torch.device("cuda", 1))
+        assert torch.equal(snap["cuda_rng"], sentinel)
+        assert calls == [torch.device("cuda", 1)]
+
+    def test_snapshot_has_no_cuda_rng_on_cpu(self):
+        from birdology.phase_c.train import _rng_snapshot
+
+        assert "cuda_rng" not in _rng_snapshot(torch.device("cpu"))
+
+    def test_restore_sets_cuda_rng_on_cuda(self, monkeypatch):
+        from birdology.phase_c.train import _rng_restore, _rng_snapshot
+
+        snap = _rng_snapshot(torch.device("cpu"))
+        snap["cuda_rng"] = torch.tensor([1, 2], dtype=torch.uint8)
+        got = {}
+        monkeypatch.setattr(
+            torch.cuda, "set_rng_state",
+            lambda state, device=None: got.update(state=state, device=device),
+        )
+        _rng_restore(snap, torch.device("cuda", 0))
+        assert torch.equal(got["state"], snap["cuda_rng"])
+        assert got["device"] == torch.device("cuda", 0)
+
+    def test_restore_refuses_cuda_checkpoint_without_cuda_rng(self):
+        """A checkpoint written by a pre-fix GPU run cannot be resumed
+        bit-exactly on CUDA — say so instead of silently diverging."""
+        from birdology.phase_c.train import _rng_restore, _rng_snapshot
+
+        snap = _rng_snapshot(torch.device("cpu"))
+        with pytest.raises(RuntimeError, match="cuda_rng"):
+            _rng_restore(snap, torch.device("cuda", 0))
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="needs a real CUDA device"
+    )
+    def test_real_cuda_checkpoint_carries_cuda_rng(self, tmp_path):
+        model = film_convnext().to("cuda")
+        train_arm(
+            model, SyntheticDataset(), SyntheticDataset(n_rows=16, seed=99),
+            _cfg(max_epochs=1), tmp_path,
+        )
+        ckpt = torch.load(tmp_path / "last.pt", weights_only=False)
+        assert "cuda_rng" in ckpt

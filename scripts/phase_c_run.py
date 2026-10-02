@@ -26,14 +26,26 @@ THE ROW REFUSES WITHOUT PROVENANCE (Global Constraints / phase_b contract)
 --------------------------------------------------------------------------
 Every results artifact names its inputs. ``build_row`` REFUSES — naming
 the field — when any of ``git_sha, checkpoint_revision, prior_doi,
-prior_variant, manifest_path, torch_version, cuda_version, arm,
-model_id, context_source`` is missing or blank: a row that cannot name
+prior_variant, manifest_path, torch_version, cuda_version, device,
+device_name, arm, model_id, context_source`` is missing or blank: a row that cannot name
 the checkpoint revision or prior DOI it came from cannot be reproduced
 or attributed, and silence here is how heterogeneous-stack rows sneak
 into a table (the project's own ledger, spec §5). ``prior_variant``
 (finding I1) is the controls axis — full/marginal/shuffle_space/
 shuffle_time, spelled EXACTLY as build_prior.py's npz suffixes
 (CONTROLS' own keys) — while ``context_source`` stays path provenance.
+
+DEVICE vs BUILD (schema v3, fleet job 5730)
+-------------------------------------------
+``cuda_version`` is the torch BUILD's CUDA (``torch.version.cuda``;
+``"cpu"`` for CPU-only builds) — STACK info, unchanged. It is NOT the
+device: job 5730's twins ran 2h43m on CPU inside a CUDA-12.9 container,
+and a v2 row would have said ``cuda_version="12.9"``. ``device``
+(``"cuda:0"`` / ``"cpu"``) and ``device_name`` (the GPU's
+``torch.cuda.get_device_name``; ``"cpu (<arch>)"`` otherwise) are read
+from the trainee's parameters AFTER the move — the device the run
+actually used — so a CPU run can never produce a row that reads like a
+GPU run.
 
 SCHEMA: write_rows' DISCIPLINE ON PHASE C'S AXES
 ------------------------------------------------
@@ -50,6 +62,7 @@ module for ``build_row``/``write_run_row`` never parses argv.
 """
 from __future__ import annotations
 
+import logging
 import sys
 import traceback
 import uuid
@@ -81,12 +94,16 @@ REQUIRED_PROVENANCE = (
     "manifest_path",
     "torch_version",
     "cuda_version",
+    "device",
+    "device_name",
     "arm",
     "model_id",
     "context_source",
 )
 
-RESULTS_SCHEMA_VERSION = "2"
+#: v3 (job 5730): + device, device_name — the device the run actually
+#: used, alongside cuda_version (the torch BUILD's CUDA, unchanged).
+RESULTS_SCHEMA_VERSION = "3"
 _RESULTS_SCHEMA = pa.schema(
     [
         pa.field("arm", pa.string()),
@@ -105,13 +122,35 @@ _RESULTS_SCHEMA = pa.schema(
         pa.field("manifest_path", pa.string()),
         pa.field("torch_version", pa.string()),
         pa.field("cuda_version", pa.string()),
+        pa.field("device", pa.string()),
+        pa.field("device_name", pa.string()),
         pa.field("context_source", pa.string()),
     ],
     metadata={b"phase_c_schema_version": RESULTS_SCHEMA_VERSION.encode()},
 )
 
 
-def _stack_provenance(args, resolved_revision: str) -> dict:
+def _device_provenance(device) -> tuple[str, str]:
+    """(device, device_name) for the device the run ACTUALLY used.
+
+    ``cuda:<i>`` + ``torch.cuda.get_device_name(i)`` on CUDA; ``cpu`` +
+    ``cpu (<machine arch>)`` otherwise (``mps`` and friends pass through
+    with their type as the name). Never derived from the torch build.
+    """
+    import platform
+
+    import torch
+
+    device = torch.device(device)
+    if device.type == "cuda":
+        index = device.index if device.index is not None else 0
+        return f"cuda:{index}", torch.cuda.get_device_name(index)
+    if device.type == "cpu":
+        return "cpu", f"cpu ({platform.machine() or 'unknown'})"
+    return str(device), device.type
+
+
+def _stack_provenance(args, resolved_revision: str, *, device) -> dict:
     """The provenance dict for this invocation's rows.
 
     CPU-only stacks carry ``torch.version.cuda = None`` — that is REAL
@@ -120,8 +159,16 @@ def _stack_provenance(args, resolved_revision: str) -> dict:
     probes, CPU smoke tests) out of writing rows entirely. Measured: the
     2026-10-01 Mac end-to-end probe refused after 49 minutes of successful
     training at exactly this seam. Recorded as ``"cpu"``.
+
+    *device* is the device the run ACTUALLY used (the trainee's
+    parameters after the move) — recorded as ``device``/``device_name``
+    because ``cuda_version`` alone describes the build, not the run
+    (job 5730). Keyword-only and required: there is no default that
+    could silently say "cpu" or "cuda".
     """
     import torch
+
+    device_str, device_name = _device_provenance(device)
 
     return {
         "git_sha": args.git_sha,
@@ -131,6 +178,8 @@ def _stack_provenance(args, resolved_revision: str) -> dict:
         "manifest_path": str(args.manifest),
         "torch_version": torch.__version__,
         "cuda_version": torch.version.cuda or "cpu",
+        "device": device_str,
+        "device_name": device_name,
         "arm": args.arm,
         "model_id": args.checkpoint,
         "context_source": args.context_source,
@@ -197,6 +246,8 @@ def build_row(
         "manifest_path": provenance["manifest_path"],
         "torch_version": provenance["torch_version"],
         "cuda_version": provenance["cuda_version"],
+        "device": provenance["device"],
+        "device_name": provenance["device_name"],
         "context_source": provenance["context_source"],
     }
 
@@ -218,6 +269,109 @@ def write_run_row(row: dict, out_dir: str | Path) -> Path:
     path = out_dir / f"run-{uuid.uuid4().hex}.parquet"
     pq.write_table(table, path)
     return path
+
+
+class _StdoutHandler(logging.StreamHandler):
+    """A StreamHandler that always writes to the CURRENT ``sys.stdout``
+    (the Slurm ``--output`` file), resolved per record — so it survives
+    stdout being swapped (pytest capture, redirection) after setup."""
+
+    @property
+    def stream(self):  # type: ignore[override]
+        return sys.stdout
+
+    @stream.setter
+    def stream(self, value) -> None:  # StreamHandler.__init__ assigns it
+        pass
+
+
+def _configure_logging(level: int = logging.INFO) -> None:
+    """Route ``birdology.*`` INFO to stdout — idempotently.
+
+    Fleet job 5730: the log held nothing after transformers' "Loading
+    weights" for 2.5 h — nothing ever configured logging, so birdology
+    INFO records fell through to logging's last-resort handler (WARNING+
+    to stderr only). A handler on the ``birdology`` logger (not
+    ``basicConfig`` on root: that would also unleash every third-party
+    library's INFO and is a silent no-op if anything configured root
+    first) makes progress visible without touching anyone else's logs.
+    """
+    lg = logging.getLogger("birdology")
+    if not any(isinstance(h, _StdoutHandler) for h in lg.handlers):
+        handler = _StdoutHandler()
+        handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s %(levelname)s %(name)s: %(message)s"
+            )
+        )
+        lg.addHandler(handler)
+    lg.setLevel(level)
+
+
+def _default_num_workers(device_spec: str) -> int:
+    """8 DataLoader workers when training on CUDA (audio decode + mel
+    frontend in the main process would starve the GPU), 0 on CPU (the
+    workers would only compete with the model for the same cores)."""
+    return 8 if device_spec.startswith("cuda") else 0
+
+
+def _resolve_device(spec: str):
+    """``--device`` → ``torch.device`` — or a refusal. NEVER a fallback.
+
+    Fleet job 5730: ten twin cells ran 2h43m at ~1300% CPU with the GPU
+    at 0% utilization, because nothing ever moved the trainee off the
+    CPU and the training loop inherits its device from the parameters.
+    A CUDA request on a stack that cannot serve it now dies HERE, first
+    thing in the cell, naming the measured causes — before any
+    checkpoint load, dataset construction or training spend.
+    """
+    import torch
+
+    device = torch.device(spec)
+    if device.type == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                f"--device {spec} requested but torch.cuda.is_available() "
+                "is False — refusing instead of silently training on CPU "
+                "(fleet job 5730: 2h43m at 0% GPU util). Likely causes: "
+                "the Slurm allocation lacks --gres=gpu:N (no GPU is "
+                "visible inside the container without it), the container "
+                "was started without --nv, or this is a CPU-only torch "
+                f"build (torch.version.cuda={torch.version.cuda!r}). For a "
+                "deliberate CPU run (Mac probe, smoke test) pass "
+                "--device cpu explicitly."
+            )
+        index = device.index if device.index is not None else 0
+        if index >= torch.cuda.device_count():
+            raise RuntimeError(
+                f"--device {spec} requested but only "
+                f"{torch.cuda.device_count()} CUDA device(s) are visible "
+                f"(cuda:{index} does not exist); check --gres=gpu:N and "
+                "CUDA_VISIBLE_DEVICES"
+            )
+        device = torch.device("cuda", index)
+    return device
+
+
+def _move_to_device(trainee, device):
+    """Move the trainee — wrapper INCLUDING its inner frozen model and
+    context encoder (they are registered submodules, so one ``.to``
+    reaches them) — then VERIFY every parameter and buffer landed. The
+    job-5730 failure was silent; this one is not."""
+    trainee = trainee.to(device)
+    stray = sorted(
+        {
+            str(t.device)
+            for t in list(trainee.parameters()) + list(trainee.buffers())
+            if t.device.type != device.type
+        }
+    )
+    if stray:
+        raise RuntimeError(
+            f"trainee tensors on {stray} after .to({device}) — refusing to "
+            f"train off the requested device {device} (fleet job 5730)"
+        )
+    return trainee
 
 
 def _build_val_dataset(
@@ -319,6 +473,10 @@ def _run_cell(args) -> int:
     from birdology.phase_c.train import TrainConfig, train_arm
     from birdology.prior.tensor import load_prior
 
+    # FIRST: the device. A cuda request that cannot be served refuses
+    # before any checkpoint load / staging-heavy dataset work (job 5730).
+    device = _resolve_device(args.device)
+
     model_cls = {
         "convnext": ConvNextForImageClassification,
         "ast": ASTForAudioClassification,
@@ -419,7 +577,16 @@ def _run_cell(args) -> int:
         else:  # token — AST only (the 3-combo grid, spec decision 2)
             trainee = TokenAST(model, encoder)
 
-    cfg = TrainConfig(arm=args.arm, seed=args.seed)
+    # ONCE, before train_arm: train_arm/evaluate_model take their device
+    # from the parameters, so this move is what puts the run on the GPU.
+    trainee = _move_to_device(trainee, device)
+
+    cfg = TrainConfig(
+        arm=args.arm,
+        seed=args.seed,
+        num_workers=args.num_workers,
+        log_every=args.log_every,
+    )
     result = train_arm(trainee, train_ds, val_ds, cfg, args.ckpt_dir)
 
     # Restore the VAL-BEST weights before evaluating: early stopping
@@ -435,7 +602,11 @@ def _run_cell(args) -> int:
 
     from birdology.phase_b.metrics import cmap as _cmap
 
-    provenance = _stack_provenance(args, resolved_revision)
+    # The device the run ACTUALLY used, read off the trainee after
+    # training — not the build, not the request.
+    provenance = _stack_provenance(
+        args, resolved_revision, device=next(trainee.parameters()).device
+    )
 
     # Finding I2: training is test-set-independent, so the cell trains
     # ONCE (above) and loops EVAL over every requested test set — one
@@ -455,7 +626,9 @@ def _run_cell(args) -> int:
             frontend=frontend,
             require_context=require_context,
         )
-        scores = evaluate_model(trainee, eval_ds, arm=args.arm)
+        scores = evaluate_model(
+            trainee, eval_ds, arm=args.arm, num_workers=args.num_workers
+        )
         cmap_value, n_scored = _cmap(scores, eval_ds.y)
 
         row = build_row(
@@ -541,7 +714,36 @@ def main(argv: list[str] | None = None) -> int:
         "arms — POW-val style tables and DELIBERATE no-context "
         "ablations only.",
     )
+    parser.add_argument(
+        "--device",
+        default="cuda",
+        help="Torch device to train/evaluate on (default: cuda). A cuda "
+        "request on a stack without a visible GPU REFUSES (fleet job "
+        "5730: no silent CPU fallback); Mac probes / CPU smoke runs must "
+        "pass --device cpu explicitly. The device actually used is "
+        "recorded in the row's device/device_name columns.",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=None,
+        help="DataLoader worker processes for train/val/eval (default: "
+        "8 on cuda, 0 on cpu). Batches are bit-identical to "
+        "num_workers=0 (crops are (seed, epoch, idx)-keyed; pinned by "
+        "test).",
+    )
+    parser.add_argument(
+        "--log-every",
+        type=int,
+        default=50,
+        help="Log one INFO progress line every N train steps (default 50).",
+    )
     args = parser.parse_args(argv)
+    if args.num_workers is None:
+        args.num_workers = _default_num_workers(args.device)
+    if args.num_workers < 0:
+        parser.error(f"--num-workers must be >= 0 (got {args.num_workers})")
+    _configure_logging()
     # --test-sets accepts comma-separated and/or repeated flags.
     args.test_sets = [
         ts for chunk in args.test_sets for ts in chunk.split(",") if ts

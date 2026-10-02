@@ -432,3 +432,48 @@ def test_item_carries_multi_hot_labels_row_on_model_axis():
     assert rows[0].tolist() == [0, 1, 0, 0, 1]
     assert rows[1].tolist() == [0, 0, 0, 0, 0]  # empty window: all-zero
     assert rows[2].tolist() == [1, 0, 0, 0, 0]
+
+
+# ---------------------------------------------------------------------------
+# Fleet job 5730: eval brackets itself with start/end log lines (rows,
+# device, wall time) — silence was indistinguishable from progress.
+# ---------------------------------------------------------------------------
+
+
+def test_evaluate_model_logs_start_and_end(caplog):
+    import logging
+
+    import torch
+    from transformers import ConvNextConfig, ConvNextForImageClassification
+
+    from birdology.phase_c.evaluate import build_eval_dataset, evaluate_model
+
+    torch.manual_seed(0)
+    model = ConvNextForImageClassification(
+        ConvNextConfig(num_channels=1, num_stages=2, hidden_sizes=[8, 16],
+                       depths=[1, 1], num_labels=3, image_size=32)
+    )
+    meta = pa.table({
+        "filepath": pa.array(["a.wav", "b.wav", "c.wav"], pa.string()),
+        "ebird_code_multilabel": pa.array(
+            [["LABEL_0"], [], ["LABEL_2"]], pa.list_(pa.string())
+        ),
+    })
+
+    class _Prov:
+        def vector(self, cell, week):
+            return np.zeros(3, dtype=np.float32), 0.0
+
+    ds = build_eval_dataset(
+        meta, lambda f: np.zeros(1600, dtype=np.float32), _Prov(),
+        ["LABEL_0", "LABEL_1", "LABEL_2"],
+        frontend=lambda w: torch.zeros(1, 32, 32), crop_s=0.05,
+    )
+    caplog.set_level(logging.INFO, logger="birdology.phase_c")
+    scores = evaluate_model(model, ds, arm="twin", batch_size=2)
+    assert scores.shape == (3, 3)
+    msgs = [r.getMessage() for r in caplog.records]
+    start = [m for m in msgs if m.startswith("eval start")]
+    end = [m for m in msgs if m.startswith("eval end")]
+    assert len(start) == 1 and "rows=3" in start[0] and "device=cpu" in start[0]
+    assert len(end) == 1 and "rows=3" in end[0] and "wall=" in end[0]

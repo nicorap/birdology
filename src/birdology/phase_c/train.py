@@ -30,17 +30,50 @@ compares real numbers or it does not run.
 REVIEW FOCUS 5 — RESUME IS BIT-EXACT, AND HERE IS WHY
 -----------------------------------------------------
 ``last.pt`` carries model + optimizer + epoch + torch/numpy/python RNG
-states, captured AFTER the epoch's validation — exactly the state the
+states (plus the training device's CUDA generator when on CUDA), captured AFTER the epoch's validation — exactly the state the
 next epoch would start from. On resume everything is restored and the
 run continues at ``epoch + 1``. Bit-equality with an uninterrupted run
 then follows from three facts: batch order is a pure function of
 ``(cfg.seed, epoch)``; crop content is a pure function of
 ``(dataset.seed, epoch, idx)`` (data.py — this loop SETS
 ``train_ds.epoch`` each epoch, including after resume); and AdamW's
-state round-trips exactly through torch.save. ``num_workers=0`` keeps
-item evaluation on the main process (crops are (seed,epoch,idx)-keyed so
-workers would not change VALUES, but single-process is the pinned,
-tested path).
+state round-trips exactly through torch.save.
+
+DATALOADER WORKERS DO NOT CHANGE A SINGLE BIT — PINNED, NOT CLAIMED
+------------------------------------------------------------------
+Fleet job 5730: with the model on the GPU, audio decode + the mel
+frontend in the main process starve it, so ``num_workers`` is a CLI
+knob (phase_c_run: 8 on cuda, 0 on cpu). Workers are value-neutral
+because of four facts, each pinned in tests/phase_c/test_train.py
+(TestDataLoaderWorkers, TestResumeWithWorkers):
+
+1. Item VALUES are a pure function of (seed, epoch, idx): CropDataset's
+   crop offset is ``default_rng((seed, epoch, idx))``, the frontend is
+   deterministic, and no dataset touches the torch RNG — so which
+   process evaluates an item is irrelevant. (Measured bit-identical,
+   one epoch of inputs/context/present/label, 0 vs 2 workers, on the
+   real CropDataset + convnext_frontend — including collate's float64
+   ``present`` widening, which happens identically in either process.)
+2. ORDER is the sampler's, in the main process; the multi-process
+   iterator re-orders worker output back to sampler order.
+3. NO LOADER EVER DRAWS FROM THE GLOBAL TORCH RNG. Every DataLoader
+   iterator draws a ``_base_seed`` (worker seeding) from
+   ``loader.generator`` at creation — from the GLOBAL generator when
+   that is None. dropout/drop_path consume the global RNG in the main
+   process, so a loader drawing there would couple weights to loader
+   bookkeeping: a persistent val loader draws once per RUN, a fresh
+   one once per EPOCH, and a resumed leg would diverge. Train loaders
+   carry the (seed, epoch) generator (as before); the val loader now
+   carries its own fixed-seed generator.
+4. The train loader is built fresh per epoch and NEVER persistent:
+   workers hold a pickled COPY of the dataset taken when the pool
+   starts, so the epoch dial set in the main process only reaches
+   workers through a new pool — a persistent pool on a reused loader
+   would keep a stale ``train_ds.epoch``. The val loader (no epoch
+   dial) is persistent when it has workers.
+
+``pin_memory`` is on iff the device is CUDA (transfer-only; values
+unchanged).
 
 COLLATE WIDENS ``present`` TO FLOAT64 — CAST AT THE SEAM
 --------------------------------------------------------
@@ -55,7 +88,9 @@ Plain torch throughout: AdamW, constant LR, no lightning, no schedulers
 """
 from __future__ import annotations
 
+import logging
 import random
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -65,6 +100,8 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from birdology.phase_b.metrics import cmap
+
+logger = logging.getLogger(__name__)
 
 #: The arm vocabulary — the whole of it.
 _ARMS = ("film", "token", "twin")
@@ -103,13 +140,26 @@ class TrainConfig:
     max_epochs: int = 2
     patience: int = 1
     batch_size: int = 64
-    #: 0 = main-process data loading, the deterministic pinned path.
+    #: DataLoader workers. 0 = main-process loading (the library
+    #: default; phase_c_run picks 8 on cuda). Bit-neutral — module
+    #: docstring, "DATALOADER WORKERS", pinned by test.
     num_workers: int = 0
+    #: Progress cadence: one INFO line every ``log_every`` train steps
+    #: (fleet job 5730 — 2.5 h of silence hid a CPU-bound run).
+    log_every: int = 50
 
     def __post_init__(self) -> None:
         if self.arm not in _ARMS:
             raise ValueError(
                 f"unknown arm {self.arm!r}; expected one of {_ARMS}"
+            )
+        if self.num_workers < 0:
+            raise ValueError(
+                f"num_workers must be >= 0 (got {self.num_workers})"
+            )
+        if self.log_every < 1:
+            raise ValueError(
+                f"log_every must be >= 1 (got {self.log_every})"
             )
 
 
@@ -164,6 +214,54 @@ def _epoch_seed(seed: int, epoch: int) -> int:
     from the config alone.
     """
     return seed * 1_000_003 + epoch
+
+
+#: The val loader's own generator seed. Its value is irrelevant (val is
+#: unshuffled and EvalDataset never reads torch RNG); its EXISTENCE is
+#: what keeps the loader off the global torch RNG (module docstring,
+#: fact 3).
+_VAL_LOADER_SEED = 0
+
+
+def _loader_kwargs(cfg: TrainConfig, device: torch.device) -> dict:
+    return {
+        "batch_size": cfg.batch_size,
+        "num_workers": cfg.num_workers,
+        "pin_memory": torch.device(device).type == "cuda",
+    }
+
+
+def make_train_loader(
+    train_ds, cfg: TrainConfig, epoch: int, device: torch.device
+) -> DataLoader:
+    """One epoch's train loader: order from (cfg.seed, epoch) alone —
+    twin-identical and resume-identical by construction — never
+    persistent (fact 4), pinned on CUDA."""
+    generator = torch.Generator()
+    generator.manual_seed(_epoch_seed(cfg.seed, epoch))
+    return DataLoader(
+        train_ds,
+        shuffle=True,
+        generator=generator,
+        persistent_workers=False,
+        **_loader_kwargs(cfg, device),
+    )
+
+
+def make_val_loader(
+    val_ds, cfg: TrainConfig, device: torch.device
+) -> DataLoader:
+    """The run's val loader: unshuffled, its OWN generator (fact 3),
+    persistent iff it has workers (reused every epoch, no epoch dial)."""
+    generator = torch.Generator()
+    generator.manual_seed(_VAL_LOADER_SEED)
+    return DataLoader(
+        val_ds,
+        shuffle=False,
+        generator=generator,
+        persistent_workers=cfg.num_workers > 0,
+        **_loader_kwargs(cfg, device),
+    )
 
 
 def _unpack_inputs(batch: dict, device: torch.device):
@@ -221,6 +319,9 @@ def _validate(
     changes nothing). Non-finite logits abort here too: a diverged model
     must kill the run, not feed garbage ranks to early stopping.
     """
+    n_rows = len(val_loader.dataset)
+    logger.info("val start rows=%d device=%s", n_rows, device)
+    t0 = time.perf_counter()
     model.eval()
     all_logits: list[np.ndarray] = []
     all_labels: list[np.ndarray] = []
@@ -252,21 +353,42 @@ def _validate(
             f"{n_scored}) — early stopping cannot run; aborting (Review "
             "Focus 4)"
         )
+    logger.info(
+        "val end rows=%d cmap=%.4f n_scored=%d wall=%.1fs",
+        n_rows, value, n_scored, time.perf_counter() - t0,
+    )
     return value
 
 
-def _rng_snapshot() -> dict:
-    return {
+def _rng_snapshot(device: torch.device) -> dict:
+    """Every RNG the next epoch reads. On CUDA that includes the
+    DEVICE's generator: dropout/drop_path on a CUDA tensor draw from it,
+    not from the CPU generator (job-5730 follow-up — before the model
+    ever reached the GPU, the CPU state was the whole story)."""
+    snap = {
         "torch_rng": torch.get_rng_state(),
         "numpy_rng": np.random.get_state(),
         "python_rng": random.getstate(),
     }
+    if torch.device(device).type == "cuda":
+        snap["cuda_rng"] = torch.cuda.get_rng_state(device)
+    return snap
 
 
-def _rng_restore(ckpt: dict) -> None:
+def _rng_restore(ckpt: dict, device: torch.device) -> None:
     torch.set_rng_state(ckpt["torch_rng"])
     np.random.set_state(ckpt["numpy_rng"])
     random.setstate(ckpt["python_rng"])
+    if torch.device(device).type == "cuda":
+        if "cuda_rng" not in ckpt:
+            raise RuntimeError(
+                "resuming on CUDA from a checkpoint without 'cuda_rng' — "
+                "it was written before the CUDA generator was "
+                "checkpointed (or on CPU), so the resumed leg's "
+                "dropout/drop_path masks would silently diverge; start "
+                "the cell from an empty ckpt_dir"
+            )
+        torch.cuda.set_rng_state(ckpt["cuda_rng"], device)
 
 
 def train_arm(
@@ -320,7 +442,7 @@ def train_arm(
         ckpt = torch.load(last_path, weights_only=False)
         model_or_wrapper.load_state_dict(ckpt["model_state"])
         optimizer.load_state_dict(ckpt["optimizer_state"])
-        _rng_restore(ckpt)
+        _rng_restore(ckpt, device)
         start_epoch = ckpt["epoch"] + 1
         val_history = list(ckpt["val_history"])
         best_val = ckpt["best_val"]
@@ -331,12 +453,7 @@ def train_arm(
         # so dropout/anything-stochastic is a function of cfg.seed.
         torch.manual_seed(cfg.seed)
 
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=cfg.batch_size,
-        shuffle=False,
-        num_workers=cfg.num_workers,
-    )
+    val_loader = make_val_loader(val_ds, cfg, device)
 
     epochs_completed = start_epoch
     model_or_wrapper.train()
@@ -347,21 +464,16 @@ def train_arm(
 
         # Batch order from (cfg.seed, epoch) alone — twin-identical and
         # resume-identical by construction.
-        generator = torch.Generator()
-        generator.manual_seed(_epoch_seed(cfg.seed, epoch))
-        train_loader = DataLoader(
-            train_ds,
-            batch_size=cfg.batch_size,
-            shuffle=True,
-            generator=generator,
-            num_workers=cfg.num_workers,
-        )
+        train_loader = make_train_loader(train_ds, cfg, epoch, device)
 
         # Training steps. Note: a NaN training loss still executes its
         # optimizer.step() (poisoning the weights) before validation
         # below aborts the epoch — harmless, because the abort happens
         # BEFORE checkpointing, so nothing poisoned is ever persisted.
-        for batch in train_loader:
+        n_steps = len(train_loader)
+        t_epoch = time.perf_counter()
+        n_seen = 0
+        for step, batch in enumerate(train_loader, start=1):
             inputs, context, present, labels = _unpack(batch, device)
             logits = _forward(model_or_wrapper, cfg.arm, inputs, context, present)
             one_hot = torch.zeros_like(logits)
@@ -370,6 +482,17 @@ def train_arm(
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            n_seen += labels.size(0)
+            if step % cfg.log_every == 0:
+                # loss.item() syncs the device — only on the log cadence.
+                elapsed = time.perf_counter() - t_epoch
+                logger.info(
+                    "train epoch %d/%d step %d/%d loss=%.5f samples/s=%.1f "
+                    "elapsed=%.1fs device=%s",
+                    epoch + 1, cfg.max_epochs, step, n_steps, loss.item(),
+                    n_seen / elapsed if elapsed > 0 else float("nan"),
+                    elapsed, device,
+                )
 
         # Validate BEFORE checkpointing: a poisoned val metric raises here
         # and the epoch is never persisted (Review Focus 4).
@@ -397,7 +520,7 @@ def train_arm(
                 "val_history": val_history,
                 "best_val": best_val,
                 "bad_epochs": bad_epochs,
-                **_rng_snapshot(),
+                **_rng_snapshot(device),
             },
             last_path,
         )

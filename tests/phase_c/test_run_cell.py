@@ -214,6 +214,11 @@ def _cell_args(
         out=str(tmp_path / "out"),
         d_ctx=8,
         allow_null_context=allow_null_context,
+        # Fleet job 5730: the device is EXPLICIT. The Mac/CPU harness
+        # says so; the fleet default is cuda (and refuses without it).
+        device="cpu",
+        num_workers=0,
+        log_every=50,
     )
 
 
@@ -497,7 +502,9 @@ def test_provenance_cuda_version_is_cpu_on_gpuless_stack(monkeypatch):
         context_source="p.npz",
         arm="twin",
     )
-    prov = pcr._stack_provenance(args, resolved_revision="deadbeef")
+    prov = pcr._stack_provenance(
+        args, resolved_revision="deadbeef", device=torch.device("cpu")
+    )
     assert prov["cuda_version"] == "cpu"
     for v in prov.values():
         assert isinstance(v, str) and v.strip()
@@ -516,7 +523,8 @@ def test_provenance_cuda_version_passes_through_when_present(monkeypatch):
         manifest="m.parquet", checkpoint="org/model",
         context_source="p.npz", arm="film",
     )
-    assert pcr._stack_provenance(args, "deadbeef")["cuda_version"] == "12.8"
+    prov = pcr._stack_provenance(args, "deadbeef", device=torch.device("cpu"))
+    assert prov["cuda_version"] == "12.8"
 
 
 # ---------------------------------------------------------------------------
@@ -691,3 +699,310 @@ def test_twin_end_to_end_with_real_multilabel_validation(
         hist = row["val_cmap_history"]
         assert 1 <= len(hist) <= 2
         assert all(np.isfinite(v) and 0.0 < v <= 1.0 for v in hist)
+
+
+# ---------------------------------------------------------------------------
+# Fleet job 5730: 10 twin cells sat 2h43m at ~1300% CPU with the GPU at 0%
+# util — _run_cell never moved the trainee off the CPU, and train_arm /
+# evaluate_model inherit the device from the parameters. The device is now
+# EXPLICIT (--device, default cuda) and a cuda request on a GPU-less stack
+# REFUSES before any heavy work — never a silent CPU fallback.
+# ---------------------------------------------------------------------------
+
+
+class TestExplicitDevice:
+    def test_cuda_requested_but_unavailable_refuses_before_any_loading(
+        self, tmp_path, fleet_stubs, monkeypatch
+    ):
+        """No checkpoint load, no dataset construction, no training: the
+        refusal is the FIRST thing _run_cell does, and it names the two
+        measured causes (missing --gres, CPU-only torch build)."""
+        import birdology.phase_c.data as data_mod
+
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        touched: list[str] = []
+        monkeypatch.setattr(
+            ConvNextForImageClassification,
+            "from_pretrained",
+            classmethod(lambda cls, *a, **k: touched.append("load")),
+        )
+
+        class _NoCrop:
+            def __init__(self, *a, **k):
+                touched.append("CropDataset")
+
+        monkeypatch.setattr(data_mod, "CropDataset", _NoCrop)
+
+        args = _cell_args(tmp_path, arm="twin")
+        args.device = "cuda"
+        with pytest.raises(RuntimeError) as exc:
+            phase_c_run._run_cell(args)
+        msg = str(exc.value)
+        assert "--gres" in msg
+        assert "CPU-only" in msg
+        assert "--device cpu" in msg
+        assert touched == [], f"heavy work ran before the refusal: {touched}"
+        assert not (Path(args.ckpt_dir) / "best.pt").exists()
+        assert not list(Path(args.out).glob("*.parquet"))
+
+    def test_cuda_index_beyond_device_count_refuses(self, monkeypatch):
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+        with pytest.raises(RuntimeError, match="cuda:3"):
+            phase_c_run._resolve_device("cuda:3")
+
+    def test_cpu_resolves_to_cpu(self):
+        assert phase_c_run._resolve_device("cpu") == torch.device("cpu")
+
+    def test_trainee_is_moved_to_the_parsed_device_before_training(
+        self, tmp_path, fleet_stubs, monkeypatch
+    ):
+        """Module.to is called on the TRAINEE with the parsed device, and
+        that happens before train_arm sees it (spy on both)."""
+        import birdology.phase_c.train as train_mod
+
+        events: list = []
+        real_to = torch.nn.Module.to
+
+        def spy_to(self, *a, **k):
+            events.append(("to", type(self).__name__, a, k))
+            return real_to(self, *a, **k)
+
+        monkeypatch.setattr(torch.nn.Module, "to", spy_to)
+        real_train_arm = train_mod.train_arm
+
+        def spy_train_arm(trainee, *a, **k):
+            events.append(("train_arm", type(trainee).__name__))
+            return real_train_arm(trainee, *a, **k)
+
+        monkeypatch.setattr(train_mod, "train_arm", spy_train_arm)
+
+        args = _cell_args(tmp_path, arm="film")
+        assert phase_c_run._run_cell(args) == 0
+        to_calls = [e for e in events if e[0] == "to"]
+        assert ("to", "FiLMConvNext", (torch.device("cpu"),), {}) in to_calls
+        first_to = events.index(
+            ("to", "FiLMConvNext", (torch.device("cpu"),), {})
+        )
+        assert first_to < events.index(("train_arm", "FiLMConvNext"))
+
+    def test_device_mismatch_after_move_refuses(
+        self, tmp_path, fleet_stubs, monkeypatch
+    ):
+        """If .to() silently left the parameters elsewhere (the job-5730
+        shape), the post-move assertion refuses before training."""
+        monkeypatch.setattr(
+            torch.nn.Module, "to", lambda self, *a, **k: self
+        )
+        monkeypatch.setattr(
+            phase_c_run, "_resolve_device", lambda spec: torch.device("meta")
+        )
+        args = _cell_args(tmp_path, arm="twin")
+        with pytest.raises(RuntimeError, match="meta"):
+            phase_c_run._run_cell(args)
+        assert not (Path(args.ckpt_dir) / "best.pt").exists()
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="needs a real CUDA device"
+    )
+    def test_real_cuda_cell_trains_on_gpu_and_says_so(
+        self, tmp_path, fleet_stubs
+    ):
+        args = _cell_args(tmp_path, arm="twin")
+        args.device = "cuda"
+        assert phase_c_run._run_cell(args) == 0
+        row = pq.read_table(next(Path(args.out).glob("*.parquet"))).to_pylist()[0]
+        assert row["device"].startswith("cuda:")
+        assert row["device_name"] == torch.cuda.get_device_name(0)
+
+
+# ---------------------------------------------------------------------------
+# Honest provenance (job 5730): cuda_version is the torch BUILD's CUDA
+# (12.9 on the fleet SIF even when the run sat on CPU). The row now names
+# the device the run ACTUALLY used, so a CPU run can never produce a row
+# indistinguishable from a GPU run.
+# ---------------------------------------------------------------------------
+
+
+def _prov_args(arm="twin"):
+    import argparse
+
+    return argparse.Namespace(
+        git_sha="abc1234", prior_doi="10.1/x", prior_variant="full",
+        manifest="m.parquet", checkpoint="org/model",
+        context_source="p.npz", arm=arm,
+    )
+
+
+class TestDeviceProvenance:
+    def test_cpu_run_on_a_cuda_build_says_cpu(self, monkeypatch):
+        """The job-5730 lie: CUDA build (12.9), CPU device. The row must
+        carry device='cpu' next to the build's cuda_version."""
+        monkeypatch.setattr(torch.version, "cuda", "12.9")
+        prov = phase_c_run._stack_provenance(
+            _prov_args(), "deadbeef", device=torch.device("cpu")
+        )
+        assert prov["cuda_version"] == "12.9"
+        assert prov["device"] == "cpu"
+        assert prov["device_name"].startswith("cpu")
+
+    def test_cuda_run_records_index_and_gpu_name(self, monkeypatch):
+        monkeypatch.setattr(
+            torch.cuda, "get_device_name", lambda d=None: "NVIDIA H100 80GB HBM3"
+        )
+        prov = phase_c_run._stack_provenance(
+            _prov_args(), "deadbeef", device=torch.device("cuda", 0)
+        )
+        assert prov["device"] == "cuda:0"
+        assert prov["device_name"] == "NVIDIA H100 80GB HBM3"
+
+    @pytest.mark.parametrize("fname", ["device", "device_name"])
+    def test_row_refuses_without_device_provenance(self, fname):
+        prov = phase_c_run._stack_provenance(
+            _prov_args(), "deadbeef", device=torch.device("cpu")
+        )
+        prov[fname] = " "
+        with pytest.raises(ValueError, match=fname):
+            phase_c_run.build_row(
+                provenance=prov, test_set="HSN", resolution=4, seed=0,
+                cmap_value=0.5, n_scored=3, val_cmap_history=[0.5],
+                epochs_ran=1,
+            )
+
+    def test_schema_version_bumped_and_device_columns_present(self):
+        names = phase_c_run._RESULTS_SCHEMA.names
+        assert "device" in names and "device_name" in names
+        assert "cuda_version" in names  # build info, kept
+        assert phase_c_run.RESULTS_SCHEMA_VERSION == "3"
+        assert phase_c_run._RESULTS_SCHEMA.metadata[
+            b"phase_c_schema_version"
+        ] == b"3"
+
+    def test_run_cell_row_carries_the_device_actually_used(
+        self, tmp_path, fleet_stubs
+    ):
+        """fleet_stubs pins torch.version.cuda='12.1' (a CUDA BUILD); the
+        cell ran on CPU, and the row must say so."""
+        args = _cell_args(tmp_path, arm="twin")
+        assert phase_c_run._run_cell(args) == 0
+        row = pq.read_table(
+            next(Path(args.out).glob("*.parquet"))
+        ).to_pylist()[0]
+        assert row["cuda_version"] == "12.1"
+        assert row["device"] == "cpu"
+        assert row["device_name"].startswith("cpu")
+
+
+# ---------------------------------------------------------------------------
+# The CLI surface for the job-5730 fix: --device (default cuda),
+# --num-workers (default 8 on cuda, 0 on cpu), --log-every (default 50),
+# and logging configured so birdology INFO lines reach STDOUT (the Slurm
+# .out file) — the fleet log had none.
+# ---------------------------------------------------------------------------
+
+_REQUIRED_ARGV = [
+    "--arm", "twin", "--model", "convnext", "--checkpoint", "x",
+    "--checkpoint-revision", "r", "--resolution", "4", "--seed", "0",
+    "--test-sets", "HSN", "--manifest", "m", "--val-metadata", "v",
+    "--eval-metadata-template", "{test_set}", "--audio-root", "a",
+    "--prior", "p", "--prior-doi", "d", "--prior-variant", "full",
+    "--bridge", "b", "--context-source", "c", "--git-sha", "g",
+    "--ckpt-dir", "k", "--out", "o",
+]
+
+
+@pytest.fixture
+def restore_birdology_logger():
+    import logging
+
+    lg = logging.getLogger("birdology")
+    saved = (list(lg.handlers), lg.level, lg.propagate)
+    yield lg
+    lg.handlers[:] = saved[0]
+    lg.setLevel(saved[1])
+    lg.propagate = saved[2]
+
+
+@pytest.fixture
+def parsed(monkeypatch, restore_birdology_logger):
+    """main(argv) with _run_cell replaced by a recorder."""
+    seen: dict = {}
+
+    def fake_run_cell(args):
+        seen["args"] = args
+        return 0
+
+    monkeypatch.setattr(phase_c_run, "_run_cell", fake_run_cell)
+
+    def run(*extra):
+        assert phase_c_run.main(_REQUIRED_ARGV + list(extra)) == 0
+        return seen["args"]
+
+    return run
+
+
+class TestCli:
+    def test_device_defaults_to_cuda(self, parsed):
+        assert parsed().device == "cuda"
+
+    def test_num_workers_default_is_8_on_cuda(self, parsed):
+        assert parsed().num_workers == 8
+
+    def test_num_workers_default_is_0_on_cpu(self, parsed):
+        assert parsed("--device", "cpu").num_workers == 0
+
+    def test_num_workers_explicit_wins(self, parsed):
+        assert parsed("--device", "cpu", "--num-workers", "3").num_workers == 3
+
+    def test_log_every_default_and_override(self, parsed):
+        assert parsed().log_every == 50
+        assert parsed("--log-every", "7").log_every == 7
+
+    def test_main_routes_birdology_info_to_stdout(
+        self, monkeypatch, capsys, restore_birdology_logger
+    ):
+        import logging
+
+        def run_cell_that_logs(args):
+            logging.getLogger("birdology.phase_c.train").info("HEARTBEAT 42")
+            return 0
+
+        monkeypatch.setattr(phase_c_run, "_run_cell", run_cell_that_logs)
+        assert phase_c_run.main(_REQUIRED_ARGV + ["--device", "cpu"]) == 0
+        assert "HEARTBEAT 42" in capsys.readouterr().out
+
+    def test_logging_config_is_idempotent(self, restore_birdology_logger):
+        phase_c_run._configure_logging()
+        n = len(restore_birdology_logger.handlers)
+        phase_c_run._configure_logging()
+        assert len(restore_birdology_logger.handlers) == n
+
+
+def test_run_cell_threads_num_workers_and_log_every_into_training(
+    tmp_path, fleet_stubs, capture_train_arm, monkeypatch
+):
+    import birdology.phase_c.evaluate as evaluate_mod
+    import birdology.phase_c.train as train_mod
+
+    seen: dict = {}
+    real = train_mod.train_arm
+
+    def spy(trainee, train_ds, val_ds, cfg, ckpt_dir):
+        seen["cfg"] = cfg
+        return real(trainee, train_ds, val_ds, cfg, ckpt_dir)
+
+    monkeypatch.setattr(train_mod, "train_arm", spy)
+    fake_eval = evaluate_mod.evaluate_model
+
+    def eval_spy(model, ds, *, arm, **kw):
+        seen["eval_kw"] = kw
+        return fake_eval(model, ds, arm=arm, **kw)
+
+    monkeypatch.setattr(evaluate_mod, "evaluate_model", eval_spy)
+    args = _cell_args(tmp_path, arm="twin")
+    args.num_workers = 0
+    args.log_every = 3
+    assert phase_c_run._run_cell(args) == 0
+    assert seen["cfg"].log_every == 3
+    assert seen["cfg"].num_workers == 0
+    assert seen["eval_kw"]["num_workers"] == 0

@@ -47,6 +47,8 @@ the gate's metrics must never rank saturated probabilities
 """
 from __future__ import annotations
 
+import logging
+import time
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Callable, Sequence
@@ -57,6 +59,8 @@ import torch
 from torch.utils.data import DataLoader
 
 from birdology.phase_c.data import SAMPLE_RATE
+
+logger = logging.getLogger(__name__)
 
 #: 5 s — the segment window every BirdSet test row represents
 #: (SAMPLE_RATE comes from data.py, the model card's single source).
@@ -239,13 +243,24 @@ def evaluate_model(
         return np.zeros((0, n_classes), dtype=np.float32)
 
     device = next(model_or_wrapper.parameters()).device
+    # Own generator: the iterator's worker _base_seed draw must never
+    # come from the global torch RNG (train.py, "DATALOADER WORKERS",
+    # fact 3); pin_memory only helps a CUDA copy.
+    generator = torch.Generator()
+    generator.manual_seed(0)
     loader = DataLoader(
         eval_ds,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
+        generator=generator,
+        pin_memory=device.type == "cuda",
     )
 
+    logger.info(
+        "eval start rows=%d arm=%s device=%s", len(eval_ds), arm, device
+    )
+    t0 = time.perf_counter()
     was_training = model_or_wrapper.training
     model_or_wrapper.eval()
     all_logits: list[np.ndarray] = []
@@ -272,4 +287,9 @@ def evaluate_model(
         if was_training:
             model_or_wrapper.train()
 
-    return np.concatenate(all_logits)
+    scores = np.concatenate(all_logits)
+    logger.info(
+        "eval end rows=%d wall=%.1fs", scores.shape[0],
+        time.perf_counter() - t0,
+    )
+    return scores
