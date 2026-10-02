@@ -193,9 +193,12 @@ def build_eval_dataset(
         )
 
     # Label matrix on the model's axis, by code; gaps counted and named.
+    # int8, not int64 (fleet jobs 5929/5970): it only holds 0/1, and every
+    # DataLoader worker unpickles its own copy -- SSW's 205,200 x 9,736
+    # matrix is ~16 GB as int64 vs ~2 GB as int8.
     class_codes = list(class_codes)
     col_of = {code: j for j, code in enumerate(class_codes)}
-    y = np.zeros((len(filepaths), len(class_codes)), dtype=np.int64)
+    y = np.zeros((len(filepaths), len(class_codes)), dtype=np.int8)
     unscoreable_counts: Counter[str] = Counter()
     for i, labels in enumerate(multilabels):
         for code in labels or []:

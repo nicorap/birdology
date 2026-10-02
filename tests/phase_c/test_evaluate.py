@@ -165,6 +165,20 @@ def test_multilabel_y_on_class_axis_by_code():
     np.testing.assert_array_equal(ds.y, expected)
 
 
+def test_label_matrix_is_int8_not_int64():
+    """Fleet jobs 5929/5970: SSW's label matrix (205,200 x 9,736) as int64
+    is ~16 GB, and every DataLoader worker unpickles its own copy -- 8
+    workers OOM-killed cells at 96G and ran at the 384G ceiling. The
+    matrix only ever holds 0/1: int8 is exact and 8x smaller."""
+    meta = make_metadata(["a.ogg", "b.ogg"], [["amecro"], []])
+    audio = audio_lookup({f: sine_audio() for f in ["a.ogg", "b.ogg"]})
+    ds = build_eval_dataset(
+        meta, audio, FakeProvider(), CLASS_CODES, frontend=tiny_frontend
+    )
+    assert ds.y.dtype == np.int8
+    assert ds.y.nbytes == 2 * N_CLASSES
+
+
 def test_y_columns_follow_class_codes_order_not_position():
     """Reordering class_codes reorders y columns with it — by code."""
     meta = make_metadata(["a.ogg"], [["blujay"]])
