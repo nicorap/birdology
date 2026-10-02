@@ -31,7 +31,7 @@ from scipy import sparse
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 
 from birdology.phase_b.rescoring import CONTROL_VARIANTS
-from birdology.phase_b.cache import CacheView
+from birdology.phase_b.cache import CacheView, load_cache
 from birdology.phase_b.sweep import (
     Provenance,
     SweepCell,
@@ -877,3 +877,175 @@ def test_run_cell_fit_cache_shares_mlp_fit_across_test_sets(monkeypatch):
         f"expected {n_seeds} fits (one per seed, shared across test sets), "
         f"got {calls['n']}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 12. non-finite embeddings — dropped at CACHE LOAD, so 5 bad Perch rows
+#     (the measured XCL fact) cannot kill a cell the way a NaN prior is
+#     refused. db0264b's repro, re-armed with NaN EMBEDDINGS.
+# ---------------------------------------------------------------------------
+
+
+def _with_nan_embeddings(table: pa.Table, rows: list[int]) -> pa.Table:
+    """The fixture table with the given rows' embeddings made all-NaN —
+    exactly the measured XCL_perch shape (all 1536 dims NaN, here all d)."""
+    emb = table.column("embedding").to_pylist()
+    for i in rows:
+        emb[i] = [float("nan")] * len(emb[i])
+    return table.set_column(
+        table.column_names.index("embedding"),
+        "embedding",
+        pa.array(emb, pa.list_(pa.float64())),
+    )
+
+
+def _view_via_load_cache(table: pa.Table, tmp_path: Path, name: str) -> CacheView:
+    """Round-trip an in-memory fixture through a real on-disk shard and
+    load_cache — the ONLY path real fleet caches take, and the layer
+    that owns the non-finite-embedding drop."""
+    d = tmp_path / name
+    d.mkdir()
+    pq.write_table(
+        table.replace_schema_metadata(
+            {b"schema_variant": b"embedding+logits"}
+        ),
+        d / "shard_0000.parquet",
+    )
+    return load_cache(d)
+
+
+def test_mlp_cell_with_nan_train_embeddings_completes_after_counted_drop(
+    tmp_path, caplog
+):
+    """Train side: 2 all-NaN embedding rows of 240 (well under the
+    broken-cache threshold) are dropped at load with ONE warning
+    counting 2 and naming both filepaths; the fit proceeds on the
+    remaining rows and the cell completes with finite metrics —
+    instead of sklearn killing the whole cell with 'Input X contains
+    NaN'."""
+    train_table = _with_nan_embeddings(_train_cache(240).table, [5, 17])
+    with caplog.at_level("WARNING", logger="birdology.phase_b.cache"):
+        train = _view_via_load_cache(train_table, tmp_path, "train")
+    assert train.table.num_rows == 238
+    eval_cache, metadata = _eval_fixture()
+    row = run_cell(
+        _cell(method="mlp", prior_variant="full", tau=None),
+        train_cache=train,
+        eval_cache=eval_cache,
+        eval_metadata=metadata,
+        prior=_prior(),
+        class_idx=_CLASS_IDX,
+        code_to_gbif=_CODE_TO_GBIF,
+        provenance=_PROV,
+        mlp_hidden=4,
+        mlp_max_iter=20,
+    )
+    assert np.isfinite(row["cmap_mean"])
+    assert row["n_scored"] > 0
+    records = [r for r in caplog.records if "non-finite" in r.getMessage()]
+    assert len(records) == 1, "ONE counted warning per cache, not per row"
+    msg = records[0].getMessage()
+    assert "2 of 240" in msg
+    assert "r5.ogg" in msg and "r17.ogg" in msg
+
+
+def test_eval_nan_embedding_row_dropped_metrics_over_remaining_rows(
+    tmp_path, caplog
+):
+    """Eval side: a NaN-embedding eval row cannot be scored by ANY arm,
+    so it is dropped THE SAME WAY (shrinking the metric denominator
+    honestly, never zero-filled) and counted in its own per-cache
+    warning — separate from any train-side count because each cache
+    dir's load names itself. The metrics must equal a clean run over
+    exactly the surviving rows."""
+    n = 200
+    multilabels: list[list[str]] = [[_CODES[i % 3]] for i in range(n)]
+    table = _cache_table(
+        n=n,
+        label_col="ebird_code",
+        labels=[item[0] for item in multilabels],
+        splits=["test_hsn"] * n,
+        logits=_correlated_logits(multilabels, 3, seed=23),
+        seed=2,
+    )
+    metadata = _metadata_for(table, multilabels)
+    poisoned = _with_nan_embeddings(table, [7])
+    with caplog.at_level("WARNING", logger="birdology.phase_b.cache"):
+        loaded = _view_via_load_cache(poisoned, tmp_path, "eval")
+    assert loaded.table.num_rows == 199
+    assert "r7.ogg" not in loaded.table.column("filepath").to_pylist()
+
+    row = _run(_cell(), eval_cache=loaded, eval_metadata=metadata)
+    # Oracle: the SAME eval set minus the bad row, handed in clean —
+    # the dropped-row run must be indistinguishable from it.
+    keep = [i for i in range(n) if i != 7]
+    clean = CacheView(
+        table=table.take(pa.array(keep)), logits_are_raw=False, n_classes=3
+    )
+    row_clean = _run(_cell(), eval_cache=clean, eval_metadata=metadata)
+    assert row["cmap_mean"] == pytest.approx(row_clean["cmap_mean"])
+    assert row["auroc_mean"] == pytest.approx(row_clean["auroc_mean"])
+    assert row["n_scored"] == row_clean["n_scored"]
+
+    records = [r for r in caplog.records if "non-finite" in r.getMessage()]
+    assert len(records) == 1
+    msg = records[0].getMessage()
+    assert "1 of 200" in msg
+    assert "r7.ogg" in msg
+    assert "eval" in msg  # the warning names WHICH cache dropped rows
+
+
+def test_mlp_marginal_cell_with_nan_embeddings_completes_with_drop_warning(
+    tmp_path, caplog
+):
+    """db0264b's fleet repro, re-armed: NaN EMBEDDINGS instead of a NaN
+    prior. The prior is clean, so _log_floored's refusal stays silent;
+    the NaN would ride the embedding block of the MLP's X straight into
+    sklearn. The load-side drop must let the cell COMPLETE — with the
+    counted per-cache warnings (train and eval counted separately) —
+    rather than refuse: a handful of degenerate recordings must not
+    kill a whole cell."""
+    n = 200
+    multilabels: list[list[str]] = [[_CODES[i % 3]] for i in range(n)]
+    eval_table = _cache_table(
+        n=n,
+        label_col="ebird_code",
+        labels=[item[0] for item in multilabels],
+        splits=["test_hsn"] * n,
+        logits=_correlated_logits(multilabels, 3, seed=23),
+        seed=2,
+    )
+    metadata = _metadata_for(eval_table, multilabels)
+    with caplog.at_level("WARNING", logger="birdology.phase_b.cache"):
+        train = _view_via_load_cache(
+            _with_nan_embeddings(_train_cache(240).table, [5, 17]),
+            tmp_path,
+            "train2",
+        )
+        eval_cache = _view_via_load_cache(
+            _with_nan_embeddings(eval_table, [3]), tmp_path, "eval2"
+        )
+    row = run_cell(
+        _cell(
+            method="mlp",
+            prior_variant=CONTROL_VARIANTS["marginal"],
+            tau=None,
+        ),
+        train_cache=train,
+        eval_cache=eval_cache,
+        eval_metadata=metadata,
+        prior=_prior(),
+        class_idx=_CLASS_IDX,
+        code_to_gbif=_CODE_TO_GBIF,
+        provenance=_PROV,
+        mlp_hidden=4,
+        mlp_max_iter=20,
+    )
+    assert np.isfinite(row["cmap_mean"])
+    assert np.isfinite(row["auroc_mean"])
+    records = [r for r in caplog.records if "non-finite" in r.getMessage()]
+    assert len(records) == 2, "one counted warning per cache (train + eval)"
+    by_msg = {("train2" if "train2" in r.getMessage() else "eval2"): r.getMessage()
+              for r in records}
+    assert "2 of 240" in by_msg["train2"]
+    assert "1 of 200" in by_msg["eval2"]

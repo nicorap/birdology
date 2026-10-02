@@ -44,16 +44,19 @@ def _write_shard(
     logits=None,
     raw_flag=None,
     multilabel=None,
+    embeddings=None,
 ):
     """One Phase A shard parquet, matching embed.py's writer contract."""
     n = len(filepaths)
+    if embeddings is None:
+        embeddings = [[0.0, 1.0]] * n
     cols = {
         "filepath": pa.array(filepaths, pa.string()),
         "cell": pa.array(["c"] * n, pa.string()),
         "week": pa.array([1] * n, pa.int8()),
         "ebird_code": pa.array([None] * n, pa.string()),
         "split": pa.array(["test"] * n, pa.string()),
-        "embedding": pa.array([[0.0, 1.0]] * n, pa.list_(pa.float32())),
+        "embedding": pa.array(embeddings, pa.list_(pa.float32())),
     }
     variant = b"embedding"
     if logits is not None:
@@ -210,6 +213,124 @@ def test_load_cache_empty_dir_raises(tmp_path):
     empty cache."""
     with pytest.raises(ValueError, match="parquet"):
         load_cache(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# non-finite embedding rows — dropped (counted, named) below the broken-
+# cache threshold, refused above it
+# ---------------------------------------------------------------------------
+
+
+def _embeddings_with_bad_rows(n, bad):
+    """n clean 2-d embeddings with the rows in *bad* made non-finite —
+    NaN for even indices, +inf for odd, so BOTH non-finite kinds are
+    exercised by every test that uses this helper."""
+    embs = [[0.0, 1.0] for _ in range(n)]
+    for k, i in enumerate(sorted(bad)):
+        embs[i] = [float("nan"), 0.5] if k % 2 == 0 else [0.5, float("inf")]
+    return embs
+
+
+def test_load_cache_drops_nonfinite_embedding_rows_with_one_counted_warning(
+    tmp_path, caplog
+):
+    """The measured fleet fact: a handful of recordings for which the
+    encoder emitted all-NaN embeddings (5 of 488,603 in XCL_perch).
+    Those rows must be DROPPED at load — counted and named in ONE
+    warning — not ride into sklearn's 'Input X contains NaN' and kill
+    the whole cell. Inf is non-finite too and takes the same path."""
+    n = 400
+    bad = {3, 7}
+    filepaths = [f"r{i}.ogg" for i in range(n)]
+    _write_shard(
+        tmp_path / "shard_0001.parquet",
+        filepaths,
+        embeddings=_embeddings_with_bad_rows(n, bad),
+    )
+    with caplog.at_level("WARNING", logger="birdology.phase_b.cache"):
+        view = load_cache(tmp_path)
+    assert view.table.num_rows == n - len(bad)
+    kept = set(view.table.column("filepath").to_pylist())
+    assert "r3.ogg" not in kept and "r7.ogg" not in kept
+    assert "r2.ogg" in kept
+    records = [r for r in caplog.records if "non-finite" in r.getMessage()]
+    assert len(records) == 1, "exactly ONE counted warning, not one per row"
+    msg = records[0].getMessage()
+    assert "2 of 400" in msg
+    assert "r3.ogg" in msg and "r7.ogg" in msg
+
+
+def test_load_cache_drop_warning_caps_named_filepaths_at_20(tmp_path, caplog):
+    """There are only ever a handful of bad rows — but if there are 21,
+    the warning names 20 and counts the rest instead of dumping an
+    unbounded list into the fleet log."""
+    n = 2500
+    bad = set(range(21))
+    filepaths = [f"r{i}.ogg" for i in range(n)]
+    _write_shard(
+        tmp_path / "shard_0001.parquet",
+        filepaths,
+        embeddings=_embeddings_with_bad_rows(n, bad),
+    )
+    with caplog.at_level("WARNING", logger="birdology.phase_b.cache"):
+        view = load_cache(tmp_path)
+    assert view.table.num_rows == n - len(bad)
+    records = [r for r in caplog.records if "non-finite" in r.getMessage()]
+    assert len(records) == 1
+    msg = records[0].getMessage()
+    assert "21 of 2500" in msg
+    named = [f for f in (f"r{i}.ogg" for i in bad) if f in msg]
+    assert len(named) == 20
+    assert "1 more" in msg
+
+
+def test_load_cache_refuses_cache_with_more_than_one_percent_nonfinite(
+    tmp_path,
+):
+    """2 bad rows of 100 is 2% — above MAX_NONFINITE_EMBEDDING_FRACTION.
+    That is no longer a handful of degenerate recordings; it is a broken
+    cache (truncated shards, wrong dtype, a bad fleet run) and silently
+    dropping 2% of the data would shift every metric. The error names
+    the fraction."""
+    _write_shard(
+        tmp_path / "shard_0001.parquet",
+        [f"r{i}.ogg" for i in range(100)],
+        embeddings=_embeddings_with_bad_rows(100, {0, 50}),
+    )
+    with pytest.raises(ValueError, match=r"2 of 100.*2\.00%|2\.00%.*2 of 100"):
+        load_cache(tmp_path)
+
+
+def test_load_cache_exactly_one_percent_nonfinite_still_drops(tmp_path, caplog):
+    """The threshold is strictly MORE than 1%: exactly 1 of 100 is the
+    boundary and still drops with a warning rather than refusing."""
+    _write_shard(
+        tmp_path / "shard_0001.parquet",
+        [f"r{i}.ogg" for i in range(100)],
+        embeddings=_embeddings_with_bad_rows(100, {42}),
+    )
+    with caplog.at_level("WARNING", logger="birdology.phase_b.cache"):
+        view = load_cache(tmp_path)
+    assert view.table.num_rows == 99
+
+
+def test_load_cache_clean_cache_is_silent_and_unchanged(tmp_path, caplog):
+    """Regression oracle: a fully finite cache loads with ZERO warnings
+    and ZERO dropped rows — the drop path must be invisible to every
+    cache that was already healthy."""
+    _write_shard(
+        tmp_path / "shard_0001.parquet",
+        ["a.ogg", "b.ogg"],
+        logits=[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+        raw_flag=b"true",
+    )
+    with caplog.at_level("WARNING", logger="birdology.phase_b.cache"):
+        view = load_cache(tmp_path)
+    assert view.table.num_rows == 2
+    assert view.logits_are_raw is True
+    assert view.n_classes == 3
+    assert view.table.column("filepath").to_pylist() == ["a.ogg", "b.ogg"]
+    assert [r for r in caplog.records if "non-finite" in r.getMessage()] == []
 
 
 # ---------------------------------------------------------------------------
