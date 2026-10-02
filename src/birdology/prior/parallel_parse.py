@@ -44,6 +44,37 @@ records every figure):
   toward the worker-phase scaling. Report figures from the recorded
   measurement file, never from this prose.
 
+THE MERGE NEVER GROUPS ON TEXT (job 5722)
+-----------------------------------------
+The first fleet run of this module (job 5722, EOD, 1.76e9 rows, 90
+workers) died six minutes in, in ``_compact``: ``Column 3: In chunk 1725:
+Invalid: Negative offsets in binary array``. The text columns were
+``pa.string()`` -- int32 offsets, 2 GiB of characters per chunk -- and the
+hash-aggregate over hundreds of millions of distinct groups emitted one
+publisher_key chunk (36 bytes per GROUP) past 2^31 bytes. The geometric
+compaction below deliberately grows the compacted base, so a >2 GiB chunk
+was inevitable at fleet scale and invisible at the 10M-row benchmark.
+
+``pa.large_string()`` is NOT the fix, measured on pyarrow 25.0.1: a 5-key
+``group_by`` with large_string keys ABORTED the process
+(``std::length_error``) at 30M groups. So text never enters a merge key:
+
+* a worker returns its partial with the text columns dictionary-encoded
+  against a LOCAL dictionary (one chunk's worth -- small);
+* the parent maps each local dictionary onto per-column global
+  vocabularies (cell / publisher / contributor -> int32 code) and merges
+  ``MERGE_SCHEMA`` tables: six fixed-width columns, ~29 bytes/row instead
+  of ~90, and integer hashing instead of string hashing;
+* ``_finalise`` turns codes back into ``arrow_strings.TEXT_TYPE`` columns
+  in CANONICAL form (sorted, used-only dictionary), so the output is a pure
+  function of the data whatever order chunks arrived in, and sorts on the
+  canonical indices -- which order exactly as the strings do.
+
+Measured effect on the recorded 10M-row benchmark (10M rows, r3/4/5):
+workers=1 74.8s -> 39.4s, workers=8 40.6s -> 15.9s, parent RSS 15 -> 9.6 GB,
+output digest identical. ``measure_parallel_parse_results.json`` is NOT
+rewritten; the before/after is recorded in the commit message.
+
 THE OUTPUT IS PRE-AGGREGATED, AND THAT IS EXACT
 -----------------------------------------------
 The tables carry (species_key, cell, week, publisher_key, recorded_by, n)
@@ -79,8 +110,11 @@ from multiprocessing import get_context
 from pathlib import Path
 
 import h3
+import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 
+from .arrow_strings import TEXT_TYPE, dictionary_from_codes
 from .indexing import iso_week
 from .occurrences import (
     _coordinates_usable,
@@ -95,17 +129,52 @@ from .occurrences import (
 #: of the ~200k rows a chunk holds, while bounding the reader's working set.
 DEFAULT_CHUNK_BYTES = 32 << 20
 
-#: The pre-aggregated schema. ``week`` is ``int8`` exactly as
-#: ``assign_cells`` writes it, so a table from this module and one from the
-#: sequential path are interchangeable downstream.
+#: The text columns, in schema order. Each is coded against its own
+#: global vocabulary during the merge.
+TEXT_COLUMNS = ("cell", "publisher_key", "recorded_by")
+
+#: The pre-aggregated OUTPUT schema. ``week`` is ``int8`` exactly as
+#: ``assign_cells`` writes it. The text columns are
+#: ``dictionary<int32, large_string>`` in canonical form (see
+#: ``arrow_strings.canonical_dictionary``): NO 32-bit-offset column exists
+#: anywhere in the parse, its output or the checkpoint (job 5722). Every
+#: consumer reads them by value -- the guards via
+#: ``arrow_strings.text_to_pylist``, ``aggregate_counts`` by narrowing to
+#: ``pa.string()`` in bounded chunks after aggregation.
 PARSE_SCHEMA = pa.schema(
     [
         ("species_key", pa.int64()),
-        ("cell", pa.string()),
+        ("cell", TEXT_TYPE),
         ("week", pa.int8()),
-        ("publisher_key", pa.string()),
-        ("recorded_by", pa.string()),
+        ("publisher_key", TEXT_TYPE),
+        ("recorded_by", TEXT_TYPE),
         ("n", pa.int64()),
+    ]
+)
+
+#: What the parent MERGES: PARSE_SCHEMA with every text column replaced by
+#: its int32 code into the parent's vocabulary. Fixed-width only -- see
+#: "THE MERGE NEVER GROUPS ON TEXT" above; ``_compact`` refuses anything
+#: else.
+MERGE_SCHEMA = pa.schema(
+    [
+        (field.name, pa.int32() if field.name in TEXT_COLUMNS else field.type)
+        for field in PARSE_SCHEMA
+    ]
+)
+
+#: A worker's partial: text dictionary-encoded against the CHUNK'S OWN
+#: dictionary. A chunk is at most ``chunk_bytes`` of input, so its text can
+#: never approach the int32-offset limit.
+_PARTIAL_SCHEMA = pa.schema(
+    [
+        (
+            field.name,
+            pa.dictionary(pa.int32(), pa.string())
+            if field.name in TEXT_COLUMNS
+            else field.type,
+        )
+        for field in PARSE_SCHEMA
     ]
 )
 
@@ -229,21 +298,92 @@ def _parse_chunk(
 
 
 def _partial_table(counts: dict) -> pa.Table:
-    """One chunk's partial counts as an UNSORTED PARSE_SCHEMA table."""
+    """One chunk's partial counts as an UNSORTED ``_PARTIAL_SCHEMA`` table.
+
+    The text columns are dictionary-encoded HERE, in the worker, so the
+    parent's per-chunk work is a lookup of each DISTINCT value rather than
+    of every row.
+    """
     if not counts:
-        return PARSE_SCHEMA.empty_table()
+        return _PARTIAL_SCHEMA.empty_table()
     species, cells, weeks, publishers, who = zip(*counts.keys())
+
+    def text(values) -> pa.DictionaryArray:
+        return pa.array(list(values), pa.string()).dictionary_encode()
+
     return pa.table(
         [
-            list(species),
-            list(cells),
-            list(weeks),
-            list(publishers),
-            list(who),
-            list(counts.values()),
+            pa.array(species, pa.int64()),
+            text(cells),
+            pa.array(weeks, pa.int8()),
+            text(publishers),
+            text(who),
+            pa.array(list(counts.values()), pa.int64()),
         ],
-        schema=PARSE_SCHEMA,
+        schema=_PARTIAL_SCHEMA,
     )
+
+
+class _Vocabulary:
+    """One text column's global string -> int32 code table (parent only).
+
+    Codes are assigned in FIRST-SEEN order, which depends on the order
+    ``imap_unordered`` delivers chunks in -- so codes are a private detail
+    of one run and never leave this module: ``_finalise`` re-encodes them
+    canonically. int32 is ample: the distinct cells, publishers and
+    contributors of a GBIF archive number in the millions, not billions,
+    and overflowing it raises rather than wraps.
+    """
+
+    def __init__(self) -> None:
+        self.code_of: dict[str, int] = {}
+        self.values: list[str] = []
+
+    def codes_for(self, dictionary: pa.Array) -> pa.Array:
+        """int32 global code for each entry of a chunk-local dictionary."""
+        out = np.empty(len(dictionary), dtype=np.int32)
+        code_of = self.code_of
+        values = self.values
+        for i, value in enumerate(dictionary.to_pylist()):
+            code = code_of.get(value)
+            if code is None:
+                code = len(values)
+                if code > np.iinfo(np.int32).max:
+                    raise OverflowError(
+                        "more distinct text values than int32 codes"
+                    )
+                code_of[value] = code
+                values.append(value)
+            out[i] = code
+        return pa.array(out, pa.int32())
+
+    def as_array(self) -> pa.Array:
+        return pa.array(self.values, pa.large_string())
+
+
+def _encode_partial(
+    partial: pa.Table, vocabularies: dict[str, _Vocabulary]
+) -> pa.Table:
+    """A worker partial as a ``MERGE_SCHEMA`` table of global codes.
+
+    ``take`` of the local->global code map by the local indices keeps a
+    null index null: a null publisher or contributor stays null, and
+    ``group_by`` groups nulls as one key exactly as it did for strings.
+    """
+    columns = []
+    for field in MERGE_SCHEMA:
+        column = partial.column(field.name)
+        if field.name in TEXT_COLUMNS:
+            vocabulary = vocabularies[field.name]
+            column = pa.chunked_array(
+                [
+                    vocabulary.codes_for(chunk.dictionary).take(chunk.indices)
+                    for chunk in column.chunks
+                ],
+                type=pa.int32(),
+            )
+        columns.append(column)
+    return pa.Table.from_arrays(columns, schema=MERGE_SCHEMA)
 
 
 def _chunks(raw, chunk_bytes: int):
@@ -261,8 +401,12 @@ def _chunks(raw, chunk_bytes: int):
         yield buf + tail
 
 
-def _merge(into: dict[int, list[pa.Table]], partials: dict[int, pa.Table]) -> None:
-    """Append one worker's partial tables to the per-resolution pending lists.
+def _merge(
+    into: dict[int, list[pa.Table]],
+    partials: dict[int, pa.Table],
+    vocabularies: dict[str, _Vocabulary],
+) -> None:
+    """Append one worker's partials, CODED, to the per-resolution pending lists.
 
     The actual summation happens in :func:`_compact`, in Arrow. The pending
     lists are compacted whenever their row total crosses
@@ -272,7 +416,7 @@ def _merge(into: dict[int, list[pa.Table]], partials: dict[int, pa.Table]) -> No
     """
     for resolution, partial in partials.items():
         if partial.num_rows:
-            into[resolution].append(partial)
+            into[resolution].append(_encode_partial(partial, vocabularies))
 
 
 #: Floor for the geometric compaction policy: the uncompacted increment
@@ -284,41 +428,89 @@ _COMPACT_PENDING_ROWS = 4_000_000
 
 
 def _compact(pending: list[pa.Table]) -> pa.Table:
-    """Sum duplicate keys across pending partial tables, in Arrow.
+    """Sum duplicate keys across pending ``MERGE_SCHEMA`` tables, in Arrow.
 
     ``group_by(...).aggregate(n, sum)`` returns int64 for an int64 input, so
     repeated compaction is associative and loss-free: compact(compact(a, b),
     c) == compact(a, b, c), which is what makes the incremental schedule
     exact whatever order ``imap_unordered`` delivers chunks in.
+
+    REFUSES a non-integer column (job 5722): a variable-width key is what
+    overflowed int32 offsets on the fleet, and its 64-bit variant aborts
+    Arrow's grouper. A regression that routes text back in fails here on
+    the first fixture rather than at 2^31 bytes on a 90-worker node.
     """
+    for table in pending:
+        for field in table.schema:
+            if not pa.types.is_integer(field.type):
+                raise ValueError(
+                    f"merge column {field.name!r} is {field.type}, not a "
+                    "fixed-width integer: text must be coded before the "
+                    "merge (job 5722 -- string keys overflow int32 offsets "
+                    "and large_string keys abort the grouper at fleet scale)"
+                )
     if not pending:
-        return PARSE_SCHEMA.empty_table()
+        return MERGE_SCHEMA.empty_table()
     stacked = pa.concat_tables(pending)
     grouped = stacked.group_by(
         ["species_key", "cell", "week", "publisher_key", "recorded_by"]
     ).aggregate([("n", "sum")])
     return grouped.rename_columns(
         ["species_key", "cell", "week", "publisher_key", "recorded_by", "n"]
-    ).select(PARSE_SCHEMA.names).cast(PARSE_SCHEMA)
+    ).select(MERGE_SCHEMA.names).cast(MERGE_SCHEMA)
 
 
-def _finalise(pending: list[pa.Table]) -> pa.Table:
-    """Final compaction + the deterministic sort the checkpoint relies on.
+def _finalise(
+    pending: list[pa.Table], vocabularies: dict[str, _Vocabulary]
+) -> pa.Table:
+    """Final compaction, canonical decode, and the deterministic sort.
 
     SORTED so the table -- and therefore the checkpoint file -- is
     byte-reproducible across runs and worker counts: ``imap_unordered``
-    deliberately randomises arrival order. Keys are unique after
-    ``_compact``, so the sort needs no tiebreak.
+    deliberately randomises arrival order (and with it the run-private
+    codes). Keys are unique after ``_compact``, so the sort needs no
+    tiebreak.
+
+    The sort runs on the CANONICAL dictionary indices, never on text:
+    Arrow cannot sort a dictionary column, and a canonical dictionary is
+    sorted, so index order IS string order -- nulls last either way. The
+    row order is therefore exactly the order the string sort produced.
     """
-    return _compact(pending).sort_by(
-        [
+    merged = _compact(pending)
+    columns = {}
+    for name in MERGE_SCHEMA.names:
+        column = merged.column(name)
+        if name in TEXT_COLUMNS:
+            column = dictionary_from_codes(column, vocabularies[name].as_array())
+        columns[name] = column
+    sort_keys = pa.table(
+        {
+            name: (
+                pa.chunked_array(
+                    [chunk.indices for chunk in columns[name].chunks],
+                    type=pa.int32(),
+                )
+                if name in TEXT_COLUMNS
+                else columns[name]
+            )
+            for name in ("species_key", "cell", "week", "publisher_key",
+                         "recorded_by")
+        }
+    )
+    order = pc.sort_indices(
+        sort_keys,
+        sort_keys=[
             ("species_key", "ascending"),
             ("cell", "ascending"),
             ("week", "ascending"),
             ("publisher_key", "ascending"),
             ("recorded_by", "ascending"),
-        ]
+        ],
     )
+    table = pa.Table.from_arrays(
+        [columns[name] for name in PARSE_SCHEMA.names], schema=PARSE_SCHEMA
+    )
+    return table.take(order)
 
 
 def parse_and_aggregate(
@@ -355,6 +547,10 @@ def parse_and_aggregate(
     dropped: dict[str, int] = dict.fromkeys(DROP_REASONS, 0)
     total = 0
     pending: dict[int, list[pa.Table]] = {r: [] for r in resolutions}
+    # ONE vocabulary per text column, shared across resolutions: a cell
+    # code at r3 and one at r5 never meet in a key, so sharing costs only
+    # code-space, and ``_finalise`` keeps each resolution's used values only.
+    vocabularies = {name: _Vocabulary() for name in TEXT_COLUMNS}
 
     def _fold(chunk_dropped: dict[str, int], chunk_total: int,
               partials: dict[int, pa.Table]) -> None:
@@ -362,7 +558,7 @@ def parse_and_aggregate(
         for reason, n in chunk_dropped.items():
             dropped[reason] += n
         total += chunk_total
-        _merge(pending, partials)
+        _merge(pending, partials, vocabularies)
         # Incremental compaction, GEOMETRIC (LSM-style): compact when the
         # UNCOMPACTED increment has grown to the size of the compacted
         # base (or the floor, for the start). Each compaction then roughly
@@ -434,7 +630,7 @@ def parse_and_aggregate(
                         _fold(chunk_dropped, chunk_total, partials)
 
     return ParseResult(
-        tables={r: _finalise(pending[r]) for r in resolutions},
+        tables={r: _finalise(pending[r], vocabularies) for r in resolutions},
         dropped=dropped,
         total=total,
     )

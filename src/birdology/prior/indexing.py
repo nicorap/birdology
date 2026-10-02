@@ -12,6 +12,7 @@ from datetime import date
 import h3
 import pyarrow as pa
 
+from .arrow_strings import TEXT_TYPE, canonical_dictionary, decode_strings
 from .leakage import guards_applied, mark_guards_applied
 
 WEEKS_PER_YEAR = 52
@@ -79,12 +80,45 @@ def aggregate_counts(table: pa.Table) -> pa.Table:
     behaviour is unchanged; the two paths produce identical counts, which
     `test_the_aggregates_feed_the_existing_pipeline` pins on a fixture whose
     groups genuinely exceed 1.
+
+    THE pa.string() BOUNDARY (job 5722)
+    -----------------------------------
+    The parallel parse hands over ``cell`` as
+    ``dictionary<int32, large_string>`` -- no 32-bit-offset column survives
+    anywhere upstream, because a fleet-sized one overflowed. Everything
+    downstream (`effort`, `backoff`, `smoothing`, `tensor`) demands
+    ``cell: pa.string()`` and never casts. So THIS is where the narrowing
+    happens: after the reduction to (species, cell, week), when the table
+    is as small as it will ever be. The aggregation groups on the canonical
+    dictionary INDICES (integers; sorted dictionary, so no information is
+    lost) and the output cell column is decoded by
+    ``arrow_strings.decode_strings`` in chunks bounded far below 2 GiB --
+    an unbounded ``.cast(pa.string())`` would be the same overflow again
+    at fleet scale. A plain ``pa.string()`` input (the sequential path)
+    takes the original route unchanged.
     """
-    if "n" in table.column_names:
-        weighted = table.select(["species_key", "cell", "week", "n"])
+    keyed = table
+    vocabulary = None
+    cell_type = table.schema.field("cell").type
+    if pa.types.is_dictionary(cell_type) or pa.types.is_large_string(cell_type):
+        canonical = canonical_dictionary(table.column("cell"))
+        vocabulary = (
+            canonical.chunk(0).dictionary
+            if canonical.num_chunks
+            else pa.array([], pa.large_string())
+        )
+        keyed = table.set_column(
+            table.schema.get_field_index("cell"),
+            "cell",
+            pa.chunked_array(
+                [chunk.indices for chunk in canonical.chunks], type=pa.int32()
+            ),
+        )
+    if "n" in keyed.column_names:
+        weighted = keyed.select(["species_key", "cell", "week", "n"])
     else:
-        weighted = table.select(["species_key", "cell", "week"]).append_column(
-            "n", pa.array([1] * table.num_rows, pa.int64())
+        weighted = keyed.select(["species_key", "cell", "week"]).append_column(
+            "n", pa.array([1] * keyed.num_rows, pa.int64())
         )
     grouped = weighted.group_by(["species_key", "cell", "week"]).aggregate(
         [("n", "sum")]
@@ -92,6 +126,20 @@ def aggregate_counts(table: pa.Table) -> pa.Table:
     counts = grouped.rename_columns({"n_sum": "n"}).select(
         ["species_key", "cell", "week", "n"]
     )
+    if vocabulary is not None:
+        counts = counts.set_column(
+            1,
+            pa.field("cell", pa.string()),
+            decode_strings(
+                pa.chunked_array(
+                    [
+                        pa.DictionaryArray.from_arrays(chunk, vocabulary)
+                        for chunk in counts.column("cell").chunks
+                    ],
+                    type=TEXT_TYPE,
+                )
+            ),
+        )
     if guards_applied(table):
         counts = mark_guards_applied(counts)
     return counts

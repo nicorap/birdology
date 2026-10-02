@@ -369,7 +369,7 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         "becomes a presence indicator rather than a count — the effort "
         "correction silently stops correcting",
         "test_aggregate_counts_sums_duplicates",
-        [('.aggregate([("n", "sum")])', '.aggregate([("n", "min")])')],
+        [('        [("n", "sum")]\n    )', '        [("n", "min")]\n    )')],
     ),
     (
         "X19",
@@ -387,12 +387,12 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         "test_aggregate_counts_emits_ONE_row_per_species_cell_week",
         [
             (
-                '        table.select(["species_key", "cell", "week"])',
-                '        table.select(["species_key", "cell", "week", "publisher_key"])',
+                '        weighted = keyed.select(["species_key", "cell", "week"])',
+                '        weighted = keyed.select(["species_key", "cell", "week", "publisher_key"])',
             ),
             (
-                '        .group_by(["species_key", "cell", "week"])',
-                '        .group_by(["species_key", "cell", "week", "publisher_key"])',
+                '    grouped = weighted.group_by(["species_key", "cell", "week"])',
+                '    grouped = weighted.group_by(["species_key", "cell", "week", "publisher_key"])',
             ),
         ],
     ),

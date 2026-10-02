@@ -592,8 +592,8 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         "test_each_value_lands_under_its_own_key_when_the_input_is_unsorted",
         [
             (
-                "    cell_idx = remap[encoded.indices.to_numpy(zero_copy_only=False).astype(np.int64)]",
-                "    cell_idx = encoded.indices.to_numpy(zero_copy_only=False).astype(np.int64)",
+                "    cell_idx = remap[codes]",
+                "    cell_idx = codes",
             )
         ],
     ),
@@ -610,11 +610,11 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         "test_a_cell_string_is_passed_through_byte_for_byte",
         [
             (
-                '    encoded = _single_array(table.column("cell")).dictionary_encode()',
+                '    codes, distinct = dictionary_codes(table.column("cell"))',
                 "    import pyarrow.compute as pc\n"
-                "    encoded = pc.utf8_lower(\n"
-                '        _single_array(table.column("cell"))\n'
-                "    ).dictionary_encode()",
+                "    codes, distinct = dictionary_codes(\n"
+                '        pc.utf8_lower(table.column("cell"))\n'
+                "    )",
             )
         ],
     ),

@@ -103,14 +103,10 @@ def test_checkpoint_round_trips_tables_and_metadata(tmp_path):
     assert meta["dropped"] == result.dropped
     assert set(tables) == {3, 4}
     for resolution in (3, 4):
-        assert tables[resolution].sort_by(
-            [(c, "ascending") for c in tables[resolution].column_names]
-        ).equals(
-            result.tables[resolution].sort_by(
-                [(c, "ascending")
-                 for c in result.tables[resolution].column_names]
-            )
-        )
+        # No sort: the parse output is deterministically ordered and its
+        # text columns are canonical dictionaries (which Arrow cannot sort
+        # anyway), so the round trip must reproduce it EXACTLY.
+        assert tables[resolution].equals(result.tables[resolution])
 
 
 def test_checkpoint_records_the_drop_counters(tmp_path):
@@ -189,6 +185,66 @@ def test_unknown_schema_version_is_refused(tmp_path):
     with pytest.raises(StaleCheckpointError, match="schema_version"):
         load_checkpoint(path, source="eod", archive=archive,
                         resolutions=[3, 4])
+
+
+def test_checkpoint_round_trip_is_bit_exact_in_the_parse_schema(tmp_path):
+    """Job 5722: the text columns are dictionary<int32, large_string> in a
+    canonical form. Parquet merges the per-resolution dictionaries on write
+    and re-splits them on read, so the loader must re-canonicalise; the
+    round trip is compared with ``.equals`` -- types, dictionaries, order --
+    not after a sort."""
+    from birdology.prior.parallel_parse import PARSE_SCHEMA
+
+    archive = _archive(tmp_path)
+    result = parse_and_aggregate(archive, [3, 4, 5], workers=1)
+    path = write_checkpoint(
+        checkpoint_path(tmp_path / "out", "eod"), result,
+        source="eod", archive=archive, resolutions=[3, 4, 5],
+    )
+    _, tables = load_checkpoint(path)
+    for resolution in (3, 4, 5):
+        assert tables[resolution].schema == PARSE_SCHEMA
+        assert tables[resolution].equals(result.tables[resolution])
+
+
+def test_a_version_1_string_checkpoint_is_refused_as_stale(tmp_path):
+    """The pre-5722 layout (pa.string text columns, schema_version 1) is a
+    checkpoint of a different SHAPE: it fails closed, naming the field,
+    rather than being cast -- a cast of a fleet-sized string column is the
+    overflow this version bump exists to retire."""
+    import json
+    import pyarrow.parquet as pq
+
+    archive = _archive(tmp_path)
+    path = checkpoint_path(tmp_path / "out", "eod")
+    path.parent.mkdir(parents=True)
+    legacy = pa.table(
+        {
+            "resolution": pa.array([4], pa.int8()),
+            "species_key": pa.array([1001], pa.int64()),
+            "cell": pa.array(["841f05bffffffff"], pa.string()),
+            "week": pa.array([2], pa.int8()),
+            "publisher_key": pa.array(["pub"], pa.string()),
+            "recorded_by": pa.array(["obs"], pa.string()),
+            "n": pa.array([1], pa.int64()),
+        }
+    )
+    meta = {
+        "schema_version": 1, "source": "eod",
+        "archive": str(archive.resolve()), "resolutions": [4],
+        "dropped": {"no_species_key": 0, "bad_coordinates": 0,
+                    "unparseable_date": 0},
+        "total_rows_read": 1,
+    }
+    pq.write_table(
+        legacy.replace_schema_metadata(
+            {b"birdology_parse_checkpoint": json.dumps(meta).encode()}
+        ),
+        path,
+    )
+    assert CHECKPOINT_SCHEMA_VERSION >= 2
+    with pytest.raises(StaleCheckpointError, match="schema_version"):
+        load_checkpoint(path, source="eod", archive=archive, resolutions=[4])
 
 
 # --------------------------------------------------------------------------

@@ -34,13 +34,20 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .parallel_parse import PARSE_SCHEMA, DROP_REASONS, ParseResult
+from .arrow_strings import canonical_dictionary
+from .parallel_parse import PARSE_SCHEMA, DROP_REASONS, TEXT_COLUMNS, ParseResult
 
 #: Bumped when the checkpoint SHAPE changes. A reader that half-understands
 #: a newer checkpoint would resume from fields that happened to parse, so an
 #: unknown version refuses rather than guesses -- same policy as the build
 #: manifest's ``MANIFEST_VERSION``.
-CHECKPOINT_SCHEMA_VERSION = 1
+#:
+#: 2 (job 5722): the text columns are ``dictionary<int32, large_string>``,
+#: not ``pa.string()``. A version-1 checkpoint is REFUSED as stale rather
+#: than cast up: none can exist for the fleet run that needed this (it died
+#: mid-parse), and casting a fleet-sized ``pa.string`` column is exactly
+#: the operation whose offsets overflowed.
+CHECKPOINT_SCHEMA_VERSION = 2
 
 #: The parquet schema-metadata key the provenance blob lives under.
 METADATA_KEY = b"birdology_parse_checkpoint"
@@ -203,10 +210,24 @@ def load_checkpoint(
         import pyarrow.compute as pc
 
         mask = pc.equal(column, pa.scalar(resolution, pa.int8()))
-        tables[resolution] = (
+        selected = (
             stacked.filter(mask)
             .drop_columns(["resolution"])
             .replace_schema_metadata(None)
-            .cast(PARSE_SCHEMA)
         )
+        # RE-CANONICALISE, never `.cast(PARSE_SCHEMA)`. Parquet merges the
+        # resolutions' dictionaries into one per row group on write and
+        # reads them back as `dictionary<int32, string>`, one dictionary per
+        # row group: a resolution's slice then carries other resolutions'
+        # values and possibly several dictionaries (which Arrow's group_by
+        # refuses). `canonical_dictionary` restores the parse's exact
+        # encoding -- sorted, used-only, shared -- chunk by chunk, so no
+        # step concatenates the text into one 32-bit-offset buffer.
+        columns = [
+            canonical_dictionary(selected.column(name))
+            if name in TEXT_COLUMNS
+            else selected.column(name).cast(field.type)
+            for name, field in zip(PARSE_SCHEMA.names, PARSE_SCHEMA)
+        ]
+        tables[resolution] = pa.Table.from_arrays(columns, schema=PARSE_SCHEMA)
     return meta, tables

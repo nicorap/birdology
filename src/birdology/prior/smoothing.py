@@ -86,6 +86,7 @@ import h3
 import numpy as np
 import pyarrow as pa
 
+from .arrow_strings import dictionary_codes
 from .indexing import WEEKS_PER_YEAR
 
 _REQUIRED_TYPES = {
@@ -289,13 +290,18 @@ def _single_array(column: pa.ChunkedArray | pa.Array) -> pa.Array:
     return column
 
 
-def _codes(values: pa.Array) -> tuple[np.ndarray, list]:
-    """Dense 0..k-1 codes plus the distinct values they index."""
-    encoded = values.dictionary_encode()
-    return (
-        np.asarray(encoded.indices.to_numpy(zero_copy_only=False), dtype=np.int64),
-        encoded.dictionary.to_pylist(),
-    )
+def _codes(values: pa.Array | pa.ChunkedArray) -> tuple[np.ndarray, list]:
+    """Dense 0..k-1 codes plus the distinct values they index.
+
+    Takes the column CHUNKED and never concatenates it (job 5722): a
+    species chunk of the full grid is 50 x cells x 52 rows, whose 15-byte
+    cell text crosses the 2 GiB int32-offset limit at ~55k cells, and
+    ``combine_chunks`` of such a ``pa.string`` column raises "offset
+    overflow". ``dictionary_codes`` yields the same codes in the same
+    first-occurrence order.
+    """
+    codes, distinct = dictionary_codes(values)
+    return codes, distinct.to_pylist()
 
 
 def _neighbour_codes(cells: list[str]) -> np.ndarray:
@@ -336,7 +342,7 @@ def smooth(
     _validate_weeks(weeks)
 
     species, _ = _codes(_single_array(estimates.column("species_key")))
-    cell_code, cells = _codes(_single_array(estimates.column("cell")))
+    cell_code, cells = _codes(estimates.column("cell"))
     _validate_cells(cells)
 
     # Mixed-radix packing, hence injective. The cell digit is bounded by

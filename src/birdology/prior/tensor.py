@@ -128,6 +128,7 @@ import pyarrow as pa
 from scipy import sparse
 
 from .backoff import FLOOR, BackoffParams
+from .arrow_strings import dictionary_codes
 from .indexing import WEEKS_PER_YEAR
 from .smoothing import SmoothingParams
 
@@ -553,12 +554,18 @@ def to_tensor(
     # `cell` is an opaque, case-sensitive, lower-case canonical H3 string. It
     # is dictionary-encoded and re-ordered, never re-derived, re-parsed or
     # case-folded: this module must hand back the exact bytes it was given.
-    encoded = _single_array(table.column("cell")).dictionary_encode()
-    dictionary = encoded.dictionary.to_pylist()
+    #
+    # `dictionary_codes`, NOT `combine_chunks().dictionary_encode()` (job
+    # 5722): concatenating a `pa.string` column whose text passes 2 GiB
+    # raises "offset overflow" -- ~143M contexts at 15-byte cells, a grid
+    # the fleet node can otherwise hold. The codes and first-occurrence
+    # order are identical to the concatenated encoding.
+    codes, distinct = dictionary_codes(table.column("cell"))
+    dictionary = distinct.to_pylist()
     cells = sorted(set(dictionary))
     position = {c: i for i, c in enumerate(cells)}
     remap = np.array([position[c] for c in dictionary], dtype=np.int64)
-    cell_idx = remap[encoded.indices.to_numpy(zero_copy_only=False).astype(np.int64)]
+    cell_idx = remap[codes]
 
     species_keys = np.unique(species.astype(np.int64))
     row_idx = np.searchsorted(species_keys, species.astype(np.int64))

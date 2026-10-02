@@ -499,9 +499,9 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         "test_an_upper_case_cell_is_rejected_rather_than_silently_unmatched",
         [
             (
-                '    cell_code, cells = _codes(_single_array(estimates.column("cell")))',
+                '    cell_code, cells = _codes(estimates.column("cell"))',
                 "    cell_code, cells = _codes(\n"
-                '        pa.compute.utf8_lower(_single_array(estimates.column("cell")))\n'
+                '        pa.compute.utf8_lower(estimates.column("cell"))\n'
                 "    )",
             )
         ],

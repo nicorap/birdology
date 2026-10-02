@@ -108,8 +108,8 @@ MUTANTS: list[tuple[str, str, list[tuple[str, str]]]] = [
         "the contract, and a crash is not a mutant",
         [
             (
-                '    keys = pa.array(sorted(XENO_CANTO_PUBLISHER_KEYS), pa.string())',
-                '    return table, 0\n    keys = pa.array(sorted(XENO_CANTO_PUBLISHER_KEYS), pa.string())',
+                '    keys = pa.array(\n        sorted(XENO_CANTO_PUBLISHER_KEYS),',
+                '    return table, 0\n    keys = pa.array(\n        sorted(XENO_CANTO_PUBLISHER_KEYS),',
             )
         ],
     ),

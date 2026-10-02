@@ -64,6 +64,8 @@ import h3
 import pyarrow as pa
 import pyarrow.compute as pc
 
+from .arrow_strings import text_to_pylist, value_type
+
 logger = logging.getLogger(__name__)
 
 #: Xeno-canto Foundation for Nature Sounds, publishing organisation on GBIF.
@@ -427,7 +429,15 @@ def _drop_xeno_canto(table: pa.Table) -> tuple[pa.Table, int]:
     so the number an escalation sees and the number a log reports can never
     disagree.
     """
-    keys = pa.array(sorted(XENO_CANTO_PUBLISHER_KEYS), pa.string())
+    # The value set is built in the column's OWN value type (job 5722: the
+    # parse output carries dictionary<int32, large_string>, the sequential
+    # path pa.string). Explicit rather than left to `is_in`'s implicit
+    # coercion: the direction of an implicit cast is Arrow's choice, and a
+    # cast of the COLUMN to pa.string is the very overflow being retired.
+    keys = pa.array(
+        sorted(XENO_CANTO_PUBLISHER_KEYS),
+        value_type(table.column("publisher_key")),
+    )
     mask = pc.invert(pc.is_in(table.column("publisher_key"), value_set=keys))
     kept = table.filter(mask)
     removed = table.num_rows - kept.num_rows
@@ -713,9 +723,12 @@ def _drop_test_contributor_cells(
     if not banned:
         return table, 0, 0, 0
 
-    cells = table.column("cell").to_pylist()
+    # `text_to_pylist`, not `.to_pylist()`: identical values for plain
+    # strings, and for the parse output's dictionary columns (job 5722) it
+    # decodes each distinct value once instead of once per row.
+    cells = text_to_pylist(table.column("cell"))
     weeks = table.column("week").to_pylist()
-    who_raw = table.column("recorded_by").to_pylist()
+    who_raw = text_to_pylist(table.column("recorded_by"))
 
     _assert_one_resolution(cells, _as_triples(banned) if placeholder else banned)
 
