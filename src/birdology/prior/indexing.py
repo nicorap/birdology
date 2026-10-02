@@ -66,12 +66,28 @@ def aggregate_counts(table: pa.Table) -> pa.Table:
     handed straight to `target_group_ratios`, and yet be decorative for every
     realistic pipeline, which routes through here. Propagating a marker is
     not the same as minting one.
+
+    AN EXISTING ``n`` COLUMN IS A WEIGHT, AND IT IS SUMMED (job 5345)
+    -----------------------------------------------------------------
+    The parallel parse (`parallel_parse.parse_and_aggregate`) hands over
+    PRE-AGGREGATED rows carrying an ``n`` of how many occurrences each
+    (species, cell, week, publisher, contributor) group collapsed. Appending
+    a fresh ``n = 1`` to such a table would silently count GROUPS instead of
+    occurrences — every count >1 shrunk to 1, no error, a plausible flatter
+    prior. Measured on the synthetic fixture: 84 of 84 groups undercounted.
+    A per-occurrence table (the sequential path) carries no ``n``, so its
+    behaviour is unchanged; the two paths produce identical counts, which
+    `test_the_aggregates_feed_the_existing_pipeline` pins on a fixture whose
+    groups genuinely exceed 1.
     """
-    grouped = (
-        table.select(["species_key", "cell", "week"])
-        .append_column("n", pa.array([1] * table.num_rows, pa.int64()))
-        .group_by(["species_key", "cell", "week"])
-        .aggregate([("n", "sum")])
+    if "n" in table.column_names:
+        weighted = table.select(["species_key", "cell", "week", "n"])
+    else:
+        weighted = table.select(["species_key", "cell", "week"]).append_column(
+            "n", pa.array([1] * table.num_rows, pa.int64())
+        )
+    grouped = weighted.group_by(["species_key", "cell", "week"]).aggregate(
+        [("n", "sum")]
     )
     counts = grouped.rename_columns({"n_sum": "n"}).select(
         ["species_key", "cell", "week", "n"]

@@ -1,0 +1,17 @@
+{
+  "n_rows": 10000000,
+  "resolutions": [
+    3,
+    4,
+    5
+  ],
+  "archive_bytes": 77584868,
+  "cpu_count": 18,
+  "decompress_only_s": 0.848,
+  "decompressed_bytes": 786408706,
+  "sequential_read_plus_assign_s": 49.535,
+  "parallel_workers_1_s": 67.242,
+  "parallel_workers_4_s": 40.452,
+  "parallel_workers_8_s": 41.59,
+  "parallel_workers_18_s": 41.151
+}

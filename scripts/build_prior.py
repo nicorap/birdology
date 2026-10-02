@@ -136,14 +136,23 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 import pyarrow as pa
 
 from birdology.prior.backoff import BackoffParams, hierarchical_estimate
+from birdology.prior.checkpoint import (
+    StaleCheckpointError,
+    checkpoint_path,
+    load_checkpoint,
+    write_checkpoint,
+)
 from birdology.prior.controls import CONTROLS
 from birdology.prior.effort import target_group_ratios
 from birdology.prior.indexing import WEEKS_PER_YEAR, aggregate_counts, assign_cells
 from birdology.prior.leakage import (
+    CONTRIBUTOR_MODES,
     TestRecording,
     apply_leakage_guards,
+    key_shape,
 )
 from birdology.prior.occurrences import read_occurrences
+from birdology.prior.parallel_parse import parse_and_aggregate
 from birdology.prior.smoothing import SmoothingParams, smooth
 from birdology.prior.tensor import PriorSpec, save_prior, to_tensor
 
@@ -1010,6 +1019,8 @@ def build_from_archive(
     min_split_match_rate: float = DEFAULT_MIN_SPLIT_MATCH_RATE,
     backoff_params: BackoffParams = BackoffParams(),
     smoothing_params: SmoothingParams = SmoothingParams(),
+    split_contributor_mode: str = "match",
+    occurrences: pa.Table | None = None,
 ) -> list[Path]:
     """Archive -> full prior + every registered control. Returns written paths.
 
@@ -1056,6 +1067,30 @@ def build_from_archive(
     RAISES rather than inventing a 0/0, and the legitimate no-split mode must
     stay buildable. The two conjuncts are separately mutated for that reason.
 
+    BOTH CLAUSES ARE MODE-AWARE IN WORDING ONLY (job 5345). Under
+    `split_contributor_mode="placeholder"` the guard's banned key is
+    (cell, week) -- the split's `recorded_by` values are test-set names, not
+    people, so the (cell, week, contributor) join is STRUCTURALLY empty and
+    clause 1 fires after the whole parse has been paid for. The integers the
+    clauses compare are the same two fields in both modes; what changes is
+    their denominator (distinct cell-weeks instead of distinct triples) and
+    the key shape the messages name, via `leakage.key_shape`, so the
+    operator triages the join that actually ran. The match-mode zero-match
+    message now also NAMES the placeholder mode: it is the structural
+    failure's one observable, and an operator who can only learn the escape
+    hatch by reading this source pays a re-parse to find it.
+
+    OCCURRENCES MAY ARRIVE PRE-PARSED (the checkpoint path). When
+    *occurrences* is passed it is the (species_key, cell, week,
+    publisher_key, recorded_by, n) aggregate for THIS resolution --
+    `parallel_parse.PARSE_SCHEMA` -- and the archive is not read at all.
+    The guards key on exactly those columns, and `aggregate_counts` sums
+    `n` as a weight, so the guarded result is identical to the
+    per-occurrence path; `zip_path` stays in the signature because it is
+    what the provenance log names. Guard row counts then count GROUPS, and
+    the escalation messages say "occurrence row(s)" advisedly: a removed
+    group is all of its occurrences.
+
     THE ARTIFACT SET IS RECORDED IN A MANIFEST (I3)
     ----------------------------------------------
     See `write_manifest`: the manifest is written LAST, after every artifact
@@ -1071,8 +1106,12 @@ def build_from_archive(
             "rather than clamped, because clamping either way silently "
             "changes what the leakage guard demands"
         )
-    table = assign_cells(read_occurrences(Path(zip_path)), resolution)
-    guarded = apply_leakage_guards(table, test_recordings)
+    table = (
+        occurrences
+        if occurrences is not None
+        else assign_cells(read_occurrences(Path(zip_path)), resolution)
+    )
+    guarded = apply_leakage_guards(table, test_recordings, split_contributor_mode)
 
     # DATA, not a log record. `zero_match` is
     # `banned_key_count > 0 and contributor_rows_removed == 0`, both computed
@@ -1081,20 +1120,28 @@ def build_from_archive(
     # actually held, which is the thing that decides whether the guard could
     # bite, and re-deriving intent from the argument here would let a split
     # that normalised away to nothing pass as legitimately empty.
+    shape = key_shape(split_contributor_mode)
     if guarded.zero_match:
         raise ZeroMatchGuardError(
-            f"the test split matched no occurrence at resolution {resolution}: "
-            f"{guarded.banned_key_count} banned (cell, week, contributor) "
+            f"the test split matched no occurrence at resolution {resolution} "
+            f"in {split_contributor_mode!r} contributor mode: "
+            f"{guarded.banned_key_count} banned {shape} "
             f"key(s) removed {guarded.contributor_rows_removed} of "
-            f"{guarded.rows_before_contributor_guard} occurrences. A split was "
-            "supplied, so this is a build failure rather than a warning: the "
+            f"{guarded.rows_before_contributor_guard} occurrence row(s). A split "
+            "was supplied, so this is a build failure rather than a warning: the "
             "artifact would carry a leakage guard that removed nothing, and "
             "would be indistinguishable from one whose guard worked. Check the "
             "H3 resolution and cell formatting of the split -- and note that "
             f"the Xeno-Canto guard ran FIRST and removed "
             f"{guarded.xeno_canto_rows_removed} row(s), so on a split whose "
             "recordings are themselves Xeno-Canto occurrences guard 1 may "
-            "legitimately have consumed the rows guard 2 would have matched"
+            "legitimately have consumed the rows guard 2 would have matched. "
+            "IF THE SPLIT'S recorded_by VALUES ARE PLACEHOLDERS (a test-set "
+            "name like 'HSN' standing in for contributor-less soundscape "
+            "recordings), the (cell, week, contributor) join is structurally "
+            "empty against any real source and no formatting fix can help: "
+            "re-run with --split-contributor-mode placeholder, which bans "
+            "every occurrence in the test sites' (cell, week)s instead"
         )
 
     # CLAUSE 2. Its own `banned_key_count > 0` conjunct: `--no-test-split`
@@ -1102,12 +1149,13 @@ def build_from_archive(
     if guarded.banned_key_count > 0 and guarded.match_rate < min_split_match_rate:
         raise PartialMatchGuardError(
             f"only {guarded.matched_key_count} of {guarded.banned_key_count} "
-            f"banned (cell, week, contributor) key(s) matched any occurrence "
-            f"at resolution {resolution} -- a match rate of "
+            f"banned {shape} key(s) matched any occurrence "
+            f"at resolution {resolution} in {split_contributor_mode!r} "
+            f"contributor mode -- a match rate of "
             f"{guarded.match_rate:.4f}, below the required "
             f"{min_split_match_rate:.4f}. The split removed "
             f"{guarded.contributor_rows_removed} of "
-            f"{guarded.rows_before_contributor_guard} occurrences, so the "
+            f"{guarded.rows_before_contributor_guard} occurrence row(s), so the "
             "total zero-match check passed and would have released this "
             "artifact: one live key disarms a whole-split condition. A "
             "coordinate bug, a contributor-spelling convention that changed "
@@ -1322,6 +1370,38 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "the leakage guard has effectively not run. `0.0` reduces this to "
         "the total check, which cannot be disabled",
     )
+    ap.add_argument(
+        "--split-contributor-mode",
+        choices=list(CONTRIBUTOR_MODES),
+        default="match",
+        help="how the test split's recorded_by column joins occurrences "
+        "(default: %(default)s). `match`: the banned key is (cell, week, "
+        "contributor) -- the split names real recordists. `placeholder`: "
+        "the split's recorded_by values are TEST-SET NAMES (e.g. 'HSN' for "
+        "contributor-less soundscape recordings), no real contributor can "
+        "ever equal one, and the banned key is (cell, week): every "
+        "occurrence in a test site's cell-week is removed regardless of "
+        "recorder -- strictly more conservative. EXPLICIT on purpose: "
+        "auto-detecting would decide a released artifact's leakage "
+        "semantics from the data it is guarding",
+    )
+    ap.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="worker processes for the archive parse (default: all CPUs). "
+        "The parse is bit-exact at any worker count; 1 disables the pool",
+    )
+    ap.add_argument(
+        "--resume",
+        action="store_true",
+        help="skip the parse and start at the leakage guards, using the "
+        "checkpoint a previous run of this SAME invocation (source, archive, "
+        "resolutions) wrote into --out. A guard refusal leaves the "
+        "checkpoint intact, so the corrected re-run costs minutes rather "
+        "than the multi-hour parse. A stale checkpoint is REFUSED naming "
+        "the mismatched field, never silently rebuilt",
+    )
     split = ap.add_mutually_exclusive_group(required=True)
     split.add_argument(
         "--test-split",
@@ -1337,7 +1417,19 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "an unguarded prior is indistinguishable from a guarded one and the "
         "highest-consequence failure in this plan would have no detector",
     )
-    return ap.parse_args(argv)
+    args = ap.parse_args(argv)
+    if args.no_test_split and args.split_contributor_mode != "match":
+        # A usage error, through argparse's own channel so it exits 2 like
+        # every other one. A contributor MODE for a split that does not
+        # exist is an operator contradiction, and silently ignoring the
+        # flag would let a command line that LOOKS placeholder-guarded run
+        # unguarded.
+        ap.error(
+            "--split-contributor-mode placeholder requires --test-split: "
+            "the mode describes how the split's recorded_by column joins, "
+            "and --no-test-split supplies no split to join"
+        )
+    return args
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -1367,12 +1459,71 @@ def main(argv: Sequence[str] | None = None) -> None:
             "contributor guard will remove nothing and the artifacts will not "
             "be safe to evaluate against any split"
         )
+    if args.split_contributor_mode == "placeholder":
+        log.warning(
+            "split contributor mode PLACEHOLDER: the split's recorded_by "
+            "values are treated as test-set names, and the leakage ban is "
+            "every occurrence in the test sites' (cell, week)s regardless "
+            "of recorder -- strictly wider than contributor matching"
+        )
+
+    # THE PARSE IS CHECKPOINTED, AND THE CHECKPOINT OUTLIVES A GUARD REFUSAL
+    # ----------------------------------------------------------------------
+    # Job 5345: ~6.5h of single-threaded parsing plus ~2.5h of guards, then a
+    # correct ZeroMatchGuardError -- and the next attempt had to pay the
+    # parse again. The parse result (per-resolution aggregated counts, with
+    # provenance columns intact for the guards) is now written to --out
+    # BEFORE any guard runs, so the refusal costs the guard phase only, and
+    # `--resume` starts the corrected invocation there. The checkpoint is
+    # deliberately NOT deleted on success either: it is cheap relative to
+    # its archive, and the operator who wants another resolution subset or
+    # a different split mode tomorrow is exactly who it exists for.
+    ckpt = checkpoint_path(args.out, args.source)
+    if args.resume:
+        # Staleness fails closed inside `load_checkpoint`, naming the
+        # mismatched field; no try/except here, per this script's uniform
+        # rule that a refusal exits non-zero at the raise site.
+        meta, tables = load_checkpoint(
+            ckpt,
+            source=args.source,
+            archive=args.archive,
+            resolutions=args.resolutions,
+        )
+        log.info(
+            "resumed from checkpoint %s: %d row(s) read in the original "
+            "parse, dropped %s; skipping the parse entirely",
+            ckpt,
+            meta["total_rows_read"],
+            meta["dropped"],
+        )
+    else:
+        parsed = parse_and_aggregate(
+            args.archive, args.resolutions, workers=args.workers
+        )
+        log.info(
+            "parse_and_aggregate(%s): read %d row(s), dropped %s "
+            "(no species key / bad coordinates / unparseable date)",
+            args.archive,
+            parsed.total,
+            parsed.dropped,
+        )
+        write_checkpoint(
+            ckpt,
+            parsed,
+            source=args.source,
+            archive=args.archive,
+            resolutions=args.resolutions,
+        )
+        log.info("parse checkpoint written to %s (BEFORE any guard)", ckpt)
+        tables = parsed.tables
 
     for resolution in args.resolutions:
         # NO try/except around the loop body. A guard ValueError -- most
         # likely an H3 resolution mismatch -- must fail THIS artifact and exit
         # non-zero, rather than being carried so the sweep can write a
         # leak-contaminated file under a name that looks like every other one.
+        # The checkpoint written above SURVIVES that exit: nothing here
+        # deletes it, which is the entire recovery story.
         paths = build_from_archive(
             args.archive,
             resolution=resolution,
@@ -1382,6 +1533,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             gbif_doi=args.gbif_doi,
             species_chunk=args.species_chunk,
             min_split_match_rate=args.min_split_match_rate,
+            split_contributor_mode=args.split_contributor_mode,
+            occurrences=tables[resolution],
         )
         for path in paths:
             print(path)

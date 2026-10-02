@@ -96,6 +96,62 @@ GUARD_MARKER_KEY = b"leakage_guards_applied"
 GUARD_MARKER_VALUE = b"1"
 
 
+#: The two contributor-join modes guard 2 can run in. EXPLICIT, never
+#: auto-detected: a guard that silently switched key shapes on a heuristic
+#: ("none of these contributors look like observer IDs") would be deciding
+#: the leakage semantics of a released artifact from the data it is
+#: guarding. The operator states the split's nature; the guard enforces it.
+#:
+#: ``match`` -- the original key, (cell, week, contributor): ban the test
+#: contributor's own other records from the same outing.
+#:
+#: ``placeholder`` -- the split's ``recorded_by`` values are TEST-SET NAMES,
+#: not people (job 5345: soundscape splits carry ``HSN`` / ``NES`` because
+#: the recordings have no contributor, and an eBird observer ID can never
+#: equal one, so the match-mode join is STRUCTURALLY empty). The banned key
+#: is (cell, week): every occurrence in a test site's cell-week is removed
+#: regardless of who recorded it -- including anonymous rows that match
+#: mode always keeps. That is MORE conservative than contributor matching,
+#: which is the right direction for a leakage guard.
+CONTRIBUTOR_MODES = ("match", "placeholder")
+
+
+def _validate_contributor_mode(contributor_mode: str) -> str:
+    """Reject an unknown mode rather than falling back to either known one.
+
+    Falling back to ``match`` would silently restore the structural
+    zero-match on a placeholder split; falling back to ``placeholder`` would
+    silently widen the ban. Both are the silent repair at a boundary this
+    plan forbids.
+    """
+    if contributor_mode not in CONTRIBUTOR_MODES:
+        raise ValueError(
+            f"contributor_mode must be one of {CONTRIBUTOR_MODES}, got "
+            f"{contributor_mode!r}. The mode decides the leakage join key "
+            "((cell, week, contributor) vs (cell, week)) and must be stated "
+            "explicitly; guessing it from the split's contents would let a "
+            "typo change which rows a released artifact excluded"
+        )
+    return contributor_mode
+
+
+def key_shape(contributor_mode: str) -> str:
+    """The banned-key shape a mode bans, for error and log messages.
+
+    One derivation, used by the guard's own log lines and by the build
+    script's escalation messages, so an operator reading either is told the
+    key the join ACTUALLY used -- a message naming (cell, week, contributor)
+    over a (cell, week) refusal would send them triaging a contributor join
+    that never ran.
+    """
+    _validate_contributor_mode(contributor_mode)
+    return (
+        "(cell, week)"
+        if contributor_mode == "placeholder"
+        else "(cell, week, contributor)"
+    )
+
+
 def mark_guards_applied(table: pa.Table) -> pa.Table:
     """Stamp *table* as having been through both guards.
 
@@ -311,6 +367,16 @@ class LeakageGuardResult:
     #: guard exists to catch degrade MOST of a split, not all of it, so the
     #: quantity that makes them visible is per-key, not per-row.
     matched_key_count: int
+    #: Which join key guard 2 ran with -- ``"match"`` for the original
+    #: (cell, week, contributor) key, ``"placeholder"`` for the (cell, week)
+    #: key a placeholder-contributor split needs (see
+    #: :data:`CONTRIBUTOR_MODES`). Carried on the RESULT so an escalation
+    #: message can name the key shape that actually joined: under
+    #: placeholder banning, ``banned_key_count`` counts distinct CELL-WEEKS
+    #: and ``matched_key_count`` counts cell-weeks that bit, so the
+    #: zero-match and match-rate clauses read unchanged while meaning the
+    #: new denominators.
+    contributor_mode: str = "match"
 
     @property
     def zero_match(self) -> bool:
@@ -509,6 +575,56 @@ def keep_mask(
     return _mask_and_matched_keys(cells, weeks, names, banned)[0]
 
 
+def banned_cell_weeks(
+    test_recordings: Iterable[TestRecording],
+) -> set[tuple[str, int]]:
+    """Normalised (cell, week) keys for PLACEHOLDER mode.
+
+    The contributor is deliberately NOT part of the key: in this mode the
+    split's ``recorded_by`` values are test-set names rather than people, so
+    joining on them is structurally empty (the job-5345 failure). Every
+    occurrence in a test site's cell-week is banned, whoever recorded it.
+
+    The recordings' contributors are still VALIDATED -- ``TestRecording``
+    construction already rejected blanks -- but two recordings differing
+    only in placeholder name collapse to one cell-week key, which is what
+    ``banned_key_count`` should count in this mode: the number of distinct
+    site-weeks the guard can act on.
+    """
+    banned: set[tuple[str, int]] = set()
+    for recording in test_recordings:
+        cell = normalise_cell(recording.cell)
+        if cell is None:
+            raise ValueError("test recording cell must not be None")
+        banned.add((cell, normalise_week(recording.week)))
+    return banned
+
+
+def _mask_and_matched_cell_weeks(
+    cells: list[str],
+    weeks: list[int],
+    banned: set[tuple[str, int]],
+) -> tuple[list[bool], set[tuple[str, int]]]:
+    """Placeholder mode's analogue of :func:`_mask_and_matched_keys`.
+
+    ONE derivation of mask and matched set, for the same reason as the
+    match-mode original. There is no contributor short-circuit: an
+    anonymous row in a banned cell-week is REMOVED here, where match mode
+    always keeps it -- that widening is the mode's entire point, and it is
+    the conservative direction for a leakage guard.
+    """
+    keep: list[bool] = []
+    matched: set[tuple[str, int]] = set()
+    for cell, week in zip(cells, weeks):
+        key = (normalise_cell(cell), normalise_week(week))
+        if key in banned:
+            matched.add(cast("tuple[str, int]", key))
+            keep.append(False)
+        else:
+            keep.append(True)
+    return keep, matched
+
+
 def _assert_one_resolution(
     table_cells: list[str | None], banned: set[tuple[str, int, str]]
 ) -> None:
@@ -558,7 +674,9 @@ def _assert_one_resolution(
 
 
 def _drop_test_contributor_cells(
-    table: pa.Table, test_recordings: Iterable[TestRecording]
+    table: pa.Table,
+    test_recordings: Iterable[TestRecording],
+    contributor_mode: str = "match",
 ) -> tuple[pa.Table, int, int, int]:
     """Guard 2, returning (kept, rows_removed, banned_key_count, matched_key_count).
 
@@ -573,8 +691,25 @@ def _drop_test_contributor_cells(
     ONE row. It is not derivable from the other two: ``rows_removed`` is a
     claim about the whole split, and one live key among a hundred dead ones
     makes it non-zero. See :func:`_mask_and_matched_keys`.
+
+    THE MODE CHANGES THE KEY, NOT THE COUNTS' MEANING TO A CALLER
+    -------------------------------------------------------------
+    In ``contributor_mode="placeholder"`` the banned key is (cell, week)
+    (see :data:`CONTRIBUTOR_MODES`): ``banned_key_count`` is then the number
+    of distinct test-site cell-weeks and ``matched_key_count`` the number
+    that removed at least one row. Zero-match and match-rate escalations
+    read the same two integers in both modes -- the denominators differ,
+    the clauses do not. The log lines name the key shape via
+    :func:`key_shape` so a human reading them triages the join that
+    actually ran.
     """
-    banned = banned_keys(test_recordings)
+    _validate_contributor_mode(contributor_mode)
+    placeholder = contributor_mode == "placeholder"
+    banned: set = (
+        banned_cell_weeks(test_recordings)
+        if placeholder
+        else banned_keys(test_recordings)
+    )
     if not banned:
         return table, 0, 0, 0
 
@@ -582,12 +717,15 @@ def _drop_test_contributor_cells(
     weeks = table.column("week").to_pylist()
     who_raw = table.column("recorded_by").to_pylist()
 
-    _assert_one_resolution(cells, banned)
+    _assert_one_resolution(cells, _as_triples(banned) if placeholder else banned)
 
     flagged = sum(
         1 for name in who_raw if name is not None and REPLACEMENT_CHARACTER in name
     )
-    if flagged:
+    if flagged and not placeholder:
+        # In placeholder mode the contributor is not part of the join key,
+        # so mojibake in `recorded_by` cannot cause a miss; warning about it
+        # would send an operator chasing a join component that never ran.
         logger.warning(
             "drop_test_contributor_cells: %d occurrence(s) carry U+FFFD in "
             "recorded_by; their contributor names were mojibaked on decode and "
@@ -595,17 +733,22 @@ def _drop_test_contributor_cells(
             flagged,
         )
 
-    keep, matched = _mask_and_matched_keys(cells, weeks, who_raw, banned)
+    if placeholder:
+        keep, matched = _mask_and_matched_cell_weeks(cells, weeks, banned)
+    else:
+        keep, matched = _mask_and_matched_keys(cells, weeks, who_raw, banned)
     kept = table.filter(pa.array(keep, pa.bool_()))
     removed = table.num_rows - kept.num_rows
+    shape = key_shape(contributor_mode)
     if removed:
         logger.info(
             "drop_test_contributor_cells: removed %d of %d occurrences "
-            "over %d of %d banned (cell, week, contributor) keys",
+            "over %d of %d banned %s keys",
             removed,
             table.num_rows,
             len(matched),
             len(banned),
+            shape,
         )
         if len(matched) < len(banned):
             # The PARTIAL case, which a row total cannot express. One live key
@@ -618,10 +761,11 @@ def _drop_test_contributor_cells(
             # deleting it deafens the log without disarming anything.
             logger.warning(
                 "drop_test_contributor_cells: only %d of %d banned "
-                "(cell, week, contributor) key(s) matched any occurrence "
+                "%s key(s) matched any occurrence "
                 "(%.1f%%); the remainder removed nothing",
                 len(matched),
                 len(banned),
+                shape,
                 100.0 * len(matched) / len(banned),
             )
     else:
@@ -638,40 +782,64 @@ def _drop_test_contributor_cells(
         # ordinary logging config. Deleting this warning deafens the log; it
         # does not disarm the guard.
         logger.warning(
-            "drop_test_contributor_cells: %d banned (cell, week, contributor) "
+            "drop_test_contributor_cells: %d banned %s "
             "key(s) %s %d occurrences; check the H3 resolution and "
             "cell formatting of the test split",
             len(banned),
+            shape,
             ZERO_MATCH_WARNING_MARKER,
             table.num_rows,
         )
     return kept, removed, len(banned), len(matched)
 
 
-def drop_test_contributor_cells(
-    table: pa.Table, test_recordings: Iterable[TestRecording]
-) -> pa.Table:
-    """Remove rows matching a test recording's (cell, week, contributor).
+def _as_triples(cell_weeks: set[tuple[str, int]]) -> set[tuple[str, int, str]]:
+    """Adapt placeholder-mode (cell, week) keys for `_assert_one_resolution`.
 
-    Every key component is normalised on BOTH sides before the join — cell via
-    :func:`normalise_cell`, week via :func:`normalise_week`, contributor via
-    :func:`normalise_contributor`. A row whose ``recorded_by`` is null can
-    never match, since a blank key is rejected at ``TestRecording`` construction.
+    The resolution check iterates (cell, week, who) triples and reads only
+    the cell; a synthetic contributor keeps ONE check serving both modes
+    rather than a second, drift-prone copy of the H3 comparison.
+    """
+    return {(cell, week, "-") for cell, week in cell_weeks}
+
+
+def drop_test_contributor_cells(
+    table: pa.Table,
+    test_recordings: Iterable[TestRecording],
+    contributor_mode: str = "match",
+) -> pa.Table:
+    """Remove rows matching a test recording's banned key.
+
+    In the default ``contributor_mode="match"`` the key is
+    (cell, week, contributor), every component normalised on BOTH sides
+    before the join — cell via :func:`normalise_cell`, week via
+    :func:`normalise_week`, contributor via :func:`normalise_contributor`.
+    A row whose ``recorded_by`` is null can never match, since a blank key
+    is rejected at ``TestRecording`` construction.
+
+    In ``contributor_mode="placeholder"`` the key is (cell, week): the
+    split's contributors are declared to be test-set names rather than
+    people, and every occurrence in a test site's cell-week is removed
+    whoever recorded it — anonymous rows included. See
+    :data:`CONTRIBUTOR_MODES` for why the mode is explicit, never detected.
 
     Raises ``ValueError`` if the test split's H3 resolution differs from the
-    table's, which would make the whole guard a silent no-op.
+    table's, which would make the whole guard a silent no-op — in either
+    mode.
 
     CONTRACT — *table* must carry a non-null, integral ``week`` column, as
     written by ``assign_cells`` (``pa.int8()`` from a non-null ``event_date``).
-    :func:`keep_mask` routes every week through :func:`normalise_week`, which
+    Both modes route every week through :func:`normalise_week`, which
     raises rather than coercing, so a null or fractional week from a table built
     some other way is a hard build failure, not a silently mis-banned week.
     """
-    return _drop_test_contributor_cells(table, test_recordings)[0]
+    return _drop_test_contributor_cells(table, test_recordings, contributor_mode)[0]
 
 
 def apply_leakage_guards(
-    table: pa.Table, test_recordings: Iterable[TestRecording]
+    table: pa.Table,
+    test_recordings: Iterable[TestRecording],
+    contributor_mode: str = "match",
 ) -> LeakageGuardResult:
     """Both guards, in order, STAMP the result, and REPORT WHAT THEY DID.
 
@@ -714,7 +882,7 @@ def apply_leakage_guards(
     """
     after_xc, xc_removed = _drop_xeno_canto(table)
     kept, contributor_removed, banned_count, matched_count = (
-        _drop_test_contributor_cells(after_xc, test_recordings)
+        _drop_test_contributor_cells(after_xc, test_recordings, contributor_mode)
     )
     return LeakageGuardResult(
         table=mark_guards_applied(kept),
@@ -723,4 +891,5 @@ def apply_leakage_guards(
         contributor_rows_removed=contributor_removed,
         rows_before_contributor_guard=after_xc.num_rows,
         matched_key_count=matched_count,
+        contributor_mode=contributor_mode,
     )

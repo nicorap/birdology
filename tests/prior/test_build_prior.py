@@ -1749,9 +1749,19 @@ def test_the_zero_match_guard_fires_under_every_hostile_logging_config(
         r for r in delivered if "matched zero of" in r.getMessage()
     ], f"{config} did not actually suppress the zero-match WARNING"
 
-    # And NOTHING was written. The original defect's signature was ten files on
-    # disk and exit 0, so this is the assertion that discriminates.
-    assert not out.exists() or not list(out.glob("*")), (
+    # And NO RELEASE ARTIFACT was written. The original defect's signature
+    # was ten files on disk and exit 0, so this is the assertion that
+    # discriminates. The PARSE CHECKPOINT is deliberately exempt: it is
+    # written BEFORE the guards precisely so a refusal like this one does
+    # not cost the multi-hour parse again (job 5345), it is not part of a
+    # release (check_manifest never names it), and its survival here is
+    # pinned by test_main_writes_the_checkpoint_before_the_guards_run.
+    leftovers = (
+        [p for p in out.glob("*") if not p.name.startswith("parse_checkpoint_")]
+        if out.exists()
+        else []
+    )
+    assert not leftovers, (
         "the build wrote artifacts despite a split that matched nothing -- "
         "this is the exact C1 failure: a complete, publishable release whose "
         "leakage guard removed nothing"
