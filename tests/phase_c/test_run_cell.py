@@ -274,6 +274,47 @@ def _states_equal(a: dict, b: dict) -> bool:
     return set(a) == set(b) and all(torch.equal(a[k], b[k]) for k in a)
 
 
+@pytest.fixture
+def forkserver_start_method():
+    """Fleet job 5913's shape: Python 3.14 on Linux starts DataLoader
+    workers with ``forkserver``, which PICKLES the dataset into each
+    worker. A closure anywhere in the dataset's state cannot cross."""
+    import multiprocessing
+
+    prev = multiprocessing.get_start_method(allow_none=True)
+    multiprocessing.set_start_method("forkserver", force=True)
+    yield
+    multiprocessing.set_start_method(prev, force=True)
+
+
+@pytest.mark.usefixtures("forkserver_start_method")
+def test_run_cell_with_dataloader_workers_pickles_its_datasets(
+    tmp_path, fleet_stubs
+):
+    """Fleet job 5913: every cell died at the first train batch with
+    ``PicklingError: Can't pickle local object _run_cell.<locals>.
+    load_audio`` -- the audio loader was a closure over ``args``, stored
+    on CropDataset, and forkserver workers must unpickle the dataset.
+    All earlier run_cell tests pinned num_workers=0, so the worker path
+    from _run_cell was never exercised end to end."""
+    args = _cell_args(tmp_path, arm="twin")
+    args.num_workers = 2
+    assert phase_c_run._run_cell(args) == 0
+
+
+def test_audio_loader_is_picklable_and_reads_under_its_root(tmp_path):
+    """The loader carries its root as STATE, not via a closure over
+    ``args``: it must survive a pickle round trip and still decode."""
+    import pickle
+
+    root = tmp_path / "audio"
+    _write_audio(root, ["a.wav"])
+    loader = phase_c_run.AudioLoader(str(root))
+    clone = pickle.loads(pickle.dumps(loader))
+    out = clone("a.wav")
+    assert out.dtype == np.float32 and out.ndim == 1 and out.size > 0
+
+
 @pytest.mark.parametrize("arm", ["twin", "film"])
 def test_run_cell_evaluates_best_checkpoint_not_last_epoch(
     tmp_path, fleet_stubs, arm

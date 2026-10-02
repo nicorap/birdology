@@ -315,6 +315,48 @@ def _default_num_workers(device_spec: str) -> int:
     return 8 if device_spec.startswith("cuda") else 0
 
 
+class AudioLoader:
+    """Decoded mono audio @32 kHz from the staged audio root.
+
+    A module-level class, not a closure (fleet job 5913): CropDataset and
+    EvalDataset store the loader, and DataLoader workers started with
+    ``forkserver`` (Python 3.14's Linux default) PICKLE the dataset into
+    each worker. A closure over ``args`` cannot be pickled; this carries
+    its root as plain state.
+
+    Shards are staged (untarred) to /raid/scratch by the sbatch BEFORE
+    this runs; filepaths resolve under ``root``. Decode matches
+    phase_a's: soundfile, mono-mean, refuse 0 samples (a truncated OGG
+    decodes empty without raising — measured).
+    """
+
+    def __init__(self, root: str) -> None:
+        self.root = str(root)
+
+    def __call__(self, filepath: str):
+        import numpy as np
+        import soundfile as sf
+
+        from birdology.phase_c.data import SAMPLE_RATE
+
+        samples, sr = sf.read(
+            str(Path(self.root) / filepath),
+            dtype="float32",
+            always_2d=False,
+        )
+        if getattr(samples, "ndim", 1) > 1:
+            samples = samples.mean(axis=1)
+        if samples.size == 0:
+            raise ValueError(f"{filepath}: decoded to 0 samples")
+        if sr != SAMPLE_RATE:
+            import librosa
+
+            samples = librosa.resample(
+                samples, orig_sr=sr, target_sr=SAMPLE_RATE
+            )
+        return np.asarray(samples, dtype=np.float32)
+
+
 def _resolve_device(spec: str):
     """``--device`` → ``torch.device`` — or a refusal. NEVER a fallback.
 
@@ -527,32 +569,7 @@ def _run_cell(args) -> int:
     code_to_gbif = json.loads(Path(args.bridge).read_text())
     provider = build_context_matrix(prior, class_codes, code_to_gbif)
 
-    def load_audio(filepath: str) -> np.ndarray:
-        """Decoded mono audio @32 kHz from the staged audio root.
-
-        Shards are staged (untarred) to /raid/scratch by the sbatch
-        BEFORE this runs; filepaths resolve under --audio-root. Decode
-        matches phase_a's: soundfile, mono-mean, refuse 0 samples (a
-        truncated OGG decodes empty without raising — measured).
-        """
-        import soundfile as sf
-
-        samples, sr = sf.read(
-            str(Path(args.audio_root) / filepath),
-            dtype="float32",
-            always_2d=False,
-        )
-        if getattr(samples, "ndim", 1) > 1:
-            samples = samples.mean(axis=1)
-        if samples.size == 0:
-            raise ValueError(f"{filepath}: decoded to 0 samples")
-        if sr != SAMPLE_RATE:
-            import librosa
-
-            samples = librosa.resample(
-                samples, orig_sr=sr, target_sr=SAMPLE_RATE
-            )
-        return np.asarray(samples, dtype=np.float32)
+    load_audio = AudioLoader(args.audio_root)
 
     manifest = _pq.read_table(args.manifest)
     train_ds = CropDataset(
