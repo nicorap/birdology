@@ -615,6 +615,46 @@ def test_mlp_rows_differ_across_seeds_same_machine():
     assert row["cmap_std"] > 0.0
 
 
+def test_mlp_marginal_cell_with_nan_prior_raises_named_error_not_sklearn(
+):
+    """The fleet's r5+marginal+UHH crash, reproduced in miniature: ONE
+    NaN stored in the prior artifact (load_prior never re-validates p)
+    is spread across that species' ENTIRE row by the marginal control
+    (a mean over any axis containing a NaN is NaN), survives the
+    floor (np.maximum(nan, FLOOR) is nan) and used to reach
+    MLPClassifier as 'Input X contains NaN'. It must now be refused by
+    OUR feature-path guard, naming the NaN count — not sklearn's
+    message, which names nothing an operator can act on."""
+    good = _prior()
+    d = good.values.toarray()
+    d[0, 5] = np.nan  # one corrupt stored entry, species 0
+    bad = PriorTensor(
+        spec=good.spec,
+        species_keys=good.species_keys,
+        cells=list(good.cells),
+        values=sparse.csr_matrix(d),
+        gbif_doi=good.gbif_doi,
+    )
+    eval_cache, metadata = _eval_fixture()
+    with pytest.raises(ValueError, match=r"NaN prior probability"):
+        run_cell(
+            _cell(
+                method="mlp",
+                prior_variant=CONTROL_VARIANTS["marginal"],
+                tau=None,
+            ),
+            train_cache=_train_cache(),
+            eval_cache=eval_cache,
+            eval_metadata=metadata,
+            prior=bad,
+            class_idx=_CLASS_IDX,
+            code_to_gbif=_CODE_TO_GBIF,
+            provenance=_PROV,
+            mlp_hidden=4,
+            mlp_max_iter=20,
+        )
+
+
 def test_offset_rows_identical_across_seeds_degenerate_flagged():
     """The offset fit is a convex 1-D minimization with no randomness:
     on variant 'full' every seed is the same fit, so the row must report

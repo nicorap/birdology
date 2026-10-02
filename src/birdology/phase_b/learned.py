@@ -15,6 +15,7 @@ the same carried obligations:
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -25,6 +26,8 @@ from scipy.optimize import minimize_scalar
 from birdology.phase_b.cache import CacheView, align_labels
 from birdology.phase_b.metrics import gather_scores
 from birdology.phase_b.rescoring import FLOOR
+
+logger = logging.getLogger(__name__)
 
 #: lam search interval for the 1-D BCE minimization. The objective is
 #: convex in lam (it is a logistic regression in the single feature
@@ -62,10 +65,43 @@ def _checked_log_scores(scores: np.ndarray) -> np.ndarray:
 
 def _log_floored(probs: np.ndarray) -> np.ndarray:
     """log of probabilities floored with the imported FLOOR — a hard 0.0
-    can never produce a -inf that vetoes a detection."""
-    return np.log(
-        np.maximum(np.asarray(probs, dtype=np.float64), FLOOR)
-    )
+    can never produce a -inf that vetoes a detection.
+
+    A NaN is REFUSED, not floored: ``np.maximum(nan, FLOOR)`` is nan
+    (NaN loses every comparison), so without this guard a NaN prior
+    rides through the floor, through the log, and into sklearn, which
+    crashes a whole fleet cell with its own message ('Input X contains
+    NaN') naming nothing about the prior. In this pipeline a NaN prior
+    probability has NO defined meaning — ``tensor._validate_p`` forbids
+    non-finite values at write time and FLOOR is the one documented
+    'no evidence' value — so a NaN here is a corrupt artifact or a
+    control built from one, and repairing it to FLOOR would silently
+    convert corruption into 'no evidence'. The error counts and
+    locates the NaNs so the operator can find the artifact.
+    """
+    p = np.asarray(probs, dtype=np.float64)
+    nan_mask = np.isnan(p)
+    if nan_mask.any():
+        n_nan = int(nan_mask.sum())
+        rows, cols = (
+            np.nonzero(nan_mask) if p.ndim == 2 else (np.nonzero(nan_mask)[0], None)
+        )
+        where = (
+            f"first at (row={int(rows[0])}, col={int(cols[0])})"
+            if cols is not None and len(rows)
+            else f"first at index {int(rows[0])}" if len(rows) else ""
+        )
+        raise ValueError(
+            f"{n_nan} NaN prior probability value(s) in the learned arms' "
+            f"feature path ({where} of shape {p.shape}); NaN has no "
+            "defined meaning for this prior — the artifact forbids "
+            "non-finite p at write time and FLOOR is the documented "
+            "'no evidence' value — so this is a corrupt prior artifact "
+            "or a control built from one. Refusing rather than flooring: "
+            "a repaired NaN would be indistinguishable from real "
+            "'no evidence' for every row downstream"
+        )
+    return np.log(np.maximum(p, FLOOR))
 
 
 @dataclass(frozen=True)
@@ -215,13 +251,35 @@ def fit_mlp_head(
     seed: int,
     hidden: int = 256,
     max_iter: int = 200,
+    validation_fraction: float = 0.1,
+    n_iter_no_change: int = 10,
 ) -> MLPModel:
     """Fit the MLP arm on cached arrays (CPU, sklearn).
 
     sklearn's MLPClassifier handles the multilabel indicator *y*
     natively (measured fact — see :class:`MLPModel`). ``random_state=
     seed`` makes the fit deterministic given (data, seed): the seed
-    enters the weight initialization and the minibatch shuffling.
+    enters the weight initialization, the minibatch shuffling AND the
+    early-stopping validation split.
+
+    EARLY STOPPING (fleet TIMEOUT fix, documented science): training
+    holds out ``validation_fraction`` of the rows, scores them each
+    epoch, and stops after ``n_iter_no_change`` epochs without
+    improvement — instead of grinding the full training loss to ``tol``
+    or ``max_iter``, which cost 12 of 48 fleet shards their 12h wall.
+    This CHANGES THE FIT slightly relative to no-early-stopping: the
+    model trains on ~90% of rows and halts at the best validation
+    score (sklearn restores the best-scoring weights). That is a
+    regularization choice, not a silent repair — it is pinned by
+    ``test_mlp_fit_early_stops_on_a_held_out_validation_fraction``,
+    and determinism per (data, seed) is preserved because the split is
+    drawn from ``random_state`` (pinned by
+    ``test_mlp_fit_with_early_stopping_stays_deterministic_per_seed``).
+    Cross-seed spread already absorbs the split's randomness: the seed
+    axis exists exactly to measure fit variance.
+
+    Each fit logs its wall-clock duration and iteration count at INFO —
+    the fleet's per-fit evidence of where a 12h budget goes.
 
     TRUST BOUNDARY: array inputs are trusted and unguarded — derive
     training arrays via :func:`prepare_training`, which enforces
@@ -237,9 +295,14 @@ def fit_mlp_head(
         hidden_layer_sizes=(hidden,),
         max_iter=max_iter,
         random_state=seed,
+        early_stopping=True,
+        validation_fraction=validation_fraction,
+        n_iter_no_change=n_iter_no_change,
     )
+    import time
     import warnings
 
+    t0 = time.perf_counter()
     with warnings.catch_warnings():
         # A small max_iter stopping before convergence is a caller
         # choice, not a defect worth polluting sweep logs over. ONLY
@@ -247,6 +310,17 @@ def fit_mlp_head(
         # emits must stay visible.
         warnings.simplefilter("ignore", category=ConvergenceWarning)
         clf.fit(features, y_arr)
+    logger.info(
+        "mlp fit: %.1fs, %d/%d iters (n=%d, d=%d, k=%d, hidden=%d, seed=%d)",
+        time.perf_counter() - t0,
+        clf.n_iter_,
+        max_iter,
+        features.shape[0],
+        features.shape[1],
+        y_arr.shape[1],
+        hidden,
+        seed,
+    )
     return MLPModel(clf=clf, n_classes=y_arr.shape[1])
 
 

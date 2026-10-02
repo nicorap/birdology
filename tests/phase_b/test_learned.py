@@ -481,6 +481,89 @@ def test_mlp_predict_shape_dtype_and_seed_determinism():
     assert not np.array_equal(pa_, pc)
 
 
+def test_mlp_refuses_nan_prior_with_named_error_not_sklearn_crash():
+    """A NaN prior probability reaching the learned arms' feature
+    assembly must raise OUR error naming the count — never sklearn's
+    'Input X contains NaN' from deep inside MLPClassifier.fit (the
+    fleet's r5+marginal crash signature). The floor-then-log path
+    cannot repair it: np.maximum(nan, FLOOR) is nan (measured), so
+    without this refusal the NaN rides into sklearn silently."""
+    embeddings, prior_probs, y = _mlp_fixture()
+    prior_probs = prior_probs.copy()
+    prior_probs[3, 1] = np.nan
+    with pytest.raises(ValueError, match=r"NaN"):
+        try:
+            fit_mlp_head(embeddings, prior_probs, y, seed=0, max_iter=20)
+        except ValueError as exc:
+            assert "Input X contains NaN" not in str(exc), (
+                "the NaN reached sklearn instead of being refused at "
+                "the feature-assembly boundary"
+            )
+            assert "prior" in str(exc)
+            raise
+
+
+def test_offset_fit_refuses_nan_prior_with_named_error():
+    """The offset arm shares the same floored-log feature path; a NaN
+    prior must be refused there too, not silently fitted on."""
+    y, scores = _balanced_y_and_scores()
+    prior = _informative_prior(y).copy()
+    prior[0, 0] = np.nan
+    with pytest.raises(ValueError, match=r"NaN.*prior|prior.*NaN"):
+        fit_logit_offset(scores, prior, y, per_species=False, seed=0)
+
+
+def test_mlp_fit_early_stops_on_a_held_out_validation_fraction():
+    """TIMEOUT fix: fit_mlp_head must enable sklearn early stopping —
+    a held-out validation_fraction scored each epoch, halting after
+    n_iter_no_change epochs without improvement. Pinned behaviorally:
+    on the separable fixture with a huge max_iter the fit stops FAR
+    before the cap and carries validation_scores_ (the attribute only
+    an early-stopping fit has). Science caveat pinned in the next
+    tests: the held-out fraction slightly changes the fit vs training
+    on all rows, and determinism is preserved because sklearn seeds
+    the validation split from random_state (= our seed).
+
+    NOTE: sklearn sets validation_scores_ = None when early stopping is
+    OFF (measured, 1.9.1), so the assertion is on the scores LIST being
+    populated — hasattr alone passes either way and pins nothing."""
+    embeddings, prior_probs, y = _mlp_fixture()
+    model = fit_mlp_head(embeddings, prior_probs, y, seed=0, max_iter=5000)
+    scores = getattr(model.clf, "validation_scores_", None)
+    assert scores is not None and len(scores) > 0, (
+        "validation_scores_ is empty/None: early stopping is not enabled, "
+        "so every fleet fit runs to tol/max_iter on the full training "
+        "loss and 12/48 shards hit the 12h wall"
+    )
+    assert model.clf.n_iter_ < 5000
+
+
+def test_mlp_fit_with_early_stopping_stays_deterministic_per_seed():
+    """The validation split is drawn with random_state=seed inside
+    sklearn, so early stopping must NOT break the same-machine
+    determinism contract: same data + same seed -> bit-identical
+    predictions."""
+    embeddings, prior_probs, y = _mlp_fixture()
+    a = fit_mlp_head(embeddings, prior_probs, y, seed=3, max_iter=200)
+    b = fit_mlp_head(embeddings, prior_probs, y, seed=3, max_iter=200)
+    assert np.array_equal(
+        a.predict(embeddings, prior_probs), b.predict(embeddings, prior_probs)
+    )
+
+
+def test_mlp_fit_logs_wall_clock_duration(caplog):
+    """Each MLP fit logs its wall-clock duration — the fleet's only way
+    to see WHICH fit groups eat the 12h budget before the scheduler
+    kills the shard with no per-fit evidence."""
+    import logging
+
+    embeddings, prior_probs, y = _mlp_fixture()
+    with caplog.at_level(logging.INFO, logger="birdology.phase_b.learned"):
+        fit_mlp_head(embeddings, prior_probs, y, seed=0, max_iter=20)
+    timed = [r for r in caplog.records if "fit" in r.message and "s" in r.message]
+    assert timed, "no per-fit duration log record was emitted"
+
+
 def test_mlp_handles_hard_zero_prior_finitely():
     """A hard-zero prior probability must be floored before the log that
     builds the [embeddings ‖ log p] feature block — fit and predict both

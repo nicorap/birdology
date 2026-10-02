@@ -185,6 +185,48 @@ def test_main_records_failure_when_metadata_misses_a_recording(cli_workspace):
     assert not list((cli_workspace["tmp"] / "results").glob("*.parquet"))
 
 
+def test_rerunning_a_shard_writes_each_row_exactly_once(cli_workspace, caplog):
+    """TIMEOUT-resume contract: a resubmitted shard SKIPS cells whose
+    rows already exist in --out (idempotent resume, keyed on the full
+    config_hash — which covers encoder/method/variant/resolution/tau/
+    test_set/seeds). The fleet resubmits timed-out shards over 918
+    already-written rows; without this, every rerun duplicates them.
+
+    Pinned: two identical runs over a 2-cell grid (one rescoring + one
+    mlp cell — the learned arm is where the 12h timeouts live) exit 0
+    both times, each config_hash lands on disk EXACTLY once, and the
+    second run logs a loud skip line per cell.
+    """
+    import logging
+
+    argv = [
+        a if a != "rescoring" else a for a in cli_workspace["argv"]
+    ]
+    # Widen the grid to rescoring + mlp (tau applies to rescoring only).
+    i = argv.index("--methods")
+    argv = argv[: i + 1] + ["rescoring", "mlp"] + argv[i + 2 :]
+
+    assert cli.main(argv) == 0
+    out = cli_workspace["tmp"] / "results"
+    first = pa.concat_tables(
+        [pq.read_table(p) for p in sorted(out.glob("*.parquet"))]
+    )
+    assert first.num_rows == 2
+
+    with caplog.at_level(logging.INFO, logger="phase_b_sweep"):
+        assert cli.main(argv) == 0
+    merged = pa.concat_tables(
+        [pq.read_table(p) for p in sorted(out.glob("*.parquet"))]
+    )
+    hashes = merged.column("config_hash").to_pylist()
+    assert len(hashes) == 2, f"rerun duplicated rows: {len(hashes)} rows"
+    assert len(set(hashes)) == 2
+    skip_lines = [r for r in caplog.records if "skip existing" in r.message]
+    assert len(skip_lines) == 2, (
+        "resume must log one loud skip line per already-written cell"
+    )
+
+
 def test_failures_filename_carries_the_grid_shard_index(cli_workspace):
     """Shard 3 of 4 writes failures_shard03.json: each shard owns its
     own failures file, so a 5-shard fleet keeps 5 failure reports
