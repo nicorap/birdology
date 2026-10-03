@@ -1402,6 +1402,17 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "than the multi-hour parse. A stale checkpoint is REFUSED naming "
         "the mismatched field, never silently rebuilt",
     )
+    ap.add_argument(
+        "--sequential",
+        action="store_true",
+        help="parse with the sequential read_occurrences path instead of the "
+        "parallel parse_and_aggregate. Jobs 5846/6237: the parallel merge did "
+        "not finish on the real EOD archive (a single parent thread at 100%% "
+        "for 6h+ after the read, 12h limit, no checkpoint), while the "
+        "sequential path completed 1.76B rows in ~6.5h (job 5345). Writes no "
+        "parse checkpoint (the checkpoint holds the parallel parse's output), "
+        "so it cannot be combined with --resume or --workers",
+    )
     split = ap.add_mutually_exclusive_group(required=True)
     split.add_argument(
         "--test-split",
@@ -1428,6 +1439,13 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "--split-contributor-mode placeholder requires --test-split: "
             "the mode describes how the split's recorded_by column joins, "
             "and --no-test-split supplies no split to join"
+        )
+    if args.sequential and (args.resume or args.workers is not None):
+        ap.error(
+            "--sequential cannot be combined with --resume or --workers: "
+            "the sequential path neither reads nor writes the parse "
+            "checkpoint and uses no worker pool, so either flag would be "
+            "silently ignored"
         )
     return args
 
@@ -1479,7 +1497,20 @@ def main(argv: Sequence[str] | None = None) -> None:
     # its archive, and the operator who wants another resolution subset or
     # a different split mode tomorrow is exactly who it exists for.
     ckpt = checkpoint_path(args.out, args.source)
-    if args.resume:
+    if args.sequential:
+        # Jobs 5846/6237: the parallel merge never finished on the real EOD
+        # archive. Hand build_from_archive occurrences=None so it takes its
+        # own read_occurrences + assign_cells fallback -- EXACTLY the path
+        # job 5345 completed over 1.76B rows. It re-reads the archive once
+        # per resolution; that is deliberate: holding one resolution's table
+        # at a time is the memory profile 5345 actually survived, where one
+        # shared read would hold all three at once (~3x the peak).
+        log.info(
+            "--sequential: build_from_archive's read_occurrences path, once "
+            "per resolution (the job-5345 memory profile)"
+        )
+        tables = {resolution: None for resolution in args.resolutions}
+    elif args.resume:
         # Staleness fails closed inside `load_checkpoint`, naming the
         # mismatched field; no try/except here, per this script's uniform
         # rule that a refusal exits non-zero at the raise site.
