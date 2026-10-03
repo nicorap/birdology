@@ -6,6 +6,9 @@ decode it with their own tooling. Everything below was derived by reading
 `src/birdology/prior/tensor.py` and inspecting an artifact it actually wrote.
 
 If you read nothing else, read
+[**Restricted artifacts**](#2f-restricted-artifacts--values-only-where-they-were-queried)
+(check `restricted` first: a restricted artifact answers only its declared
+contexts),
 [**A missing entry is NOT zero**](#a-missing-entry-is-not-zero),
 [**What is actually shipped**](#what-is-actually-shipped) and
 [**How hard the artifact was smoothed**](#2b-how-hard-the-artifact-was-smoothed--and-why-it-matters-to-you).
@@ -100,7 +103,10 @@ species and two cells:
     "time_weight": 0.3
   },
   "gbif_doi": "10.15468/dl.abc123",
-  "attribution": "Derived from GBIF occurrence download 10.15468/dl.abc123. Released under CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/); cite that DOI and this licence when redistributing or building on this artifact."
+  "attribution": "Derived from GBIF occurrence download 10.15468/dl.abc123. Released under CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/); cite that DOI and this licence when redistributing or building on this artifact.",
+  "format_version": 2,
+  "restricted": false,
+  "restriction": null
 }
 ```
 
@@ -121,6 +127,9 @@ species and two cells:
 | `smoothing_params` | **how hard this artifact was smoothed** — a JSON object, or `null`. See section 2b |
 | `gbif_doi` | the GBIF occurrence-download DOI this prior was derived from |
 | `attribution` | a ready-made attribution string naming both the DOI and the licence |
+| `format_version` | sidecar format version, currently `2`. **Absent means version 1** (written before restriction existed; such an artifact is unrestricted). A version you do not know must be refused |
+| `restricted` | `false` for an artifact spanning its whole grid; `true` for one built only on a query set. **Read this before anything else** — see section 2f |
+| `restriction` | `null`, or (when `restricted` is `true`) the declared domain and the query set that defined it. See section 2f |
 
 `nnz` and `dense_capacity` are published so a release carries visible evidence
 of how much of its own grid is stored. See
@@ -412,6 +421,71 @@ same way you would treat a missing control: **not a complete release.**
 
 ---
 
+## 2f. Restricted artifacts — values only where they were queried
+
+**An artifact whose sidecar says `"restricted": true` holds values only at
+the contexts its `restriction.contexts` lists. Every other context is NOT
+"no evidence": the full build would hold a real estimate there and this
+artifact holds none. Do not fill it with `missing_value`; refuse it.**
+
+Why they exist: the full build stores `species x cells x 52` contexts. On a
+global archive that is ~8e9 contexts at H3 resolution 3 (~2 TiB to build)
+and ~4e10 at resolution 4. Every consumer of the prior in this project only
+looks up the (cell, week) contexts of its own recordings, so the global
+priors are built only there.
+
+A restricted sidecar (format version 2) carries:
+
+```text
+"format_version": 2,
+"restricted": true,
+"restriction": {
+  "domain": "query_contexts",
+  "query_set_path": "/abs/path/query_set.parquet",
+  "query_set_sha256": "<sha256 of that file's bytes>",
+  "counts": {"query_contexts": ..., "on_grid_contexts": ..., "off_grid_contexts": ...,
+             "halo_cells": ..., "observed_cells": ..., "support_points": ...,
+             "query_set_rows": ...},
+  "contexts": [["<cell>", <week>], ...]
+}
+```
+
+| field | meaning |
+|---|---|
+| `domain` | always `query_contexts`: the declared domain is a list of (cell, week) contexts, not of cells |
+| `query_set_path` / `query_set_sha256` | the resolution-free `(lat, lon, week)` query set the domain was derived from (`scripts/build_query_set.py`), and the hash of its bytes |
+| `contexts` | **the declared domain**: every distinct (cell, week) of the query set at this artifact's resolution, sorted |
+| `counts` | the build's bookkeeping, for audit |
+
+Three facts a decoder needs:
+
+1. **The values in the domain are the full build's values, bit for bit.**
+   The build evaluates the backoff and the one smoothing pass on the query
+   contexts plus their observed one-step hex neighbours and adjacent weeks
+   (the smoothing "halo") and keeps only the query contexts. Every level of
+   the backoff is a ratio of sums over the whole occurrence table, so
+   nothing else changes a value.
+2. **A domain context whose cell was never observed is off the cell axis,**
+   exactly as against the full build: the domain lists it, `cells` does not.
+   Treat it as you would an unknown cell of the full build.
+3. **The cell axis is the on-grid query cells, not every observed cell,**
+   and the matrix stores exactly `len(species_keys) x (on-grid domain
+   contexts)` entries. `nnz < dense_capacity` here, and the unstored
+   columns are OUT OF DOMAIN, not floored. Section 5's `load_dense` fills
+   them with `missing_value` and is therefore only correct inside the
+   domain; its `lookup` refuses anything outside it.
+
+**Controls built from a restricted prior are restricted too**, carry the
+same `restriction`, and are defined over the domain rather than over a full
+grid: `uniform` is the mean over the domain's contexts, `marginal` each
+species' mean over them, `shuffle_space` permutes cells WITHIN each week's
+queried contexts, `shuffle_time` permutes weeks WITHIN each cell's queried
+contexts, and `separable` is the outer product of the domain's cell and
+week marginals. They are null models of the prior *as queried*, not of the
+global prior.
+
+---
+
 ## 2e. Known limitation: ISO week 53 makes week 52 the least-shrunk week
 
 **Week 52 systematically carries more records — and therefore less shrinkage —
@@ -590,6 +664,10 @@ def load_dense(npz_path, json_path):
 
 def lookup(meta, grid, species_key, cell, week):
     """P(species | cell, week). Raises for a key that is not on an axis."""
+    # A RESTRICTED artifact (section 2f) answers only its declared domain;
+    # the grid's other columns are out of domain, not floored.
+    if meta.get("restricted") and [cell, week] not in meta["restriction"]["contexts"]:
+        raise ValueError(f"({cell!r}, {week!r}) is outside this restricted artifact's domain")
     if species_key not in meta["species_keys"]:
         raise ValueError(f"species_key {species_key!r} is not on the species axis")
     if cell not in meta["cells"]:
@@ -695,7 +773,11 @@ limitation is deleted rather than left standing as a stale warning. Section
 Section 2d's claim that this document ships beside the artifacts is pinned by
 `tests/prior/test_build_prior.py::test_the_build_SHIPS_the_format_documentation_beside_the_artifacts`,
 which builds through `build_from_archive` and compares the shipped bytes with
-this file's. Every number in section 2e — the 71-in-400 week-53 frequency, the
+this file's. Section 2f's restricted format, its out-of-domain refusal and
+its recipe line are pinned by `tests/prior/test_restricted_tensor.py`, and its
+bit-for-bit equality with the full build by
+`tests/prior/test_restricted_build.py::test_the_restricted_values_EQUAL_the_full_build_bit_for_bit`.
+Every number in section 2e — the 71-in-400 week-53 frequency, the
 1.1775 inflation and all four shrinkage rows — is recomputed from the Gregorian
 calendar and the shipped default weight by
 `tests/prior/test_tensor.py::test_the_documented_WEEK_53_ASYMMETRY_matches_the_calendar_and_the_code`.*

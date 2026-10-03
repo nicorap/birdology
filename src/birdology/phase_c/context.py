@@ -41,6 +41,16 @@ it, and a late-December recording must not sink a training batch. Any
 OTHER out-of-range week stays loud: the tensor's own ValueError surfaces,
 because week 54 is a caller bug, not a calendar fact.
 
+A RESTRICTED PRIOR REFUSES OUT-OF-DOMAIN CONTEXTS. A prior built on a
+query set (``prior.restriction`` set) holds values only at its declared
+(cell, week) domain. A located, dated row OUTSIDE it raises
+``OutOfDomainError``: answering "absent context" there would hide a real
+estimate the full build holds. Rows with no cell or week, and domain
+contexts whose cell was never observed, keep today's absent-context answer.
+``ContextProvider.require_domain`` checks a whole table up front, naming the
+count and examples, so a run fails before its first epoch rather than in a
+DataLoader worker. Unrestricted priors are unchanged.
+
 NORMALISATION: ``(log p - mean) / (std + 1e-6)`` over the class axis —
 the spec's "log(floored), layer-norm". The prior is a per-species
 marginal that NEVER sums to one (see ``prior.tensor``); layer-norming the
@@ -118,6 +128,21 @@ class ContextProvider:
     def __post_init__(self) -> None:
         self._known_cells = set(self.prior.cells)
 
+    def require_domain(self, cells, weeks) -> None:
+        """Refuse a table with any located, dated row outside a restricted
+        prior's domain -- all rows at once, naming the count and examples.
+        A no-op for an unrestricted prior. Week 53 folds to 52 first."""
+        pairs = [
+            (c, 52 if w == 53 else w)
+            for c, w in zip(cells, weeks)
+            if c is not None and w is not None
+        ]
+        self.prior.require_domain(
+            [c for c, _ in pairs],
+            [w for _, w in pairs],
+            where="ContextProvider.require_domain",
+        )
+
     @property
     def n_classes(self) -> int:
         return len(self.class_codes)
@@ -132,13 +157,18 @@ class ContextProvider:
         flag 1.0, even when every value is the floor: that IS the prior's
         answer there (Review Focus 2).
         """
-        if cell is None or week is None or cell not in self._known_cells:
+        if cell is None or week is None:
             return np.zeros(self.n_classes, dtype=np.float32), 0.0
 
         # The phase_b ruling: ISO week 53 folds to 52 BEFORE the lookup.
         # Any other out-of-range week stays loud via the tensor's guard.
         if week == 53:
             week = 52
+        # A restricted prior refuses BEFORE the off-axis answer below, which
+        # would otherwise hide an observed-but-unqueried context.
+        self.prior.require_domain([cell], [week], where="ContextProvider.vector")
+        if cell not in self._known_cells:
+            return np.zeros(self.n_classes, dtype=np.float32), 0.0
 
         on_prior = self.prior.vector(cell, week)  # species_keys order, floored
         probs = np.full(self.n_classes, FLOOR, dtype=np.float64)

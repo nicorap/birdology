@@ -118,6 +118,45 @@ STATED IN THE SIDECAR because an artifact whose grid is narrower than 52 weeks
 and does not say so is a silent lie about its own coverage, or a streaming
 `to_tensor`. Falling back to the observed axes is NOT one of them: it
 reintroduces the exact defect this design prevents.
+
+OPTION (b): BUILD ONLY WHERE THE PRIOR IS QUERIED (`--query-set`)
+-----------------------------------------------------------------
+The table above is for Denmark. The GLOBAL EOD archive (fleet job 6481:
+1.76e9 occurrences after the guards, 10 319 species, 15 463 observed r3
+cells) projects 8.3e9 contexts / ~2 TiB at r3 and 3.6e10 / ~9 TiB at r4; r5
+segfaulted at ~800 GB. Every consumer of the prior only looks up the (cell,
+week) contexts of its own recordings, so `--query-set` (written by
+`scripts/build_query_set.py` from the Phase A manifests) restricts the
+ESTIMATION -- never the parse, the guards or the RatioTable -- to those
+contexts, and the result is BIT-IDENTICAL to the full build there:
+
+1. the backoff's global and cell levels are ratios of sums over the WHOLE
+   RatioTable, so a point's value depends on the table and on its own
+   (species, cell, week) only -- which points are requested changes nothing
+   (`backoff.hierarchical_estimate`; reproduced point-wise by
+   `point_backoff.PointStatistics`);
+2. smoothing is ONE pass in which (c, w) reads its six `grid_disk(c, 1)`
+   neighbours at w and (c, w +- 1) with the 52 <-> 1 wrap, and a neighbour
+   counts only if its cell is on the grid's cell list -- in the full build,
+   the OBSERVED cells (`smoothing._neighbour_codes`).
+
+So evaluating the backoff on the query contexts' SUPPORT -- themselves,
+their adjacent weeks and their OBSERVED ring-1 neighbours at the same week
+(`query_set.plan_restriction`) -- and applying the same pass
+(`query_set.smooth_on_plan`) reproduces the full build's value at every
+query context whose cell was observed. A query cell that was never observed
+stays off the cell axis, exactly as in the full build. The artifact says it
+is restricted (sidecar format version 2), and every consumer refuses a
+lookup outside its declared domain instead of flooring it.
+
+THE GUARDED COUNTS ARE CHECKPOINTED (`--resume-counts`)
+-------------------------------------------------------
+Once both leakage escalation clauses have passed, `main` writes the guarded
+per-resolution counts -- the exact input to `target_group_ratios` -- to
+`--out/guarded_counts_{source}_r{res}.parquet` with their provenance
+(`counts_checkpoint.py`). `--resume-counts` starts the next run there,
+skipping the parse and the guards; a checkpoint from another archive,
+resolution, split file or contributor mode is refused naming the field.
 """
 from __future__ import annotations
 
@@ -143,6 +182,12 @@ from birdology.prior.checkpoint import (
     write_checkpoint,
 )
 from birdology.prior.controls import CONTROLS
+from birdology.prior.counts_checkpoint import (
+    CountsIdentity,
+    counts_checkpoint_path,
+    load_counts_checkpoint,
+    write_counts_checkpoint,
+)
 from birdology.prior.effort import target_group_ratios
 from birdology.prior.indexing import WEEKS_PER_YEAR, aggregate_counts, assign_cells
 from birdology.prior.leakage import (
@@ -153,8 +198,22 @@ from birdology.prior.leakage import (
 )
 from birdology.prior.occurrences import read_occurrences
 from birdology.prior.parallel_parse import parse_and_aggregate
+from birdology.prior.point_backoff import PointStatistics
+from birdology.prior.query_set import (
+    QuerySet,
+    RestrictionPlan,
+    load_query_set,
+    plan_restriction,
+    smooth_on_plan,
+)
 from birdology.prior.smoothing import SmoothingParams, smooth
-from birdology.prior.tensor import PriorSpec, save_prior, to_tensor
+from birdology.prior.tensor import (
+    PriorSpec,
+    Restriction,
+    restricted_tensor,
+    save_prior,
+    to_tensor,
+)
 
 log = logging.getLogger("birdology.prior.build")
 
@@ -487,6 +546,101 @@ def estimate_over_full_grid(
             smoothing_params,
         )
     return pa.concat_tables(pieces)
+
+
+def estimate_over_query_set(
+    ratios: pa.Table,
+    species: Sequence[int],
+    plan: RestrictionPlan,
+    *,
+    species_chunk: int = DEFAULT_SPECIES_CHUNK,
+    backoff_params: BackoffParams = BackoffParams(),
+    smoothing_params: SmoothingParams = SmoothingParams(),
+    stats: PointStatistics | None = None,
+) -> "np.ndarray":
+    """The FULL build's values at ``plan.on_grid_contexts``, streamed by chunk.
+
+    Returns ``(len(species), len(plan.on_grid_contexts))`` float64. Per
+    species chunk: the backoff at ``plan.support_points`` (the query contexts,
+    their adjacent weeks and their observed ring-1 neighbours), then the one
+    smoothing pass evaluated only at the query contexts, written into the
+    output block -- so the working set is one chunk's support block, never a
+    halo table. Exactness argument: the module docstring, "OPTION (b)".
+
+    `ratios` is the WHOLE RatioTable: restricting it would change every
+    parent level of the hierarchy.
+    """
+    import numpy as np
+
+    if species_chunk < 1:
+        raise ValueError(
+            f"species_chunk must be >= 1, got {species_chunk}; a chunk size of "
+            "zero or less would silently emit an EMPTY prior rather than fail"
+        )
+    stats = stats if stats is not None else PointStatistics(ratios)
+    ordered = list(species)
+    out = np.empty((len(ordered), len(plan.on_grid_contexts)), dtype=np.float64)
+    support = plan.support_points
+    for start in range(0, len(ordered), species_chunk):
+        chunk = ordered[start : start + species_chunk]
+        out[start : start + len(chunk)] = smooth_on_plan(
+            stats.estimate(chunk, support, backoff_params), plan, smoothing_params
+        )
+    return out
+
+
+#: MEASURED net peak bytes per STORED context of a restricted build
+#: (`build_from_counts` with a query set, end to end: estimation, the full
+#: tensor, five controls and six `save_prior` writes). Slope of net
+#: `ru_maxrss` against stored contexts at a fixed RatioTable, each point its
+#: own subprocess (macOS arm64, 3.0e6 ratio rows, 8 000 on-grid contexts):
+#:
+#:     species   stored     net peak    slope vs previous
+#:     -------   ------     --------    -----------------
+#:         500   4.0e6        963 MB
+#:       2 000   1.6e7      1 763 MB    69.9 B/stored
+#:       4 000   3.2e7      2 734 MB    63.6 B/stored
+#:
+#: Rounded UP from the worst slope, for the reason `MEASURED_BYTES_PER_CONTEXT`
+#: is: an under-estimate costs the operator the whole run.
+RESTRICTED_BYTES_PER_STORED_CONTEXT = 72
+
+#: MEASURED net peak bytes per RatioTable row of a restricted build: the
+#: intercept of the series above (963 MB - 4.0e6 x 70 B over 2.98e6 rows =
+#: ~232 B/row) -- `target_group_ratios`, the species/cell axes and
+#: `point_backoff.PointStatistics` (68-80 B/row on its own, measured
+#: separately at 2e6-2e7 rows). Rounded up. It does NOT include the guarded
+#: counts table that already exists when estimation starts, nor the parse and
+#: guards, which are unchanged by `--query-set` and dominate on the fleet.
+RESTRICTED_BYTES_PER_RATIO_ROW = 240
+
+#: Per support point, per species of one chunk: the support block and the
+#: smoothing pass's temporaries (~6 float64 arrays of the chunk's size). An
+#: ACCOUNTING, not a fit; it is the smallest of the three terms at fleet
+#: scale (~2 GB at r5 with the default chunk).
+RESTRICTED_BYTES_PER_CHUNK_SUPPORT_POINT = 48
+
+
+def project_restricted_peak_bytes(
+    n_species: int,
+    n_stored_contexts: int,
+    n_support_points: int,
+    n_ratio_rows: int,
+    species_chunk: int,
+) -> int:
+    """Projected peak RSS of a RESTRICTED build, excluding the parse/guards.
+
+    Three terms, summed to stay on the side of telling an operator the
+    build is MORE expensive than it is: the RatioTable-proportional cost,
+    one chunk's support working set, and the stored result plus controls.
+    """
+    return (
+        n_ratio_rows * RESTRICTED_BYTES_PER_RATIO_ROW
+        + min(species_chunk, max(n_species, 1))
+        * n_support_points
+        * RESTRICTED_BYTES_PER_CHUNK_SUPPORT_POINT
+        + n_species * n_stored_contexts * RESTRICTED_BYTES_PER_STORED_CONTEXT
+    )
 
 
 #: MEASURED bytes of peak RSS per grid context, NET OF THE ~77-82 MB
@@ -1021,8 +1175,14 @@ def build_from_archive(
     smoothing_params: SmoothingParams = SmoothingParams(),
     split_contributor_mode: str = "match",
     occurrences: pa.Table | None = None,
+    query_set: QuerySet | None = None,
+    counts_identity: CountsIdentity | None = None,
 ) -> list[Path]:
     """Archive -> full prior + every registered control. Returns written paths.
+
+    *query_set* restricts the ESTIMATION to the queried contexts (exactly;
+    see the module docstring, "OPTION (b)"). *counts_identity*, when given,
+    checkpoints the guarded counts under it once the guards have passed.
 
     `gbif_doi` reaches EVERY artifact, controls included: `save_prior` refuses
     an empty one, and `controls._respec` carries it from the full prior into
@@ -1168,18 +1328,129 @@ def build_from_archive(
         )
 
     counts = aggregate_counts(guarded.table)
+    guard = guard_record(guarded)
+    # AFTER both escalation clauses, BEFORE any estimation: the guarded
+    # counts are what every later stage is a function of, and the stage the
+    # fleet iterates on (estimation, restriction) is cheap beside the parse
+    # and guards that produced them. Only when the caller names an identity:
+    # `main` always does; a library caller opts in.
+    if counts_identity is not None:
+        write_counts_checkpoint(
+            counts_checkpoint_path(out_dir, source, resolution),
+            counts,
+            identity=counts_identity,
+            guard=guard,
+        )
+    return build_from_counts(
+        counts,
+        guard,
+        resolution=resolution,
+        source=source,
+        out_dir=out_dir,
+        gbif_doi=gbif_doi,
+        species_chunk=species_chunk,
+        backoff_params=backoff_params,
+        smoothing_params=smoothing_params,
+        query_set=query_set,
+    )
+
+
+def guard_record(guarded) -> dict:
+    """The guard's returned counts, as the dict the counts checkpoint records."""
+    return {
+        "banned_key_count": guarded.banned_key_count,
+        "matched_key_count": guarded.matched_key_count,
+        "xeno_canto_rows_removed": guarded.xeno_canto_rows_removed,
+        "contributor_rows_removed": guarded.contributor_rows_removed,
+        "rows_before_contributor_guard": guarded.rows_before_contributor_guard,
+        "rows_after_guards": guarded.table.num_rows,
+    }
+
+
+def check_resumed_guards(
+    guard: dict,
+    resolution: int,
+    min_split_match_rate: float,
+    split_contributor_mode: str,
+) -> None:
+    """Both escalation clauses, re-run on a checkpoint's RECORDED guard counts.
+
+    A resumed build skips the guards, not their verdict. Clause 1 cannot
+    newly fire (the checkpoint was only written after it passed), but it is
+    re-checked anyway because the record is a file; clause 2 depends on
+    `--min-split-match-rate`, which the resumed invocation may set stricter
+    than the one that wrote the checkpoint.
+    """
+    shape = key_shape(split_contributor_mode)
+    banned = int(guard["banned_key_count"])
+    matched = int(guard["matched_key_count"])
+    if banned > 0 and int(guard["contributor_rows_removed"]) == 0:
+        raise ZeroMatchGuardError(
+            f"the resumed guarded-counts checkpoint records that the test split "
+            f"matched no occurrence at resolution {resolution}: {banned} banned "
+            f"{shape} key(s) removed nothing. Re-run without --resume-counts"
+        )
+    if banned > 0 and matched / banned < min_split_match_rate:
+        raise PartialMatchGuardError(
+            f"the resumed guarded-counts checkpoint records that only {matched} "
+            f"of {banned} banned {shape} key(s) matched any occurrence at "
+            f"resolution {resolution} in {split_contributor_mode!r} contributor "
+            f"mode -- a match rate of {matched / banned:.4f}, below the required "
+            f"{min_split_match_rate:.4f}. If the split really is this sparse and "
+            "you accept it, say so explicitly with --min-split-match-rate"
+        )
+
+
+def build_from_counts(
+    counts: pa.Table,
+    guard: dict,
+    *,
+    resolution: int,
+    source: str,
+    out_dir: Path,
+    gbif_doi: str,
+    species_chunk: int = DEFAULT_SPECIES_CHUNK,
+    backoff_params: BackoffParams = BackoffParams(),
+    smoothing_params: SmoothingParams = SmoothingParams(),
+    query_set: QuerySet | None = None,
+) -> list[Path]:
+    """GUARDED counts -> full prior + every registered control. Returns paths.
+
+    The second half of `build_from_archive`, and the whole of a
+    `--resume-counts` build. With *query_set* the estimation is restricted
+    (see the module docstring, "OPTION (b)"); without it this is the full
+    52-week grid, byte for byte the path the DOF priors were built with.
+    """
     ratios = target_group_ratios(counts)
     species = species_axis(counts)
     cells = cell_axis(counts)
+    if query_set is not None:
+        full = _restricted_full_prior(
+            ratios,
+            species,
+            cells,
+            query_set,
+            guard,
+            resolution=resolution,
+            source=source,
+            species_chunk=species_chunk,
+            backoff_params=backoff_params,
+            smoothing_params=smoothing_params,
+        )
+        full.gbif_doi = gbif_doi
+        return _write_release(
+            full, out_dir, source, resolution, gbif_doi,
+            backoff_params, smoothing_params,
+        )
     log.info(
         "resolution %d: %d occurrences (%d dropped by the leakage guards over "
         "%d of %d banned key(s)), %d species, %d cells -> %d grid "
         "contexts over %d weeks, projected peak ~%.1f GiB",
         resolution,
-        guarded.table.num_rows,
-        guarded.xeno_canto_rows_removed + guarded.contributor_rows_removed,
-        guarded.matched_key_count,
-        guarded.banned_key_count,
+        guard["rows_after_guards"],
+        guard["xeno_canto_rows_removed"] + guard["contributor_rows_removed"],
+        guard["matched_key_count"],
+        guard["banned_key_count"],
         len(species),
         len(cells),
         len(species) * len(cells) * WEEKS_PER_YEAR,
@@ -1209,7 +1480,108 @@ def build_from_archive(
         smoothing_params=smoothing_params,
     )
     full.gbif_doi = gbif_doi
+    return _write_release(
+        full, out_dir, source, resolution, gbif_doi,
+        backoff_params, smoothing_params,
+    )
 
+
+def _restricted_full_prior(
+    ratios: pa.Table,
+    species: list[int],
+    cells: list[str],
+    query_set: QuerySet,
+    guard: dict,
+    *,
+    resolution: int,
+    source: str,
+    species_chunk: int,
+    backoff_params: BackoffParams,
+    smoothing_params: SmoothingParams,
+):
+    """The full prior, restricted to *query_set* at *resolution*. Exact."""
+    plan = plan_restriction(query_set.contexts_at(resolution), cells)
+    if not plan.on_grid_contexts:
+        raise ValueError(
+            f"the query set {query_set.path} touches no OBSERVED cell at "
+            f"resolution {resolution} ({plan.counts['query_contexts']} query "
+            "contexts, none on the observed-cell axis); a restricted artifact "
+            "would store nothing. Check that the query set and the archive "
+            "cover the same region"
+        )
+    stats = PointStatistics(ratios)
+    log.info(
+        "resolution %d: RESTRICTED to query set %s (sha256 %s): %d occurrences "
+        "after the leakage guards (%d dropped over %d of %d banned key(s)), "
+        "%d species, %d observed cells; %d query contexts over %d cells, %d "
+        "on the observed grid (%d off it); halo %d cells, %d support points "
+        "-> %d stored contexts instead of the full grid's %d, projected peak "
+        "~%.1f GiB (ratio rows %d, species chunk %d; parse and guards not "
+        "included)",
+        resolution,
+        query_set.path,
+        query_set.sha256,
+        guard["rows_after_guards"],
+        guard["xeno_canto_rows_removed"] + guard["contributor_rows_removed"],
+        guard["matched_key_count"],
+        guard["banned_key_count"],
+        len(species),
+        len(cells),
+        plan.counts["query_contexts"],
+        plan.counts["query_cells"],
+        plan.counts["on_grid_contexts"],
+        plan.counts["off_grid_contexts"],
+        plan.counts["halo_cells"],
+        plan.counts["support_points"],
+        len(species) * plan.counts["on_grid_contexts"],
+        len(species) * len(cells) * WEEKS_PER_YEAR,
+        project_restricted_peak_bytes(
+            len(species),
+            plan.counts["on_grid_contexts"],
+            plan.counts["support_points"],
+            stats.n_ratio_rows,
+            species_chunk,
+        )
+        / (1 << 30),
+        stats.n_ratio_rows,
+        species_chunk,
+    )
+    block = estimate_over_query_set(
+        ratios,
+        species,
+        plan,
+        species_chunk=species_chunk,
+        backoff_params=backoff_params,
+        smoothing_params=smoothing_params,
+        stats=stats,
+    )
+    restriction = Restriction(
+        query_set_path=query_set.path,
+        query_set_sha256=query_set.sha256,
+        contexts=tuple(plan.query_contexts),
+        counts={**plan.counts, "query_set_rows": len(query_set)},
+    )
+    return restricted_tensor(
+        block,
+        species,
+        plan.on_grid_contexts,
+        PriorSpec(resolution=resolution, source=source, variant="full"),
+        restriction,
+        backoff_params=backoff_params,
+        smoothing_params=smoothing_params,
+    )
+
+
+def _write_release(
+    full,
+    out_dir: Path,
+    source: str,
+    resolution: int,
+    gbif_doi: str,
+    backoff_params: BackoffParams,
+    smoothing_params: SmoothingParams,
+) -> list[Path]:
+    """The full prior, every registered control, the doc and the manifest."""
     written: list[Path] = []
     stem = artifact_stem(source, resolution)
     # DELETED FIRST, written LAST. A manifest surviving from an earlier,
@@ -1413,6 +1785,28 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "parse checkpoint (the checkpoint holds the parallel parse's output), "
         "so it cannot be combined with --resume or --workers",
     )
+    ap.add_argument(
+        "--query-set",
+        type=Path,
+        default=None,
+        help="restrict the ESTIMATION to the (lat, lon, week) contexts in this "
+        "parquet (scripts/build_query_set.py), exactly: the artifact equals the "
+        "full build bit for bit on every queried context whose cell was "
+        "observed, holds nothing elsewhere, and says so in its sidecar "
+        "(restricted=true, the query set's sha256). The parse, the guards and "
+        "the RatioTable are NOT restricted. Without it: the full 52-week grid, "
+        "unchanged",
+    )
+    ap.add_argument(
+        "--resume-counts",
+        action="store_true",
+        help="skip the parse AND the leakage guards: start from the guarded "
+        "per-resolution counts a previous run wrote into --out "
+        "(guarded_counts_{source}_r{res}.parquet). Refused, naming the field, "
+        "if the checkpoint was written for another archive, source, "
+        "resolution, split file or contributor mode. The escalation clauses "
+        "are re-checked on the recorded guard counts",
+    )
     split = ap.add_mutually_exclusive_group(required=True)
     split.add_argument(
         "--test-split",
@@ -1440,6 +1834,14 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "the mode describes how the split's recorded_by column joins, "
             "and --no-test-split supplies no split to join"
         )
+    if args.resume_counts and (
+        args.resume or args.sequential or args.workers is not None
+    ):
+        ap.error(
+            "--resume-counts cannot be combined with --resume, --sequential or "
+            "--workers: it reads no archive at all, so each of those would be "
+            "silently ignored"
+        )
     if args.sequential and (args.resume or args.workers is not None):
         ap.error(
             "--sequential cannot be combined with --resume or --workers: "
@@ -1448,6 +1850,17 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "silently ignored"
         )
     return args
+
+
+def split_digest(path: Path | None) -> str | None:
+    """sha256 of the test-split FILE's bytes, or None for --no-test-split.
+
+    The guarded counts depend on the split's content; the file hash is the
+    identity the counts checkpoint records for it.
+    """
+    if path is None:
+        return None
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -1496,6 +1909,65 @@ def main(argv: Sequence[str] | None = None) -> None:
     # deliberately NOT deleted on success either: it is cheap relative to
     # its archive, and the operator who wants another resolution subset or
     # a different split mode tomorrow is exactly who it exists for.
+    query_set = load_query_set(args.query_set) if args.query_set else None
+    if query_set is not None:
+        log.info(
+            "--query-set %s: %d (lat, lon, week) row(s), sha256 %s; the "
+            "estimation is RESTRICTED to them",
+            query_set.path,
+            len(query_set),
+            query_set.sha256,
+        )
+    split_sha256 = split_digest(None if args.no_test_split else args.test_split)
+
+    def identity(resolution: int) -> CountsIdentity:
+        return CountsIdentity(
+            source=args.source,
+            archive=str(Path(args.archive).resolve()),
+            resolution=int(resolution),
+            split_sha256=split_sha256,
+            contributor_mode=args.split_contributor_mode,
+        )
+
+    if args.resume_counts:
+        # Every resolution's checkpoint is loaded and checked BEFORE any
+        # artifact is written, so a stale one for r5 cannot leave r3 and r4
+        # rebuilt from a different run's counts beside it.
+        resumed = {}
+        for resolution in args.resolutions:
+            meta, counts = load_counts_checkpoint(
+                counts_checkpoint_path(args.out, args.source, resolution),
+                identity=identity(resolution),
+            )
+            check_resumed_guards(
+                meta["guard"],
+                resolution,
+                args.min_split_match_rate,
+                args.split_contributor_mode,
+            )
+            resumed[resolution] = (meta, counts)
+        for resolution in args.resolutions:
+            meta, counts = resumed[resolution]
+            log.info(
+                "resolution %d: resumed guarded counts (%d row(s)); skipping "
+                "the parse and the leakage guards",
+                resolution,
+                counts.num_rows,
+            )
+            paths = build_from_counts(
+                counts,
+                meta["guard"],
+                resolution=resolution,
+                source=args.source,
+                out_dir=args.out,
+                gbif_doi=args.gbif_doi,
+                species_chunk=args.species_chunk,
+                query_set=query_set,
+            )
+            for path in paths:
+                print(path)
+        return
+
     ckpt = checkpoint_path(args.out, args.source)
     if args.sequential:
         # Jobs 5846/6237: the parallel merge never finished on the real EOD
@@ -1566,6 +2038,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             min_split_match_rate=args.min_split_match_rate,
             split_contributor_mode=args.split_contributor_mode,
             occurrences=tables[resolution],
+            query_set=query_set,
+            counts_identity=identity(resolution),
         )
         for path in paths:
             print(path)

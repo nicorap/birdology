@@ -205,6 +205,36 @@ call and ``_validate_p`` makes it at write time.
 The column-count guard survives untouched: it is about the RESHAPE, not about
 sparsity, and nothing in the reversal touches it.
 
+ON A RESTRICTED PRIOR THE CONTROLS ARE FUNCTIONS OF THE QUERY SET
+-----------------------------------------------------------------
+A restricted prior (``tensor.Restriction``; built with ``build_prior.py
+--query-set``) holds values only at its declared domain of (cell, week)
+contexts, which is NOT a cells x 52 rectangle. ``dense()`` refuses on it, and
+every control is computed instead over ``D = t.domain_dense()``, the
+(species x on-axis domain contexts) block, and carries the same restriction.
+What that changes, per control -- a definitional change the user rules on,
+not an implementation detail:
+
+* ``uniform``       the mean over the QUERIED contexts, not over the global
+  grid. Total mass over the domain is preserved exactly.
+* ``marginal``      each species' mean over the QUERIED contexts: "label
+  frequency" now means frequency where the recordings are, weighted by how
+  many distinct (cell, week) the query set holds per place and week.
+* ``shuffle_space`` within each WEEK, permutes the queried cells of that week
+  (one permutation per week, shared across species). Weeks queried in one
+  cell only cannot move. A value can only land in another QUERIED cell.
+* ``shuffle_time``  within each CELL, permutes that cell's queried weeks
+  (one permutation per cell, shared across species) -- NOT one permutation
+  of 52 slots shared by every cell, which is undefined on a ragged domain.
+  Cells queried in one week only cannot move.
+* ``separable``     ``cellmean * weekmean / grandmean`` with the means taken
+  over the domain's contexts. On a ragged domain this NO LONGER reproduces
+  either marginal exactly or preserves mass exactly; it is only exact when
+  the domain is a full cells x weeks rectangle.
+
+All five refuse the same degenerate cases as on a full prior (an unmoved
+shuffle, a separable surrogate above 1.0). See ``_restricted_control``.
+
 Errors
 ------
 Every contract violation raises ``ValueError`` naming that specific check.
@@ -501,6 +531,8 @@ def uniform_prior(t: PriorTensor) -> PriorTensor:
     Flat across species AND across contexts. Either kind of variation would be
     information, and this control is the one that has none.
     """
+    if t.restriction is not None:
+        return _restricted_control(t, "uniform")
     dense = _control_grid(t, "uniform")
     fill = float(dense.mean())
     return _respec(t, "uniform", np.full(dense.shape, fill, dtype=np.float64))
@@ -579,6 +611,8 @@ def marginal_prior(t: PriorTensor) -> PriorTensor:
     artifact built through ``build_from_archive``, so neither number can drift
     into standing for the other.
     """
+    if t.restriction is not None:
+        return _restricted_control(t, "marginal")
     dense = _control_grid(t, "marginal")
     per_species = dense.mean(axis=1, keepdims=True)
     return _respec(t, "marginal", np.tile(per_species, (1, dense.shape[1])))
@@ -607,6 +641,8 @@ def shuffle_space(t: PriorTensor, seed: int = 0) -> PriorTensor:
     than on the permutation, because a prior whose cell blocks are all equal is
     unmoved by a perfectly good permutation too.
     """
+    if t.restriction is not None:
+        return _restricted_control(t, "shuffle_space", seed)
     dense = _control_grid(t, "shuffle_space")
     n_cells = len(t.cells)
     blocks = dense.reshape(dense.shape[0], n_cells, WEEKS_PER_YEAR)
@@ -645,6 +681,8 @@ def shuffle_time(t: PriorTensor, seed: int = 0) -> PriorTensor:
     with a flat season in every cell is unmoved by any week permutation, and
     the emitted-grid guard catches that where a permutation check would not.
     """
+    if t.restriction is not None:
+        return _restricted_control(t, "shuffle_time", seed)
     dense = _control_grid(t, "shuffle_time")
     n_cells = len(t.cells)
     blocks = dense.reshape(dense.shape[0], n_cells, WEEKS_PER_YEAR)
@@ -764,6 +802,8 @@ def separable_prior(t: PriorTensor) -> PriorTensor:
     then knows their prior is too concentrated for a separable surrogate to be
     a probability distribution.
     """
+    if t.restriction is not None:
+        return _restricted_control(t, "separable")
     dense = _control_grid(t, "separable")
     n_cells = len(t.cells)
     blocks = dense.reshape(dense.shape[0], n_cells, WEEKS_PER_YEAR)
@@ -784,6 +824,95 @@ def separable_prior(t: PriorTensor) -> PriorTensor:
             "renormalised control as a weak spatiotemporal effect"
         )
     return _respec(t, "separable", surrogate.reshape(dense.shape))
+
+
+def _permute_within_groups(
+    dense: np.ndarray, keys: list, seed: int
+) -> np.ndarray:
+    """Permute the columns of *dense* within each group of equal *keys*.
+
+    ONE generator, groups visited in sorted key order, one permutation per
+    group shared across every species (row) -- the restricted analogue of
+    the full controls' one shared permutation (T9-R3).
+    """
+    rng = np.random.default_rng(seed)
+    out = dense.copy()
+    groups: dict = {}
+    for j, key in enumerate(keys):
+        groups.setdefault(key, []).append(j)
+    for key in sorted(groups):
+        cols = np.asarray(groups[key], dtype=np.int64)
+        out[:, cols] = dense[:, cols[rng.permutation(cols.size)]]
+    return out
+
+
+def _restricted_control(t: PriorTensor, where: str, seed: int = 0) -> PriorTensor:
+    """A control of a RESTRICTED prior, over its declared domain.
+
+    See the module docstring's "ON A RESTRICTED PRIOR" section for how each
+    definition changes. Same refusals as the full controls: a control of a
+    control, an unmoved shuffle, a separable surrogate above 1.0.
+    """
+    if t.spec.variant != "full":
+        raise ValueError(
+            f"the {where} control requires the FULL prior, but this tensor is "
+            f"already the {t.spec.variant!r} control: a control of a control "
+            "is meaningless"
+        )
+    dense = t.domain_dense()
+    _, contexts = t.domain_columns()
+    cells = [c for c, _ in contexts]
+    weeks = [w for _, w in contexts]
+    if where == "uniform":
+        block = np.full(dense.shape, float(dense.mean()), dtype=np.float64)
+    elif where == "marginal":
+        block = np.tile(dense.mean(axis=1, keepdims=True), (1, dense.shape[1]))
+    elif where == "shuffle_space":
+        block = _refuse_an_unmoved_shuffle(
+            _permute_within_groups(dense, weeks, seed),
+            dense,
+            where,
+            "cell (within each queried week)",
+            len(set(cells)),
+            seed,
+        )
+    elif where == "shuffle_time":
+        block = _refuse_an_unmoved_shuffle(
+            _permute_within_groups(dense, cells, seed),
+            dense,
+            where,
+            "week (within each queried cell)",
+            len(set(weeks)),
+            seed,
+        )
+    else:  # separable
+        cell_ids = {c: i for i, c in enumerate(sorted(set(cells)))}
+        week_ids = {w: i for i, w in enumerate(sorted(set(weeks)))}
+        ci = np.array([cell_ids[c] for c in cells], dtype=np.int64)
+        wi = np.array([week_ids[w] for w in weeks], dtype=np.int64)
+        cell_mean = np.stack(
+            [np.bincount(ci, weights=row) / np.bincount(ci) for row in dense]
+        ) if dense.size else np.zeros((dense.shape[0], len(cell_ids)))
+        week_mean = np.stack(
+            [np.bincount(wi, weights=row) / np.bincount(wi) for row in dense]
+        ) if dense.size else np.zeros((dense.shape[0], len(week_ids)))
+        grand = dense.mean(axis=1, keepdims=True)
+        block = cell_mean[:, ci] * week_mean[:, wi] / grand
+        if block.size and block.max() > 1.0:
+            raise ValueError(
+                "the separable control cannot represent this restricted prior "
+                f"as a probability: the outer product of its domain marginals "
+                f"reaches {float(block.max()):.6g}, above 1.0. Clamping is "
+                "refused, as on a full prior"
+            )
+    control = t.with_domain_values(
+        block, PriorSpec(t.spec.resolution, t.spec.source, where)
+    )
+    # Params are NOT carried, exactly as `_respec` does not carry them: the
+    # build script sets them on every control it writes.
+    control.backoff_params = None
+    control.smoothing_params = None
+    return control
 
 
 CONTROLS: dict[str, Callable[..., PriorTensor]] = {

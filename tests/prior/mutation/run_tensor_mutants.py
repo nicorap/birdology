@@ -1610,9 +1610,9 @@ MUTANTS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         [
             (
                 "    smoothing_params: SmoothingParams | None = None\n"
-                "    _species_index:",
+                "    #: `None` for an artifact spanning its whole grid;",
                 "    smoothing_params: SmoothingParams | None = SmoothingParams()\n"
-                "    _species_index:",
+                "    #: `None` for an artifact spanning its whole grid;",
             )
         ],
     ),

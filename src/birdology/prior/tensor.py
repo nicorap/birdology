@@ -109,6 +109,30 @@ still contributes the floor, on top of the rest) or far below it (only a
 subset of species was requested). Code or a test that assumes it sums to one
 is wrong about the pipeline, not about this module.
 
+A RESTRICTED ARTIFACT ANSWERS ONLY ITS DOMAIN (format version 2)
+-----------------------------------------------------------------
+A prior built with `scripts/build_prior.py --query-set` (option (b) of the
+EOD sizing ruling) carries values ONLY at the queried (cell, week) contexts
+its `Restriction` declares -- bit-identical there to the full build, and
+absent everywhere else. Everywhere else is NOT "no evidence": the full
+build would hold a real estimate there, so flooring it would be a silent
+wrong number. So, on a restricted tensor:
+
+* `lookup` / `vector` of a context OUTSIDE the declared domain raise
+  `OutOfDomainError` (a `ValueError`), naming it;
+* a domain context whose cell is not on the cell axis (queried, never
+  observed) behaves exactly as an unknown cell does against the full build;
+* `dense()` REFUSES -- it would floor every out-of-domain column -- and
+  `domain_dense()` is the restricted spelling: the (species x domain)
+  block, which is what the controls and the marginals are computed over.
+
+An unrestricted tensor's behaviour is unchanged in every respect. Sidecars
+written before format version 2 carry no `format_version` key and load as
+unrestricted: restriction did not exist when they were written, so that is
+a fact about them rather than a default. A version-2 sidecar must carry
+both `restricted` and `restriction`, and a version this module does not know
+is refused.
+
 Errors
 ------
 Every contract violation raises `ValueError` naming that specific check. There
@@ -133,6 +157,92 @@ from .indexing import WEEKS_PER_YEAR
 from .smoothing import SmoothingParams
 
 LICENCE = "CC BY 4.0"
+
+#: Sidecar format version. 2 adds `format_version`, `restricted` and
+#: `restriction`. A sidecar with no `format_version` key is version 1 and is
+#: unrestricted by construction (restriction did not exist).
+FORMAT_VERSION = 2
+_KNOWN_FORMAT_VERSIONS = (1, 2)
+
+#: The one domain kind a restricted artifact can declare: the distinct
+#: (cell, week) contexts of the query set at the artifact's resolution.
+RESTRICTION_DOMAIN = "query_contexts"
+
+#: How many out-of-domain contexts an `OutOfDomainError` names.
+_EXAMPLES = 5
+
+
+class OutOfDomainError(ValueError):
+    """A lookup outside a RESTRICTED artifact's declared domain.
+
+    The full build would have answered such a context with a real estimate,
+    and this artifact holds none: answering with the floor would be a
+    silent wrong number. Rebuild the prior with a query set that covers the
+    contexts, or use an unrestricted artifact.
+    """
+
+
+@dataclass(frozen=True)
+class Restriction:
+    """What a restricted artifact covers, and the query set that defined it.
+
+    ``contexts`` is the DECLARED DOMAIN: every distinct (cell, week) of the
+    query set at this artifact's resolution, sorted -- including those whose
+    cell was never observed (they are off the cell axis, as against the full
+    build). ``counts`` is the build's bookkeeping (query/on-grid/off-grid
+    contexts, halo cells, ...), published so the restriction can be audited.
+    """
+
+    query_set_path: str
+    query_set_sha256: str
+    contexts: tuple
+    counts: dict
+    domain: str = RESTRICTION_DOMAIN
+
+    def __post_init__(self) -> None:
+        if self.domain != RESTRICTION_DOMAIN:
+            raise ValueError(
+                f"restriction domain {self.domain!r} is not one this build "
+                f"implements ({RESTRICTION_DOMAIN!r})"
+            )
+        if not self.query_set_sha256:
+            raise ValueError(
+                "a restriction must name the sha256 of its query set; an "
+                "artifact whose domain cannot be traced to the file that "
+                "defined it cannot be audited"
+            )
+        object.__setattr__(
+            self,
+            "contexts",
+            tuple(sorted({(str(c), int(w)) for c, w in self.contexts})),
+        )
+
+    def payload(self) -> dict:
+        return {
+            "domain": self.domain,
+            "query_set_path": self.query_set_path,
+            "query_set_sha256": self.query_set_sha256,
+            "counts": dict(self.counts),
+            "contexts": [[c, w] for c, w in self.contexts],
+        }
+
+    @classmethod
+    def from_payload(cls, payload: dict) -> "Restriction":
+        expected = {"domain", "query_set_path", "query_set_sha256", "counts", "contexts"}
+        if not isinstance(payload, dict) or set(payload) != expected:
+            got = sorted(payload) if isinstance(payload, dict) else type(payload).__name__
+            raise ValueError(
+                f"sidecar `restriction` records {got!r}, expected exactly "
+                f"{sorted(expected)!r}; a restriction that cannot be read in "
+                "full cannot say which contexts the artifact answers"
+            )
+        return cls(
+            query_set_path=payload["query_set_path"],
+            query_set_sha256=payload["query_set_sha256"],
+            contexts=tuple((c, w) for c, w in payload["contexts"]),
+            counts=dict(payload["counts"]),
+            domain=payload["domain"],
+        )
 LICENCE_URL = "https://creativecommons.org/licenses/by/4.0/"
 
 #: The sidecar keys recording how the artifact was shrunk and smoothed, each
@@ -386,14 +496,23 @@ class PriorTensor:
     #: backoff would then publish a claim about parameters it never used.
     backoff_params: BackoffParams | None = None
     smoothing_params: SmoothingParams | None = None
+    #: `None` for an artifact spanning its whole grid; a `Restriction` for
+    #: one built only on a query set (see the module docstring).
+    restriction: Restriction | None = None
     _species_index: dict[int, int] = field(default_factory=dict, repr=False)
     _cell_index: dict[str, int] = field(default_factory=dict, repr=False)
+    _domain: frozenset = field(default_factory=frozenset, repr=False)
 
     def __post_init__(self) -> None:
         # Always rebuilt from the axes, never trusted from the caller: an
         # index that disagrees with its axis silently reads the wrong row.
         self._species_index = {int(k): i for i, k in enumerate(self.species_keys)}
         self._cell_index = {c: i for i, c in enumerate(self.cells)}
+        self._domain = (
+            frozenset(self.restriction.contexts)
+            if self.restriction is not None
+            else frozenset()
+        )
         if len(self._species_index) != len(self.species_keys):
             raise ValueError(
                 "species_keys contains a duplicate; the later copy would "
@@ -470,6 +589,123 @@ class PriorTensor:
             )
         return row
 
+    def in_domain(self, cell: str, week: int) -> bool:
+        """Whether (cell, week) is a context this artifact answers for.
+
+        Always True for an unrestricted artifact. For a restricted one, True
+        exactly for the declared domain -- including a queried context whose
+        cell was never observed, which then behaves as against the full build.
+        """
+        return self.restriction is None or (cell, int(week)) in self._domain
+
+    def require_domain(self, cells, weeks, where: str = "a prior lookup") -> None:
+        """Refuse any (cell, week) outside a restricted artifact's domain.
+
+        Raises `OutOfDomainError` naming HOW MANY contexts are outside and the
+        first few of them. A no-op on an unrestricted artifact. *weeks* must
+        already be folded (ISO week 53 -> 52), as for `vector`.
+        """
+        if self.restriction is None:
+            return
+        outside = []
+        n_outside = 0
+        for cell, week in zip(cells, weeks):
+            if (cell, int(week)) not in self._domain:
+                n_outside += 1
+                if len(outside) < _EXAMPLES:
+                    outside.append((cell, int(week)))
+        if n_outside:
+            raise OutOfDomainError(
+                f"{n_outside} context(s) requested in {where} are outside this "
+                f"RESTRICTED prior's declared domain "
+                f"({len(self._domain)} query contexts from query set "
+                f"{self.restriction.query_set_path} sha256 "
+                f"{self.restriction.query_set_sha256[:12]}...); first "
+                f"{len(outside)}: {outside}. The full build would answer them "
+                "with real estimates and this artifact holds none, so the "
+                "floor would be a silent wrong number. Rebuild the prior with a "
+                "query set that covers these contexts, or use an unrestricted "
+                "artifact"
+            )
+
+    def _require_in_domain(self, cell, week, where: str) -> None:
+        if self.restriction is not None:
+            _validate_week(week, where)
+            self.require_domain([cell], [int(week)], where)
+
+    def domain_columns(self) -> tuple[np.ndarray, list[tuple[str, int]]]:
+        """(packed columns, contexts) of the domain contexts ON the cell axis.
+
+        Sorted by (cell, week), so the columns are ascending. For an
+        unrestricted artifact: every column, in packing order.
+        """
+        if self.restriction is None:
+            contexts = [
+                (c, w) for c in self.cells for w in range(1, WEEKS_PER_YEAR + 1)
+            ]
+        else:
+            contexts = [
+                (c, w) for c, w in self.restriction.contexts if c in self._cell_index
+            ]
+        cols = np.array(
+            [_column_index(self._cell_index[c], w) for c, w in contexts],
+            dtype=np.int64,
+        )
+        return cols, contexts
+
+    def domain_dense(self) -> np.ndarray:
+        """(species x on-axis domain contexts), floored -- the restricted `dense`.
+
+        For an unrestricted artifact this is exactly `dense()`.
+        """
+        if self.restriction is None:
+            return self.dense()
+        cols, _ = self.domain_columns()
+        # Gathered row-chunk by row-chunk straight from the CSR arrays: at r5
+        # the block is ~1e9 values, and `values[:, cols].toarray()` would hold
+        # a second CSR of the same size beside it. Unstored domain contexts
+        # read the floor, through `_floor_missing` like every other reader.
+        matrix = self.values.tocsr()
+        position = np.full(matrix.shape[1], -1, dtype=np.int64)
+        position[cols] = np.arange(cols.size)
+        out = np.full((matrix.shape[0], cols.size), FLOOR, dtype=np.float64)
+        step = 256
+        for start in range(0, matrix.shape[0], step):
+            stop = min(start + step, matrix.shape[0])
+            lo, hi = matrix.indptr[start], matrix.indptr[stop]
+            rows = np.repeat(
+                np.arange(start, stop), np.diff(matrix.indptr[start : stop + 1])
+            )
+            where = position[matrix.indices[lo:hi]]
+            keep = where >= 0
+            out[rows[keep], where[keep]] = _floor_missing(matrix.data[lo:hi][keep])
+        return out
+
+    def with_domain_values(self, block: np.ndarray, spec: "PriorSpec") -> "PriorTensor":
+        """A tensor on THIS tensor's axes and domain, holding *block*.
+
+        *block* is ``(n_species, n_domain_columns)`` in `domain_columns`
+        order. The restriction is carried; for an unrestricted tensor the
+        block is the whole grid.
+        """
+        cols, _ = self.domain_columns()
+        block = np.asarray(block, dtype=np.float64)
+        if block.shape != (len(self.species_keys), cols.size):
+            raise ValueError(
+                f"domain block has shape {block.shape} but this tensor's domain "
+                f"is {len(self.species_keys)} species x {cols.size} contexts"
+            )
+        return PriorTensor(
+            spec=spec,
+            species_keys=self.species_keys,
+            cells=self.cells,
+            values=_domain_matrix(block, cols, len(self.cells) * WEEKS_PER_YEAR),
+            gbif_doi=self.gbif_doi,
+            backoff_params=self.backoff_params,
+            smoothing_params=self.smoothing_params,
+            restriction=self.restriction,
+        )
+
     def lookup(self, species_key: int, cell: str, week: int | float) -> float:
         """P(species | cell, week).
 
@@ -486,6 +722,7 @@ class PriorTensor:
         through the stored keys instead -- the matrix's own coordinates, or
         `values.nnz` against `dense_capacity` in aggregate.
         """
+        self._require_in_domain(cell, week, "a tensor lookup")
         col = self._column(cell, week)
         row = self._row(species_key)
         # PRECONDITION, enforced in `_validate_p`, NOT here: a stored `p` at or
@@ -506,6 +743,7 @@ class PriorTensor:
         NOT normalised: the values are whatever the pipeline produced, and
         their sum carries no meaning. See the module docstring.
         """
+        self._require_in_domain(cell, week, "a tensor lookup")
         col = self._column(cell, week)
         stored = np.asarray(self.values[:, [col]].todense(), dtype=np.float64).ravel()
         return _floor_missing(stored)
@@ -517,8 +755,86 @@ class PriorTensor:
         expose, through the same `_floor_missing`, for callers that genuinely
         need every context at once (the dense controls). It materialises
         `dense_capacity` float64s, which is the inherent cost of being dense.
+
+        REFUSED on a restricted artifact: it would floor every out-of-domain
+        context, which the full build holds a real value for. Use
+        `domain_dense`.
         """
+        if self.restriction is not None:
+            raise OutOfDomainError(
+                "dense() of a RESTRICTED prior would floor every context "
+                "outside its declared domain, where the full build holds real "
+                "estimates; use domain_dense(), the (species x domain) block"
+            )
         return _floor_missing(np.asarray(self.values.toarray(), dtype=np.float64))
+
+
+def _domain_matrix(block: np.ndarray, cols: np.ndarray, n_cols: int) -> sparse.csr_matrix:
+    """CSR holding *block*'s columns at packed columns *cols* (ascending).
+
+    Built straight from CSR arrays -- no COO detour -- so a restricted
+    artifact's peak is the block plus one int32 index per stored value.
+    `_validate_p`'s precondition holds for every caller: a block of
+    probabilities in (0, 1].
+    """
+    n_rows, width = block.shape
+    _validate_p(block.ravel())
+    index_type = np.int32 if max(n_cols, block.size) < np.iinfo(np.int32).max else np.int64
+    indices = np.tile(cols.astype(index_type), n_rows)
+    indptr = np.arange(0, (n_rows + 1) * width, width, dtype=index_type)
+    return sparse.csr_matrix(
+        (block.ravel(), indices, indptr), shape=(n_rows, n_cols), dtype=np.float64
+    )
+
+
+def restricted_tensor(
+    block: np.ndarray,
+    species_keys,
+    contexts: list[tuple[str, int]],
+    spec: "PriorSpec",
+    restriction: Restriction,
+    *,
+    backoff_params: BackoffParams | None = None,
+    smoothing_params: SmoothingParams | None = None,
+) -> PriorTensor:
+    """A restricted prior: *block* ``(species x contexts)`` at *contexts*.
+
+    *contexts* are the on-grid domain contexts, sorted; the cell axis is
+    their distinct cells. Every one of them must be in *restriction*.
+    """
+    contexts = [(str(c), int(w)) for c, w in contexts]
+    if contexts != sorted(set(contexts)):
+        raise ValueError("restricted contexts must be sorted and distinct")
+    domain = set(restriction.contexts)
+    stray = [ctx for ctx in contexts if ctx not in domain]
+    if stray:
+        raise ValueError(
+            f"{len(stray)} stored context(s) are outside the declared domain, "
+            f"first {stray[:_EXAMPLES]}; an artifact must not hold values it "
+            "says it does not answer for"
+        )
+    for _c, w in contexts:
+        _validate_week(w, "a restricted context")
+    cells = sorted({c for c, _ in contexts})
+    position = {c: i for i, c in enumerate(cells)}
+    cols = np.array([_column_index(position[c], w) for c, w in contexts], dtype=np.int64)
+    species_keys = np.asarray(species_keys, dtype=np.int64)
+    if np.any(np.diff(species_keys) <= 0):
+        raise ValueError("species_keys must be strictly ascending")
+    block = np.asarray(block, dtype=np.float64)
+    if block.shape != (species_keys.size, len(contexts)):
+        raise ValueError(
+            f"block shape {block.shape} != ({species_keys.size}, {len(contexts)})"
+        )
+    return PriorTensor(
+        spec=spec,
+        species_keys=species_keys,
+        cells=cells,
+        values=_domain_matrix(block, cols, len(cells) * WEEKS_PER_YEAR),
+        backoff_params=backoff_params,
+        smoothing_params=smoothing_params,
+        restriction=restriction,
+    )
 
 
 def to_tensor(
@@ -776,6 +1092,14 @@ def save_prior(tensor: PriorTensor, path: Path) -> Path:
             "licence when redistributing or building on this artifact."
         ),
     }
+    # FORMAT VERSION 2: every new sidecar says whether it is restricted, and
+    # a restricted one says to WHAT. Added after the literal so a version-1
+    # field can never be re-spelled by this addition.
+    meta["format_version"] = FORMAT_VERSION
+    meta["restricted"] = tensor.restriction is not None
+    meta["restriction"] = (
+        tensor.restriction.payload() if tensor.restriction is not None else None
+    )
     _sidecar_path(npz).write_text(json.dumps(meta, indent=2), encoding="utf-8")
     return npz
 
@@ -797,6 +1121,7 @@ def load_prior(path: Path) -> PriorTensor:
             "unobserved context would be answered against a different "
             "convention from the one the artifact was published under"
         )
+    restriction = _restriction_from_sidecar(meta)
     matrix = sparse.load_npz(npz).tocsr()
     if int(meta["nnz"]) != matrix.nnz:
         raise ValueError(
@@ -815,4 +1140,64 @@ def load_prior(path: Path) -> PriorTensor:
         # refused rather than read as "no record". See its docstring.
         backoff_params=_params_from_sidecar(meta, "backoff_params"),
         smoothing_params=_params_from_sidecar(meta, "smoothing_params"),
+        restriction=_checked_restriction(restriction, meta, matrix),
     )
+
+
+def _restriction_from_sidecar(meta: dict) -> Restriction | None:
+    """The sidecar's restriction, by format version. Absent v2 keys refuse."""
+    version = meta.get("format_version", 1)
+    if version not in _KNOWN_FORMAT_VERSIONS:
+        raise ValueError(
+            f"sidecar format_version {version!r} is not one this build reads "
+            f"({_KNOWN_FORMAT_VERSIONS}); refusing to half-read an artifact "
+            "whose newer fields may change what its values mean"
+        )
+    if version == 1:
+        return None
+    for key in ("restricted", "restriction"):
+        if key not in meta:
+            raise ValueError(
+                f"format_version {version} sidecar has no {key!r} field; a "
+                "version-2 artifact must say whether it is restricted, and "
+                "reading the absence as 'unrestricted' would let a restricted "
+                "artifact's out-of-domain contexts floor silently"
+            )
+    restricted = meta["restricted"]
+    payload = meta["restriction"]
+    if restricted is not True and restricted is not False:
+        raise ValueError(f"sidecar `restricted` is {restricted!r}, not a boolean")
+    if restricted != (payload is not None):
+        raise ValueError(
+            f"sidecar says restricted={restricted!r} but its `restriction` is "
+            f"{'present' if payload is not None else 'null'}; the two halves "
+            "of the declaration disagree"
+        )
+    return Restriction.from_payload(payload) if restricted else None
+
+
+def _checked_restriction(restriction, meta, matrix):
+    """Refuse a restricted sidecar paired with values outside its domain."""
+    if restriction is None:
+        return None
+    cells = list(meta["cells"])
+    position = {c: i for i, c in enumerate(cells)}
+    allowed = np.array(
+        sorted(
+            _column_index(position[c], w)
+            for c, w in restriction.contexts
+            if c in position
+        ),
+        dtype=np.int64,
+    )
+    # bincount, not np.unique: O(nnz) with an n_cols-sized counter, where a
+    # sort of ~1e9 indices would cost a second index array.
+    used = np.flatnonzero(np.bincount(matrix.indices, minlength=matrix.shape[1]))
+    outside = np.setdiff1d(used, allowed)
+    if outside.size:
+        raise ValueError(
+            f"restricted artifact stores values in {outside.size} column(s) "
+            "outside its declared domain; the sidecar and the `.npz` are not "
+            "halves of the same restricted artifact"
+        )
+    return restriction

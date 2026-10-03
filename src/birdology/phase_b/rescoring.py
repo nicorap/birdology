@@ -88,6 +88,15 @@ def prior_for_rows(
     the no-evidence answer is exactly the floor. Every floored cell is
     COUNTED, never silently dropped.
 
+    A RESTRICTED prior (built on a query set; ``prior.restriction`` set)
+    REFUSES first: every row with a (cell, week) is checked against the
+    declared domain, and any outside it raise ``OutOfDomainError`` naming the
+    count and the first few. Flooring them would be a silent wrong number --
+    the full build holds real estimates there. A domain context whose cell
+    was never observed floors exactly as against the full build, and a row
+    with no cell or week keeps today's behaviour. Unrestricted priors are
+    unchanged.
+
     *weeks* should be pre-folded via :func:`birdology.prior.indexing.iso_week`
     (which maps ISO week 53 -> 52); a defensive fold is applied here too,
     so a late-December recording in one of the 71-in-400-years week-53
@@ -102,6 +111,9 @@ def prior_for_rows(
     # Defensive fold of ISO week 53 -> 52 (71 of every 400 years have a
     # week 53; prior.vector would raise and sink the whole batch).
     weeks = [52 if w == 53 else w for w in weeks]
+    prior.require_domain(
+        *_located(cells, weeks), where="prior_for_rows"
+    )
     species_index = {int(k): i for i, k in enumerate(prior.species_keys)}
     known_cells = set(prior.cells)
 
@@ -134,6 +146,12 @@ def prior_for_rows(
     )
 
 
+def _located(cells, weeks) -> tuple[list, list]:
+    """The rows that HAVE a (cell, week) -- the only ones a domain can refuse."""
+    pairs = [(c, w) for c, w in zip(cells, weeks) if c is not None and w is not None]
+    return [c for c, _ in pairs], [w for _, w in pairs]
+
+
 def rescore(
     scores: np.ndarray,
     prior_probs: np.ndarray,
@@ -164,8 +182,15 @@ def rescore(
 
 def _global_marginal(prior: PriorTensor) -> np.ndarray:
     """Per-species mean of the FULL (floored) prior over every cell-week
-    column — "how common is this species, everywhere and always"."""
-    return prior.dense().mean(axis=1)
+    column — "how common is this species, everywhere and always".
+
+    On a RESTRICTED prior the mean is over its declared domain's on-axis
+    contexts (``domain_dense``) -- "how common is this species where and when
+    the recordings are" -- because the rest of the grid was never built.
+    That is a different quantity; see the restricted-build report. For an
+    unrestricted prior ``domain_dense`` IS ``dense``.
+    """
+    return prior.domain_dense().mean(axis=1)
 
 
 def control_prior(
@@ -198,6 +223,8 @@ def control_prior(
             f"unknown control kind {kind!r}; expected one of "
             f"{sorted(_CONTROL_VARIANTS)}"
         )
+    if prior.restriction is not None:
+        return _restricted_control_prior(kind, prior, rng)
     n_species = len(prior.species_keys)
     n_cells = len(prior.cells)
     dense = prior.dense()
@@ -227,6 +254,48 @@ def control_prior(
         gbif_doi=prior.gbif_doi,
         backoff_params=prior.backoff_params,
         smoothing_params=prior.smoothing_params,
+    )
+
+
+def _restricted_control_prior(
+    kind: str, prior: PriorTensor, rng: np.random.Generator
+) -> PriorTensor:
+    """`control_prior` on a RESTRICTED prior: the same four nulls over its domain.
+
+    The domain is a ragged set of (cell, week) contexts, not a cells x 52
+    rectangle, so:
+
+    * ``uniform``        -- unchanged: ``1/n_species`` everywhere in the domain;
+    * ``marginal``       -- the per-species mean over the DOMAIN;
+    * ``space_shuffled`` -- within each queried WEEK, its queried cells are
+      permuted (one permutation per week, shared across species, weeks in
+      ascending order);
+    * ``time_shuffled``  -- within each queried CELL, its queried weeks are
+      permuted (one permutation per cell, cells in axis order) -- the
+      unrestricted control's per-cell shape, on the cell's queried weeks
+      instead of all 52.
+
+    The result carries the same restriction, so it refuses the same lookups.
+    """
+    dense = prior.domain_dense()
+    _, contexts = prior.domain_columns()
+    if kind == "uniform":
+        new = np.full_like(dense, 1.0 / len(prior.species_keys))
+    elif kind == "marginal":
+        new = np.broadcast_to(dense.mean(axis=1)[:, None], dense.shape).copy()
+    else:
+        group_of = [w for _, w in contexts] if kind == "space_shuffled" else [
+            c for c, _ in contexts
+        ]
+        groups: dict = {}
+        for j, key in enumerate(group_of):
+            groups.setdefault(key, []).append(j)
+        new = dense.copy()
+        for key in sorted(groups):
+            cols = np.asarray(groups[key], dtype=np.int64)
+            new[:, cols] = dense[:, cols[rng.permutation(cols.size)]]
+    return prior.with_domain_values(
+        new, replace(prior.spec, variant=_CONTROL_VARIANTS[kind])
     )
 
 
