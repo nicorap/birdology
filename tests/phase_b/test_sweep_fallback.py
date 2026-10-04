@@ -27,6 +27,7 @@ from scipy import sparse
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 
 import birdology.phase_b.sweep as sweep_mod
+from tests.phase_b._locations import R4_CELLS, locations_for
 from birdology.phase_b.cache import CacheView
 from birdology.phase_b.learned import (
     OffsetModel,
@@ -47,7 +48,8 @@ from birdology.phase_b.sweep import (
 from birdology.prior.indexing import WEEKS_PER_YEAR
 from birdology.prior.tensor import FLOOR, PriorSpec, PriorTensor
 
-_CELLS = ["cella", "cellb", "cellc", "celld"]
+# Real r4 H3 cells, as Phase A caches carry them (see _locations.py).
+_CELLS = list(R4_CELLS)
 _DOI = "10.15468/dl.test00"
 
 _PROV = Provenance(
@@ -189,6 +191,8 @@ def _run(cell, fixture, **kwargs) -> dict:
         train_cache=train,
         eval_cache=eval_view,
         eval_metadata=metadata,
+        eval_locations=locations_for(eval_view.table),
+        train_locations=locations_for(train.table),
         prior=prior,
         class_idx=class_idx,
         code_to_gbif=code_to_gbif,

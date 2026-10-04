@@ -20,7 +20,16 @@ carried obligations:
 * Weeks come ONLY off the cache's `week` column (already iso_week-folded
   by the manifest); they are never recomputed from dates.
 * `prepare_training`'s arrays are row-parallel to the cache table, so
-  the table's `cell`/`week` columns zip directly into `prior_for_rows`.
+  the table's `week` column and the row-parallel DERIVED cells zip
+  directly into `prior_for_rows`.
+* CELLS ARE DERIVED AT THE CELL'S RESOLUTION, never read off the cache.
+  Phase A caches carry `cell` at H3 resolution 4 ONLY; fed to an r3/r5
+  prior every lookup floored (DOF) or raised OutOfDomainError (restricted
+  EOD) — fleet job 7022, the resolution axis never varied. Each row's
+  cell is `latlng_cells(lat, lon, cell.resolution)` — the prior's own
+  derivation — from a Phase A manifest joined BY FILEPATH; a missing or
+  null location, or a derived r4 cell disagreeing with the cache's r4
+  `cell`, is refused (see `_cells_at_resolution`).
 * Nothing gates on cross-machine bit-identity of MLP outputs; the
   determinism contract is same-machine only.
 * `prior_coverage_failures_train` / `prior_coverage_failures_eval`
@@ -77,6 +86,7 @@ from birdology.phase_b.rescoring import (
     rescore,
     train_marginal_from_prior,
 )
+from birdology.prior.indexing import latlng_cells
 from birdology.prior.tensor import FLOOR, PriorTensor
 
 logger = logging.getLogger(__name__)
@@ -464,6 +474,93 @@ def _align_eval_labels(
     return align_labels(aligned, class_idx)
 
 
+#: The resolution the Phase A embedding caches' own ``cell`` column is at
+#: (measured: h3.get_resolution == 4 for every row of every cache).
+_CACHE_CELL_RESOLUTION = 4
+
+#: How many offending filepaths a location refusal names.
+_N_EXAMPLES = 5
+
+
+def _cells_at_resolution(
+    table: pa.Table, locations: pa.Table, resolution: int, *, side: str
+) -> list[str]:
+    """Each cache row's H3 cell AT *resolution*, row-parallel to *table*.
+
+    The caches' ``cell`` column is r4 only, so it cannot feed an r3/r5
+    prior (fleet job 7022: the resolution axis never varied). The cell is
+    derived from the row's lat/lon in *locations* (a Phase A manifest:
+    ``filepath, lat, lon``), joined BY FILEPATH, through
+    :func:`birdology.prior.indexing.latlng_cells` — the same call that
+    built the prior's own cell axis. Never falls back to the cache cell.
+
+    Refuses (ValueError naming counts and examples): a filepath located at
+    two different points; a cache row with no location row, or a null
+    lat/lon; and — the CONSISTENCY GUARD — any row whose r4 cell derived
+    here disagrees with the cache's own r4 ``cell`` column, which proves
+    on real data that the join attached each recording's own location.
+    Location rows matching no cache row (a manifest covers recordings a
+    cache dropped at load) are ignored.
+    """
+    files: list[str] = table.column("filepath").to_pylist()
+    point_of: dict[str, tuple] = {}
+    conflicting: set[str] = set()
+    for f, lat, lon in zip(
+        locations.column("filepath").to_pylist(),
+        locations.column("lat").to_pylist(),
+        locations.column("lon").to_pylist(),
+    ):
+        if f in point_of and point_of[f] != (lat, lon):
+            conflicting.add(f)
+        point_of[f] = (lat, lon)
+    conflicts = [f for f in dict.fromkeys(files) if f in conflicting]
+    if conflicts:
+        raise ValueError(
+            f"{len(conflicts)} {side} cache recording(s) are located at more "
+            f"than one point in the {side} locations table: "
+            f"{conflicts[:_N_EXAMPLES]} -- picking one would be arbitrary; "
+            "refusing"
+        )
+    missing = [f for f in files if f not in point_of]
+    if missing:
+        raise ValueError(
+            f"{len(missing)} of {len(files)} {side} cache row(s) have no "
+            f"location row (joined by filepath): {missing[:_N_EXAMPLES]} -- "
+            f"their cell at resolution {resolution} cannot be derived, and "
+            "the cache's r4 cell is never a substitute; refusing"
+        )
+    null = [
+        f for f in files if point_of[f][0] is None or point_of[f][1] is None
+    ]
+    if null:
+        raise ValueError(
+            f"{len(null)} of {len(files)} {side} cache row(s) have a null "
+            f"lat/lon in the {side} locations table: {null[:_N_EXAMPLES]} -- "
+            f"their cell at resolution {resolution} cannot be derived; "
+            "refusing"
+        )
+    lats = [point_of[f][0] for f in files]
+    lons = [point_of[f][1] for f in files]
+    derived_r4 = latlng_cells(lats, lons, _CACHE_CELL_RESOLUTION)
+    cache_r4 = table.column("cell").to_pylist()
+    mismatched = [
+        (f, c, d) for f, c, d in zip(files, cache_r4, derived_r4) if c != d
+    ]
+    if mismatched:
+        raise ValueError(
+            f"{len(mismatched)} of {len(files)} {side} cache row(s) carry an "
+            f"r4 cell that disagrees with the r4 cell derived from their "
+            f"location row; first {len(mismatched[:_N_EXAMPLES])} as "
+            f"(filepath, cache cell, derived cell): "
+            f"{mismatched[:_N_EXAMPLES]} -- the {side} locations table does "
+            "not describe these recordings (wrong manifest or a broken "
+            "join); refusing"
+        )
+    if resolution == _CACHE_CELL_RESOLUTION:
+        return derived_r4
+    return latlng_cells(lats, lons, resolution)
+
+
 def _merge_strata(dicts: list[dict]) -> dict[str, list]:
     """Mean the per-seed stratified cmap tuples into one JSON-ready
     dict ``{stratum: [cmap_or_null, n_scored]}``.
@@ -490,6 +587,8 @@ def run_cell(
     train_cache: CacheView,
     eval_cache: CacheView,
     eval_metadata: pa.Table,
+    eval_locations: pa.Table,
+    train_locations: pa.Table | None = None,
     prior: PriorTensor,
     class_idx: dict[str, int],
     code_to_gbif: dict[str, int],
@@ -499,6 +598,13 @@ def run_cell(
     fit_cache: dict | None = None,
 ) -> dict:
     """Execute *cell* for ALL its seeds and return ONE results row.
+
+    *eval_locations* / *train_locations* are Phase A manifests
+    (``filepath, lat, lon``) joined to the eval / train cache rows BY
+    FILEPATH; every row's H3 cell is derived from them at
+    ``cell.resolution`` (:func:`_cells_at_resolution`) — the caches' own
+    ``cell`` column is r4 only. *train_locations* is required for the
+    learned arms (rescoring performs no training lookup).
 
     *eval_metadata* is the test set's metadata table (``filepath`` +
     ``ebird_code_multilabel``): real Phase A caches carry no label
@@ -537,7 +643,11 @@ def run_cell(
     )
     eval_scores = _eval_probabilities(eval_cache, class_idx, scoreable)
     # Obligation: weeks come ONLY off the cache's `week` column.
-    eval_cells = eval_table.column("cell").to_pylist()
+    # Cells are DERIVED at the cell's resolution from lat/lon (the cache's
+    # own `cell` column is r4 only — fleet job 7022).
+    eval_cells = _cells_at_resolution(
+        eval_table, eval_locations, cell.resolution, side="eval"
+    )
     eval_weeks = eval_table.column("week").to_pylist()
 
     # I1 — class-level strata, fixed across seeds (they derive from the
@@ -580,12 +690,22 @@ def run_cell(
     fallback_cols = np.empty(0, dtype=np.int64)
     fitted_mask = np.empty(0, dtype=np.bool_)
     if cell.method in _LEARNED_METHODS:
+        if train_locations is None:
+            raise ValueError(
+                f"{cell.method} cells fit on the training rows' prior lookup "
+                "and need train_locations (the train cache's Phase A "
+                "manifest: filepath, lat, lon) to derive those rows' cells "
+                f"at resolution {cell.resolution}; got None. The cache's own "
+                "cell column is r4 only and is never a substitute"
+            )
         # prepare_training's arrays are row-parallel to the train table,
-        # so the table's cell/week columns zip against them directly.
+        # so its week column and the derived cells zip against them.
         embeddings, train_scores, y_train, train_scoreable, _stats = (
             prepare_training(train_cache, class_idx)
         )
-        train_cells = train_cache.table.column("cell").to_pylist()
+        train_cells = _cells_at_resolution(
+            train_cache.table, train_locations, cell.resolution, side="train"
+        )
         train_weeks = train_cache.table.column("week").to_pylist()
         eval_embeddings = (
             np.asarray(

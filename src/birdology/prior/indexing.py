@@ -29,13 +29,24 @@ def iso_week(d: date) -> int:
     return WEEKS_PER_YEAR if week > WEEKS_PER_YEAR else week
 
 
+def latlng_cells(lats, lons, resolution: int) -> list[str]:
+    """H3 cells at *resolution* for parallel lat/lon sequences.
+
+    THE one derivation of a cell from a point: the prior's cell axis is
+    built through it (`assign_cells`) and Phase B derives every recording's
+    cell through it too, so a prior and its queries can never disagree on
+    how a point becomes a cell.
+    """
+    return [h3.latlng_to_cell(lat, lon, resolution) for lat, lon in zip(lats, lons)]
+
+
 def assign_cells(table: pa.Table, resolution: int) -> pa.Table:
     """Add `cell` (H3 index at *resolution*) and `week` columns."""
     lats = table.column("lat").to_pylist()
     lons = table.column("lon").to_pylist()
     dates = table.column("event_date").to_pylist()
 
-    cells = [h3.latlng_to_cell(lat, lon, resolution) for lat, lon in zip(lats, lons)]
+    cells = latlng_cells(lats, lons, resolution)
     weeks = [iso_week(d) for d in dates]
 
     return table.append_column(

@@ -23,12 +23,14 @@ from scipy import sparse
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "scripts"))
 
+from tests.phase_b._locations import R4_CELLS, locations_for
 import phase_b_sweep as cli
 from birdology.prior.indexing import WEEKS_PER_YEAR
 from birdology.prior.tensor import PriorSpec, PriorTensor, save_prior
 
 _CODES = ["amecro", "blujay", "carwre"]
-_CELLS = ["cella", "cellb", "cellc", "celld"]
+# Real r4 H3 cells, as Phase A caches carry them (see _locations.py).
+_CELLS = list(R4_CELLS)
 _DOI = "10.15468/dl.test00"
 
 
@@ -74,15 +76,34 @@ def _metadata_table(cache_table: pa.Table) -> pa.Table:
     )
 
 
-def _write_prior(path: Path) -> None:
-    n_species, n_cols = 3, len(_CELLS) * WEEKS_PER_YEAR
+def _manifest(cache_table: pa.Table) -> pa.Table:
+    """A Phase A manifest for a fixture cache: filepath, lat, lon, week,
+    cell (r4) — the manifest's column subset the sweep reads, plus the
+    r4 cell/week the caches copied from it."""
+    locs = locations_for(cache_table)
+    return pa.table(
+        {
+            "filepath": locs.column("filepath"),
+            "lat": locs.column("lat"),
+            "lon": locs.column("lon"),
+            "week": cache_table.column("week"),
+            "cell": cache_table.column("cell"),
+        }
+    )
+
+
+def _write_prior(
+    path: Path, *, cells: list[str] | None = None, resolution: int = 4
+) -> None:
+    cells = list(_CELLS) if cells is None else list(cells)
+    n_species, n_cols = 3, len(cells) * WEEKS_PER_YEAR
     dense = (1.0 + np.arange(n_species * n_cols, dtype=np.float64)).reshape(
         n_species, n_cols
     ) / (n_species * n_cols + 1.0)
     tensor = PriorTensor(
-        spec=PriorSpec(resolution=4, source="eod", variant="full"),
+        spec=PriorSpec(resolution=resolution, source="eod", variant="full"),
         species_keys=np.asarray([111, 222, 333], dtype=np.int64),
-        cells=list(_CELLS),
+        cells=cells,
         values=sparse.csr_matrix(dense),
         gbif_doi=_DOI,
     )
@@ -107,6 +128,16 @@ def cli_workspace(tmp_path: Path) -> dict:
     metadata_path = meta_dir / "HSN_metadata.parquet"
     pq.write_table(_metadata_table(eval_table), metadata_path)
 
+    # Phase A manifests: per-recording lat/lon (+ the r4 cell/week the
+    # caches copied), joined to cache rows by filepath. Extra rows (a
+    # manifest covers recordings a cache dropped) are harmless.
+    loc_dir = tmp_path / "manifests"
+    loc_dir.mkdir()
+    train_locations_path = loc_dir / "XCL_r4_manifest.parquet"
+    pq.write_table(_manifest(train_table), train_locations_path)
+    eval_locations_path = loc_dir / "HSN_test_5s_r4_manifest.parquet"
+    pq.write_table(_manifest(eval_table), eval_locations_path)
+
     _write_prior(tmp_path / "prior_res4.npz")
     labels_path = tmp_path / "labels.txt"
     labels_path.write_text("\n".join(_CODES) + "\n", encoding="utf-8")
@@ -119,11 +150,16 @@ def cli_workspace(tmp_path: Path) -> dict:
         "tmp": tmp_path,
         "metadata_path": metadata_path,
         "eval_table": eval_table,
+        "train_locations_path": train_locations_path,
+        "eval_locations_path": eval_locations_path,
         "argv": [
             "--train-cache", str(tmp_path / "caches" / "train" / "{encoder}"),
             "--eval-cache",
             str(tmp_path / "caches" / "eval" / "{encoder}" / "{test_set}"),
             "--eval-labels", str(meta_dir / "{test_set}_metadata.parquet"),
+            "--train-locations", str(train_locations_path),
+            "--eval-locations",
+            str(loc_dir / "{test_set}_test_5s_r4_manifest.parquet"),
             "--prior", str(tmp_path / "prior_res{resolution}.npz"),
             "--labels", str(labels_path),
             "--bridge", str(bridge_path),
@@ -248,3 +284,35 @@ def test_failures_filename_carries_the_grid_shard_index(cli_workspace):
     shard_files = sorted(out.glob("failures_shard*.json"))
     assert [p.name for p in shard_files] == [f"failures_shard{owner:02d}.json"]
     assert not (out / "failures.json").exists()
+
+
+def test_main_runs_r3_and_r5_cells_against_priors_on_their_own_grids(
+    cli_workspace,
+):
+    """Fleet job 7022 end to end: r3/r5 priors are built on r3/r5 cells,
+    the caches carry r4 cells only. Through main(), every cell (rescoring
+    AND a learned arm, which looks up the TRAIN rows too) must find each
+    row's cell on its own resolution's grid — zero coverage failures on
+    both sides. Pre-fix, every r3/r5 lookup floored."""
+    from tests.phase_b._locations import cells_at
+
+    tmp = cli_workspace["tmp"]
+    for res in (3, 5):
+        _write_prior(tmp / f"prior_res{res}.npz", cells=cells_at(res), resolution=res)
+    argv = list(cli_workspace["argv"])
+    i = argv.index("--resolutions")
+    argv = argv[: i + 1] + ["3", "5"] + argv[i + 2 :]
+    i = argv.index("--methods")
+    argv = argv[: i + 1] + ["rescoring", "offset_global"] + argv[i + 2 :]
+    assert cli.main(argv) == 0
+    rows = pa.concat_tables(
+        [pq.read_table(p) for p in sorted((tmp / "results").glob("*.parquet"))]
+    ).to_pylist()
+    assert sorted((r["resolution"], r["method"]) for r in rows) == [
+        (3, "offset_global"), (3, "rescoring"),
+        (5, "offset_global"), (5, "rescoring"),
+    ]
+    for r in rows:
+        assert r["prior_coverage_failures_eval"] == 0, r
+        if r["method"] != "rescoring":
+            assert r["prior_coverage_failures_train"] == 0, r

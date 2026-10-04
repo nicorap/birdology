@@ -32,6 +32,8 @@ exec /shared/apps/ML/venvs/hf/bin/python \
   --train-cache "/faic/weka/ML/phase_a/embeddings/XCL_{encoder}" \
   --eval-cache "/faic/weka/ML/phase_a/embeddings/{test_set}_test_5s_{encoder}" \
   --eval-labels "/faic/weka/ML/birdset/{test_set}/{test_set}/{test_set}_metadata_test_5s.parquet" \
+  --train-locations /faic/weka/ML/phase_a/XCL_r4_manifest.parquet \
+  --eval-locations "/faic/weka/ML/phase_a/{test_set}_test_5s_r4_manifest.parquet" \
   --prior "$PRIOR_DIR/prior_r{resolution}_full.npz" \
   --labels "/shared/apps/ML/models/{encoder}_labels.txt" \
   --bridge /faic/weka/ML/phase_a/code_to_gbif.json \

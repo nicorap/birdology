@@ -30,6 +30,7 @@ from scipy import sparse
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 
+from tests.phase_b._locations import R4_CELLS, locations_for
 from birdology.phase_b.rescoring import CONTROL_VARIANTS
 from birdology.phase_b.cache import CacheView, load_cache
 from birdology.phase_b.sweep import (
@@ -56,7 +57,8 @@ from birdology.prior.tensor import PriorSpec, PriorTensor
 _CODES = ["amecro", "blujay", "carwre"]
 _CLASS_IDX = {code: i for i, code in enumerate(_CODES)}
 _CODE_TO_GBIF = {"amecro": 111, "blujay": 222, "carwre": 333}
-_CELLS = ["cella", "cellb", "cellc", "celld"]
+# Real r4 H3 cells, as Phase A caches carry them (see _locations.py).
+_CELLS = list(R4_CELLS)
 _DOI = "10.15468/dl.test00"
 
 _PROV = Provenance(
@@ -228,11 +230,14 @@ def _run(
 ) -> dict:
     if eval_cache is None and eval_metadata is None:
         eval_cache, eval_metadata = _eval_fixture()
+    train_cache = _train_cache()
     return run_cell(
         cell,
-        train_cache=_train_cache(),
+        train_cache=train_cache,
         eval_cache=eval_cache,
         eval_metadata=eval_metadata,
+        eval_locations=locations_for(eval_cache.table),
+        train_locations=locations_for(train_cache.table),
         prior=_prior(),
         class_idx=_CLASS_IDX,
         code_to_gbif=_CODE_TO_GBIF,
@@ -335,6 +340,8 @@ def test_run_cell_refuses_empty_prior_doi():
                 train_cache=_train_cache(),
                 eval_cache=eval_cache,
                 eval_metadata=eval_metadata,
+                eval_locations=locations_for(eval_cache.table),
+                train_locations=locations_for(_train_cache().table),
                 prior=_prior(),
                 class_idx=_CLASS_IDX,
                 code_to_gbif=_CODE_TO_GBIF,
@@ -646,6 +653,8 @@ def test_mlp_marginal_cell_with_nan_prior_raises_named_error_not_sklearn(
             train_cache=_train_cache(),
             eval_cache=eval_cache,
             eval_metadata=metadata,
+            eval_locations=locations_for(eval_cache.table),
+            train_locations=locations_for(_train_cache().table),
             prior=bad,
             class_idx=_CLASS_IDX,
             code_to_gbif=_CODE_TO_GBIF,
@@ -933,6 +942,8 @@ def test_mlp_cell_with_nan_train_embeddings_completes_after_counted_drop(
         train_cache=train,
         eval_cache=eval_cache,
         eval_metadata=metadata,
+        eval_locations=locations_for(eval_cache.table),
+        train_locations=locations_for(train.table),
         prior=_prior(),
         class_idx=_CLASS_IDX,
         code_to_gbif=_CODE_TO_GBIF,
@@ -1034,6 +1045,8 @@ def test_mlp_marginal_cell_with_nan_embeddings_completes_with_drop_warning(
         train_cache=train,
         eval_cache=eval_cache,
         eval_metadata=metadata,
+        eval_locations=locations_for(eval_cache.table),
+        train_locations=locations_for(train.table),
         prior=_prior(),
         class_idx=_CLASS_IDX,
         code_to_gbif=_CODE_TO_GBIF,

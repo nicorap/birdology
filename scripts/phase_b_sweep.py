@@ -5,6 +5,8 @@
         --train-cache 'caches/train/{encoder}' \
         --eval-cache 'caches/eval/{encoder}/{test_set}' \
         --eval-labels 'metadata/{test_set}_metadata.parquet' \
+        --train-locations manifests/XCL_r4_manifest.parquet \
+        --eval-locations 'manifests/{test_set}_test_5s_r4_manifest.parquet' \
         --prior 'output/priors/prior_{source}_res{resolution}.npz' \
         --labels labels/perch_labels.txt \
         --bridge bridges/ebird_to_gbif.json \
@@ -30,6 +32,15 @@ that way), one entry per failed cell naming the cell and the error, a
 per-cell summary is printed, and the process exits 1 — so one bad cache
 path costs one cell, not a night of compute, while the failure stays
 loud enough to block a merge.
+
+LOCATIONS: the caches' own `cell` column is H3 resolution 4 ONLY, so it
+cannot answer an r3/r5 prior (fleet job 7022 — the resolution axis never
+varied). `--train-locations` / `--eval-locations` point at the Phase A
+manifests (`filepath, lat, lon`, ...; {test_set} placeholder on the eval
+side); `run_cell` joins them to the cache rows BY FILEPATH and derives
+each row's cell at the cell's resolution with the prior's own
+`latlng_to_cell` call, refusing a missing/null location or any row whose
+derived r4 cell disagrees with the cache's r4 `cell`.
 
 The results rows carry full provenance (git SHA, cache dirs, prior path,
 prior DOI). The DOI comes FROM THE PRIOR SIDECAR — `run_cell` refuses an
@@ -85,6 +96,24 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "ebird_code_multilabel), one per test set; may contain "
             "{test_set}. Real Phase A caches carry no label column — "
             "labels are joined to cache rows by filepath."
+        ),
+    )
+    parser.add_argument(
+        "--train-locations",
+        required=True,
+        help=(
+            "train-side Phase A manifest parquet (filepath, lat, lon); may "
+            "contain {encoder}. Each training row's H3 cell is derived from "
+            "it at the cell's resolution — the cache's own cell is r4 only."
+        ),
+    )
+    parser.add_argument(
+        "--eval-locations",
+        required=True,
+        help=(
+            "eval-side Phase A manifest parquet path template (filepath, "
+            "lat, lon), one per test set; may contain {test_set} and "
+            "{encoder}."
         ),
     )
     parser.add_argument(
@@ -195,6 +224,7 @@ def main(argv: list[str] | None = None) -> int:
     caches: dict[str, CacheView] = {}
     priors: dict[str, PriorTensor] = {}
     metadata_tables: dict[str, pa.Table] = {}
+    location_tables: dict[str, pa.Table] = {}
 
     def _cache(template: str, **fields) -> CacheView:
         path = template.format(**fields)
@@ -209,6 +239,15 @@ def main(argv: list[str] | None = None) -> int:
                 path, columns=["filepath", "ebird_code_multilabel"]
             )
         return metadata_tables[path]
+
+    def _locations(template: str, **fields) -> pa.Table:
+        """(filepath, lat, lon) of a Phase A manifest, read once per path."""
+        path = template.format(**fields)
+        if path not in location_tables:
+            location_tables[path] = pq.read_table(
+                path, columns=["filepath", "lat", "lon"]
+            )
+        return location_tables[path]
 
     def _prior(resolution: int) -> tuple[str, PriorTensor]:
         path = args.prior.format(resolution=resolution)
@@ -239,6 +278,14 @@ def main(argv: list[str] | None = None) -> int:
                     test_set=cell.test_set,
                 ),
                 eval_metadata=_eval_metadata(cell.test_set),
+                eval_locations=_locations(
+                    args.eval_locations,
+                    encoder=cell.encoder,
+                    test_set=cell.test_set,
+                ),
+                train_locations=_locations(
+                    args.train_locations, encoder=cell.encoder
+                ),
                 prior=prior,
                 class_idx=_class_idx(cell.encoder),
                 code_to_gbif=code_to_gbif,
