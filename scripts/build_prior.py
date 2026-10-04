@@ -947,12 +947,25 @@ def manifest_path(out_dir: Path, source: str, resolution: int) -> Path:
     return out_dir / f"{artifact_stem(source, resolution)}_manifest.json"
 
 
+#: Controls a RESTRICTED release does not ship, with the reason recorded in
+#: its manifest's `omitted_controls`. See `_write_release` (job 6787_3).
+RESTRICTED_OMITTED_CONTROLS = {
+    "separable": (
+        "not defined on a restricted prior: the query set is not a cell x "
+        "week product, so the outer product of its marginals is unbounded "
+        "(2.67 > 1.0 on the global EOD query set at r4, job 6787) and "
+        "clamping is refused; no consumer schedules this control"
+    ),
+}
+
+
 def write_manifest(
     out_dir: Path,
     source: str,
     resolution: int,
     written: Sequence[Path],
     gbif_doi: str,
+    omitted_controls: dict[str, str] | None = None,
 ) -> Path:
     """Record every artifact this resolution is supposed to contain. I3.
 
@@ -1050,6 +1063,11 @@ def write_manifest(
             "sha256": documentation_digest(doc.read_bytes()),
         },
     }
+    # Only when non-empty, so an unrestricted manifest is unchanged. A
+    # control absent from `artifacts` with no entry here is a truncated set;
+    # with one, it is a stated omission (restricted releases, job 6787_3).
+    if omitted_controls:
+        payload["omitted_controls"] = dict(sorted(omitted_controls.items()))
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return path
@@ -1598,7 +1616,22 @@ def _write_release(
     # contract beside it.
     copy_format_documentation(out_dir)
     written.append(save_prior(full, out_dir / f"{stem}_full.npz"))
+    omitted: dict[str, str] = {}
     for name, make in CONTROLS.items():
+        if full.restriction is not None and name in RESTRICTED_OMITTED_CONTROLS:
+            # Job 6787_3: on the global EOD query set the separable outer
+            # product reached 2.67 > 1.0. A query set is not a cell x week
+            # product, so the product of its marginals is unbounded by
+            # construction, and `controls` (rightly) refuses to clamp. No
+            # consumer schedules it (phase_c_run.PRIOR_VARIANTS; phase_b's
+            # four controls), so it is OMITTED -- by name, with the reason,
+            # in the manifest -- rather than failing the release.
+            omitted[name] = RESTRICTED_OMITTED_CONTROLS[name]
+            log.warning(
+                "resolution %d: control %r omitted: %s",
+                resolution, name, omitted[name],
+            )
+            continue
         control = make(full)
         # Belt and braces beside `_respec`'s pass-through: this script is what
         # KNOWS the DOI, and a control shipped without it is as uncitable as a
@@ -1622,7 +1655,9 @@ def _write_release(
         written.append(save_prior(control, out_dir / f"{stem}_{name}.npz"))
 
     # LAST, after every artifact of this resolution. See `write_manifest`.
-    manifest = write_manifest(out_dir, source, resolution, written, gbif_doi)
+    manifest = write_manifest(
+        out_dir, source, resolution, written, gbif_doi, omitted_controls=omitted
+    )
 
     log.info(
         "resolution %d: wrote %d artifacts to %s (manifest %s); nnz=%d of "

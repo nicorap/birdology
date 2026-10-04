@@ -341,7 +341,8 @@ def test_the_restricted_sidecar_records_the_restriction_and_the_query_set_hash(t
 def test_EVERY_artifact_of_a_restricted_build_is_marked_restricted(tmp_path):
     qs = load_query_set(query_set_file(tmp_path))
     out = build(tmp_path, "restricted", query_set=qs)
-    for variant in ("full", *CONTROLS):
+    shipped = ("full", *(n for n in CONTROLS if n not in build_prior.RESTRICTED_OMITTED_CONTROLS))
+    for variant in shipped:
         meta = json.loads((out / f"prior_dof_r4_{variant}.json").read_text())
         assert meta["restricted"] is True, variant
         assert meta["restriction"]["query_set_sha256"] == qs.sha256, variant
@@ -400,8 +401,30 @@ def test_the_restricted_controls_are_defined_over_the_DOMAIN(tmp_path):
     for c in set(cells.tolist()):  # values move only among weeks of ONE cell
         m = cells == c
         assert np.array_equal(np.sort(time[:, m], axis=1), np.sort(D[:, m], axis=1))
-    sep = load("separable")
-    assert np.all(sep > 0) and np.all(sep <= 1.0)
+
+
+def test_a_restricted_release_omits_separable_and_says_so(tmp_path):
+    """Job 6787_3: on the global EOD query set the separable surrogate's
+    outer product reached 2.67 > 1.0 and the build died AFTER the full prior
+    and four controls were written. A query set is not a cell x week
+    product, so the product of its marginals is unbounded by construction;
+    no consumer schedules it (phase_c_run.PRIOR_VARIANTS, phase_b's four
+    controls). A restricted release skips it and the MANIFEST records why;
+    an unrestricted release still ships it."""
+    qs = load_query_set(query_set_file(tmp_path))
+    out = build(tmp_path, "restricted", query_set=qs)
+    assert not (out / "prior_dof_r4_separable.npz").exists()
+    for name in ("full", *(n for n in CONTROLS if n != "separable")):
+        assert (out / f"prior_dof_r4_{name}.npz").exists()
+    meta = json.loads((out / "prior_dof_r4_manifest.json").read_text())
+    assert "separable" in meta["omitted_controls"]
+    assert "restricted" in meta["omitted_controls"]["separable"]
+    build_prior.check_manifest(out, "dof", RES)
+
+    unrestricted = build(tmp_path, "full")
+    assert (unrestricted / "prior_dof_r4_separable.npz").exists()
+    meta = json.loads((unrestricted / "prior_dof_r4_manifest.json").read_text())
+    assert "omitted_controls" not in meta
 
 
 def test_restricted_controls_refuse_out_of_domain_lookups_too(tmp_path):
@@ -409,7 +432,7 @@ def test_restricted_controls_refuse_out_of_domain_lookups_too(tmp_path):
 
     qs = load_query_set(query_set_file(tmp_path))
     out = build(tmp_path, "restricted", query_set=qs)
-    for variant in ("full", *CONTROLS):
+    for variant in ("full", *(n for n in CONTROLS if n != "separable")):
         t = load_prior(out / f"prior_dof_r4_{variant}.npz")
         with pytest.raises(OutOfDomainError):
             t.vector(A, 5)
