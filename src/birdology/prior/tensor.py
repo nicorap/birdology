@@ -502,6 +502,12 @@ class PriorTensor:
     _species_index: dict[int, int] = field(default_factory=dict, repr=False)
     _cell_index: dict[str, int] = field(default_factory=dict, repr=False)
     _domain: frozenset = field(default_factory=frozenset, repr=False)
+    #: Column-major copy of `values`, built on the first `vector()` call and
+    #: reused (job 6961). Excluded from repr and equality: it is a cache of
+    #: `values`, never independent state.
+    _columns: sparse.csc_matrix | None = field(
+        default=None, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         # Always rebuilt from the axes, never trusted from the caller: an
@@ -745,7 +751,18 @@ class PriorTensor:
         """
         self._require_in_domain(cell, week, "a tensor lookup")
         col = self._column(cell, week)
-        stored = np.asarray(self.values[:, [col]].todense(), dtype=np.float64).ravel()
+        # A column READ from a column-major copy, never `values[:, [col]]`:
+        # slicing one column out of CSR scans every row -- 1.51 s per call on
+        # the fleet's restricted EOD r4 prior (nnz 7.8e8), which held the
+        # Phase C pilot (job 6961) at 0.5 samples/s against the twin's 50. The
+        # CSC copy costs one conversion (~20 s, ~9 GiB at r4) and then answers
+        # in ~0.07 ms, bit-identically. Built lazily, once per tensor.
+        if self._columns is None:
+            self._columns = self.values.tocsc()
+        columns = self._columns
+        lo, hi = columns.indptr[col], columns.indptr[col + 1]
+        stored = np.zeros(columns.shape[0], dtype=np.float64)
+        stored[columns.indices[lo:hi]] = columns.data[lo:hi]
         return _floor_missing(stored)
 
     def dense(self) -> np.ndarray:
