@@ -290,6 +290,33 @@ def test_aggregate_counts_emits_pa_string_in_bounded_chunks(tmp_path, monkeypatc
     )
 
 
+def test_aggregate_counts_bounds_a_plain_string_input_too(tmp_path, monkeypatch):
+    """Job 6787_5: the SEQUENTIAL path hands ``assign_cells``' plain
+    ``pa.string()`` cell column straight to ``group_by``, whose string output
+    at r5 crossed 2 GiB in one chunk and wrote negative offsets
+    (``ArrowInvalid: Column 1: In chunk 4367: Invalid: Negative offsets in
+    binary array`` from the counts-checkpoint parquet write). A plain string
+    input must take the same integer-code route and bounded decode as the
+    dictionary input, with the same counts."""
+    strings = _arrow_strings()
+    monkeypatch.setattr(strings, "MAX_STRING_CHUNK_BYTES", 64)
+    archive = _archive(tmp_path)
+    sequential = mark_guards_applied(assign_cells(read_occurrences(archive), 4))
+    assert sequential.schema.field("cell").type == pa.string()
+    counts = aggregate_counts(sequential)
+    assert counts.schema.field("cell").type == pa.string()
+    cell = counts.column("cell")
+    assert cell.num_chunks > 1
+    assert all(_string_data_bytes(c) <= 64 for c in cell.chunks)
+
+    parsed = parallel_parse.parse_and_aggregate(archive, [4], workers=1)
+    reference = aggregate_counts(mark_guards_applied(parsed.tables[4]))
+    key = ["species_key", "cell", "week", "n"]
+    assert sorted(tuple(r[k] for k in key) for r in counts.to_pylist()) == sorted(
+        tuple(r[k] for k in key) for r in reference.to_pylist()
+    )
+
+
 def test_aggregate_counts_accepts_chunks_with_differing_dictionaries():
     """A parquet read or a filter can hand over dictionary chunks whose
     dictionaries differ; Arrow's group_by refuses those outright

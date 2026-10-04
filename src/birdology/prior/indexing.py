@@ -95,12 +95,22 @@ def aggregate_counts(table: pa.Table) -> pa.Table:
     ``arrow_strings.decode_strings`` in chunks bounded far below 2 GiB --
     an unbounded ``.cast(pa.string())`` would be the same overflow again
     at fleet scale. A plain ``pa.string()`` input (the sequential path)
-    takes the original route unchanged.
+    takes the SAME route since job 6787_5: grouping on the raw strings
+    emitted a >2 GiB key chunk at r5 and negative offsets.
     """
     keyed = table
     vocabulary = None
     cell_type = table.schema.field("cell").type
-    if pa.types.is_dictionary(cell_type) or pa.types.is_large_string(cell_type):
+    # ALL text layouts take the integer-code route (job 6787_5). The plain
+    # pa.string() input of the sequential path used to go straight into
+    # group_by, whose string key output is one unbounded chunk: at r5 over
+    # 1.76B occurrences it crossed 2 GiB and wrote negative offsets
+    # ("Negative offsets in binary array" at the counts-checkpoint write).
+    if (
+        pa.types.is_dictionary(cell_type)
+        or pa.types.is_large_string(cell_type)
+        or pa.types.is_string(cell_type)
+    ):
         canonical = canonical_dictionary(table.column("cell"))
         vocabulary = (
             canonical.chunk(0).dictionary
