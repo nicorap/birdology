@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# One-time setup: a venv with the HF stack, on /shared/apps/ML so it is visible
-# from every node (not on /faic/weka, which today exists only on dgx171).
+# One-time setup: a venv with the HF stack, under /srv/home/rapnic/birdology/apps
+# so it is visible from every node.
 #
 # The Apptainer image has soundfile but NOT huggingface_hub or datasets, so the
 # download tooling has to come from PyPI. PyPI is reachable from compute nodes.
 set -euo pipefail
 
-VENV=/shared/apps/ML/venvs/hf
+VENV=/srv/home/rapnic/birdology/apps/venvs/hf
 mkdir -p "$(dirname "$VENV")"
 
 if [ -d "$VENV" ]; then

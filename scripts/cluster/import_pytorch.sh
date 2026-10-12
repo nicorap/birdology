@@ -6,8 +6,8 @@
 #SBATCH --mem=64G
 #SBATCH --time=02:00:00
 #SBATCH --chdir=/tmp
-#SBATCH --output=/shared/apps/ML/logs/import-%j.out
-#SBATCH --error=/shared/apps/ML/logs/import-%j.out
+#SBATCH --output=/srv/home/rapnic/birdology/apps/logs/import-%j.out
+#SBATCH --error=/srv/home/rapnic/birdology/apps/logs/import-%j.out
 
 # Jobs run as uid 1000 name 'nvidia' with an unreadable $HOME, so every enroot
 # path must be redirected to node-local scratch or the import dies on mkdir.
@@ -24,7 +24,7 @@ mkdir -p "$ENROOT_CACHE_PATH" "$ENROOT_DATA_PATH" "$ENROOT_RUNTIME_PATH" \
          "$ENROOT_TEMP_PATH" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" "$XDG_RUNTIME_DIR"
 
 IMAGE="${1:-nvidia/pytorch:25.08-py3}"
-OUT=/shared/apps/ML/containers/pytorch.sqsh
+OUT=/srv/home/rapnic/birdology/apps/containers/pytorch.sqsh
 STAGE="$ENROOT_TEMP_PATH/pytorch.sqsh"
 
 echo "host=$(hostname -s) image=$IMAGE"

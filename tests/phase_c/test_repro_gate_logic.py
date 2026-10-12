@@ -308,7 +308,7 @@ def _full_provenance() -> dict:
         "checkpoint_revision": "deadbeefcafe",
         "prior_doi": "10.5281/zenodo.0000000",
         "prior_variant": "full",
-        "manifest_path": "/faic/weka/ML/phase_a/XCM_r4_manifest.parquet",
+        "manifest_path": "/srv/home/rapnic/birdology/data/phase_a/XCM_r4_manifest.parquet",
         "torch_version": "2.6.0",
         "cuda_version": "12.4",
         # Schema v3 (job 5730): the device the run actually used —
@@ -387,21 +387,21 @@ def test_write_run_row_writes_one_parquet_row_with_provenance(tmp_path):
 def test_sbatch_pins_the_three_measured_constraints():
     """Plan mandate: --gres=gpu:1 (no GPU inside the container without
     it), /raid/scratch staging (5.3 GB/s local vs ~300 MB/s shared), and
-    the /faic/weka bind (an unbound /faic/weka is an EMPTY DIR in the
+    the birdology-home bind (an unbound home is an EMPTY DIR in the
     container — 0 files, exit 0)."""
     sbatch = (
         _REPO / "scripts" / "cluster" / "phase_c_train.sbatch"
     ).read_text()
     assert "--gres=gpu:1" in sbatch
     assert "/raid/scratch" in sbatch
-    assert "--bind /faic/weka" in sbatch
+    assert '--bind "$BIRDOLOGY_ROOT":"$BIRDOLOGY_ROOT"' in sbatch
 
 
-def test_sbatch_binds_weka_and_guards_the_mountpoint():
+def test_sbatch_binds_home_and_guards_its_visibility():
     sbatch = (
         _REPO / "scripts" / "cluster" / "phase_c_train.sbatch"
     ).read_text()
-    assert "mountpoint -q /faic/weka" in sbatch
+    assert '[ -d "$BIRDOLOGY_ROOT/data/phase_a" ] ||' in sbatch
     assert "--nv" in sbatch
     assert "pytorch.sif" in sbatch
 

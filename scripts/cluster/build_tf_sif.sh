@@ -5,13 +5,13 @@
 #   - TF >= 2.20 is REQUIRED by the Perch v2 GPU SavedModel (Kaggle model card).
 #   - birdnet's GPU path is the ProtoBuf backend (TFLite is CPU-only), which
 #     needs full TF -- same base serves both.
-# Weights: downloaded ONCE to /shared/apps/ML/models (shared, node-agnostic);
+# Weights: downloaded ONCE to /srv/home/rapnic/birdology/apps/models (shared, node-agnostic);
 #   KAGGLEHUB_CACHE and BIRDNET_APP_DATA point there at runtime.
 set -uo pipefail
 
-CONTAINERS=/shared/apps/ML/containers
-MODELS=/shared/apps/ML/models
-DEF=/shared/apps/ML/tf.def
+CONTAINERS=/srv/home/rapnic/birdology/apps/containers
+MODELS=/srv/home/rapnic/birdology/apps/models
+DEF=/srv/home/rapnic/birdology/apps/tf.def
 TMP=${TMPDIR:-/raid/scratch}/tf_sif_build.$$
 
 echo "=== 1. write the def file ==="
@@ -49,7 +49,7 @@ ls -la "$CONTAINERS/tf.sif"
 echo "=== 3. weights depot ==="
 # Perch v2 via kagglehub (anonymous for public models); BirdNET via its own
 # Zenodo downloader. HOME must be writable (job HOME is not) for both.
-apptainer exec --bind /shared/apps/ML:/shared/apps/ML "$CONTAINERS/tf.sif" \
+apptainer exec --bind /srv/home/rapnic/birdology/apps:/srv/home/rapnic/birdology/apps "$CONTAINERS/tf.sif" \
   env HOME=/tmp \
       KAGGLEHUB_CACHE="$MODELS/kagglehub" \
       BIRDNET_APP_DATA="$MODELS/birdnet" \
@@ -75,12 +75,12 @@ echo "=== 4. GPU verification: both models embed a 1 s sine ==="
 # A REAL FILE, not a heredoc: birdnet's spawn workers re-execute the main
 # module via runpy, and a <stdin> main kills every worker with
 # FileNotFoundError(/tmp/<stdin>). Measured 2026-09-30.
-apptainer exec --nv --bind /shared/apps/ML:/shared/apps/ML "$CONTAINERS/tf.sif" \
+apptainer exec --nv --bind /srv/home/rapnic/birdology/apps:/srv/home/rapnic/birdology/apps "$CONTAINERS/tf.sif" \
   env HOME=/tmp \
       KAGGLEHUB_CACHE="$MODELS/kagglehub" \
       BIRDNET_APP_DATA="$MODELS/birdnet" \
       TF_FORCE_GPU_ALLOW_GROWTH=true \
-  python3 /shared/apps/ML/verify_encoders.py
+  python3 /srv/home/rapnic/birdology/apps/verify_encoders.py
 rc=$?
 [ $rc -ne 0 ] && { echo "VERIFY FAILED rc=$rc"; exit $rc; }
 echo "ALL DONE"

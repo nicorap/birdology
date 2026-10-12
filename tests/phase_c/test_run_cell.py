@@ -141,7 +141,7 @@ def _write_val_soundscape(
 
 
 def _write_pow_manifest_shape(path: Path, filepaths: list[str]) -> None:
-    """The MEASURED /faic/weka/ML/phase_a/POW_r4_manifest.parquet shape
+    """The MEASURED /srv/home/rapnic/birdology/data/phase_a/POW_r4_manifest.parquet shape
     that killed fleet job 5679: every ebird_code == '' and cell/week
     None (POW is a soundscape set; the focal manifest has no label)."""
     n = len(filepaths)

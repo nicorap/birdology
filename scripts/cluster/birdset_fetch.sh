@@ -19,8 +19,8 @@
 # point somewhere writable or huggingface_hub dies reading ~/.cache/.../token.
 set -uo pipefail
 
-VENV=/shared/apps/ML/venvs/hf
-DEST=${DEST:-/faic/weka/ML/birdset}
+VENV=/srv/home/rapnic/birdology/apps/venvs/hf
+DEST=${DEST:-/srv/home/rapnic/birdology/data/birdset}
 CONFIG=${CONFIG:-HSN}
 
 [ -d "$VENV" ] || { echo "venv missing: $VENV"; exit 2; }

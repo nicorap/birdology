@@ -5,7 +5,7 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=96G
 #SBATCH --time=06:00:00
-#SBATCH --output=/faic/weka/ML/phase_c/logs/train_%A_%a.out
+#SBATCH --output=/srv/home/rapnic/birdology/data/phase_c/logs/train_%A_%a.out
 #
 # Phase C fleet runner: ONE (arm, model, resolution, seed, prior_variant)
 # cell per array task, one GPU each. Each task trains ONCE and then loops
@@ -32,7 +32,7 @@
 # raw BirdSet metadata parquets carry NO cell/week columns, so a
 # conditioned eval fed them would silently run present=0 throughout and
 # the conditioned−twin headline would measure training-side noise only.
-# The tables under /faic/weka/ML/phase_c/eval_ctx/ are produced by
+# The tables under /srv/home/rapnic/birdology/data/phase_c/eval_ctx/ are produced by
 # scripts/phase_c_build_eval_ctx.py (test-set label metadata joined with
 # H3 cell + ISO week, phase_a's own derivation); build them BEFORE
 # launching the array. phase_c_run refuses an all-null table for
@@ -43,7 +43,7 @@
 #   --gres=gpu:1            without it, torch.cuda.is_available() is False
 #                           INSIDE the container even with --nv
 #   --nv                    without it, the container has no CUDA driver
-#   --bind /faic/weka        without it, /faic/weka is an EMPTY DIRECTORY in
+#   --bind $BIRDOLOGY_ROOT   without it, the birdology home is an EMPTY DIRECTORY in
 #                           the container -- 0 files found, exit 0
 # Plus the Phase C staging ruling: ALL shard I/O goes to /raid/scratch
 # FIRST (measured: 5.3 GB/s local vs ~300 MB/s shared WEKA at contention)
@@ -53,17 +53,20 @@ set -euo pipefail
 
 CELLS=${1:?usage: sbatch --array=0-N phase_c_train.sbatch CELLS_TSV}
 
-REPO=/shared/apps/ML/birdology
-SIF=/shared/apps/ML/containers/pytorch.sif
-OUT=/faic/weka/ML/phase_c/results
-CKPT_ROOT=/faic/weka/ML/phase_c/checkpoints
-PRIOR_DIR=/faic/weka/ML/prior/eod
-BRIDGE=/faic/weka/ML/phase_a/code_to_gbif.json
+REPO=/srv/home/rapnic/birdology/apps/birdology
+SIF=/srv/home/rapnic/birdology/apps/containers/pytorch.sif
+OUT=/srv/home/rapnic/birdology/data/phase_c/results
+CKPT_ROOT=/srv/home/rapnic/birdology/data/phase_c/checkpoints
+PRIOR_DIR=/srv/home/rapnic/birdology/data/prior/eod
+BRIDGE=/srv/home/rapnic/birdology/data/phase_a/code_to_gbif.json
 PRIOR_DOI=${PRIOR_DOI:?export PRIOR_DOI -- a row that cannot cite its prior is refused}
 GIT_SHA=$(git -C "$REPO" rev-parse HEAD)
 
 # Fail loudly rather than writing to a local directory of the same name.
-mountpoint -q /faic/weka || { echo "FATAL: /faic/weka is not a mountpoint on $(hostname -s)"; exit 2; }
+BIRDOLOGY_ROOT=/srv/home/rapnic/birdology
+# Fail loudly if this node cannot see the birdology home: an unmounted
+# /srv/home leaves a missing or empty dir here -- 0 files, exit 0.
+[ -d "$BIRDOLOGY_ROOT/data/phase_a" ] || { echo "FATAL: $BIRDOLOGY_ROOT/data/phase_a is not visible on $(hostname -s)"; exit 2; }
 [ -f "$CELLS" ] || { echo "FATAL: no cells file at $CELLS"; exit 2; }
 
 IDX=${SLURM_ARRAY_TASK_ID:-0}
@@ -76,7 +79,7 @@ case "$PRIOR_VARIANT" in
     *) echo "FATAL: unknown prior_variant '$PRIOR_VARIANT' (finding I1: must be an npz suffix build_prior.py writes)"; exit 2 ;;
 esac
 
-mkdir -p "$OUT" /faic/weka/ML/phase_c/logs
+mkdir -p "$OUT" /srv/home/rapnic/birdology/data/phase_c/logs
 echo "host=$(hostname -s) task=$IDX arm=$ARM model=$MODEL r=$RESOLUTION seed=$SEED variant=$PRIOR_VARIANT tests=$TEST_SETS"
 
 # ---- /raid/scratch staging (the measured I/O ruling) -------------------
@@ -101,16 +104,16 @@ mkdir -p "$CKPT_DIR"
 
 # The SIF does NOT carry this repo: bind-mount it, PYTHONPATH it, and
 # redirect $HOME (jobs run with an unreadable $HOME; python touches it).
-apptainer exec --nv --bind /faic/weka:/faic/weka,/raid/scratch:/raid/scratch,"$REPO":/opt/birdology,/shared/apps/ML:/shared/apps/ML "$SIF" \
+apptainer exec --nv --bind "$BIRDOLOGY_ROOT":"$BIRDOLOGY_ROOT",/raid/scratch:/raid/scratch,"$REPO":/opt/birdology "$SIF" \
     env HOME=/tmp PYTHONPATH=/opt/birdology/src \
-        HF_HOME=/shared/apps/ML/models/hf \
+        HF_HOME=/srv/home/rapnic/birdology/apps/models/hf \
     python3 /opt/birdology/scripts/phase_c_run.py \
         --arm "$ARM" --model "$MODEL" \
         --checkpoint "$CHECKPOINT" --checkpoint-revision "$REVISION" \
         --resolution "$RESOLUTION" --seed "$SEED" --test-sets "$TEST_SETS" \
-        --manifest "/faic/weka/ML/phase_a/XCM_r${RESOLUTION}_manifest.parquet" \
-        --val-metadata "/faic/weka/ML/phase_a/POW_r${RESOLUTION}_manifest.parquet" \
-        --eval-metadata-template "/faic/weka/ML/phase_c/eval_ctx/{test_set}_eval_ctx.parquet" \
+        --manifest "/srv/home/rapnic/birdology/data/phase_a/XCM_r${RESOLUTION}_manifest.parquet" \
+        --val-metadata "/srv/home/rapnic/birdology/data/phase_a/POW_r${RESOLUTION}_manifest.parquet" \
+        --eval-metadata-template "/srv/home/rapnic/birdology/data/phase_c/eval_ctx/{test_set}_eval_ctx.parquet" \
         --audio-root "$STAGE/audio" \
         --prior "$PRIOR_DIR/prior_r${RESOLUTION}_${PRIOR_VARIANT}.npz" \
         --prior-doi "$PRIOR_DOI" \

@@ -22,9 +22,9 @@ they are the measured degradation path, and dropping them would change
 the eval population between the conditioned run and its twin.
 
     python scripts/phase_c_build_eval_ctx.py \
-        --metadata /faic/weka/ML/birdset/HSN/HSN/HSN_metadata_test_5s.parquet \
+        --metadata /srv/home/rapnic/birdology/data/birdset/HSN/HSN/HSN_metadata_test_5s.parquet \
         --resolution 4 \
-        --out /faic/weka/ML/phase_c/eval_ctx/HSN_eval_ctx.parquet
+        --out /srv/home/rapnic/birdology/data/phase_c/eval_ctx/HSN_eval_ctx.parquet
 
 ALL-NULL TABLES REFUSE UNLESS --allow-undated
 ---------------------------------------------
@@ -38,9 +38,9 @@ null-context path), and its table is emitted only under the explicit
 ``ebird_code == ''`` on every row and emptied the val set):
 
     python scripts/phase_c_build_eval_ctx.py \
-        --metadata /faic/weka/ML/birdset/POW/POW/POW_metadata_test_5s.parquet \
+        --metadata /srv/home/rapnic/birdology/data/birdset/POW/POW/POW_metadata_test_5s.parquet \
         --resolution 4 --allow-undated \
-        --out /faic/weka/ML/phase_c/eval_ctx/POW_r4_eval_ctx.parquet
+        --out /srv/home/rapnic/birdology/data/phase_c/eval_ctx/POW_r4_eval_ctx.parquet
 
 Column names are configurable (``--filepath-col`` etc.) because the
 BirdSet parquets are not perfectly uniform; the OUTPUT shape is fixed:

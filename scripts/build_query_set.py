@@ -2,9 +2,9 @@
 """Build the prior's QUERY SET from the Phase A manifests.
 
     python scripts/build_query_set.py \\
-        --manifests /faic/weka/ML/phase_a/XCL_r4_manifest.parquet \\
-                    /faic/weka/ML/phase_a/XCM_r4_manifest.parquet \\
-                    /faic/weka/ML/phase_a/{HSN,NES,PER,SSW,SNE,UHH}_test_5s_r4_manifest.parquet \\
+        --manifests /srv/home/rapnic/birdology/data/phase_a/XCL_r4_manifest.parquet \\
+                    /srv/home/rapnic/birdology/data/phase_a/XCM_r4_manifest.parquet \\
+                    /srv/home/rapnic/birdology/data/phase_a/{HSN,NES,PER,SSW,SNE,UHH}_test_5s_r4_manifest.parquet \\
         --out output/priors/query_set.parquet
 
 Writes ``query_set.parquet`` (distinct, sorted ``lat, lon, week`` rows) and

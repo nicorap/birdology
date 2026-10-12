@@ -2,8 +2,8 @@
 """Build the Phase A context manifest for one BirdSet config.
 
     python scripts/phase_a_manifest.py \
-        --corpus /faic/weka/ML/birdset --config XCM --resolution 4 \
-        --key-file /shared/apps/ML/secrets/xc_key --out /faic/weka/ML/phase_a
+        --corpus /srv/home/rapnic/birdology/data/birdset --config XCM --resolution 4 \
+        --key-file /srv/home/rapnic/birdology/apps/secrets/xc_key --out /srv/home/rapnic/birdology/data/phase_a
 
 FOCAL configs (XCM, XCL, and each test set's `_train` metadata) are dated from
 the Xeno-Canto v3 API. SOUNDSCAPE metadata (`_test`, `_test_5s`) is dated from
@@ -340,7 +340,7 @@ def main() -> None:
     ap.add_argument("--config", required=True)
     ap.add_argument("--resolution", type=int, default=4)
     ap.add_argument("--key-file", type=Path, default=None)
-    ap.add_argument("--out", type=Path, default=Path("/faic/weka/ML/phase_a"))
+    ap.add_argument("--out", type=Path, default=Path("/srv/home/rapnic/birdology/data/phase_a"))
     ap.add_argument("--min-coverage", type=float, default=DEFAULT_MIN_COVERAGE)
     ap.add_argument(
         "--split",

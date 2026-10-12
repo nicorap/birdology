@@ -8,8 +8,8 @@
 #SBATCH --mem=32G
 #SBATCH --time=00:25:00
 #SBATCH --chdir=/tmp
-#SBATCH --output=/shared/apps/ML/logs/fleet-%j.out
-#SBATCH --error=/shared/apps/ML/logs/fleet-%j.out
+#SBATCH --output=/srv/home/rapnic/birdology/apps/logs/fleet-%j.out
+#SBATCH --error=/srv/home/rapnic/birdology/apps/logs/fleet-%j.out
 
 # Fleet-wide check: does the SIF start and see a GPU on every node, including
 # dgx184-187 which have no system apptainer/enroot/pyxis (module binary only)?
@@ -19,7 +19,7 @@ export HOME=/tmp/appt/home
 mkdir -p "$APPTAINER_CACHEDIR" "$APPTAINER_TMPDIR" "$HOME"
 
 APPT=$(command -v apptainer || ls -d /shared/apps/software/Apptainer/*/bin/apptainer 2>/dev/null | head -1)
-SIF=/shared/apps/ML/containers/pytorch.sif
+SIF=/srv/home/rapnic/birdology/apps/containers/pytorch.sif
 
 srun --export=ALL bash -c '
   export APPTAINER_CACHEDIR=/tmp/appt/cache APPTAINER_TMPDIR=/tmp/appt/tmp HOME=/tmp/appt/home

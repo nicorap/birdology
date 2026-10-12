@@ -5,14 +5,14 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
 #SBATCH --time=02:00:00
-#SBATCH --output=/faic/weka/ML/phase_a/logs/embed_%A_%a.out
+#SBATCH --output=/srv/home/rapnic/birdology/data/phase_a/logs/embed_%A_%a.out
 #
 # One array task per shard, one GPU each. Deliberately 1 GPU per task so a
 # flaky node kills one shard rather than the run.
 #
 #   sbatch --array=0-181 scripts/cluster/phase_a_embed.sbatch XCM 4
 #
-# FIRST SUBMISSION on a fresh tree: run `mkdir -p /faic/weka/ML/phase_a/logs`
+# FIRST SUBMISSION on a fresh tree: run `mkdir -p /srv/home/rapnic/birdology/data/phase_a/logs`
 # beforehand (`make phase-a-manifest` does it) -- Slurm opens the
 # #SBATCH --output path BEFORE this script runs, so the in-job mkdir below
 # is too late for the very first array.
@@ -21,13 +21,12 @@
 #   --gres=gpu:1            without it, torch.cuda.is_available() is False
 #                           INSIDE the container even with --nv
 #   --nv                    without it, the container has no CUDA driver
-#   --bind /faic/weka        without it, /faic/weka is an EMPTY DIRECTORY in the
+#   --bind $BIRDOLOGY_ROOT   without it, the birdology home is an EMPTY DIRECTORY in the
 #                           container -- the shard loop finds 0 files, exit 0
-# WEKA is fleet-wide (verified across all 20 schedulable nodes, 2026-09-30),
-# so the array spreads over the whole fleet; the mountpoint guard below still
-# protects against any node that silently loses the mount -- with 20 nodes
-# mounting independently, one silently losing it fabricates an empty corpus
-# on that node only.
+# Data lives under /srv/home/rapnic/birdology (moved off the shared ML
+# folders, 2026-10-12). The array spreads over the whole fleet; the
+# visibility guard below protects against any node that silently lacks the
+# home mount -- one such node fabricates an empty corpus on that node only.
 #
 # ONE ARRAY TASK OWNS ONE SHARD, EXCLUSIVELY: SLURM_ARRAY_TASK_ID indexes the
 # SORTED shard list below. Re-submitting into the same OUT with a DIFFERENT
@@ -51,27 +50,30 @@ ENCODER=${4:-melsummary}
 WITH_LOGITS=${5:-}
 
 SUFFIX=${SPLIT:+_${SPLIT}}
-CORPUS=/faic/weka/ML/birdset/${CONFIG}/${CONFIG}
+CORPUS=/srv/home/rapnic/birdology/data/birdset/${CONFIG}/${CONFIG}
 # The encoder is part of OUT: caches from different encoders must never
 # share a directory (indistinguishable rows, and shard_is_complete would
 # skip real work).
-OUT=/faic/weka/ML/phase_a/embeddings/${CONFIG}${SUFFIX}_${ENCODER}
-MANIFEST=/faic/weka/ML/phase_a/${CONFIG}${SUFFIX}_r${RESOLUTION}_manifest.parquet
+OUT=/srv/home/rapnic/birdology/data/phase_a/embeddings/${CONFIG}${SUFFIX}_${ENCODER}
+MANIFEST=/srv/home/rapnic/birdology/data/phase_a/${CONFIG}${SUFFIX}_r${RESOLUTION}_manifest.parquet
 # tf.sif for the TF encoders; pytorch.sif for the checkpoint-free stand-in.
 case "$ENCODER" in
-    perch|birdnet) SIF=/shared/apps/ML/containers/tf.sif ;;
-    *)             SIF=/shared/apps/ML/containers/pytorch.sif ;;
+    perch|birdnet) SIF=/srv/home/rapnic/birdology/apps/containers/tf.sif ;;
+    *)             SIF=/srv/home/rapnic/birdology/apps/containers/pytorch.sif ;;
 esac
 # The SIF does NOT carry this repo (verified on the fleet, 2026-09-30): the
 # code must be bind-mounted in and put on PYTHONPATH, and $HOME redirected --
 # jobs run with an unreadable $HOME, and python's site machinery touches it.
-REPO=/shared/apps/ML/birdology
+REPO=/srv/home/rapnic/birdology/apps/birdology
 
 # Fail loudly rather than writing to a local directory of the same name.
-mountpoint -q /faic/weka || { echo "FATAL: /faic/weka is not a mountpoint on $(hostname -s)"; exit 2; }
+BIRDOLOGY_ROOT=/srv/home/rapnic/birdology
+# Fail loudly if this node cannot see the birdology home: an unmounted
+# /srv/home leaves a missing or empty dir here -- 0 files, exit 0.
+[ -d "$BIRDOLOGY_ROOT/data/phase_a" ] || { echo "FATAL: $BIRDOLOGY_ROOT/data/phase_a is not visible on $(hostname -s)"; exit 2; }
 [ -f "$MANIFEST" ] || { echo "FATAL: no manifest at $MANIFEST"; exit 2; }
 
-mkdir -p "$OUT" /faic/weka/ML/phase_a/logs
+mkdir -p "$OUT" /srv/home/rapnic/birdology/data/phase_a/logs
 
 if [ -n "$SPLIT" ]; then
     # Split-sharded configs name shards WITHOUT the split's underscores:
@@ -103,10 +105,10 @@ echo "host=$(hostname -s) task=$IDX/$N shard=$(basename "$SHARD")"
 LOGITS_FLAG=""
 [ "$WITH_LOGITS" = "logits" ] && LOGITS_FLAG="--with-logits"
 
-apptainer exec --nv --bind /faic/weka:/faic/weka,"$REPO":/opt/birdology,/shared/apps/ML:/shared/apps/ML "$SIF" \
+apptainer exec --nv --bind "$BIRDOLOGY_ROOT":"$BIRDOLOGY_ROOT","$REPO":/opt/birdology "$SIF" \
     env HOME=/tmp PYTHONPATH=/opt/birdology/src \
-        KAGGLEHUB_CACHE=/shared/apps/ML/models/kagglehub \
-        BIRDNET_APP_DATA=/shared/apps/ML/models/birdnet \
+        KAGGLEHUB_CACHE=/srv/home/rapnic/birdology/apps/models/kagglehub \
+        BIRDNET_APP_DATA=/srv/home/rapnic/birdology/apps/models/birdnet \
         TF_FORCE_GPU_ALLOW_GROWTH=true \
     python3 -m birdology.phase_a.embed_cli \
         --shard "$SHARD" --manifest "$MANIFEST" --out "$OUT" \

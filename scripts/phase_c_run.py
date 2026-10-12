@@ -693,7 +693,7 @@ def main(argv: list[str] | None = None) -> int:
         help="POW-val table: the MULTI-LABEL soundscape table "
         "(filepath, ebird_code_multilabel, cell, week) from "
         "`phase_c_build_eval_ctx.py --allow-undated`, e.g. "
-        "/faic/weka/ML/phase_c/eval_ctx/POW_r4_eval_ctx.parquet — "
+        "/srv/home/rapnic/birdology/data/phase_c/eval_ctx/POW_r4_eval_ctx.parquet — "
         "scored as multi-hot cmAP on the null-context path (spec §2). "
         "NOT the focal phase_a POW manifest (ebird_code == '' on every "
         "row; refused by name).",
@@ -703,7 +703,7 @@ def main(argv: list[str] | None = None) -> int:
         required=True,
         help="Per-test-set eval table path template containing "
         "'{test_set}', e.g. "
-        "/faic/weka/ML/phase_c/eval_ctx/{test_set}_eval_ctx.parquet — "
+        "/srv/home/rapnic/birdology/data/phase_c/eval_ctx/{test_set}_eval_ctx.parquet — "
         "the CONTEXT-JOINED tables from phase_c_build_eval_ctx.py "
         "(finding C1), never the raw BirdSet metadata parquets.",
     )

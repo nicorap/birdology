@@ -6,8 +6,8 @@
 #SBATCH --mem=256G
 #SBATCH --time=03:00:00
 #SBATCH --chdir=/tmp
-#SBATCH --output=/shared/apps/ML/logs/sif-%j.out
-#SBATCH --error=/shared/apps/ML/logs/sif-%j.out
+#SBATCH --output=/srv/home/rapnic/birdology/apps/logs/sif-%j.out
+#SBATCH --error=/srv/home/rapnic/birdology/apps/logs/sif-%j.out
 
 # Apptainer route. Pyxis/enroot cannot be used: pyxis derives its enroot paths
 # from the passwd HOME (/home/ubuntu), which is unreadable inside a job, and it
@@ -27,7 +27,7 @@ mkdir -p "$APPTAINER_CACHEDIR" "$APPTAINER_TMPDIR" "$HOME"
 APPT=$(command -v apptainer || ls -d /shared/apps/software/Apptainer/*/bin/apptainer 2>/dev/null | head -1)
 IMAGE="${1:-docker://nvcr.io/nvidia/pytorch:25.08-py3}"
 STAGE=/tmp/appt/pytorch.sif
-OUT=/shared/apps/ML/containers/pytorch.sif
+OUT=/srv/home/rapnic/birdology/apps/containers/pytorch.sif
 
 echo "host=$(hostname -s) apptainer=$APPT image=$IMAGE"
 "$APPT" --version
