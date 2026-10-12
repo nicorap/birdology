@@ -385,25 +385,27 @@ def test_write_run_row_writes_one_parquet_row_with_provenance(tmp_path):
 
 
 def test_sbatch_pins_the_three_measured_constraints():
-    """Plan mandate: --gres=gpu:1 (no GPU inside the container without
-    it), /raid/scratch staging (5.3 GB/s local vs ~300 MB/s shared), and
-    the birdology-home bind (an unbound home is an EMPTY DIR in the
-    container — 0 files, exit 0)."""
+    """Plan mandate: --gres=gpu:1 (no visible GPU without it),
+    /raid/scratch staging (5.3 GB/s local vs ~300 MB/s shared), and an
+    explicit --device cuda (job 5730: twins silently ran on CPU)."""
     sbatch = (
         _REPO / "scripts" / "cluster" / "phase_c_train.sbatch"
     ).read_text()
     assert "--gres=gpu:1" in sbatch
     assert "/raid/scratch" in sbatch
-    assert '--bind "$BIRDOLOGY_ROOT":"$BIRDOLOGY_ROOT"' in sbatch
+    assert "--device cuda" in sbatch
 
 
-def test_sbatch_binds_home_and_guards_its_visibility():
+def test_sbatch_runs_the_phase_c_venv_and_guards_home_visibility():
+    """No container: the fleet runs the phase_c venv directly. The deploy
+    is a copy without .git, so the SHA must arrive from the environment."""
     sbatch = (
         _REPO / "scripts" / "cluster" / "phase_c_train.sbatch"
     ).read_text()
     assert '[ -d "$BIRDOLOGY_ROOT/data/phase_a" ] ||' in sbatch
-    assert "--nv" in sbatch
-    assert "pytorch.sif" in sbatch
+    assert "/apps/venvs/phase_c/bin/python" in sbatch
+    assert "GIT_SHA=${GIT_SHA:?" in sbatch
+    assert "apptainer" not in sbatch
 
 
 # ---------------------------------------------------------------------------
@@ -455,8 +457,8 @@ def test_sbatch_derives_prior_path_from_variant_column():
         _REPO / "scripts" / "cluster" / "phase_c_train.sbatch"
     ).read_text()
     assert "PRIOR_VARIANT" in sbatch
-    assert "prior_r${RESOLUTION}_${PRIOR_VARIANT}.npz" in sbatch
-    assert "prior_r${RESOLUTION}_full.npz" not in sbatch
+    assert "_r${RESOLUTION}_${PRIOR_VARIANT}.npz" in sbatch
+    assert "_r${RESOLUTION}_full.npz" not in sbatch
     assert "--prior-variant" in sbatch
 
 

@@ -17,18 +17,23 @@
 #                             any difference is printed and fails.
 #                             `verify --checksum` also compares content (slow).
 #   move_to_home.sh delete --yes
-#                             re-verifies, refuses while any of your Slurm jobs
-#                             is queued or running, then removes the SOURCES.
-#                             Without --yes it only prints what it would remove.
+#                             re-verifies, refuses while any of your OTHER Slurm
+#                             jobs is queued or running, removes the SOURCES,
+#                             then runs fix-venvs. Without --yes it only prints
+#                             what it would remove.
+#   move_to_home.sh fix-venvs rewrite old-root shebangs in the moved venvs'
+#                             bin/ scripts (pip, hf, ...). Runs after delete,
+#                             not before: verify would flag the edits.
 #
 # Run it on a node that mounts BOTH /faic/weka and /srv/home, inside an
 # allocation, not on the login node -- birdset alone is large:
 #   srun --cpus-per-task=8 --mem=16G --time=24:00:00 --pty \
 #       bash scripts/cluster/move_to_home.sh copy
 #
-# venvs/ is NOT copied: a venv bakes its absolute path into its scripts'
-# shebangs, so a copied venv runs the wrong interpreter or none. Re-create it
-# at the new path with scripts/cluster/hf_setup.sh after the copy.
+# venvs/ IS copied: every venv's base interpreter lives outside the ML folders
+# (/usr/bin, /shared/apps/software; measured 2026-10-12) and every script calls
+# venvs/<name>/bin/python directly, which relocates cleanly. Only console-script
+# shebangs name the old root -- fix-venvs rewrites them after the delete.
 set -euo pipefail
 
 # Overridable only so the script can be rehearsed on scratch dirs.
@@ -40,9 +45,24 @@ NEW_APPS=$BIRDOLOGY_ROOT/apps
 
 # The move list: what the repo's scripts read or write. Anything else found in
 # the ML folders is reported by `plan` and left alone.
-DATA_ITEMS=(birdset phase_a phase_b phase_c prior)
-APPS_ITEMS=(birdology containers models secrets logs priors)
-SKIPPED_APPS_ITEMS=(venvs)  # re-created by hf_setup.sh, never copied
+DATA_ITEMS=(birdset phase_a phase_b phase_c prior .hf)
+APPS_ITEMS=(birdology containers models secrets logs priors venvs
+    staging birdology_task6 code ebird_code_to_sci.json hf.token hf_setup.sh tf.def
+    # Fleet-side scripts and probes, mirrored as-is (several were never in git;
+    # the operational ones are upstreamed into scripts/cluster/ separately).
+    baseline_gate.py batch_embed_probe.py bn_bs_probe.py bn_mask_probe.py
+    bn_order_probe.py bn_probe.py bn_seq_probe.py bn_session_probe.py
+    bn_speed_probe.py bn_topk_probe.py bn_twoload_probe.py gate_min_probe.py
+    golden_reference.py hf_diag.py logits_live.py logits_probe.py logits_probe2.py
+    perch_shape_probe.py pow_probe.py tf_gpu_probe.py verify_encoders.py
+    window_probe.py birdset_pilot.sh build_tf_sif.sh cd.sh ctd.sh ib.sh ij.sh is.sh
+    stack_bench.sh birdset_testsets.sbatch gbif_fetch.sbatch nbp_dl.sbatch
+    phase_b_sweep.sbatch phase_b_sweep.sbatch.bak-0919 phase_c_train.sbatch
+    phase_c_train.sbatch.bak-0829 phase_c_train.sbatch.bak-device
+    phase_c_train.sbatch.bak-prefill prior_build_dof.sbatch prior_build_eod.sbatch
+    prior_build_eod.sbatch.bak-5345 prior_build_eod_q.sbatch
+    prior_build_eod_seq.sbatch redo_shard_0067.sbatch testset_manifests.sbatch
+    xcl_manifest.sbatch)
 
 PARALLEL=${PARALLEL:-4}
 LOG_DIR=$BIRDOLOGY_ROOT/move_logs
@@ -61,7 +81,12 @@ pairs() {
     return 0
 }
 
-my_jobs() { squeue -h -u "$USER" -o '%i %j %T' 2>/dev/null || true; }
+# Your jobs OTHER than the one this script runs in: only GPU nodes mount
+# /faic/weka, so every step runs inside an allocation, which must not count.
+my_jobs() {
+    squeue -h -u "$USER" -o '%i %j %T' 2>/dev/null \
+        | awk -v self="${SLURM_JOB_ID:-none}" '$1 != self' || true
+}
 
 require_mounts() {
     local d
@@ -95,13 +120,12 @@ cmd_plan() {
         for entry in "$root"/* "$root"/.[!.]*; do
             [ -e "$entry" ] || continue
             name=$(basename "$entry"); listed=no
-            for item in "${DATA_ITEMS[@]}" "${APPS_ITEMS[@]}" "${SKIPPED_APPS_ITEMS[@]}"; do
+            for item in "${DATA_ITEMS[@]}" "${APPS_ITEMS[@]}"; do
                 [ "$name" = "$item" ] && listed=yes
             done
             [ "$listed" = no ] && echo "    $entry ($(du -sh "$entry" 2>/dev/null | cut -f1))"
         done
     done
-    echo "    venvs/ is skipped on purpose: re-create with scripts/cluster/hf_setup.sh"
 
     echo; echo "== destination space"
     df -h "$(dirname "$BIRDOLOGY_ROOT")"
@@ -137,6 +161,7 @@ cmd_copy() {
     pairs | while IFS=$'\t' read -r src dst; do printf '%s\0%s\0' "$src" "$dst"; done \
         | xargs -0 -n 2 -P "$PARALLEL" bash -c 'copy_one "$1" "$2"' _
     [ -d "$NEW_APPS/secrets" ] && chmod -R go-rwx "$NEW_APPS/secrets"
+    [ -f "$NEW_APPS/hf.token" ] && chmod 600 "$NEW_APPS/hf.token"
     echo "copy done. Next: $0 verify"
 }
 
@@ -145,10 +170,17 @@ cmd_copy() {
 # difference. Sizes + mtimes by default; content checksums with --checksum.
 # Permissions and owners are NOT compared (-rlHt, not -a): copy tightens
 # secrets/ on purpose, and a home filesystem may map owners differently.
+# A single file is compared directly (size; bytes under --checksum): an
+# itemised dry run of one file is not reliable across rsync implementations.
 differences() {
     local src=$1 dst=$2 flags=$3
-    [ -d "$src" ] && { src=$src/; dst=$dst/; }
-    rsync -rlHtn --delete --itemize-changes $flags "$src" "$dst" 2>&1 | grep -v '^\.d' || true
+    if [ -f "$src" ]; then
+        [ -f "$dst" ] || { echo "not a file: $dst"; return; }
+        [ "$(wc -c <"$src")" -eq "$(wc -c <"$dst")" ] || { echo "size differs: $dst"; return; }
+        [ "$flags" = "-c" ] && ! cmp -s "$src" "$dst" && echo "content differs: $dst"
+        return 0
+    fi
+    rsync -rlHtn --delete --itemize-changes $flags "$src/" "$dst/" 2>&1 | grep -v '^\.d' || true
 }
 
 cmd_verify() {
@@ -185,7 +217,6 @@ cmd_delete() {
     if [ "$yes" != "--yes" ]; then
         echo; echo "Would remove (re-run with --yes to do it):"
         pairs | cut -f1 | sed 's/^/    /'
-        [ -d "$OLD_APPS/venvs" ] && echo "    (venvs/ is left alone -- remove $OLD_APPS/venvs by hand once hf_setup.sh has rebuilt it)"
         return 0
     fi
     while IFS=$'\t' read -r src dst; do
@@ -193,6 +224,24 @@ cmd_delete() {
         rm -rf -- "$src"
     done < <(pairs)
     echo "delete done."
+    cmd_fix_venvs
+}
+
+cmd_fix_venvs() {
+    local f n=0
+    [ -d "$NEW_APPS/venvs" ] || { echo "no $NEW_APPS/venvs, nothing to fix"; return 0; }
+    for f in "$NEW_APPS"/venvs/*/bin/*; do
+        [ -f "$f" ] && [ ! -L "$f" ] || continue
+        # Text scripts only (a #! line, or activate*): never sed a binary.
+        case "$(basename "$f")" in
+            activate*) ;;
+            *) [ "$(head -c 2 "$f")" = '#!' ] || continue ;;
+        esac
+        grep -qF "$OLD_APPS" "$f" || continue
+        sed -i "s#$OLD_APPS/#$NEW_APPS/#g" "$f"
+        n=$((n + 1))
+    done
+    echo "fix-venvs: rewrote $OLD_APPS -> $NEW_APPS in $n venv bin/ file(s)"
 }
 
 case "${1:-}" in
@@ -200,5 +249,6 @@ case "${1:-}" in
     copy) cmd_copy ;;
     verify) shift; cmd_verify "${1:-}" ;;
     delete) shift; cmd_delete "${1:-}" ;;
+    fix-venvs) cmd_fix_venvs ;;
     *) usage ;;
 esac
