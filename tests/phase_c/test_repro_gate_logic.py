@@ -396,6 +396,19 @@ def test_sbatch_pins_the_three_measured_constraints():
     assert "--device cuda" in sbatch
 
 
+def test_sbatch_stages_once_per_node_not_per_task():
+    """Off WEKA the shards come from the home NFS (0.55 GB/s measured):
+    a per-task stage would pull ~225 GB per task. The stage is per node,
+    serialized by flock, and no exit trap may delete it under the other
+    tasks still reading it."""
+    sbatch = (
+        _REPO / "scripts" / "cluster" / "phase_c_train.sbatch"
+    ).read_text()
+    assert "STAGE=/raid/scratch/birdology_phase_c_stage" in sbatch
+    assert "flock -x 9" in sbatch
+    assert "trap" not in sbatch.split("STAGE=", 1)[1]
+
+
 def test_sbatch_runs_the_phase_c_venv_and_guards_home_visibility():
     """No container: the fleet runs the phase_c venv directly. The deploy
     is a copy without .git, so the SHA must arrive from the environment."""

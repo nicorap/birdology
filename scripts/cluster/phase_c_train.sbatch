@@ -46,9 +46,9 @@
 #   home visibility guard   an unmounted /srv/home is an EMPTY DIRECTORY --
 #                           0 files found, exit 0
 # Plus the Phase C staging ruling: ALL shard I/O goes to /raid/scratch
-# FIRST (measured: 5.3 GB/s local vs ~300 MB/s shared WEKA at contention)
-# -- a training loop reading crops off WEKA would starve every GPU on the
-# node, silently.
+# FIRST (measured: 5.3 GB/s local vs ~300 MB/s shared WEKA at contention,
+# 0.55 GB/s off the home NFS) -- a training loop reading crops off shared
+# storage would starve every GPU on the node, silently.
 set -euo pipefail
 
 CELLS=${1:?usage: sbatch --array=0-N phase_c_train.sbatch CELLS_TSV}
@@ -81,13 +81,22 @@ esac
 mkdir -p "$OUT" /srv/home/rapnic/birdology/data/phase_c/logs
 echo "host=$(hostname -s) task=$IDX arm=$ARM model=$MODEL r=$RESOLUTION seed=$SEED variant=$PRIOR_VARIANT tests=$TEST_SETS"
 
-# ---- /raid/scratch staging (the measured I/O ruling) -------------------
-# Stage this task's shards to node-local scratch BEFORE any decode; the
-# trap reclaims the space on every exit path (preemption included).
-STAGE=/raid/scratch/phase_c_${SLURM_JOB_ID:-manual}_${IDX}
-mkdir -p "$STAGE/audio"
-trap 'rm -rf "$STAGE"' EXIT
-N_STAGED=0
+# ---- /raid/scratch staging: ONE persistent stage per NODE --------------
+# Since the move off WEKA (2026-10-12) the shards come from the home NFS:
+# measured 0.55 GB/s for 16 parallel readers on dgx160, vs ~5 GB/s WEKA.
+# A task needs ~225 GB (XCM 90G + fill 13G + POW 16G + six test sets
+# 107G); staged per TASK, a 173-cell sweep would pull ~39 TB through the
+# server every home directory lives on. So the stage is per node and
+# outlives the task: the first task to need a tar extracts it under an
+# exclusive flock and only then drops its marker; later tasks on the node
+# find the marker and extract nothing. A crash mid-tar leaves no marker,
+# so the next task re-extracts it (tar overwrites). Files from different
+# tars never collide (measured), so extracting a new tar cannot touch
+# files a running task reads. Nothing removes the stage on exit -- between
+# array waves the node would re-pull it. Remove it after the sweep:
+#   srun -p gpu -w <node> rm -rf /raid/scratch/birdology_phase_c_stage
+STAGE=/raid/scratch/birdology_phase_c_stage
+mkdir -p "$STAGE/audio" "$STAGE/.done"
 # Train shards (XCM) + POW val + this cell's eval test sets, all into one
 # root: test-set tars extract flat filenames, XCM extracts data/xeno-canto/...
 # -- measured, no collisions. Extraction runs 8-way parallel.
@@ -99,9 +108,16 @@ for TS in POW $(echo "$TEST_SETS" | tr ',' ' '); do
     ALL_TARS="$ALL_TARS $(ls /srv/home/rapnic/birdology/data/birdset/$TS/$TS/*.tar.gz 2>/dev/null)"
 done
 N_STAGED=$(echo $ALL_TARS | wc -w)
-echo $ALL_TARS | tr ' ' '\n' | xargs -P 8 -I{} tar -xzf {} -C "$STAGE/audio" || { echo "FATAL: tar extraction failed"; exit 2; }
 [ "$N_STAGED" -gt 0 ] || { echo "FATAL: shard glob matched nothing: $SHARDS_GLOB"; exit 2; }
-echo "staged $N_STAGED shard(s) to $STAGE/audio"
+marker() { printf '%s' "$1" | md5sum | cut -c1-32; }
+(
+    flock -x 9
+    TODO=$(for t in $ALL_TARS; do [ -f "$STAGE/.done/$(marker "$t")" ] || echo "$t"; done)
+    echo "stage $(hostname -s): $(echo $TODO | wc -w)/$N_STAGED shard(s) to extract"
+    [ -z "$TODO" ] || echo "$TODO" | xargs -P 8 -I{} bash -c \
+        'tar -xzf "$1" -C "$2/audio" && touch "$2/.done/$(printf "%s" "$1" | md5sum | cut -c1-32)"' _ {} "$STAGE"
+) 9>"$STAGE/.lock" || { echo "FATAL: tar extraction failed"; exit 2; }
+echo "staged $N_STAGED shard(s) at $STAGE/audio"
 
 # Pre-flight: every filepath in the val + eval tables must exist on disk
 # NOW, not at the end of epoch 1 hours from now.
