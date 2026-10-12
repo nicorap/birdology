@@ -46,7 +46,7 @@ NEW_APPS=$BIRDOLOGY_ROOT/apps
 # The move list: what the repo's scripts read or write. Anything else found in
 # the ML folders is reported by `plan` and left alone.
 DATA_ITEMS=(birdset phase_a phase_b phase_c prior .hf)
-APPS_ITEMS=(birdology containers models secrets logs priors venvs
+APPS_ITEMS=(containers models secrets logs priors venvs
     staging birdology_task6 code ebird_code_to_sci.json hf.token hf_setup.sh tf.def
     # Fleet-side scripts and probes, mirrored as-is (several were never in git;
     # the operational ones are upstreamed into scripts/cluster/ separately).
@@ -63,6 +63,11 @@ APPS_ITEMS=(birdology containers models secrets logs priors venvs
     prior_build_eod.sbatch.bak-5345 prior_build_eod_q.sbatch
     prior_build_eod_seq.sbatch redo_shard_0067.sbatch testset_manifests.sbatch
     xcl_manifest.sbatch)
+# Removed by delete but never copied: the code deploy is a plain copy of a git
+# commit (55fd29b, matched 180/180 files 2026-10-12), so it is re-deployed
+# fresh from git into $NEW_APPS/birdology instead -- copying it would make
+# verify fail the moment the new code lands.
+RETIRE_ITEMS=("$OLD_APPS/birdology")
 
 PARALLEL=${PARALLEL:-4}
 LOG_DIR=$BIRDOLOGY_ROOT/move_logs
@@ -120,7 +125,7 @@ cmd_plan() {
         for entry in "$root"/* "$root"/.[!.]*; do
             [ -e "$entry" ] || continue
             name=$(basename "$entry"); listed=no
-            for item in "${DATA_ITEMS[@]}" "${APPS_ITEMS[@]}"; do
+            for item in "${DATA_ITEMS[@]}" "${APPS_ITEMS[@]}" birdology; do
                 [ "$name" = "$item" ] && listed=yes
             done
             [ "$listed" = no ] && echo "    $entry ($(du -sh "$entry" 2>/dev/null | cut -f1))"
@@ -217,12 +222,18 @@ cmd_delete() {
     if [ "$yes" != "--yes" ]; then
         echo; echo "Would remove (re-run with --yes to do it):"
         pairs | cut -f1 | sed 's/^/    /'
+        printf '    %s (retired: redeployed from git)\n' "${RETIRE_ITEMS[@]}"
         return 0
     fi
     while IFS=$'\t' read -r src dst; do
         echo "removing $src"
         rm -rf -- "$src"
     done < <(pairs)
+    for src in "${RETIRE_ITEMS[@]}"; do
+        [ -e "$src" ] || continue
+        echo "removing $src (retired: redeployed from git)"
+        rm -rf -- "$src"
+    done
     echo "delete done."
     cmd_fix_venvs
 }
