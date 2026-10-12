@@ -225,15 +225,26 @@ cmd_delete() {
         printf '    %s (retired: redeployed from git)\n' "${RETIRE_ITEMS[@]}"
         return 0
     fi
+    # Keep going past a failed rm and report it at the end: under /faic/weka/ML
+    # the parent dir belongs to the old `nvidia` account, so rapnic can empty an
+    # item but not unlink the item itself -- that last rmdir needs sudo.
+    local left=()
     while IFS=$'\t' read -r src dst; do
         echo "removing $src"
-        rm -rf -- "$src"
+        rm -rf -- "$src" 2>/dev/null || left+=("$src")
     done < <(pairs)
     for src in "${RETIRE_ITEMS[@]}"; do
         [ -e "$src" ] || continue
         echo "removing $src (retired: redeployed from git)"
-        rm -rf -- "$src"
+        rm -rf -- "$src" 2>/dev/null || left+=("$src")
     done
+    if [ "${#left[@]}" -gt 0 ]; then
+        echo "LEFT BEHIND (no write permission on the parent; remove with sudo):"
+        local p
+        for p in "${left[@]}"; do
+            echo "    $p ($(find "$p" -mindepth 1 2>/dev/null | wc -l) entries inside)"
+        done
+    fi
     echo "delete done."
     cmd_fix_venvs
 }
