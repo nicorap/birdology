@@ -54,8 +54,20 @@ set -euo pipefail
 CELLS=${1:?usage: sbatch --array=0-N phase_c_train.sbatch CELLS_TSV}
 
 REPO=/srv/home/rapnic/birdology/apps/birdology
-OUT=/srv/home/rapnic/birdology/data/phase_c/results
-CKPT_ROOT=/srv/home/rapnic/birdology/data/phase_c/checkpoints
+# A retrain on different inputs (e.g. the --keep-undated manifests) points
+# PHASE_C_MANIFEST_DIR at them AND PHASE_C_OUT / PHASE_C_CKPT_ROOT at fresh
+# dirs: results keys and checkpoint dirs carry no manifest identity, so a
+# shared OUT would mix the two grids silently and a shared CKPT_ROOT would
+# overwrite the first grid's checkpoints. Refused below, not just advised.
+DEFAULT_MANIFEST_DIR=/srv/home/rapnic/birdology/data/phase_a
+DEFAULT_OUT=/srv/home/rapnic/birdology/data/phase_c/results
+DEFAULT_CKPT_ROOT=/srv/home/rapnic/birdology/data/phase_c/checkpoints
+MANIFEST_DIR=${PHASE_C_MANIFEST_DIR:-$DEFAULT_MANIFEST_DIR}
+OUT=${PHASE_C_OUT:-$DEFAULT_OUT}
+CKPT_ROOT=${PHASE_C_CKPT_ROOT:-$DEFAULT_CKPT_ROOT}
+if [ "$MANIFEST_DIR" != "$DEFAULT_MANIFEST_DIR" ] && { [ "$OUT" = "$DEFAULT_OUT" ] || [ "$CKPT_ROOT" = "$DEFAULT_CKPT_ROOT" ]; }; then
+    echo "FATAL: PHASE_C_MANIFEST_DIR=$MANIFEST_DIR needs its own PHASE_C_OUT and PHASE_C_CKPT_ROOT"; exit 2
+fi
 PRIOR_DIR=${PRIOR_DIR:-/srv/home/rapnic/birdology/data/prior/eod}
 BRIDGE=/srv/home/rapnic/birdology/data/phase_a/code_to_gbif.json
 PRIOR_DOI=${PRIOR_DOI:?export PRIOR_DOI -- a row that cannot cite its prior is refused}
@@ -79,6 +91,7 @@ case "$PRIOR_VARIANT" in
 esac
 
 mkdir -p "$OUT" /srv/home/rapnic/birdology/data/phase_c/logs
+echo "manifests=$MANIFEST_DIR out=$OUT ckpt=$CKPT_ROOT"
 echo "host=$(hostname -s) task=$IDX arm=$ARM model=$MODEL r=$RESOLUTION seed=$SEED variant=$PRIOR_VARIANT tests=$TEST_SETS"
 
 # ---- /raid/scratch staging: ONE persistent stage per NODE --------------
@@ -121,10 +134,10 @@ echo "staged $N_STAGED shard(s) at $STAGE/audio"
 
 # Pre-flight: every filepath in the val + eval tables must exist on disk
 # NOW, not at the end of epoch 1 hours from now.
-/srv/home/rapnic/birdology/apps/venvs/phase_c/bin/python - "$STAGE/audio" "$RESOLUTION" "$TEST_SETS" <<'PYEOF' || { echo "FATAL: pre-flight failed"; exit 2; }
+/srv/home/rapnic/birdology/apps/venvs/phase_c/bin/python - "$STAGE/audio" "$RESOLUTION" "$TEST_SETS" "$MANIFEST_DIR" <<'PYEOF' || { echo "FATAL: pre-flight failed"; exit 2; }
 import sys, os, pyarrow.parquet as pq
-root, res, sets = sys.argv[1], sys.argv[2], sys.argv[3].split(",")
-paths = {"TRAIN(XCM)": f"/srv/home/rapnic/birdology/data/phase_a/XCM_r{res}_manifest.parquet",
+root, res, sets, mdir = sys.argv[1], sys.argv[2], sys.argv[3].split(","), sys.argv[4]
+paths = {"TRAIN(XCM)": f"{mdir}/XCM_r{res}_manifest.parquet",
          "POW(val)": f"/srv/home/rapnic/birdology/data/phase_c/eval_ctx/POW_r{res}_eval_ctx.parquet"}
 paths.update({ts: f"/srv/home/rapnic/birdology/data/phase_c/eval_ctx/{ts}_r{res}_eval_ctx.parquet" for ts in sets})
 bad = 0
@@ -153,7 +166,7 @@ env HOME=/tmp PYTHONPATH=$REPO/src \
         --arm "$ARM" --model "$MODEL" \
         --checkpoint "$CHECKPOINT" --checkpoint-revision "$REVISION" \
         --resolution "$RESOLUTION" --seed "$SEED" --test-sets "$TEST_SETS" \
-        --manifest "/srv/home/rapnic/birdology/data/phase_a/XCM_r${RESOLUTION}_manifest.parquet" \
+        --manifest "$MANIFEST_DIR/XCM_r${RESOLUTION}_manifest.parquet" \
         --val-metadata "/srv/home/rapnic/birdology/data/phase_c/eval_ctx/POW_r${RESOLUTION}_eval_ctx.parquet" \
         --eval-metadata-template "/srv/home/rapnic/birdology/data/phase_c/eval_ctx/{test_set}_r${RESOLUTION}_eval_ctx.parquet" \
         --audio-root "$STAGE/audio" \

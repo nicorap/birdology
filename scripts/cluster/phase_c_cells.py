@@ -20,6 +20,9 @@ twin" and "the token twin" are the same training run. Twins are
 resolution-independent and run at r4 (the manifests cover the same
 recordings at every resolution; only the context columns differ).
 
+A retrain of the conditioned arms alone (e.g. on new manifests) is
+``--variants full``: 45 conditioned + their 10 twins = 55 cells.
+
 RESUME: --skip-done drops every cell whose results rows already cover
 ALL its test sets, keyed (arm, model_id, resolution, seed,
 prior_variant). A partially-evaluated cell is kept: re-running it is
@@ -49,11 +52,18 @@ TEST_SETS = ("HSN", "NES", "PER", "SSW", "SNE", "UHH")
 SHARDS_GLOB = f"{DATA}/birdset/XCM/XCM/*.tar.gz"
 
 
-def grid() -> list[tuple]:
-    """Every cell as the sbatch's 9 fields, in launch order."""
+def grid(variants: tuple[str, ...] = VARIANTS) -> list[tuple]:
+    """Every cell as the sbatch's 9 fields, in launch order.
+
+    *variants* narrows the conditioned/control cells; the twins are always
+    included, since every conditioned cell is read against its twin.
+    """
+    unknown = set(variants) - set(VARIANTS)
+    if unknown:
+        raise ValueError(f"unknown prior variants {sorted(unknown)}; expected a subset of {VARIANTS}")
     tests = ",".join(TEST_SETS)
     cells = []
-    for variant in VARIANTS:
+    for variant in (v for v in VARIANTS if v in variants):
         for res in RESOLUTIONS:
             for arm, model in COMBOS:
                 ckpt, rev = CHECKPOINTS[model]
@@ -94,9 +104,11 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--skip-done", type=Path, default=None, metavar="RESULTS_DIR")
+    ap.add_argument("--variants", nargs="+", choices=VARIANTS, default=list(VARIANTS),
+                    help="prior variants to emit (default: all); twins are always emitted")
     args = ap.parse_args(argv)
 
-    cells = grid()
+    cells = grid(tuple(args.variants))
     if args.skip_done is not None:
         if not args.skip_done.is_dir():
             ap.error(f"--skip-done {args.skip_done} is not a directory")

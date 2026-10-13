@@ -558,3 +558,24 @@ def test_score_then_gate_round_trip(tmp_path, monkeypatch):
         ["gate", "--pair", f"convnext:HSN:{npz_path}"]
     )
     assert rc in (0, 1)
+
+
+def test_sbatch_refuses_new_manifests_into_the_default_results(tmp_path):
+    """A retrain on other manifests must not write into (or overwrite the
+    checkpoints of) the first grid: the guard fires before any staging."""
+    import subprocess
+
+    sbatch = _REPO / "scripts" / "cluster" / "phase_c_train.sbatch"
+    text = sbatch.read_text()
+    guard = text[text.index("DEFAULT_MANIFEST_DIR="):text.index("PRIOR_DIR=${PRIOR_DIR:-")]
+    script = tmp_path / "guard.sh"
+    script.write_text("set -euo pipefail\n" + guard + "echo PASSED\n")
+    run = lambda env: subprocess.run(["bash", str(script)], env=env, capture_output=True, text=True)
+
+    assert run({}).stdout.strip() == "PASSED"
+    bad = run({"PHASE_C_MANIFEST_DIR": "/x/keep_undated", "PHASE_C_OUT": "/x/out"})
+    assert bad.returncode == 2 and "FATAL" in bad.stdout
+    ok = run({"PHASE_C_MANIFEST_DIR": "/x/keep_undated", "PHASE_C_OUT": "/x/out",
+              "PHASE_C_CKPT_ROOT": "/x/ckpt"})
+    assert ok.stdout.strip() == "PASSED"
+    assert '--manifest "$MANIFEST_DIR/XCM_r${RESOLUTION}_manifest.parquet"' in text

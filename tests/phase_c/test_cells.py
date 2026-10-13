@@ -78,3 +78,12 @@ def test_cli_writes_nine_tab_fields_and_refuses_overwrite(tmp_path):
     assert all(len(line.split("\t")) == 9 for line in lines)
     with pytest.raises(SystemExit):
         cells.main(["--out", str(out)])
+
+
+def test_variants_filter_keeps_twins():
+    g = cells.grid(("full",))
+    assert len(g) == 55
+    assert sum(c[0] == "twin" for c in g) == 10
+    assert {c[6] for c in g} == {"full"}
+    with pytest.raises(ValueError):
+        cells.grid(("uniform",))
