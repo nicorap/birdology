@@ -57,7 +57,8 @@ def cmd_build(args) -> int:
     print(f"BirdNET 'basic' signature returns {'logits' if logits else 'sigmoid scores'}")
     m = DanishBirdNET(BIRDNET / "model-fp32", arrays, scores_are_logits=logits)
     args.out.mkdir(parents=True, exist_ok=True)
-    tf.saved_model.save(m, str(args.out / "savedmodel"), signatures={"serving_default": m.__call__})
+    tf.saved_model.save(m, str(args.out / "savedmodel"),
+                        signatures={"serving_default": m.__call__, "recording": m.recording})
     to_tflite(m, args.out / "DanishBirdNET.tflite")
     shutil.copy(BIRDNET / "labels/en_uk.txt", args.out / "DanishBirdNET_Labels.txt")
     shutil.copy(BIRDNET / "labels/da.txt", args.out / "DanishBirdNET_Labels_da.txt")
@@ -91,7 +92,7 @@ def cmd_check(args) -> int:
     m = tf.saved_model.load(str(args.export / "savedmodel"))
     alpha = json.loads((args.export / "export.json").read_text())["alpha"]
 
-    names, true, raw_max, fused_max, parity = [], [], [], [], []
+    names, true, raw_max, fused_max, rec_fused, parity = [], [], [], [], [], []
     for shard in sorted((B / "data/birdset/DKX/DKX").glob("*.tar.gz")):
         with tarfile.open(shard) as tar:
             for mem in tar:
@@ -114,11 +115,12 @@ def cmd_check(args) -> int:
                 names.append(mem.name); true.append(t)
                 raw_max.append(s_max)
                 fused_max.append((parts["log_s"] + alpha * parts["log_q"]).max(0))
+                rec_fused.append(m.recording(tf.constant(chunks(x)))["logits"].numpy()[0])
                 if mem.name in cached:
                     c = cached[mem.name]
                     parity.append((float(np.abs(s_max - c).max()), int(s_max.argmax() == c.argmax())))
     true = np.array(true)
-    raw_max, fused_max = np.stack(raw_max), np.stack(fused_max)
+    raw_max, fused_max, rec_fused = np.stack(raw_max), np.stack(fused_max), np.stack(rec_fused)
     bs = RecordistBootstrap(meta.loc[names, "recordist"].to_numpy())
     raw_t1, fused_t1 = top1_hits(raw_max, true), top1_hits(fused_max, true)
     lo, hi = bs.ci(fused_t1 - raw_t1)
@@ -128,6 +130,10 @@ def cmd_check(args) -> int:
           f"median max|diff| {np.median(par[:, 0]):.4f}")
     print(f"chunk-level (3 s, max over chunks): raw BirdNET top-1 {raw_t1.mean():.3f}; "
           f"fused top-1 {fused_t1.mean():.3f}; diff {(fused_t1 - raw_t1).mean():+.3f} [{lo:+.3f}, {hi:+.3f}]")
+    rec_t1 = top1_hits(rec_fused, true)
+    lo, hi = bs.ci(rec_t1 - raw_t1)
+    print(f"recording-level signature (scores max, embeddings mean): fused top-1 {rec_t1.mean():.3f}; "
+          f"diff vs raw {(rec_t1 - raw_t1).mean():+.3f} [{lo:+.3f}, {hi:+.3f}]")
 
     interp = tf.lite.Interpreter(model_path=str(args.export / "DanishBirdNET.tflite"))
     interp.allocate_tensors()

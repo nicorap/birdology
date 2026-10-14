@@ -6,9 +6,14 @@ Output ``logits`` (n, 6522) is on BirdNET's full label axis, chosen so that
     sigmoid(logits) = s * q**alpha
 
 where s is BirdNET's score and q the head's probability (``floor_q`` for species
-the head never saw). BirdNET-Analyzer applies a sigmoid to a custom classifier's
-output, so thresholds keep their usual meaning, and the model is a drop-in
-replacement for BirdNET's own: same inputs, same labels file, same species.
+the head never saw). ``__call__`` scores each 3 s chunk on its own (what
+BirdNET-Analyzer does); ``recording`` takes all chunks of one recording and pools
+them the way the head was trained (scores max, embeddings mean), which is the
+setting the head's DKX numbers were measured in.
+
+BirdNET-Analyzer applies a sigmoid to a custom classifier's output, so
+thresholds keep their usual meaning, and the model is a drop-in replacement for
+BirdNET's own: same inputs, same labels file, same species.
 
 Needs TensorFlow (the fleet's tf.sif); import it only there.
 """
@@ -60,6 +65,22 @@ class DanishBirdNET(tf.Module):
         log_s, log_q = self._parts(inputs)
         log_p = tf.minimum(log_s + self.alpha * log_q, -1e-6)
         return {"logits": log_p - tf.math.log(-tf.math.expm1(log_p))}     # logit(p) = log p - log(1 - p)
+
+    @tf.function(input_signature=[tf.TensorSpec([None, CHUNK], tf.float32, name="inputs")])
+    def recording(self, inputs):
+        """All chunks of ONE recording -> (1, n_axis) logits, pooled the way the head
+        was trained: BirdNET scores max over chunks, embeddings mean over chunks."""
+        s = self._basic(inputs=inputs)["scores"]
+        s = tf.sigmoid(s) if self.scores_are_logits else s
+        log_s = tf.math.log(tf.clip_by_value(tf.reduce_max(s, axis=0, keepdims=True), 1e-12, 1.0))
+        e = tf.reduce_mean(self._embed(inputs=inputs)["embeddings"], axis=0, keepdims=True)
+        h = tf.matmul((e - self.mu) / self.sd, self.W1) + self.b1
+        if self.mlp:
+            h = tf.matmul(tf.nn.gelu(h, approximate=False), self.W2) + self.b2
+        log_q_head = tf.maximum(tf.nn.log_softmax(h, axis=1), self.log_floor)
+        log_q = tf.matmul(log_q_head, self.scatter) + (1.0 - self.seen) * self.log_floor
+        log_p = tf.minimum(log_s + self.alpha * log_q, -1e-6)
+        return {"logits": log_p - tf.math.log(-tf.math.expm1(log_p))}
 
     @tf.function(input_signature=[tf.TensorSpec([None, CHUNK], tf.float32, name="inputs")])
     def parts(self, inputs):
