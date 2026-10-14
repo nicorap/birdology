@@ -59,6 +59,9 @@ def main(argv=None) -> int:
         shutil.copy(src_dir / f, out / f)
     am = cfg["audioModel"]
     am["name"] = f"{am['name']} + Danish head"
+    # the app caches the extracted model as <file>_v<version>: a new head under
+    # the same file name needs a new version, or phones keep the old one
+    am["version"] = f"{am['version']}-dk.{rel(args.head).parent.name}"
     am["description"] = (f"{am['description']} With a Danish classifier head (birdology Phase D; "
                          f"{len(head.classes)} species, alpha {head.alpha}, fusion {args.fusion}, "
                          f"offset {float(arrays['offset']):.3f}).")
