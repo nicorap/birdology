@@ -148,3 +148,33 @@ class DanishHead:
         return cls(model=model, kind=ck["kind"], classes=np.asarray(ck["classes"]), n_axis=int(n_axis),
                    mu=ck["mu"], sd=ck["sd"], alpha=float(ck["alpha"]), floor_q=float(ck["floor_q"]),
                    remap=dict(ck.get("remap", {})), meta=dict(ck.get("meta", {})))
+
+
+def head_arrays(head: DanishHead) -> dict[str, np.ndarray]:
+    """The head as plain arrays (for the TensorFlow export, which has no torch)."""
+    sd = {k: v.detach().cpu().numpy() for k, v in head.model.state_dict().items()}
+    if head.kind == "linear":
+        layers = {"W1": sd["weight"].T, "b1": sd["bias"]}
+    else:                                   # Sequential: 0 dropout, 1 linear, 2 gelu, 3 dropout, 4 linear
+        layers = {"W1": sd["1.weight"].T, "b1": sd["1.bias"], "W2": sd["4.weight"].T, "b2": sd["4.bias"]}
+    return {**{k: v.astype(np.float32) for k, v in layers.items()},
+            "mu": np.asarray(head.mu, np.float32), "sd": np.asarray(head.sd, np.float32),
+            "classes": np.asarray(head.classes, np.int64), "n_axis": np.int64(head.n_axis),
+            "alpha": np.float32(head.alpha), "floor_q": np.float32(head.floor_q),
+            "kind": np.array(head.kind)}
+
+
+def arrays_log_q(arrays: dict[str, np.ndarray], E: np.ndarray) -> np.ndarray:
+    """NumPy forward pass of ``head_arrays``: the reference the TF export is checked against."""
+    from scipy.special import erf, log_softmax
+
+    z = (np.asarray(E, np.float32) - arrays["mu"]) / arrays["sd"]
+    h = z @ arrays["W1"] + arrays["b1"]
+    if "W2" in arrays:
+        h = 0.5 * h * (1.0 + erf(h / np.sqrt(2.0)))        # exact GELU, as torch.nn.GELU()
+        h = h @ arrays["W2"] + arrays["b2"]
+    q = log_softmax(h.astype(np.float64), axis=1)
+    floor = np.log(float(arrays["floor_q"]))
+    out = np.full((len(q), int(arrays["n_axis"])), floor)
+    out[:, arrays["classes"]] = np.maximum(q, floor)
+    return out

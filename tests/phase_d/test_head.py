@@ -81,3 +81,16 @@ def test_save_load_round_trip(trained, tmp_path):
 def test_unknown_head_kind_is_refused():
     with pytest.raises(ValueError):
         make_head("transformer", 4, 2)
+
+
+@pytest.mark.parametrize("kind", ["linear", "mlp"])
+def test_numpy_arrays_reproduce_the_torch_head(kind):
+    from birdology.phase_d.head import arrays_log_q, head_arrays
+    torch.manual_seed(0)
+    model = make_head(kind, DIM, len(CLASSES)).eval()
+    X, _ = _blobs(n=20)
+    head = DanishHead(model=model, kind=kind, classes=CLASSES, n_axis=N_AXIS,
+                      mu=X.mean(0), sd=X.std(0) + 1e-6, alpha=0.7, floor_q=1e-4)
+    arrays = head_arrays(head)
+    assert np.allclose(arrays_log_q(arrays, X), head.log_q(X), atol=1e-5)
+    assert str(arrays["kind"]) == kind and int(arrays["n_axis"]) == N_AXIS
