@@ -51,6 +51,9 @@ def main(argv=None) -> int:
     ap.add_argument("--root", type=Path, default=Path("/srv/home/rapnic/birdology"))
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--extra-cache", type=Path, nargs="*", default=[], help="more XCL BirdNET cache dirs (relative to --root or absolute)")
+    ap.add_argument("--noisy-cache", type=Path, nargs="*", default=[],
+                    help="BirdNET caches of the SAME recordings with noise mixed in (phase_d.embed_noisy_cli); "
+                         "added to train as augmentation and to val, so selection sees both conditions")
     ap.add_argument("--prior", default="data/prior/dof_pre2025/prior_dof_r4_full.npz", help="DOF prior whose species define 'recorded in Denmark'")
     ap.add_argument("--min-train", type=int, default=5, help="recordings a species needs to get a head output")
     ap.add_argument("--val-quantile", type=float, default=0.9)
@@ -100,11 +103,23 @@ def main(argv=None) -> int:
     log.info("European XCL: %d labelled recordings (%d val, XC id >= %d); head classes %d (%d recorded in Denmark)",
              len(y), is_val.sum(), val_id, len(classes), danish[classes].sum())
 
-    mu, sd = xc.embeddings[tr].mean(0), xc.embeddings[tr].std(0) + 1e-6
+    E_tr, y_tr = xc.embeddings[tr], y[tr]
+    E_va, S_va, y_va_axis = xc.embeddings[va], xc.scores[va], y[va]
+    if args.noisy_cache:
+        noisy = load_cache([rel(p) for p in args.noisy_cache], keep=xc.filepaths)
+        pos = {f: i for i, f in enumerate(xc.filepaths)}
+        ni = np.array([pos[f] for f in noisy.filepaths])
+        ntr, nva = tr[ni], va[ni]
+        E_tr, y_tr = np.concatenate([E_tr, noisy.embeddings[ntr]]), np.concatenate([y_tr, y[ni][ntr]])
+        E_va = np.concatenate([E_va, noisy.embeddings[nva]])
+        S_va = np.concatenate([S_va, noisy.scores[nva]])
+        y_va_axis = np.concatenate([y_va_axis, y[ni][nva]])
+        log.info("noisy augmentation: +%d train, +%d val rows", ntr.sum(), nva.sum())
+    mu, sd = E_tr.mean(0), E_tr.std(0) + 1e-6
     z = lambda a: torch.from_numpy(((a - mu) / sd).astype(np.float32))  # noqa: E731
-    Xtr, ytr = z(xc.embeddings[tr]), torch.tensor([head_idx[c] for c in y[tr]])
-    Xva, yva = z(xc.embeddings[va]), torch.tensor([head_idx[c] for c in y[va]])
-    Sva, y_va_axis = xc.scores[va].astype(np.float64), y[va]
+    Xtr, ytr = z(E_tr), torch.tensor([head_idx[c] for c in y_tr])
+    Xva, yva = z(E_va), torch.tensor([head_idx[c] for c in y_va_axis])
+    Sva = S_va.astype(np.float64)
     log.info("raw BirdNET top-1 on val: %.3f", (Sva.argmax(1) == y_va_axis).mean())
 
     rows, heads = [], []
@@ -112,7 +127,7 @@ def main(argv=None) -> int:
         res = train_head(Xtr, ytr, Xva, yva, len(classes), cfg)
         head = DanishHead(model=res.model, kind=cfg.kind, classes=classes, n_axis=len(codes), mu=mu, sd=sd,
                           floor_q=args.floor_q, remap=remap)
-        lq = head.log_q(xc.embeddings[va])
+        lq = head.log_q(E_va)
         log.info("%s wd=%g lr=%g: val loss %.3f (epoch %d), head val top-1 %.3f",
                  cfg.kind, cfg.weight_decay, cfg.lr, res.val_loss, res.best_epoch, res.val_top1)
         for a in ALPHAS:
@@ -129,7 +144,8 @@ def main(argv=None) -> int:
     fused.alpha = float(pick.alpha)
     fused.meta = {"val_xc_id_min": val_id, "val_fusion_top1": float(pick.fusion_val_top1), "kind": pick.kind,
                   "weight_decay": float(pick.wd), "lr": float(pick.lr), "min_train": args.min_train,
-                  "n_train": int(tr.sum()), "n_val": int(va.sum())}
+                  "n_train": int(len(y_tr)), "n_val": int(len(y_va_axis)),
+                  "noisy_cache": [str(p) for p in args.noisy_cache]}
     fused.save(args.out / "head.pt")
     log.info("chosen on val: fusion %s wd=%g lr=%g alpha=%g (val top-1 %.3f)",
              pick.kind, pick.wd, pick.lr, pick.alpha, pick.fusion_val_top1)

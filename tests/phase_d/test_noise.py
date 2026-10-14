@@ -108,3 +108,41 @@ def test_mix_shard_writes_decodable_members_with_the_same_names(tmp_path):
         yb, _ = sf.read(io.BytesIO(b.extractfile("XC1.flac").read()), dtype="float32")
     x = _tone(seconds=1.5)
     assert np.corrcoef(ya - x, yb - x)[0, 1] > 0.95
+
+
+def test_noisy_encoder_is_deterministic_per_recording_and_passes_through():
+    from birdology.phase_d.noise import NoisyEncoder
+    seen = []
+    def enc(samples, sr):
+        seen.append(samples.copy())
+        return np.ones(3, np.float32), None
+    class Closable:
+        closed = False
+        def __call__(self, s, sr): return enc(s, sr)
+        def close(self): Closable.closed = True
+    pool = NoisePool({"hum": (_tone(seconds=0.3, f=150.0), SR)})
+    ne = NoisyEncoder(Closable(), pool, snr_range=(5.0, 5.0))
+    x = _tone(seconds=1.0)
+    out = ne(x, SR)
+    assert out[1] is None and out[0].shape == (3,)
+    ne(x, SR)
+    assert np.array_equal(seen[0], seen[1])                       # same audio -> same noise
+    measured = 20 * np.log10(_rms(x) / _rms(seen[0] - x))
+    assert measured == pytest.approx(5.0, abs=0.1)
+    ne.close()
+    assert Closable.closed
+
+
+def test_screened_clips_drops_birdy_noise_and_other_folds(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from birdology.phase_d.noise import screened_clips
+    sci = ["Turdus merula", "Engine"]
+    (tmp_path / "meta.csv").write_text(
+        "filename,fold,target,category\n"
+        "a.wav,1,0,wind\nb.wav,1,0,rain\nc.wav,5,0,engine\n")
+    pq.write_table(pa.table({"filepath": ["a.wav", "b.wav", "c.wav"],
+                             "logits": [[0.1, 0.9], [0.6, 0.0], [0.0, 0.0]]}), tmp_path / "s.parquet")
+    keep, dropped = screened_clips(tmp_path / "meta.csv", tmp_path / "s.parquet", sci, folds=[1], bird_max=0.25)
+    # a.wav: the 0.9 is the non-bird Engine class, so it stays; b.wav hears a blackbird
+    assert keep == ["a.wav"] and [d[0] for d in dropped] == ["b.wav"]

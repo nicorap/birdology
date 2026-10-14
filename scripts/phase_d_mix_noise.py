@@ -18,26 +18,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-import numpy as np
-import pandas as pd
-import pyarrow.parquet as pq
-
-from birdology.phase_d.noise import NoisePool, is_bird_label, mix_shard
-
-
-def bird_free_clips(root: Path, folds: list[int], bird_max: float) -> tuple[list[str], pd.DataFrame]:
-    """ESC clips in ``folds`` whose top BirdNET bird score is at most ``bird_max``."""
-    meta = pd.read_csv(root / "data/noise/ESCN/escn_meta.csv")
-    caches = sorted((root / "data/phase_a/embeddings/ESCN_birdnet").glob("*.parquet"))
-    if not caches:
-        raise SystemExit("no BirdNET scores for the noise clips: run phase_d_noise_pack.py and embed ESCN first")
-    scored = pq.read_table(caches[0], columns=["filepath", "logits"]).to_pandas()
-    sci = [l.strip() for l in open(root / "apps/models/birdnet_labels_raw.txt")]
-    bird = np.array([is_bird_label(s) for s in sci])
-    scored["bird_max"] = [float(np.asarray(v)[bird].max()) for v in scored.logits]
-    meta = meta.merge(scored[["filepath", "bird_max"]], left_on="filename", right_on="filepath")
-    pool = meta[meta.fold.isin(folds)]
-    return pool[pool.bird_max <= bird_max].filename.tolist(), pool[pool.bird_max > bird_max]
+from birdology.phase_d.noise import NoisePool, mix_shard, screened_clips
 
 
 def main(argv=None) -> int:
@@ -52,9 +33,13 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     R = args.root
     src = (args.src if args.src.is_absolute() else R / args.src) / args.shard
-    keep, dropped = bird_free_clips(R, args.folds, args.bird_max)
+    scores = sorted((R / "data/phase_a/embeddings/ESCN_birdnet").glob("*.parquet"))
+    if not scores:
+        raise SystemExit("no BirdNET scores for the noise clips: run phase_d_noise_pack.py and embed ESCN first")
+    sci = [l.strip() for l in open(R / "apps/models/birdnet_labels_raw.txt")]
+    keep, dropped = screened_clips(R / "data/noise/ESCN/escn_meta.csv", scores[0], sci, args.folds, args.bird_max)
     print(f"noise folds {args.folds}: {len(keep)} clips kept, {len(dropped)} dropped for birds "
-          f"{dropped.category.value_counts().to_dict()}")
+          f"{sorted({d[1] for d in dropped})}")
     pool = NoisePool.from_files([R / "data/noise/ESC-50-master/audio" / f for f in keep])
     outs = {float(s): R / f"data/birdset/{args.name}/snr{s:02d}/{args.name}_snr{s:02d}/{args.shard}" for s in args.snrs}
     written, skipped = mix_shard(src, outs, pool)

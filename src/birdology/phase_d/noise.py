@@ -155,3 +155,65 @@ def mix_shard(src: Path, outs: Mapping[float, Path], pool: NoisePool) -> tuple[i
         for t in tars.values():
             t.close()
     return written, skipped
+
+
+def screened_clips(meta_csv: Path, scores_parquet: Path, sci: Sequence[str],
+                   folds: Sequence[int], bird_max: float) -> tuple[list[str], list[tuple[str, str, float]]]:
+    """ESC-50 clips in ``folds`` whose top BirdNET bird score is at most ``bird_max``.
+
+    ``scores_parquet`` is BirdNET's cache of the packed clips (logits = scores on
+    the axis whose scientific names are ``sci``). Returns (kept filenames,
+    [(filename, category, bird score)] dropped). Pure csv + pyarrow, so it also
+    runs inside the TF container, which has no pandas.
+    """
+    import csv
+
+    import pyarrow.parquet as pq
+
+    bird = np.array([is_bird_label(s) for s in sci])
+    t = pq.read_table(scores_parquet, columns=["filepath", "logits"])
+    best = {f: float(np.asarray(v, np.float32)[bird].max())
+            for f, v in zip(t.column("filepath").to_pylist(), t.column("logits").to_pylist())}
+    keep, dropped = [], []
+    with open(meta_csv, newline="") as fh:
+        for row in csv.DictReader(fh):
+            if int(row["fold"]) not in set(folds) or row["filename"] not in best:
+                continue
+            score = best[row["filename"]]
+            if score <= bird_max:
+                keep.append(row["filename"])
+            else:
+                dropped.append((row["filename"], row["category"], score))
+    return sorted(keep), dropped
+
+
+class NoisyEncoder:
+    """Wrap a Phase A encoder so every recording is mixed with noise before encoding.
+
+    The encoder sees only (samples, sr), not the file name, so the noise draw is
+    seeded from the audio itself: the same recording always gets the same noise
+    and SNR. The SNR is drawn uniformly from ``snr_range`` (dB) per recording.
+    """
+
+    def __init__(self, encoder, pool: NoisePool, snr_range: tuple[float, float] = (0.0, 20.0), seed: int = 0):
+        self._encoder = encoder
+        self._pool = pool
+        self._lo, self._hi = snr_range
+        self._seed = seed
+
+    def _rng(self, samples: np.ndarray) -> np.random.Generator:
+        head = np.ascontiguousarray(samples[:48000], dtype=np.float32).tobytes()
+        digest = hashlib.sha1(head + len(samples).to_bytes(8, "little") + self._seed.to_bytes(4, "little")).hexdigest()
+        return np.random.default_rng(int(digest[:12], 16))
+
+    def mix(self, samples: np.ndarray, sr: int) -> np.ndarray:
+        rng = self._rng(samples)
+        snr = rng.uniform(self._lo, self._hi)
+        return mix_at_snr(np.asarray(samples, np.float32), self._pool.bed(len(samples), sr, rng), snr)
+
+    def __call__(self, samples: np.ndarray, sr: int):
+        return self._encoder(self.mix(samples, sr), sr)
+
+    def close(self) -> None:
+        if hasattr(self._encoder, "close"):
+            self._encoder.close()
