@@ -4,7 +4,8 @@
 Reads the clean DKX cache and every noisy copy (DKXN_snrXX_birdnet, built by
 phase_d_mix_noise.py + cluster/phase_d_embed.sbatch), restricted to the
 recordings present in all of them. CIs are recordist-clustered and paired with
-raw BirdNET at the SAME SNR.
+raw BirdNET at the SAME SNR. With several heads, every later head is also
+compared with the first one, paired per recording (written to <out>_heads.csv).
 
     python scripts/phase_d_noise_eval.py --heads data/phase_d/dk_head_v3/head.pt \\
         --out data/phase_d/noise_curve.csv
@@ -57,7 +58,7 @@ def main(argv=None) -> int:
     filt = np.where(danish, 0.0, -np.inf)[None, :]
     print(f"recordings in every set: {len(common)}, recordists {len(bs.recordists)}")
 
-    rows = []
+    rows, head_rows = [], []
     for cond, c in caches.items():
         pos = {f: i for i, f in enumerate(c.filepaths)}
         ix = np.array([pos[f] for f in common])
@@ -76,6 +77,14 @@ def main(argv=None) -> int:
             rows.append(dict(condition=cond, scorer=k, top1=t1.mean(), cmap=cmap(Xf, Y)[0],
                              d_raw=(t1 - base).mean(), d_raw_lo=lo, d_raw_hi=hi,
                              d_filter=(t1 - base_f).mean(), d_filter_lo=lo2, d_filter_hi=hi2))
+        if len(heads) > 1:
+            ref = top1_hits(scorers[f"{heads[0][0]} fusion"], true)
+            for name, _ in heads[1:]:
+                t1 = top1_hits(scorers[f"{name} fusion"], true)
+                lo, hi = bs.ci(t1 - ref)
+                head_rows.append(dict(condition=cond, head=name, vs=heads[0][0], d_top1=(t1 - ref).mean(),
+                                      d_lo=lo, d_hi=hi, gained=int(((t1 == 1) & (ref == 0)).sum()),
+                                      lost=int(((t1 == 0) & (ref == 1)).sum())))
     df = pd.DataFrame(rows)
     pd.set_option("display.width", 220)
     print(df.round(3).to_string(index=False))
@@ -84,6 +93,13 @@ def main(argv=None) -> int:
     args.out.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(args.out, index=False)
     print("wrote", args.out)
+    if head_rows:
+        hf = pd.DataFrame(head_rows)
+        print("\nfusion top-1, head vs head (paired, recordist-clustered CI):")
+        print(hf.round(3).to_string(index=False))
+        hp = args.out.with_name(args.out.stem + "_heads.csv")
+        hf.to_csv(hp, index=False)
+        print("wrote", hp)
     return 0
 
 
