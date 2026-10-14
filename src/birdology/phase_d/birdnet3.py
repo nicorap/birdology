@@ -158,12 +158,22 @@ class Embedder:
         self.input = self.session.get_inputs()[0].name
 
     def __call__(self, W: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """(predictions, embeddings) for a (n, samples) stack of windows."""
+        """(predictions, embeddings) for a (n, samples) stack of windows.
+
+        Each chunk is padded (repeating its last window) up to a power of two:
+        on CUDA, cuDNN searches convolution algorithms for every new input
+        shape, and with one shape per recording length that search was most of
+        the run time (6 windows/s on an H100)."""
         P, E = [], []
         for i in range(0, len(W), self.batch):
-            p, e = self.session.run(["predictions", "embeddings_out"], {self.input: W[i:i + self.batch]})
-            P.append(p)
-            E.append(e)
+            w = W[i:i + self.batch]
+            n = len(w)
+            size = min(self.batch, 1 << (n - 1).bit_length())
+            if size > n:
+                w = np.concatenate([w, np.repeat(w[-1:], size - n, axis=0)])
+            p, e = self.session.run(["predictions", "embeddings_out"], {self.input: w})
+            P.append(p[:n])
+            E.append(e[:n])
         return np.concatenate(P), np.concatenate(E)
 
 

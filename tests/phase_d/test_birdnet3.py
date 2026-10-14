@@ -115,3 +115,23 @@ def test_decode_windows_caps_the_audio_it_reads():
     assert capped.shape == (2, WINDOW)
     # the extra 1 s keeps the resampling filter's edge out of the kept windows
     np.testing.assert_allclose(capped, full[:2], atol=1e-6)
+
+
+def test_embedder_pads_chunks_to_powers_of_two():
+    from birdology.phase_d.birdnet3 import Embedder
+
+    shapes = []
+
+    class Session:
+        def run(self, names, feed):
+            w = feed["input"]
+            shapes.append(len(w))
+            return w[:, :3] * 2, w[:, :2]
+
+    emb = Embedder.__new__(Embedder)
+    emb.session, emb.batch, emb.input = Session(), 8, "input"
+    W = np.arange(11 * 4, dtype=np.float32).reshape(11, 4)
+    p, e = emb(W)
+    assert shapes == [8, 4]                 # 8 + 3 -> padded to 8 + 4
+    np.testing.assert_array_equal(p, W[:, :3] * 2)
+    np.testing.assert_array_equal(e, W[:, :2])
