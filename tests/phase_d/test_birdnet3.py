@@ -86,12 +86,13 @@ def test_iter_window_cache_sorts_and_filters(tmp_path):
 
     from birdology.phase_d.birdnet3 import iter_window_cache
 
-    E = np.arange(8, dtype=np.float32).reshape(4, 2)
-    pq.write_table(pa.table({"filepath": ["b", "a", "b", "a"], "window": pa.array([1, 0, 0, 1], pa.int32()),
+    E = np.arange(10, dtype=np.float32).reshape(5, 2)
+    E[4] = np.nan
+    pq.write_table(pa.table({"filepath": ["b", "a", "b", "a", "a"], "window": pa.array([1, 0, 0, 1, 2], pa.int32()),
                              "embedding": pa.FixedSizeListArray.from_arrays(pa.array(E.ravel()), 2)}),
                    tmp_path / "s.parquet")
     (fp, w, X), = list(iter_window_cache(tmp_path))
-    assert fp.tolist() == ["a", "a", "b", "b"] and w.tolist() == [0, 1, 0, 1]
+    assert fp.tolist() == ["a", "a", "b", "b"] and w.tolist() == [0, 1, 0, 1]     # the NaN row is dropped
     np.testing.assert_array_equal(X[0], E[1])
     (fp, _, _), = list(iter_window_cache(tmp_path, keep={"b"}))
     assert fp.tolist() == ["b", "b"]

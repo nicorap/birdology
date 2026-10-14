@@ -2,7 +2,9 @@
 """Per-window BirdNET+ V3 embeddings of one tar shard (birdology.phase_d.birdnet3).
 
 Writes <out>/<shard stem>.parquet with one row per 3 s window: filepath,
-window (0-based), embedding (1280 float32). Species scores are not stored;
+window (0-based), embedding (1280 float32). All-zero windows (digital
+silence, which some Xeno-canto files are padded with) are skipped: the model
+returns NaN for them. Species scores are not stored;
 birdnet3.scores rebuilds them from the embeddings. Files that fail to decode
 go to <shard stem>.failures.json. With --manifest only its filepaths are
 embedded (tar members are matched exactly, then by basename).
@@ -76,12 +78,16 @@ def main(argv=None) -> int:
             if x.size == 0:
                 raise ValueError("decoded to 0 samples")
             w = windows(resample(x, sr))
-            _, e = embed(w[: args.max_windows] if args.max_windows else w)
+            w = w[: args.max_windows] if args.max_windows else w
+            idx = np.flatnonzero(np.abs(w).max(1) > 0)     # V3 returns NaN for an all-zero window
+            if idx.size == 0:
+                raise ValueError("digital silence: every window is all zeros")
+            _, e = embed(w[idx])
         except Exception as exc:  # one bad file must not lose the shard
             failed[canonical] = f"{type(exc).__name__}: {exc}"
             continue
         F += [canonical] * len(e)
-        I += list(range(len(e)))
+        I += idx.tolist()
         E.append(e.astype(np.float32))
     emb = np.concatenate(E) if E else np.zeros((0, 1280), np.float32)
     table = pa.table({

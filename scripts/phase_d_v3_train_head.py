@@ -106,30 +106,34 @@ def main(argv=None) -> int:
     ids = np.array([xc_id(f) for f in xm.index])
     val_id = int(np.quantile(ids, args.val_quantile))
     xm["val"] = ids >= val_id
-    counts = np.bincount(xm.y[~xm.val], minlength=len(v3_sci))
-    classes = np.flatnonzero(counts >= args.min_train)
-    xm = xm[np.isin(xm.y, classes)]
-    head_idx = np.full(len(v3_sci), -1)
-    head_idx[classes] = np.arange(len(classes))
-    log.info("pool %d recordings (%d val, XC id >= %d); %d head classes", len(xm), xm.val.sum(), val_id, len(classes))
-
     y_of, val_of = xm.y.to_dict(), xm.val.to_dict()
-    Etr, ytr, Eva_k, yva_k, Eva, fva = [], [], [], [], [], []
+
+    # top-k windows of every cached pool recording; every window of the val ones
+    Ek, yk, fk, Eva, fva = [], [], [], [], []
     for fp, _, E in iter_window_cache(rel(args.cache), keep=set(xm.index)):
         y = np.array([y_of[f] for f in fp])
         label_logit = np.einsum("ij,ij->i", E, clf.W[y]) + clf.b[y]
         k = top_windows(fp, label_logit, args.top_k)
+        Ek.append(E[k]); yk.append(y[k]); fk.append(fp[k])
         is_val = np.array([val_of[f] for f in fp])
-        tr_k, va_k = k[~is_val[k]], k[is_val[k]]
-        Etr.append(E[tr_k]); ytr.append(y[tr_k])
-        Eva_k.append(E[va_k]); yva_k.append(y[va_k])
         Eva.append(E[is_val]); fva.append(fp[is_val])
-    Etr, ytr = np.concatenate(Etr), np.concatenate(ytr)
-    Eva_k, yva_k = np.concatenate(Eva_k), np.concatenate(yva_k)
+    Ek, yk, fk = np.concatenate(Ek), np.concatenate(yk), np.concatenate(fk)
     Eva, fva = np.concatenate(Eva), np.concatenate(fva)
-    n_tr_rec = len(set(xm.index[~xm.val]))
-    log.info("windows: %d train (top-%d of %d recordings), %d val top-k, %d val all (%d recordings)",
-             len(ytr), args.top_k, n_tr_rec, len(yva_k), len(Eva), len(set(fva)))
+    k_val = np.array([val_of[f] for f in fk])
+
+    # head classes: species with >= min_train cached TRAINING recordings
+    tr_rec = pd.Series(yk[~k_val], index=fk[~k_val]).groupby(level=0).first()
+    counts = np.bincount(tr_rec.to_numpy(), minlength=len(v3_sci))
+    classes = np.flatnonzero(counts >= args.min_train)
+    head_idx = np.full(len(v3_sci), -1)
+    head_idx[classes] = np.arange(len(classes))
+    tr, va = ~k_val & (head_idx[yk] >= 0), k_val & (head_idx[yk] >= 0)
+    Etr, ytr, Eva_k, yva_k = Ek[tr], yk[tr], Ek[va], yk[va]
+    keep_val = head_idx[np.array([y_of[f] for f in fva])] >= 0
+    Eva, fva = Eva[keep_val], fva[keep_val]
+    n_tr_rec = int(len(set(fk[tr])))
+    log.info("cached pool: %d train recordings (%d windows, top-%d), %d val recordings (%d windows; XC id >= %d); "
+             "%d head classes", n_tr_rec, len(ytr), args.top_k, len(set(fva)), len(Eva), val_id, len(classes))
 
     mu, sd = Etr.mean(0), Etr.std(0) + 1e-6
     z = lambda a: torch.from_numpy(((a - mu) / sd).astype(np.float32))  # noqa: E731

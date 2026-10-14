@@ -160,7 +160,9 @@ def app_week(month: int, day: int) -> int:
 
 def iter_window_cache(d: Path, keep: set[str] | None = None):
     """Yield (filepaths, window index, embeddings) per cached shard of
-    scripts/phase_d_v3_embed.py, rows sorted by (filepath, window)."""
+    scripts/phase_d_v3_embed.py, rows sorted by (filepath, window). Rows with
+    non-finite embeddings (all-zero windows cached before the embedder skipped
+    them) are dropped."""
     import pyarrow.compute as pc
     import pyarrow.parquet as pq
 
@@ -173,7 +175,9 @@ def iter_window_cache(d: Path, keep: set[str] | None = None):
         t = t.sort_by([("filepath", "ascending"), ("window", "ascending")])
         fp = np.asarray(t.column("filepath").to_pylist())
         E = np.asarray(t.column("embedding").combine_chunks().flatten(), np.float32).reshape(t.num_rows, -1)
-        yield fp, np.asarray(t.column("window").to_numpy()), E
+        ok = np.isfinite(E).all(1)
+        if ok.any():
+            yield fp[ok], np.asarray(t.column("window").to_numpy())[ok], E[ok]
 
 
 def pa_strings(values) -> "object":
