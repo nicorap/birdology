@@ -12,7 +12,7 @@
 # apps/venvs/onnx venv (onnxruntime-gpu). Throttle big corpora (%8): each task
 # streams its shard off the home NFS.
 #
-#   export SRC=data/birdset/DKX/DKX OUT=data/phase_d/v3/DKX [MANIFEST=...]
+#   export SRC=data/birdset/DKX/DKX OUT=data/phase_d/v3/DKX [MANIFEST=... MAX_WINDOWS=100]
 #   sbatch --array=0-6 scripts/cluster/phase_d_v3_embed.sbatch
 set -euo pipefail
 : "${SRC:?export SRC}" "${OUT:?export OUT}"
@@ -24,4 +24,4 @@ IDX=${SLURM_ARRAY_TASK_ID:-0}
 mkdir -p "$OUT" 2>/dev/null || [ -d "$OUT" ]
 echo "host=$(hostname -s) task=$IDX shard=$(basename "${SHARDS[$IDX]}") out=$OUT"
 PYTHONPATH=$B/apps/birdology/src exec $B/apps/venvs/onnx/bin/python -P $B/apps/birdology/scripts/phase_d_v3_embed.py \
-    --shard "${SHARDS[$IDX]}" --out "$OUT" ${MANIFEST:+--manifest "$MANIFEST"}
+    --shard "${SHARDS[$IDX]}" --out "$OUT" ${MANIFEST:+--manifest "$MANIFEST"} ${MAX_WINDOWS:+--max-windows "$MAX_WINDOWS"}

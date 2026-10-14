@@ -40,6 +40,8 @@ def main(argv=None) -> int:
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--manifest", type=Path, help="parquet with a filepath column; default: every audio member")
     ap.add_argument("--model", type=Path, default=Path(MODEL))
+    ap.add_argument("--max-windows", type=int, default=0,
+                    help="keep at most this many windows per recording (the first ones); 0 keeps all")
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -73,7 +75,8 @@ def main(argv=None) -> int:
             x, sr = sf.read(io.BytesIO(payload), dtype="float32", always_2d=False)
             if x.size == 0:
                 raise ValueError("decoded to 0 samples")
-            _, e = embed(windows(resample(x, sr)))
+            w = windows(resample(x, sr))
+            _, e = embed(w[: args.max_windows] if args.max_windows else w)
         except Exception as exc:  # one bad file must not lose the shard
             failed[canonical] = f"{type(exc).__name__}: {exc}"
             continue
