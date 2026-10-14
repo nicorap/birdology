@@ -8,8 +8,9 @@ returns NaN for them. Species scores are not stored;
 birdnet3.scores rebuilds them from the embeddings. Files that fail to decode
 go to <shard stem>.failures.json. With --manifest only its filepaths are
 embedded (tar members are matched exactly, then by basename). Decoding and
-resampling run on a thread pool (SLURM_CPUS_PER_TASK - 1 threads): one thread
-was the bottleneck, not the GPU.
+resampling run on a thread pool (SLURM_CPUS_PER_TASK - 1 threads), and
+windows of many recordings go to the model together in fixed batches of 64:
+on CUDA, V3 is ~20x slower when the batch shape changes with every recording.
 
 Needs onnxruntime (apps/venvs/onnx on the fleet):
 
@@ -69,7 +70,7 @@ def main(argv=None) -> int:
         resolved = {m: m for m in members}
 
     workers = max(1, int(os.environ.get("SLURM_CPUS_PER_TASK", "8")) - 1)
-    embed = Embedder(rel(args.model), threads=1)
+    embed = Embedder(rel(args.model), threads=1, fixed=True)
     log.info("%s: %d members to embed; providers %s", shard.name, len(resolved), embed.session.get_providers())
     F, I, E, failed = [], [], [], {}
     t0 = time.time()
@@ -81,16 +82,36 @@ def main(argv=None) -> int:
             raise ValueError("digital silence: every window is all zeros")
         return w[idx], idx
 
+    buf: list[tuple[str, np.ndarray, np.ndarray]] = []
+
+    def flush() -> None:
+        if not buf:
+            return
+        _, e = embed(np.concatenate([w for _, w, _ in buf]))
+        if not np.isfinite(e).all():           # find the culprit rather than lose the batch
+            bad = {c for c, w, _ in buf if not np.isfinite(embed(w)[1]).all()}
+            for c in bad:
+                failed[c] = "ValueError: non-finite embedding"
+        else:
+            bad = set()
+        at = 0
+        for c, w, idx in buf:
+            if c not in bad:
+                F.extend([c] * len(w))
+                I.extend(idx.tolist())
+                E.append(e[at:at + len(w)].astype(np.float32))
+            at += len(w)
+        buf.clear()
+
     def collect(canonical: str, fut) -> None:
         try:
             w, idx = fut.result()
-            _, e = embed(w)
         except Exception as exc:  # one bad file must not lose the shard
             failed[canonical] = f"{type(exc).__name__}: {exc}"
             return
-        F.extend([canonical] * len(e))
-        I.extend(idx.tolist())
-        E.append(e.astype(np.float32))
+        buf.append((canonical, w, idx))
+        if sum(len(x) for _, x, _ in buf) >= 8 * embed.batch:
+            flush()
 
     pending: deque = deque()
     with ThreadPoolExecutor(workers) as pool:
@@ -103,6 +124,7 @@ def main(argv=None) -> int:
                 collect(*pending.popleft())
         while pending:
             collect(*pending.popleft())
+    flush()
     emb = np.concatenate(E) if E else np.zeros((0, 1280), np.float32)
     table = pa.table({
         "filepath": pa.array(F, pa.string()),

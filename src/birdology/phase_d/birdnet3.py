@@ -139,9 +139,11 @@ def classifier_from_onnx(path: Path) -> Classifier:
 class Embedder:
     """onnxruntime session over the app's model; CUDA when available."""
 
-    def __init__(self, path: Path, providers: list[str] | None = None, batch: int = 64, threads: int = 0):
+    def __init__(self, path: Path, providers: list[str] | None = None, batch: int = 64, threads: int = 0,
+                 fixed: bool = False):
         """``threads`` > 0 caps onnxruntime's CPU threads (and stops them spinning):
-        by default it starts one per core of the node, ignoring the Slurm allocation."""
+        by default it starts one per core of the node, ignoring the Slurm allocation.
+        ``fixed`` pads every chunk to ``batch``, so the model sees one input shape."""
         import onnxruntime as ort
 
         if hasattr(ort, "preload_dlls"):     # CUDA/cuDNN from the nvidia-* wheels, if installed
@@ -154,21 +156,22 @@ class Embedder:
             opts.inter_op_num_threads = 1
             opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
         self.session = ort.InferenceSession(str(path), sess_options=opts, providers=providers)
-        self.batch = batch
+        self.batch, self.fixed = batch, fixed
         self.input = self.session.get_inputs()[0].name
 
     def __call__(self, W: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """(predictions, embeddings) for a (n, samples) stack of windows.
 
-        Each chunk is padded (repeating its last window) up to a power of two:
-        on CUDA, cuDNN searches convolution algorithms for every new input
-        shape, and with one shape per recording length that search was most of
-        the run time (6 windows/s on an H100)."""
+        Each chunk is padded (repeating its last window) up to a power of two,
+        or to ``batch`` when ``fixed``: on CUDA, a new input shape is slow, and
+        one shape per recording length ran V3 at 7 windows/s on an H100 against
+        139 windows/s for a fixed batch. Bulk runs should also batch across
+        recordings (scripts/phase_d_v3_embed.py)."""
         P, E = [], []
         for i in range(0, len(W), self.batch):
             w = W[i:i + self.batch]
             n = len(w)
-            size = min(self.batch, 1 << (n - 1).bit_length())
+            size = self.batch if self.fixed else min(self.batch, 1 << (n - 1).bit_length())
             if size > n:
                 w = np.concatenate([w, np.repeat(w[-1:], size - n, axis=0)])
             p, e = self.session.run(["predictions", "embeddings_out"], {self.input: w})

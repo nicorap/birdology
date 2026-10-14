@@ -129,9 +129,26 @@ def test_embedder_pads_chunks_to_powers_of_two():
             return w[:, :3] * 2, w[:, :2]
 
     emb = Embedder.__new__(Embedder)
-    emb.session, emb.batch, emb.input = Session(), 8, "input"
+    emb.session, emb.batch, emb.fixed, emb.input = Session(), 8, False, "input"
     W = np.arange(11 * 4, dtype=np.float32).reshape(11, 4)
     p, e = emb(W)
     assert shapes == [8, 4]                 # 8 + 3 -> padded to 8 + 4
     np.testing.assert_array_equal(p, W[:, :3] * 2)
     np.testing.assert_array_equal(e, W[:, :2])
+
+
+def test_embedder_fixed_pads_every_chunk_to_batch():
+    from birdology.phase_d.birdnet3 import Embedder
+
+    shapes = []
+
+    class Session:
+        def run(self, names, feed):
+            shapes.append(len(feed["input"]))
+            return feed["input"], feed["input"]
+
+    emb = Embedder.__new__(Embedder)
+    emb.session, emb.batch, emb.fixed, emb.input = Session(), 8, True, "input"
+    W = np.arange(11 * 2, dtype=np.float32).reshape(11, 2)
+    np.testing.assert_array_equal(emb(W)[1], W)
+    assert shapes == [8, 8]
