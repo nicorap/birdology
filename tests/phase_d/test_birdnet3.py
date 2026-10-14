@@ -59,7 +59,7 @@ def test_classifier_from_onnx_recovers_the_head(tmp_path):
         [helper.make_tensor_value_info("predictions", TensorProto.FLOAT, [None, 4])],
         [numpy_helper.from_array(W, "W"), numpy_helper.from_array(b, "b"), numpy_helper.from_array(np.float32(2.0), "T")])
     path = tmp_path / "m.onnx"
-    onnx.save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)]), path)
+    onnx.save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)], ir_version=9), path)
     clf = classifier_from_onnx(path)
     assert clf.scale == pytest.approx(1.5)
     E = rng.normal(size=(2, 6)).astype(np.float32)
