@@ -161,7 +161,7 @@ def head_arrays(head: DanishHead) -> dict[str, np.ndarray]:
             "mu": np.asarray(head.mu, np.float32), "sd": np.asarray(head.sd, np.float32),
             "classes": np.asarray(head.classes, np.int64), "n_axis": np.int64(head.n_axis),
             "alpha": np.float32(head.alpha), "floor_q": np.float32(head.floor_q),
-            "kind": np.array(head.kind)}
+            "kind": np.array(head.kind), "offset": np.float32(head.meta.get("app_offset", 0.0))}
 
 
 def arrays_log_q(arrays: dict[str, np.ndarray], E: np.ndarray) -> np.ndarray:

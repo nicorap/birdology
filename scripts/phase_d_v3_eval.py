@@ -10,7 +10,10 @@ with BirdNET 2.4 (raw, + DOF filter, + a Danish head) on the SAME recordings:
                     recording's lat/lon/week
   V3 + DOF filter   species recorded in Denmark (our filter, mapped by name)
   V3 + <head>       with --v3-head: log s + alpha log q per window, then max
-                    (scripts/phase_d_v3_train_head.py), alone and with the geo filter
+                    (scripts/phase_d_v3_train_head.py), alone and with the geo filter.
+                    The app export (``cal`` fusion) ranks exactly like this; its
+                    scores are sigmoid(fused + the head's app_offset), which is
+                    what the app's 0.35 threshold sees.
 
 CIs resample recordists, paired against the app default.
 
@@ -41,15 +44,13 @@ GEO_LABELS = f"{V3}/BirdNET+_Geomodel_V3.0.4_Global_10K-pruned_Labels.txt"
 GEO_THRESHOLD = 0.03                     # the app's default (settings_providers.dart)
 
 
-def pooled_v3(d: Path, clf, head=None, norm: bool = False) -> dict[str, np.ndarray]:
-    """filepath -> max over windows of log V3 score (+ alpha log q of ``head``;
-    with ``norm``, log q minus its per-window max, as the app export does)."""
+def pooled_v3(d: Path, clf, head=None) -> dict[str, np.ndarray]:
+    """filepath -> max over windows of log V3 score (+ alpha log q of ``head``)."""
     out = {}
     for fp, _, E in iter_window_cache(d):
         X = log_scores(1.0 / (1.0 + np.exp(-clf.logits(E))))
         if head is not None:
-            lq = head.log_q(E)
-            X = X + head.alpha * (lq - lq.max(1, keepdims=True) if norm else lq)
+            X = X + head.alpha * head.log_q(E)
         names, M = max_by_recording(fp, X.astype(np.float32))
         out.update(zip(names, M))
     return out
@@ -103,7 +104,8 @@ def main(argv=None) -> int:
         h3 = DanishHead.load(rel(args.v3_head))
         v3h_name = f"V3 + {args.v3_head.parent.name}"
         v3h = {k: pooled_v3(d3, clf, h3) for k, (d3, _) in conds.items()}
-        v3hn = {k: pooled_v3(d3, clf, h3, norm=True) for k, (d3, _) in conds.items()}
+        offset = float(h3.meta.get("app_offset", 0.0))
+        print(f"{v3h_name}: app offset {offset:.3f}")
     b24 = {k: load_cache([d]) for k, (_, d) in conds.items()}
 
     common = set.intersection(*[set(x) for x in v3.values()], *[set(c.filepaths) for c in b24.values()])
@@ -160,11 +162,12 @@ def main(argv=None) -> int:
             H3 = np.stack([v3h[cond][f] for f in common]).astype(np.float64)
             sc[v3h_name] = (H3, true3, Y3)
             sc[f"{v3h_name} + geo filter"] = (np.where(geo_rows, H3, -np.inf), true3, Y3)
-            N3 = np.stack([v3hn[cond][f] for f in common]).astype(np.float64)
-            sc[f"{v3h_name} (app export) + geo filter"] = (np.where(geo_rows, N3, -np.inf), true3, Y3)
-            for name, X in (("V3 raw (app, filter off)", S3), (f"{v3h_name} (app export) + geo filter", N3)):
-                top = np.where(geo_rows, X, -np.inf).max(1) if "geo" in name else X.max(1)
-                print(f"{cond:>6} {name}: top score >= 0.35 (app threshold) in {np.mean(np.exp(top) >= 0.35):.3f} of recordings")
+            app_scores = {"V3 + geo filter (app default)": np.exp(np.where(geo_rows, S3, -np.inf).max(1)),
+                          f"{v3h_name} (app export)": 1 / (1 + np.exp(-(H3.max(1) + offset))),
+                          f"{v3h_name} (app export) + geo filter":
+                              1 / (1 + np.exp(-(np.where(geo_rows, H3, -np.inf).max(1) + offset)))}
+            for name, top in app_scores.items():
+                print(f"{cond:>6} {name}: top score >= 0.35 (app threshold) in {np.mean(top >= 0.35):.3f} of recordings")
         ref = top1_hits(finite(sc["V3 + geo filter (app default)"][0]), true3)
         for name, (X, t, Y) in sc.items():
             Xf = finite(X)

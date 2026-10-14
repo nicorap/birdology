@@ -27,7 +27,7 @@ def _arrays(kind, n_in=6, n_axis=5, seed=1):
     rng = np.random.default_rng(seed)
     a = {"mu": rng.normal(size=n_in).astype(np.float32), "sd": rng.uniform(0.5, 2, n_in).astype(np.float32),
          "classes": np.array([0, 2, 4]), "n_axis": np.int64(n_axis), "alpha": np.float32(1.5),
-         "floor_q": np.float32(1e-3), "kind": np.array(kind)}
+         "floor_q": np.float32(1e-3), "kind": np.array(kind), "offset": np.float32(0.7)}
     if kind == "mlp":
         a |= {"W1": rng.normal(size=(n_in, 4)).astype(np.float32), "b1": rng.normal(size=4).astype(np.float32),
               "W2": rng.normal(size=(4, 3)).astype(np.float32), "b2": rng.normal(size=3).astype(np.float32)}
@@ -37,7 +37,7 @@ def _arrays(kind, n_in=6, n_axis=5, seed=1):
 
 
 @pytest.mark.parametrize("kind", ["mlp", "linear"])
-@pytest.mark.parametrize("fusion", ["raw", "norm"])
+@pytest.mark.parametrize("fusion", ["cal", "raw", "norm"])
 def test_appended_head_matches_numpy_and_keeps_the_app_interface(tmp_path, kind, fusion):
     from birdology.phase_d.export_onnx import append_head, reference
 
@@ -55,7 +55,11 @@ def test_appended_head_matches_numpy_and_keeps_the_app_interface(tmp_path, kind,
     np.testing.assert_allclose(s2, s, rtol=1e-6)
     np.testing.assert_allclose(e2, e, rtol=1e-6)
     np.testing.assert_allclose(p, reference(s, e, arrays, fusion), rtol=1e-4, atol=1e-7)
-    assert (p <= s + 1e-6).all()
+    if fusion == "cal":      # same ranking as raw, only the scale moves
+        raw = reference(s, e, arrays, "raw")
+        np.testing.assert_array_equal(np.argsort(p, 1), np.argsort(raw, 1))
+    else:
+        assert (p <= s + 1e-6).all()
     if fusion == "norm":     # the head's favourite keeps BirdNET's score
         top = np.argmax(reference(np.ones_like(s), e, arrays, fusion), 1)
         np.testing.assert_allclose(p[np.arange(7), top], s[np.arange(7), top], rtol=1e-5)

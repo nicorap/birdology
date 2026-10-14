@@ -38,7 +38,7 @@ def main(argv=None) -> int:
     ap.add_argument("--root", type=Path, default=Path("/srv/home/rapnic/birdology"))
     ap.add_argument("--head", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
-    ap.add_argument("--fusion", choices=FUSIONS, default="norm")
+    ap.add_argument("--fusion", choices=FUSIONS, default="cal")
     ap.add_argument("--name", default="BirdNET+_V3.0-preview3.1_Global_10K-pruned_DK_FP16")
     ap.add_argument("--check-recordings", type=int, default=20)
     args = ap.parse_args(argv)
@@ -60,7 +60,8 @@ def main(argv=None) -> int:
     am = cfg["audioModel"]
     am["name"] = f"{am['name']} + Danish head"
     am["description"] = (f"{am['description']} With a Danish classifier head (birdology Phase D; "
-                         f"{len(head.classes)} species, alpha {head.alpha}, fusion {args.fusion}).")
+                         f"{len(head.classes)} species, alpha {head.alpha}, fusion {args.fusion}, "
+                         f"offset {float(arrays['offset']):.3f}).")
     am["modelFile"] = am["onnx"]["modelFile"] = model_file
     (out / "model_config.json").write_text(json.dumps(cfg, indent=2) + "\n")
 

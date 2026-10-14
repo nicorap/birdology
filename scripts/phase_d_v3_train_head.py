@@ -13,6 +13,11 @@ Selection is done the way the app is scored: per window
     fused = log s_V3 + alpha * log q_head
 then max over the recording's windows, top-1 against the label.
 
+The app shows a species when its score passes a threshold (0.35). The head's
+``meta["app_offset"]`` is the offset b in sigmoid(fused + b) (the ``cal`` app
+export, birdology.phase_d.export_onnx) at which as many validation
+recordings pass the threshold as with V3 alone.
+
     python scripts/phase_d_v3_train_head.py --out data/phase_d/v3_head_v1
 """
 from __future__ import annotations
@@ -44,18 +49,39 @@ GRID = [TrainConfig(kind=k, weight_decay=wd, lr=lr)
         for k in ("linear", "mlp") for wd, lr in ((1e-2, 1e-3), (1e-2, 1e-4))]
 ALPHAS = (0.25, 0.5, 1.0, 2.0)
 CHUNK = 20000          # windows scored at once on validation (x 9789 species)
+APP_THRESHOLD = 0.35   # the app's default confidence threshold
 
 
-def recording_top1(clf, E, fp, true_by_fp, heads, alphas):
-    """Recording-level top-1 of raw V3 and of every (head, alpha) fusion, max over windows."""
+def _chunks(fp: np.ndarray):
+    """(lo, hi) bounds of about CHUNK windows that never split a recording."""
     starts = np.flatnonzero(np.r_[True, fp[1:] != fp[:-1]])
     bounds = [0]
     for s in starts[1:]:
         if s - bounds[-1] >= CHUNK:
             bounds.append(s)
     bounds.append(len(fp))
+    return list(zip(bounds[:-1], bounds[1:]))
+
+
+def app_offset(clf, E, fp, head, threshold: float = APP_THRESHOLD) -> tuple[float, float]:
+    """(offset, pass rate): sigmoid(max fused + offset) >= threshold for the same
+    share of recordings as V3's own top score >= threshold."""
+    top_raw, top_fused = [], []
+    for lo, hi in _chunks(fp):
+        lS = log_scores(1.0 / (1.0 + np.exp(-clf.logits(E[lo:hi]))))
+        f = fp[lo:hi]
+        top_raw.append(max_by_recording(f, lS)[1].max(1))
+        top_fused.append(max_by_recording(f, lS + head.alpha * head.log_q(E[lo:hi]))[1].max(1))
+    top_raw, top_fused = np.concatenate(top_raw), np.concatenate(top_fused)
+    rate = float(np.mean(np.exp(top_raw) >= threshold))
+    logit_t = float(np.log(threshold / (1 - threshold)))
+    return logit_t - float(np.quantile(top_fused, 1 - rate)), rate
+
+
+def recording_top1(clf, E, fp, true_by_fp, heads, alphas):
+    """Recording-level top-1 of raw V3 and of every (head, alpha) fusion, max over windows."""
     hits = {"raw": []} | {(h, a): [] for h in range(len(heads)) for a in alphas}
-    for lo, hi in zip(bounds[:-1], bounds[1:]):
+    for lo, hi in _chunks(fp):
         f = fp[lo:hi]
         t = np.array([true_by_fp[x] for x in max_by_recording(f, np.zeros((hi - lo, 1)))[0]])
         lS = log_scores(1.0 / (1.0 + np.exp(-clf.logits(E[lo:hi]))))
@@ -155,14 +181,17 @@ def main(argv=None) -> int:
     pick = grid.loc[grid.fusion_val_top1.idxmax()]
     head = heads[int(pick.model)]
     head.alpha = float(pick.alpha)
+    offset, pass_rate = app_offset(clf, Eva, fva, head)
     head.meta = {"backbone": "BirdNET+ V3.0-preview3.1 Global 10K-pruned FP16", "unit": "3 s window",
                  "top_k": args.top_k, "val_xc_id_min": val_id, "val_raw_top1": acc["raw"],
                  "val_fusion_top1": float(pick.fusion_val_top1), "kind": pick.kind, "weight_decay": float(pick.wd),
-                 "lr": float(pick.lr), "n_train_windows": int(len(ytr)), "n_train_recordings": n_tr_rec}
+                 "lr": float(pick.lr), "n_train_windows": int(len(ytr)), "n_train_recordings": n_tr_rec,
+                 "app_offset": offset, "app_threshold": APP_THRESHOLD, "val_threshold_pass_rate": pass_rate}
     head.save(out / "head.pt")
     log.info("val grid:\n%s", grid.round(3).to_string(index=False))
-    log.info("chosen: %s wd=%g lr=%g alpha=%g, val top-1 %.3f (raw V3 %.3f); done in %.0f s -> %s",
-             pick.kind, pick.wd, pick.lr, pick.alpha, pick.fusion_val_top1, acc["raw"], time.time() - t0, out)
+    log.info("chosen: %s wd=%g lr=%g alpha=%g, val top-1 %.3f (raw V3 %.3f); app offset %.3f "
+             "(%.3f of val recordings pass %.2f); done in %.0f s -> %s", pick.kind, pick.wd, pick.lr, pick.alpha,
+             pick.fusion_val_top1, acc["raw"], offset, pass_rate, APP_THRESHOLD, time.time() - t0, out)
     (out / "summary.json").write_text(json.dumps(head.meta, indent=2))
     return 0
 

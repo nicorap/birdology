@@ -11,10 +11,15 @@ model's axis (``floor_q`` for species the head never saw):
 
     raw:   predictions = s * q**alpha
     norm:  predictions = s * (q / max_j q_j)**alpha
+    cal:   predictions = sigmoid(log s + alpha log q + offset)
 
-``norm`` ranks species within a window exactly like ``raw`` but leaves the
-head's favourite at BirdNET's own score, so the app's confidence threshold
-(0.35 by default) keeps its meaning instead of every score shrinking by q.
+``cal`` (the default) ranks species and windows exactly like ``raw``, with
+``offset`` (head_arrays: the head's ``meta["app_offset"]``, set by
+scripts/phase_d_v3_train_head.py) chosen so the app's confidence threshold
+(0.35) passes as many recordings as it does for BirdNET alone. ``norm`` also
+keeps the threshold's meaning, by leaving each window's favourite at
+BirdNET's score, but that lets a window where the head is unsure compete
+with a clear call: on DKX it kept 0.858 top-1 of ``raw``'s 0.898.
 
 Needs ``onnx`` (fleet: apps/venvs/onnx, apps/venvs/phase_c).
 """
@@ -24,10 +29,10 @@ from pathlib import Path
 
 import numpy as np
 
-FUSIONS = ("raw", "norm")
+FUSIONS = ("cal", "raw", "norm")
 
 
-def append_head(model_path: Path, arrays: dict, out_path: Path, fusion: str = "norm") -> None:
+def append_head(model_path: Path, arrays: dict, out_path: Path, fusion: str = "cal") -> None:
     import onnx
     from onnx import TensorProto, helper, numpy_helper
 
@@ -59,6 +64,7 @@ def append_head(model_path: Path, arrays: dict, out_path: Path, fusion: str = "n
         "dk_gather": gather, "dk_alpha": np.array(float(arrays["alpha"]), np.float32),
         "dk_eps": np.array(1e-12, np.float32), "dk_zero": np.array(0.0, np.float32),
         "dk_axis1": np.array([1], np.int64),
+        "dk_offset": np.array(float(arrays.get("offset", 0.0)), np.float32),
     }
     mlp = "W2" in arrays
     if mlp:
@@ -96,22 +102,26 @@ def append_head(model_path: Path, arrays: dict, out_path: Path, fusion: str = "n
     nodes += [
         N("Max", ["birdnet_predictions", "dk_eps"], ["dk_sc"]), N("Log", ["dk_sc"], ["dk_ls"]),
         N("Mul", [lq, "dk_alpha"], ["dk_alq"]), N("Add", ["dk_ls", "dk_alq"], ["dk_lp"]),
-        N("Min", ["dk_lp", "dk_zero"], ["dk_lpc"]), N("Exp", ["dk_lpc"], ["predictions"]),
     ]
+    if fusion == "cal":
+        nodes += [N("Add", ["dk_lp", "dk_offset"], ["dk_lpo"]), N("Sigmoid", ["dk_lpo"], ["predictions"])]
+    else:
+        nodes += [N("Min", ["dk_lp", "dk_zero"], ["dk_lpc"]), N("Exp", ["dk_lpc"], ["predictions"])]
     g.node.extend(nodes)
     out = helper.make_tensor_value_info("predictions", TensorProto.FLOAT, ["batch_size", n_axis])
     outputs = [out] + list(g.output)
     del g.output[:]
     g.output.extend(outputs)
     m.metadata_props.append(onnx.StringStringEntryProto(key="danish_head", value=(
-        f"kind={arrays['kind']} classes={k} alpha={float(arrays['alpha'])} floor_q={float(arrays['floor_q'])} fusion={fusion}")))
+        f"kind={arrays['kind']} classes={k} alpha={float(arrays['alpha'])} floor_q={float(arrays['floor_q'])} "
+        f"fusion={fusion} offset={float(arrays.get('offset', 0.0))}")))
     onnx.checker.check_model(m)
     onnx.save(m, str(out_path))
 
 
-def reference(s: np.ndarray, E: np.ndarray, arrays: dict, fusion: str = "norm") -> np.ndarray:
+def reference(s: np.ndarray, E: np.ndarray, arrays: dict, fusion: str = "cal") -> np.ndarray:
     """NumPy version of the appended graph, for parity checks."""
-    from scipy.special import erf, log_softmax
+    from scipy.special import erf, expit, log_softmax
 
     h = (np.asarray(E, np.float64) - arrays["mu"]) / arrays["sd"] @ np.asarray(arrays["W1"], np.float64) + arrays["b1"]
     if "W2" in arrays:
@@ -121,4 +131,7 @@ def reference(s: np.ndarray, E: np.ndarray, arrays: dict, fusion: str = "norm") 
     lq[:, arrays["classes"]] = np.maximum(log_softmax(h, axis=1), floor)
     if fusion == "norm":
         lq = lq - lq.max(1, keepdims=True)
-    return np.exp(np.minimum(np.log(np.maximum(s, 1e-12)) + float(arrays["alpha"]) * lq, 0.0))
+    lp = np.log(np.maximum(s, 1e-12)) + float(arrays["alpha"]) * lq
+    if fusion == "cal":
+        return expit(lp + float(arrays.get("offset", 0.0)))
+    return np.exp(np.minimum(lp, 0.0))
