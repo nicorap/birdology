@@ -338,6 +338,14 @@ paired):
   3. From 20 dB down, the gain over raw BirdNET is significant. At 10 dB and
   0 dB it also beats the Danish species filter; at 5 dB that interval touches
   zero. The head never saw noisy audio.
+- **Training on noise does not add much:** a second head (v5) was trained on the
+  same pool plus a noisy copy of it: every recording re-embedded with ESC-50
+  folds 1–4 mixed in at a random 0–20 dB (`phase_d.embed_noisy_cli`; disjoint
+  from the fold-5 test noise). The search chose the same configuration. Against
+  v4, paired: clean +0.000 [−0.013, +0.011], 20 dB +0.002, 10 dB +0.003,
+  5 dB +0.008 [−0.004, +0.026], 0 dB +0.003 [−0.006, +0.013]. That is at most
+  a handful of recordings, and no interval excludes zero. The robustness comes
+  from the head itself, not from seeing noise in training.
 - **The filter's share:** much of BirdNET's collapse in noise is it drifting to
   non-European species, which the filter alone recovers. The head still adds
   2–5 points on top.
@@ -372,13 +380,15 @@ the head are packaged as one TensorFlow model: a SavedModel, plus a 68 MB TFLite
 file for BirdNET-Analyzer's `--classifier`. It keeps BirdNET's input (3 s chunks
 at 48 kHz) and BirdNET's 6,522 labels, with English and Danish label files. Its
 output satisfies sigmoid(logits) = s · q^α, so detection thresholds keep their
-meaning. Checked on DKX audio (622 recordings):
+meaning. The exported head is v5, the noise-augmented one (`data/phase_d/export_v5`,
+`scripts/cluster/phase_d_export.sbatch`, job 11306); v4's export gave the same
+numbers to within 0.002. Checked on DKX audio (622 recordings):
 
 | check | result |
 |---|---|
 | backbone parity with the cached BirdNET scores | top-1 agreement 0.979 |
-| per chunk, max over chunks (BirdNET-Analyzer's mode) | raw 0.859 → fused 0.873, +0.014 [−0.007, +0.035] |
-| whole recording (scores max, embeddings mean; `recording` signature) | raw 0.859 → fused **0.902**, +0.043 [+0.010, +0.070] |
+| per chunk, max over chunks (BirdNET-Analyzer's mode) | raw 0.859 → fused 0.875, +0.016 [−0.005, +0.033] |
+| whole recording (scores max, embeddings mean; `recording` signature) | raw 0.859 → fused **0.904**, +0.045 [+0.010, +0.070] |
 | TFLite against SavedModel | logits within 0.04, same arg-max |
 
 The head was trained on whole-recording (mean-pooled) embeddings, so it helps
@@ -402,3 +412,6 @@ per-chunk embeddings. **TODO.**
   XCL fill `data/phase_a/XCL_eu_undated_fill_manifest.parquet` and
   `data/phase_a/embeddings/XCL_eu_undated_fill_birdnet`; hard errors
   `data/phase_d/dkx_hard_errors.csv`.
+- Phase D noise-augmented head (job 11181): `data/phase_d/dk_head_v5/`, trained
+  with `data/phase_a/embeddings/XCL_eu_noisy_birdnet` (job 11180); v5 against v4
+  in `data/phase_d/noise_curve_heads.csv` (job 11307).
