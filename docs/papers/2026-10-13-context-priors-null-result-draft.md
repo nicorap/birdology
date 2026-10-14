@@ -395,6 +395,42 @@ The head was trained on whole-recording (mean-pooled) embeddings, so it helps
 most when applied that way. A per-chunk detector would need a head trained on
 per-chunk embeddings. **TODO.**
 
+**The same head on BirdNET+ V3, for the phone app.** BirdNET Live (the iPhone
+and Android app) runs BirdNET+ V3.0-preview3.1 (ONNX, 32 kHz, 9,789 species),
+not 2.4, and scores a file as 3 s windows, max over windows. A head was
+trained on V3's per-window embeddings (`scripts/phase_d_v3_train_head.py`; each
+European training recording contributes its 3 windows where V3 scores the
+label highest; 115,487 recordings, 379 species; linear, α = 2) and scored on DKX
+the app's way (`scripts/phase_d_v3_eval.py`; 618 recordings, eurdot and lirplo
+missing from an axis; CIs resample recordists, paired against the app default):
+
+| top-1 | clean | 20 dB | 10 dB | 5 dB | 0 dB |
+|---|---|---|---|---|---|
+| V3 + geo filter (the app as shipped) | 0.850 | 0.840 | 0.843 | 0.850 | 0.846 |
+| V3 raw | 0.856 | 0.840 | 0.846 | 0.845 | 0.838 |
+| BirdNET 2.4 + head v5 (whole-recording) | 0.900 | 0.900 | 0.898 | 0.883 | 0.874 |
+| **V3 + head** | **0.898** | **0.900** | 0.890 | 0.874 | 0.871 |
+| V3 + head + geo filter | 0.882 | 0.888 | 0.880 | 0.867 | 0.862 |
+
+V3 + head against the app: +0.049 [+0.031, +0.085] clean, +0.060 [+0.039,
++0.083] at 20 dB, +0.047 [+0.033, +0.079] at 10 dB; at 5 and 0 dB the CIs touch
+zero (+0.024 [−0.002, +0.057], +0.024 [−0.005, +0.049]). cmAP 0.813 against
+0.757 for 2.4 + head. V3 alone hardly degrades with noise, so the head's gain
+there is smaller than on 2.4. The geo filter costs 1.6 points on top of the head
+(it drops the true species in 2.8% of recordings). Caveat: V3's training data
+may include 2025 Xeno-canto uploads, i.e. DKX.
+
+Export (`phase_d.export_onnx`, `scripts/phase_d_v3_export.py`): the head is
+appended to the app's ONNX graph with the same input and output names, so the
+app needs only a new `model_config.json`. Its scores are sigmoid(log s + α log q
++ b), which ranks exactly like the fused score above; b = 2.94 is set on
+validation so the app's 0.35 threshold passes as many recordings as V3 alone
+(DKX clean: 0.979 against 0.964 for the app as shipped). A first export that
+instead rescaled each window by its best head probability kept the threshold
+but lost most of the gain (0.858): it lets a window where the head is unsure
+compete with a clear call. Parity on DKX audio: original outputs identical,
+fused scores within 5e-7 of NumPy.
+
 ## 8. Provenance
 
 - Phase B: `/srv/home/rapnic/birdology/data/phase_b/results_eod/*.parquet`
@@ -415,3 +451,6 @@ per-chunk embeddings. **TODO.**
 - Phase D noise-augmented head (job 11181): `data/phase_d/dk_head_v5/`, trained
   with `data/phase_a/embeddings/XCL_eu_noisy_birdnet` (job 11180); v5 against v4
   in `data/phase_d/noise_curve_heads.csv` (job 11307).
+- Phase D V3 (BirdNET Live app): window embeddings `data/phase_d/v3/` (DKX, DKXN,
+  XCL_eu; jobs 11347, 11387); head `data/phase_d/v3_head_v2/` and app files
+  `data/phase_d/app_export_v2/` (job 11485); DKX scores `data/phase_d/v3_dkx_head_v2.csv`.
