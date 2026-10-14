@@ -367,6 +367,24 @@ decision layer on the same embeddings helps.
   reproduces the first, scratch run (clean 0.902, 0 dB 0.873) to within the
   seed difference.
 
+**Export** (`scripts/phase_d_export.py`, `phase_d.export_tf`). BirdNET 2.4 and
+the head are packaged as one TensorFlow model: a SavedModel, plus a 68 MB TFLite
+file for BirdNET-Analyzer's `--classifier`. It keeps BirdNET's input (3 s chunks
+at 48 kHz) and BirdNET's 6,522 labels, with English and Danish label files. Its
+output satisfies sigmoid(logits) = s · q^α, so detection thresholds keep their
+meaning. Checked on DKX audio (622 recordings):
+
+| check | result |
+|---|---|
+| backbone parity with the cached BirdNET scores | top-1 agreement 0.979 |
+| per chunk, max over chunks (BirdNET-Analyzer's mode) | raw 0.859 → fused 0.873, +0.014 [−0.007, +0.035] |
+| whole recording (scores max, embeddings mean; `recording` signature) | raw 0.859 → fused **0.902**, +0.043 [+0.010, +0.070] |
+| TFLite against SavedModel | logits within 0.04, same arg-max |
+
+The head was trained on whole-recording (mean-pooled) embeddings, so it helps
+most when applied that way. A per-chunk detector would need a head trained on
+per-chunk embeddings. **TODO.**
+
 ## 8. Provenance
 
 - Phase B: `/srv/home/rapnic/birdology/data/phase_b/results_eod/*.parquet`
