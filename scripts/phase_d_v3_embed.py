@@ -7,7 +7,9 @@ silence, which some Xeno-canto files are padded with) are skipped: the model
 returns NaN for them. Species scores are not stored;
 birdnet3.scores rebuilds them from the embeddings. Files that fail to decode
 go to <shard stem>.failures.json. With --manifest only its filepaths are
-embedded (tar members are matched exactly, then by basename).
+embedded (tar members are matched exactly, then by basename). Decoding and
+resampling run on a thread pool (SLURM_CPUS_PER_TASK - 1 threads): one thread
+was the bottleneck, not the GPU.
 
 Needs onnxruntime (apps/venvs/onnx on the fleet):
 
@@ -17,19 +19,20 @@ Needs onnxruntime (apps/venvs/onnx on the fleet):
 from __future__ import annotations
 
 import argparse
-import io
 import json
 import logging
+import os
 import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
-import soundfile as sf
 
 from birdology.phase_a.embed import _audio_member_names, _resolve_members, iter_shard_audio
-from birdology.phase_d.birdnet3 import Embedder, resample, windows
+from birdology.phase_d.birdnet3 import Embedder, decode_windows
 
 log = logging.getLogger("phase_d_v3_embed")
 MODEL = "apps/models/birdnet_v3/BirdNET+_V3.0-preview3.1_Global_10K-pruned_FP16.onnx"
@@ -65,30 +68,41 @@ def main(argv=None) -> int:
     else:
         resolved = {m: m for m in members}
 
-    embed = Embedder(rel(args.model))
+    workers = max(1, int(os.environ.get("SLURM_CPUS_PER_TASK", "8")) - 1)
+    embed = Embedder(rel(args.model), threads=1)
     log.info("%s: %d members to embed; providers %s", shard.name, len(resolved), embed.session.get_providers())
     F, I, E, failed = [], [], [], {}
     t0 = time.time()
-    for name, payload in iter_shard_audio(shard):
-        canonical = resolved.get(name)
-        if canonical is None:
-            continue
+
+    def prepare(payload: bytes) -> tuple[np.ndarray, np.ndarray]:
+        w = decode_windows(payload, args.max_windows)
+        idx = np.flatnonzero(np.abs(w).max(1) > 0)     # V3 returns NaN for an all-zero window
+        if idx.size == 0:
+            raise ValueError("digital silence: every window is all zeros")
+        return w[idx], idx
+
+    def collect(canonical: str, fut) -> None:
         try:
-            x, sr = sf.read(io.BytesIO(payload), dtype="float32", always_2d=False)
-            if x.size == 0:
-                raise ValueError("decoded to 0 samples")
-            w = windows(resample(x, sr))
-            w = w[: args.max_windows] if args.max_windows else w
-            idx = np.flatnonzero(np.abs(w).max(1) > 0)     # V3 returns NaN for an all-zero window
-            if idx.size == 0:
-                raise ValueError("digital silence: every window is all zeros")
-            _, e = embed(w[idx])
+            w, idx = fut.result()
+            _, e = embed(w)
         except Exception as exc:  # one bad file must not lose the shard
             failed[canonical] = f"{type(exc).__name__}: {exc}"
-            continue
-        F += [canonical] * len(e)
-        I += idx.tolist()
+            return
+        F.extend([canonical] * len(e))
+        I.extend(idx.tolist())
         E.append(e.astype(np.float32))
+
+    pending: deque = deque()
+    with ThreadPoolExecutor(workers) as pool:
+        for name, payload in iter_shard_audio(shard):
+            canonical = resolved.get(name)
+            if canonical is None:
+                continue
+            pending.append((canonical, pool.submit(prepare, payload)))
+            while len(pending) > 4 * workers:
+                collect(*pending.popleft())
+        while pending:
+            collect(*pending.popleft())
     emb = np.concatenate(E) if E else np.zeros((0, 1280), np.float32)
     table = pa.table({
         "filepath": pa.array(F, pa.string()),

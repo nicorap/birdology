@@ -56,6 +56,25 @@ def windows(x: np.ndarray) -> np.ndarray:
     return x[: n * WINDOW].reshape(n, WINDOW)
 
 
+def decode_windows(payload: bytes, max_windows: int = 0) -> np.ndarray:
+    """``windows(resample(audio))`` of an encoded file, keeping at most
+    ``max_windows`` (0 keeps all). With a cap, only the audio the kept windows
+    need (plus 1 s, so the resampling filter sees no cut) is decoded: long
+    Xeno-canto files would otherwise be decoded in full for a few windows."""
+    import io
+
+    import soundfile as sf
+
+    with sf.SoundFile(io.BytesIO(payload)) as f:
+        sr = f.samplerate
+        frames = -1 if not max_windows else (max_windows * WINDOW_SECONDS + 1) * sr
+        x = f.read(frames, dtype="float32", always_2d=False)
+    if x.size == 0:
+        raise ValueError("decoded to 0 samples")
+    w = windows(resample(x, sr))
+    return w[:max_windows] if max_windows else w
+
+
 @dataclass(frozen=True)
 class Classifier:
     W: np.ndarray        # (n_species, 1280)
@@ -120,14 +139,21 @@ def classifier_from_onnx(path: Path) -> Classifier:
 class Embedder:
     """onnxruntime session over the app's model; CUDA when available."""
 
-    def __init__(self, path: Path, providers: list[str] | None = None, batch: int = 64):
+    def __init__(self, path: Path, providers: list[str] | None = None, batch: int = 64, threads: int = 0):
+        """``threads`` > 0 caps onnxruntime's CPU threads (and stops them spinning):
+        by default it starts one per core of the node, ignoring the Slurm allocation."""
         import onnxruntime as ort
 
         if hasattr(ort, "preload_dlls"):     # CUDA/cuDNN from the nvidia-* wheels, if installed
             ort.preload_dlls()
         avail = ort.get_available_providers()
         providers = providers or [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider") if p in avail]
-        self.session = ort.InferenceSession(str(path), providers=providers)
+        opts = ort.SessionOptions()
+        if threads > 0:
+            opts.intra_op_num_threads = threads
+            opts.inter_op_num_threads = 1
+            opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
+        self.session = ort.InferenceSession(str(path), sess_options=opts, providers=providers)
         self.batch = batch
         self.input = self.session.get_inputs()[0].name
 

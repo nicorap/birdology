@@ -96,3 +96,22 @@ def test_iter_window_cache_sorts_and_filters(tmp_path):
     np.testing.assert_array_equal(X[0], E[1])
     (fp, _, _), = list(iter_window_cache(tmp_path, keep={"b"}))
     assert fp.tolist() == ["b", "b"]
+
+
+def test_decode_windows_caps_the_audio_it_reads():
+    import io
+
+    import soundfile as sf
+
+    from birdology.phase_d.birdnet3 import decode_windows
+
+    sr = 48000
+    x = np.random.default_rng(0).uniform(-0.5, 0.5, sr * 20).astype(np.float32)   # 20 s
+    buf = io.BytesIO()
+    sf.write(buf, x, sr, format="WAV", subtype="FLOAT")
+    full = decode_windows(buf.getvalue())
+    capped = decode_windows(buf.getvalue(), max_windows=2)
+    assert full.shape == (6, WINDOW)
+    assert capped.shape == (2, WINDOW)
+    # the extra 1 s keeps the resampling filter's edge out of the kept windows
+    np.testing.assert_allclose(capped, full[:2], atol=1e-6)
