@@ -9,6 +9,8 @@ with BirdNET 2.4 (raw, + DOF filter, + a Danish head) on the SAME recordings:
   V3 + geo filter   the app's default: geoExclude, geo-model score >= 0.03 at the
                     recording's lat/lon/week
   V3 + DOF filter   species recorded in Denmark (our filter, mapped by name)
+  V3 + <head>       with --v3-head: log s + alpha log q per window, then max
+                    (scripts/phase_d_v3_train_head.py), alone and with the geo filter
 
 CIs resample recordists, paired against the app default.
 
@@ -25,7 +27,7 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 from birdology.phase_b.metrics import cmap
-from birdology.phase_d.birdnet3 import app_week, classifier_from_onnx, load_labels, scores
+from birdology.phase_d.birdnet3 import app_week, classifier_from_onnx, iter_window_cache, load_labels, max_by_recording
 from birdology.phase_d.data import load_cache
 from birdology.phase_d.evaluate import RecordistBootstrap, finite, label_matrix, log_scores, top1_hits
 from birdology.phase_d.taxonomy import remap_code, resolve_remap, species_mask
@@ -39,16 +41,15 @@ GEO_LABELS = f"{V3}/BirdNET+_Geomodel_V3.0.4_Global_10K-pruned_Labels.txt"
 GEO_THRESHOLD = 0.03                     # the app's default (settings_providers.dart)
 
 
-def pooled_v3(d: Path, clf, n_species: int) -> dict[str, np.ndarray]:
-    """filepath -> (n_species,) max over windows of the rebuilt predictions."""
+def pooled_v3(d: Path, clf, head=None) -> dict[str, np.ndarray]:
+    """filepath -> max over windows of log V3 score (+ alpha log q of ``head``)."""
     out = {}
-    for f in sorted(d.glob("*.parquet")):
-        t = pq.read_table(f)
-        fp = np.array(t.column("filepath").to_pylist())
-        E = np.asarray(t.column("embedding").combine_chunks().flatten(), np.float32).reshape(len(fp), -1)
-        S = scores(clf, E).astype(np.float32)
-        for k in np.unique(fp):
-            out[k] = S[fp == k].max(0)
+    for fp, _, E in iter_window_cache(d):
+        X = log_scores(1.0 / (1.0 + np.exp(-clf.logits(E))))
+        if head is not None:
+            X = X + head.alpha * head.log_q(E)
+        names, M = max_by_recording(fp, X.astype(np.float32))
+        out.update(zip(names, M))
     return out
 
 
@@ -66,6 +67,7 @@ def main(argv=None) -> int:
     ap.add_argument("--v3-dir", type=Path, default=Path("data/phase_d/v3"))
     ap.add_argument("--snrs", type=int, nargs="+", default=[20, 10, 5, 0])
     ap.add_argument("--head", type=Path, help="a BirdNET 2.4 Danish head (head.pt) to compare with")
+    ap.add_argument("--v3-head", type=Path, help="a Danish head on V3 windows (phase_d_v3_train_head.py)")
     ap.add_argument("--prior", default="data/prior/dof_pre2025/prior_dof_r4_full.npz")
     ap.add_argument("--out", type=Path, required=True)
     args = ap.parse_args(argv)
@@ -92,7 +94,13 @@ def main(argv=None) -> int:
     emb = R / "data/phase_a/embeddings"
     conds = {"clean": (rel(args.v3_dir) / "DKX", emb / "DKX_focal_birdnet")}
     conds |= {f"{s} dB": (rel(args.v3_dir) / f"DKXN_snr{s:02d}", emb / f"DKXN_snr{s:02d}_birdnet") for s in args.snrs}
-    v3 = {k: pooled_v3(d3, clf, len(v3_sci)) for k, (d3, _) in conds.items()}
+    v3 = {k: pooled_v3(d3, clf) for k, (d3, _) in conds.items()}
+    v3h, v3h_name = None, None
+    if args.v3_head:
+        from birdology.phase_d.head import DanishHead
+        h3 = DanishHead.load(rel(args.v3_head))
+        v3h_name = f"V3 + {args.v3_head.parent.name}"
+        v3h = {k: pooled_v3(d3, clf, h3) for k, (d3, _) in conds.items()}
     b24 = {k: load_cache([d]) for k, (_, d) in conds.items()}
 
     common = set.intersection(*[set(x) for x in v3.values()], *[set(c.filepaths) for c in b24.values()])
@@ -134,7 +142,7 @@ def main(argv=None) -> int:
 
     rows = []
     for cond in conds:
-        S3 = log_scores(np.stack([v3[cond][f] for f in common]).astype(np.float64))
+        S3 = np.stack([v3[cond][f] for f in common]).astype(np.float64)
         pos = {f: i for i, f in enumerate(b24[cond].filepaths)}
         ix = np.array([pos[f] for f in common])
         S24, E24 = b24[cond].scores[ix].astype(np.float64), b24[cond].embeddings[ix]
@@ -145,6 +153,10 @@ def main(argv=None) -> int:
               "BirdNET 2.4 + DOF filter": (log_scores(S24) + filt24, true24, Y24)}
         if head is not None:
             sc[f"BirdNET 2.4 + {args.head.parent.name}"] = (head.fuse(S24, E24), true24, Y24)
+        if v3h is not None:
+            H3 = np.stack([v3h[cond][f] for f in common]).astype(np.float64)
+            sc[v3h_name] = (H3, true3, Y3)
+            sc[f"{v3h_name} + geo filter"] = (np.where(geo_rows, H3, -np.inf), true3, Y3)
         ref = top1_hits(finite(sc["V3 + geo filter (app default)"][0]), true3)
         for name, (X, t, Y) in sc.items():
             Xf = finite(X)

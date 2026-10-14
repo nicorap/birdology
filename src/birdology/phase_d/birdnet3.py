@@ -156,3 +156,44 @@ def load_labels(path: Path) -> list[str]:
 def app_week(month: int, day: int) -> int:
     """The geo-model's week: 4 per month, 1-48 (geo_model.dart)."""
     return (int(month) - 1) * 4 + min(4, (int(day) - 1) // 7 + 1)
+
+
+def iter_window_cache(d: Path, keep: set[str] | None = None):
+    """Yield (filepaths, window index, embeddings) per cached shard of
+    scripts/phase_d_v3_embed.py, rows sorted by (filepath, window)."""
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    for f in sorted(Path(d).glob("*.parquet")):
+        t = pq.read_table(f)
+        if keep is not None:
+            t = t.filter(pc.is_in(t.column("filepath"), value_set=pa_strings(keep)))
+        if t.num_rows == 0:
+            continue
+        t = t.sort_by([("filepath", "ascending"), ("window", "ascending")])
+        fp = np.asarray(t.column("filepath").to_pylist())
+        E = np.asarray(t.column("embedding").combine_chunks().flatten(), np.float32).reshape(t.num_rows, -1)
+        yield fp, np.asarray(t.column("window").to_numpy()), E
+
+
+def pa_strings(values) -> "object":
+    import pyarrow as pa
+
+    return pa.array(sorted(values), pa.string())
+
+
+def max_by_recording(fp: np.ndarray, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Max over each recording's windows; ``fp`` must be grouped (sorted)."""
+    fp = np.asarray(fp)
+    starts = np.flatnonzero(np.r_[True, fp[1:] != fp[:-1]])
+    return fp[starts], np.maximum.reduceat(X, starts, axis=0)
+
+
+def top_windows(fp: np.ndarray, score: np.ndarray, k: int) -> np.ndarray:
+    """Indices of the k highest-``score`` windows of each recording (all of
+    them when it has fewer); ``fp`` must be grouped."""
+    fp = np.asarray(fp)
+    order = np.lexsort((-np.asarray(score), fp))
+    starts = np.flatnonzero(np.r_[True, fp[order][1:] != fp[order][:-1]])
+    rank = np.arange(len(fp)) - np.repeat(starts, np.diff(np.r_[starts, len(fp)]))
+    return np.sort(order[rank < k])

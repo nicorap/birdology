@@ -65,3 +65,33 @@ def test_classifier_from_onnx_recovers_the_head(tmp_path):
     E = rng.normal(size=(2, 6)).astype(np.float32)
     ref = ort.InferenceSession(str(path)).run(None, {"emb": E})[0]
     np.testing.assert_allclose(scores(clf, E), ref, rtol=1e-5)
+
+
+def test_max_by_recording_and_top_windows():
+    from birdology.phase_d.birdnet3 import max_by_recording, top_windows
+
+    fp = np.array(["a", "a", "a", "b", "c", "c"])
+    X = np.array([[1, 5], [3, 0], [2, 2], [7, 7], [0, 1], [4, -1]], float)
+    names, M = max_by_recording(fp, X)
+    assert names.tolist() == ["a", "b", "c"]
+    np.testing.assert_array_equal(M, [[3, 5], [7, 7], [4, 1]])
+    s = np.array([0.1, 0.9, 0.5, 0.2, 0.3, 0.4])
+    assert top_windows(fp, s, 2).tolist() == [1, 2, 3, 4, 5]
+    assert top_windows(fp, s, 1).tolist() == [1, 3, 5]
+
+
+def test_iter_window_cache_sorts_and_filters(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from birdology.phase_d.birdnet3 import iter_window_cache
+
+    E = np.arange(8, dtype=np.float32).reshape(4, 2)
+    pq.write_table(pa.table({"filepath": ["b", "a", "b", "a"], "window": pa.array([1, 0, 0, 1], pa.int32()),
+                             "embedding": pa.FixedSizeListArray.from_arrays(pa.array(E.ravel()), 2)}),
+                   tmp_path / "s.parquet")
+    (fp, w, X), = list(iter_window_cache(tmp_path))
+    assert fp.tolist() == ["a", "a", "b", "b"] and w.tolist() == [0, 1, 0, 1]
+    np.testing.assert_array_equal(X[0], E[1])
+    (fp, _, _), = list(iter_window_cache(tmp_path, keep={"b"}))
+    assert fp.tolist() == ["b", "b"]
