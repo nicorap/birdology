@@ -1,0 +1,158 @@
+"""BirdNET+ V3.0 (the BirdNET Live app's model) as a per-window embedder.
+
+The app ships ``BirdNET+_V3.0-preview3.1_Global_10K-pruned_FP16.onnx``: raw mono
+32 kHz audio of any length in, ``predictions`` (n, 9789 sigmoid scores) and
+``embeddings_out`` (n, 1280) out. File analysis cuts a file into non-overlapping
+3 s windows and scores each one.
+
+The species scores are a linear layer on the embedding (measured by tracing
+the ONNX graph, 2026-10-14):
+
+    predictions = sigmoid(scale * (embedding @ W.T + b))
+
+with ``scale`` = 5 / temperature (five summed copies of the same head, then a
+divide). So a cache only needs the embeddings; :func:`classifier_from_onnx`
+pulls ``W``, ``b`` and ``scale`` out of the model and :func:`scores` rebuilds
+the predictions, which keeps a European XCL pass at ~10 GB instead of ~60.
+
+onnx/onnxruntime are imported lazily: the fleet has them in apps/venvs/onnx,
+the dev Mac and CI do not.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+
+SAMPLE_RATE = 32000
+WINDOW_SECONDS = 3
+WINDOW = WINDOW_SECONDS * SAMPLE_RATE
+
+
+def resample(x: np.ndarray, sr: int) -> np.ndarray:
+    """Mono float32 at 32 kHz (polyphase, as the rest of the project does)."""
+    x = np.asarray(x, np.float32)
+    if x.ndim > 1:
+        x = x.mean(1)
+    if sr == SAMPLE_RATE:
+        return x
+    from scipy.signal import resample_poly
+
+    g = np.gcd(int(sr), SAMPLE_RATE)
+    return resample_poly(x, SAMPLE_RATE // g, int(sr) // g).astype(np.float32)
+
+
+def windows(x: np.ndarray) -> np.ndarray:
+    """(n, WINDOW) non-overlapping 3 s windows of 32 kHz audio, the app's file
+    analysis at its default overlap of 0. A trailing piece shorter than a
+    window is dropped, except that a recording shorter than one window is
+    zero-padded to one (the app refuses such files; a test set should not
+    silently lose them)."""
+    x = np.asarray(x, np.float32)
+    n = len(x) // WINDOW
+    if n == 0:
+        return np.pad(x, (0, WINDOW - len(x)))[None, :]
+    return x[: n * WINDOW].reshape(n, WINDOW)
+
+
+@dataclass(frozen=True)
+class Classifier:
+    W: np.ndarray        # (n_species, 1280)
+    b: np.ndarray        # (n_species,)
+    scale: float
+
+    def logits(self, E: np.ndarray) -> np.ndarray:
+        return self.scale * (np.asarray(E, np.float32) @ self.W.T + self.b)
+
+
+def scores(clf: Classifier, E: np.ndarray) -> np.ndarray:
+    """The model's ``predictions`` rebuilt from cached embeddings."""
+    return 1.0 / (1.0 + np.exp(-clf.logits(E)))
+
+
+def classifier_from_onnx(path: Path) -> Classifier:
+    """Read the final linear layer and its output scale out of the ONNX graph.
+
+    Expects the measured structure: ``predictions`` <- Cast <- Sigmoid <- Div(c)
+    <- k chained Adds of the same Gemm(embeddings, head.weight, head.bias).
+    Anything else raises: a silently wrong head would mis-score every window.
+    """
+    import onnx
+    from onnx import numpy_helper
+
+    g = onnx.load(str(path)).graph
+    prod = {o: n for n in g.node for o in n.output}
+    init = {i.name: numpy_helper.to_array(i) for i in g.initializer}
+    const = {n.output[0]: numpy_helper.to_array(n.attribute[0].t) for n in g.node if n.op_type == "Constant"}
+    value = lambda name: init.get(name, const.get(name))  # noqa: E731
+
+    node = prod["predictions"]
+    while node.op_type in ("Cast", "Identity"):
+        node = prod[node.input[0]]
+    if node.op_type != "Sigmoid":
+        raise ValueError(f"expected Sigmoid before predictions, found {node.op_type}")
+    node = prod[node.input[0]]
+    divisor = 1.0
+    if node.op_type == "Div":
+        divisor = float(np.asarray(value(node.input[1])).reshape(()))
+        node = prod[node.input[0]]
+    gemms, stack = [], [node]
+    while stack:
+        n = stack.pop()
+        if n.op_type == "Add":
+            stack += [prod[i] for i in n.input if i in prod]
+        elif n.op_type == "Gemm":
+            gemms.append(n)
+        elif n.op_type != "Expand":            # zeros_like seed of the sum
+            raise ValueError(f"unexpected {n.op_type} in the classifier sum")
+    if not gemms or len({(g_.input[1], g_.input[2]) for g_ in gemms}) != 1:
+        raise ValueError(f"expected copies of ONE linear head, found {len(gemms)} Gemm nodes")
+    gm = gemms[0]
+    attrs = {a.name: onnx.helper.get_attribute_value(a) for a in gm.attribute}
+    W = np.asarray(value(gm.input[1]), np.float32)
+    if not attrs.get("transB", 0):
+        W = W.T
+    b = np.asarray(value(gm.input[2]), np.float32)
+    return Classifier(W=W, b=b, scale=float(attrs.get("alpha", 1.0)) * len(gemms) / divisor)
+
+
+class Embedder:
+    """onnxruntime session over the app's model; CUDA when available."""
+
+    def __init__(self, path: Path, providers: list[str] | None = None, batch: int = 64):
+        import onnxruntime as ort
+
+        if hasattr(ort, "preload_dlls"):     # CUDA/cuDNN from the nvidia-* wheels, if installed
+            ort.preload_dlls()
+        avail = ort.get_available_providers()
+        providers = providers or [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider") if p in avail]
+        self.session = ort.InferenceSession(str(path), providers=providers)
+        self.batch = batch
+        self.input = self.session.get_inputs()[0].name
+
+    def __call__(self, W: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """(predictions, embeddings) for a (n, samples) stack of windows."""
+        P, E = [], []
+        for i in range(0, len(W), self.batch):
+            p, e = self.session.run(["predictions", "embeddings_out"], {self.input: W[i:i + self.batch]})
+            P.append(p)
+            E.append(e)
+        return np.concatenate(P), np.concatenate(E)
+
+
+def load_labels(path: Path) -> list[str]:
+    """Scientific names in model-output order, from the app's ';' labels CSV."""
+    import csv
+
+    with open(path, newline="") as f:
+        rows = list(csv.DictReader(f, delimiter=";"))
+    rows.sort(key=lambda r: int(r["idx"]))
+    if [int(r["idx"]) for r in rows] != list(range(len(rows))):
+        raise ValueError(f"{path}: idx column is not 0..n-1")
+    return [r["sci_name"] for r in rows]
+
+
+def app_week(month: int, day: int) -> int:
+    """The geo-model's week: 4 per month, 1-48 (geo_model.dart)."""
+    return (int(month) - 1) * 4 + min(4, (int(day) - 1) // 7 + 1)
