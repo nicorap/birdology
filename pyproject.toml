@@ -34,6 +34,7 @@ bench = [
     "scipy>=1.11.0",
     "soundfile>=0.12",
     "librosa>=0.11.0",
+    "pandas>=2.2",
 ]
 phase_c = [
     "torch>=2.4",
