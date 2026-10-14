@@ -1,8 +1,9 @@
 # Spatiotemporal occurrence priors do not improve strong bird-sound classifiers
 
 **Draft, 2026-10-13.** Results from the birdology Phase B and Phase C sweeps on the
-Gimle (corespark) cluster. Every number below comes from the results parquets cited in
-§7. Items marked **TODO** were not verified in the session that wrote this draft.
+Gimle (corespark) cluster. Every number below comes from the results files cited in
+§8. Items marked **TODO** were not verified in the session that wrote this draft.
+§7 (Phase D) was added on 2026-10-14.
 
 ## Abstract
 
@@ -22,7 +23,10 @@ significantly worse (−0.014 to −0.017, p < 0.001). The prior carries real
 information: it beats a spatially scrambled copy of itself by up to 0.1 cmAP. A
 strong acoustic model simply recovers that information on its own, and the spatial
 part of the prior is what hurts. We release the prior, the controls and the
-evaluation harness.
+evaluation harness. What does help on Danish recordings is local training data: a small head on
+BirdNET's own embeddings, trained on European Xeno-canto and fused with BirdNET, lifts
+top-1 from 0.863 to 0.899 on clean recordings and from 0.677 to 0.868 under 0 dB of
+urban noise.
 
 ## 1. Question
 
@@ -175,6 +179,17 @@ arm. **TODO:** check whether NES differs in prior coverage or species compositio
   **TODO:** confirm, by diff, that no model or training code changed.
 - **TODO:** the reproduction gate (frozen checkpoints within ±0.05 of the published
   BirdSet LT row) passed in Phase C planning, but this draft has not re-checked it.
+- **Renamed taxa were dropped from every XCL- and XCM-derived set.** The Xeno-canto
+  date lookup (`birdology.phase_a.xc_dates`) queries by the eBird code's *current*
+  scientific name. Xeno-canto does not use that name for taxa renamed or split
+  since BirdSet was built. Examples: `brnowl` resolves to *Tyto furcata*,
+  `lirplo` to *Thinornis dubius*, and `hergul` has no name at all. Those
+  recordings came back "undated" and were dropped. In the European part of XCL
+  that is 4,380 recordings, almost all Barn Owl, Whimbrel, Little Ringed Plover,
+  Goshawk, Herring Gull, Little Bittern, redpolls, House Martin, Nutcracker and
+  Dotterel. Phases A–C trained and evaluated without those species' XCL/XCM
+  recordings. Phase D (§7) works around it; the date lookup itself is not
+  fixed yet.
 
 ## 6. A dense national prior on local recordings (DKX, preliminary)
 
@@ -243,15 +258,116 @@ classes; offsets fitted on the XCL training cache) gives the same picture:
   available.
 - Perch results are not interpretable yet: it collapses under every rule (raw
   logits plus FLOOR handling). **TODO.**
-- The national filter's cmAP dip comes from 7 recordings whose species are missing
-  from the eBird↔GBIF bridge.
+- The national filter's cmAP dip comes from 9 recordings of species it removes.
+  Seven are Danish rarities absent from DOF's pre-2025 species list: Cetti's
+  Warbler (3), Song Sparrow (2), Rock Ptarmigan (1) and Swinhoe's Snipe (1).
+  The other two are Little Ringed Plover, a common breeder: its old eBird code
+  bridges to a GBIF key, *Thinornis dubius*, that DOF's records do not use. A
+  hard species filter therefore costs exactly the detections birders care
+  most about, and needs a name-level bridge.
 
 **Implication.** For local recognition, use the DOF prior as a species list
 (presence in Denmark) and leave the scores alone. Its fine-grained probabilities
 are better suited to flagging detections that are unusual for a given place and
 week than to rescoring.
 
-## 7. Provenance
+## 7. What does help: a Danish head on BirdNET's embeddings (Phase D)
+
+If the prior cannot add local knowledge, local *training data* might. Phase D
+(`birdology.phase_d`) trains a small classifier head on BirdNET 2.4's frozen
+1024-d embeddings of European Xeno-canto recordings, then fuses it with
+BirdNET:
+
+    fused = log s_BirdNET + α · log q_head
+
+**Data.**
+- **Training pool:** XCL recordings inside a European box (lat 46–71.5°,
+  lon −11–32°).
+- **Excluded:** DKX's 36 recordists, so no recordist appears in both training
+  and test.
+- **Labels:** remapped onto BirdNET's axis by scientific name
+  (`phase_d.taxonomy`). Without the remap, 4,538 European recordings in 42
+  renamed codes were dropped.
+- **Fill:** the 4,380 recordings the XCL manifest had dropped as "undated" (§5)
+  were embedded separately.
+- **Size:** 130,704 labelled recordings. The newest 10% by Xeno-canto ID (ID ≥
+  800,970, about 2023 onward) are held out for validation. Those are the uploads
+  BirdNET 2.4 is least likely to have trained on: on them, raw BirdNET's top-1 is
+  only 0.768.
+- **Head output:** the 389 species with at least five training recordings, 348
+  of them recorded in Denmark. They cover 99.2% of DKX's true species.
+
+**Model selection, on validation only.** The search covered linear and 2-layer
+MLP heads, four weight-decay/learning-rate pairs, and
+α ∈ {0.25, 0.5, 1, 2, 4}. The chosen fusion is an MLP with weight decay 0.01,
+learning rate 1e-4 and α = 1. It reaches validation top-1 0.849, against raw
+BirdNET's 0.768. DKX was scored once, after selection.
+
+**Clean DKX** (622 recordings, 36 recordists; CIs resample recordists and are
+paired):
+
+| scorer | cmAP | top-1 | Δ top-1 vs raw [95% CI] | Δ vs filter [95% CI] |
+|---|---|---|---|---|
+| raw BirdNET | 0.734 | 0.863 | — | −0.011 [−0.023, −0.003] |
+| BirdNET + DOF filter (§6) | 0.716 | 0.875 | +0.011 [+0.003, +0.023] | — |
+| head alone | 0.679 | 0.860 | −0.003 [−0.060, +0.022] | −0.014 [−0.074, +0.014] |
+| **head + BirdNET (fusion)** | **0.753** | **0.899** | +0.035 [−0.007, +0.058] | +0.024 [−0.020, +0.045] |
+
+**Noisy DKX.**
+- **Construction:** the same 622 recordings with bird-free urban and outdoor
+  noise mixed in at fixed signal-to-noise ratios (`phase_d.noise`).
+- **Noise classes:** ESC-50 engine, car horn, train, siren, aircraft,
+  helicopter, church bells, footsteps, wind and rain.
+- **Test noise:** fold 5 only. 12 of its 80 clips were dropped because BirdNET
+  heard a bird in them.
+- **SNR:** measured over the whole recording, so during the calls themselves it
+  is higher than nominal.
+
+| SNR | raw BirdNET | BirdNET + filter | fusion | fusion Δ vs raw [95% CI] | fusion Δ vs filter [95% CI] |
+|---|---|---|---|---|---|
+| clean | 0.863 | 0.875 | 0.899 | +0.035 [−0.007, +0.058] | +0.024 [−0.020, +0.045] |
+| 20 dB | 0.836 | 0.862 | 0.897 | +0.061 [+0.010, +0.086] | +0.035 [−0.008, +0.058] |
+| 10 dB | 0.786 | 0.842 | 0.894 | +0.108 [+0.056, +0.130] | +0.051 [+0.019, +0.074] |
+| 5 dB | 0.741 | 0.838 | 0.873 | +0.132 [+0.066, +0.169] | +0.035 [+0.000, +0.058] |
+| 0 dB | 0.677 | 0.820 | 0.868 | +0.191 [+0.115, +0.224] | +0.048 [+0.014, +0.071] |
+
+**Findings.**
+- **Clean recordings:** the fused head improves BirdNET by 3.5 points top-1 and
+  0.019 cmAP. The top-1 interval still includes zero.
+- **Noise:** BirdNET loses 19 points between clean and 0 dB; the fused head loses
+  3. From 20 dB down, the gain over raw BirdNET is significant. At 10 dB and
+  0 dB it also beats the Danish species filter; at 5 dB that interval touches
+  zero. The head never saw noisy audio.
+- **The filter's share:** much of BirdNET's collapse in noise is it drifting to
+  non-European species, which the filter alone recovers. The head still adds
+  2–5 points on top.
+- **Remaining errors:** Danish rarities the head pulls toward common species
+  (Pallas's Leaf Warbler, Greenish Warbler, Red-rumped Swallow, Black-winged
+  Kite), and Hooded Crow called Carrion Crow. The training pool is western
+  European, where Carrion Crow dominates.
+
+**Where BirdNET fails on DKX** (`scripts/phase_d_dkx_errors.py`). Of raw
+BirdNET's 85 errors:
+- 25 predict a background species that really is in the recording.
+- 25 predict a species never recorded in Denmark.
+- Only 4 confuse two species of the same genus.
+- In 27, the true species is not even in BirdNET's top 5.
+
+Hard errors concentrate where BirdNET is unsure: 76% of recordings whose top
+score is below 0.25 are wrong, against 4.4% when it is above 0.8. Quality grade
+barely matters (A 9.7%, C 10.6%). The failures are recognition failures, not
+fine distinctions between close relatives, which is why a better-trained
+decision layer on the same embeddings helps.
+
+**Caveats.**
+- The noise is synthetic, and DKX is still focal recordings.
+- 36 recordists make the clean-data interval wide.
+- ESC-50 is CC BY-NC.
+- The repo implementation (`scripts/phase_d_train_head.py`, commit de70931)
+  reproduces the first, scratch run (clean 0.902, 0 dB 0.873) to within the
+  seed difference.
+
+## 8. Provenance
 
 - Phase B: `/srv/home/rapnic/birdology/data/phase_b/results_eod/*.parquet`
   (1,255 rows).
@@ -262,3 +378,9 @@ week than to rescoring.
 - Comparison script: `/srv/home/rapnic/birdology/data/phase_c/keep_undated/compare_grids.py`.
 - Design: `docs/superpowers/specs/2026-09-28-context-conditioned-bioacoustics-design.md`
   and `docs/superpowers/specs/2026-10-01-phase-c-gpu-arms-design.md`.
+- Phase D (repo code, commit de70931): head `data/phase_d/dk_head_v4/` (`head.pt`,
+  `val_grid.csv`, `dkx_scores.csv`); noise curve `data/phase_d/noise_curve.csv`;
+  noisy DKX `data/birdset/DKXN/` and `data/phase_a/embeddings/DKXN_snr*_birdnet`;
+  XCL fill `data/phase_a/XCL_eu_undated_fill_manifest.parquet` and
+  `data/phase_a/embeddings/XCL_eu_undated_fill_birdnet`; hard errors
+  `data/phase_d/dkx_hard_errors.csv`.
