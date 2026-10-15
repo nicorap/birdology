@@ -41,3 +41,6 @@ output/.birdology*_oxi/
 # (tests/phase_c/make_ast_goldens.py --birdset-src). Never committed:
 # the committed .npz goldens are the offline ground truth.
 .dev_ast_golden/
+
+# Fleet model weights mirrored locally (rsync from /srv/home/rapnic/birdology/apps/models)
+apps/models/

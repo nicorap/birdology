@@ -221,3 +221,5 @@ The gains are real on Danish focal recordings; the main open question is how the
 | On-device test | `integration_test/danish_model_test.dart` in the fork |
 
 Cluster paths are under `/srv/home/rapnic/birdology` on the Gimle fleet.
+
+The weights are also on the Mac, at the same relative paths in the birdology checkout: every `data/phase_d` head, export and result CSV, plus the base models in `apps/models` (BirdNET 2.4, BirdNET+ V3, label files). That is 99 files, about 650 MB, all matching the fleet by sha256 (2026-10-15). The window embeddings (`data/phase_d/v3`, 5 GB) stay on the fleet only.
