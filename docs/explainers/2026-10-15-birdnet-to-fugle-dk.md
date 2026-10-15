@@ -147,7 +147,7 @@ The head now lives inside the app's own model file, so the app runs it without a
 
 ## 6. The iPhone app: Fugle DK
 
-Fugle DK is a fork of BirdNET Live with the Danish model inside; it builds, runs in the iOS simulator and passes an on-device model test, and is one Apple ID and one cable away from a real iPhone.
+Fugle DK is a fork of BirdNET Live with the Danish model inside; it builds, passes an on-device model test in the iOS simulator, and since 2026-10-15 runs on a real iPhone 15 Pro (iOS 27.2).
 
 **Why a fork.** BirdNET Live (Flutter, MIT licence; model weights Apache-2.0) bundles its model and cannot load another at runtime. Its acceptable-use policy asks derivatives to use their own name, so ours is a renamed fork.
 
@@ -169,11 +169,13 @@ Fugle DK is a fork of BirdNET Live with the Danish model inside; it builds, runs
 
 **Left to do, by you:**
 
-- [ ] Add your Apple Account in Xcode → Settings → Accounts (free Personal Team).
-- [ ] Plug in the iPhone, tap “Trust”, turn on Settings → Privacy & Security → Developer Mode.
-- [ ] After the install, trust the developer under Settings → General → VPN & Device Management.
+- [x] Add your Apple Account in Xcode → Settings → Accounts (free Personal Team).
+- [x] Plug in the iPhone, tap “Trust”, turn on Settings → Privacy & Security → Developer Mode.
+- [x] After the install, trust the developer under Settings → General → VPN & Device Management.
 
-A free Apple ID install expires after 7 days (re-running the install renews it). Sharing with others through TestFlight needs the paid Apple Developer Program ($99 a year) and a new app icon, since the current one is BirdNET's.
+The first device install failed ("This provisioning profile cannot be installed on this device"): the profile had been made before the phone was registered. Building for the phone with `xcodebuild -allowProvisioningUpdates -allowProvisioningDeviceRegistration -destination id=<UDID>` registered it, and `xcrun devicectl device install app` then worked.
+
+A free Apple ID install expires after 7 days (re-running the install renews it). Sharing with others through TestFlight needs the paid Apple Developer Program ($99 a year). The app now has its own icon, a white wagtail on a Dannebrog-red disc (tools/icon/wagtail.py in the fork).
 
 ## 7. Results
 
@@ -199,8 +201,8 @@ The gains are real on Danish focal recordings; the main open question is how the
 
 **Open items**
 
-- [ ] Install on your iPhone (section 6) and try it on real birds.
-- [ ] New app icon before sharing via TestFlight.
+- [ ] Try it on real birds, including live mode on the microphone (installed on the iPhone 2026-10-15, section 6).
+- [x] New app icon before sharing via TestFlight.
 - [ ] Push `main` (blocked as “merge without review”; needs you) and push `feat/birdnet-app`.
 - [ ] Decide where the fork lives on GitHub (not created yet).
 - [ ] Fix the renamed-taxa date lookup; add a name bridge for Little Ringed Plover.
