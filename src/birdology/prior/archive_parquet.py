@@ -161,6 +161,7 @@ def convert_archive(
         "member_crc32": f"{info.CRC:08x}",
         "member_compressed_bytes": info.compress_size,
         "member_bytes": info.file_size,
+        "header": header,
         "columns": keep,
         "absent_columns": absent,
         "rows": rows,
