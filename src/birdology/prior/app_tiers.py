@@ -261,35 +261,73 @@ class CalibrationError(Exception):
     pass
 
 
-def check_tiers(tiers: np.ndarray, species: list[str], su: set[str]) -> dict[str, dict]:
-    """The spec's three checks on tiers [cells, 52, S]."""
+def su_columns(species: list[str], su: set[str]) -> dict[str, int]:
+    """App species name -> column, for every exported species an SU name reaches:
+    exactly, or through a SYNONYMS group or APP_ALIASES (Sylvia nisoria -> Curruca nisoria)."""
+    col = {s: i for i, s in enumerate(species)}
+    groups = {n: g for g in SYNONYMS.values() for n in g}
+    out: dict[str, int] = {}
+    for name in sorted(su):
+        for cand in (name, *groups.get(name, ()), *APP_ALIASES.get(name, ())):
+            if cand in col:
+                out[cand] = col[cand]
+    return out
+
+
+def force_su_rare(tiers: np.ndarray, species: list[str], su: set[str]) -> tuple[np.ndarray, list[str]]:
+    """Copy of tiers with every exported SU species rare in every cell and week,
+    and the sorted app names forced."""
+    cols = su_columns(species, su)
+    out = np.array(tiers, copy=True)
+    for c in cols.values():
+        out[:, :, c] = 0
+    return out, sorted(cols)
+
+
+def check_su_per_species(tiers: np.ndarray, species: list[str], su: set[str]) -> dict:
+    """The SU check per species: the minimum over exported SU species of the share of
+    their cell-weeks that are rare; every one must be entirely rare."""
+    cols = su_columns(species, su)
+    if len(cols) < MIN_SU_SPECIES:
+        raise CalibrationError(f"only {len(cols)} SU species exported; need {MIN_SU_SPECIES}")
+    shares = {n: float((tiers[:, :, c] == 0).mean()) for n, c in cols.items()}
+    low = min(shares, key=shares.get)
+    v = shares[low]
+    return {"value": v, "need": 1.0, "passed": v >= 1.0, "worst": low, "species": len(cols)}
+
+
+def check_calibration(tiers: np.ndarray, species: list[str]) -> dict[str, dict]:
+    """The breeders and swift checks, which drive the thresholds."""
     col = {s: i for i, s in enumerate(species)}
     missing = [s for s in (*BREEDERS, SWIFT) if s not in col]
     if missing:
         raise CalibrationError(f"check species not exported: {missing}")
-    su_cols = [col[s] for s in sorted(su) if s in col]
-    if len(su_cols) < MIN_SU_SPECIES:
-        raise CalibrationError(f"only {len(su_cols)} SU species exported; need {MIN_SU_SPECIES}")
-    rare, common = 0, 4
-    su_share = float((tiers[:, :, su_cols] == rare).mean())
+    common = 4
     breed_share = float((tiers[:, _SUMMER][:, :, [col[s] for s in BREEDERS]] >= common).mean())
-    swift_share = float((tiers[:, _WINTER, col[SWIFT]] == rare).mean())
+    swift_share = float((tiers[:, _WINTER, col[SWIFT]] == 0).mean())
     return {
-        "su_rare": {"value": su_share, "need": 0.95, "passed": su_share >= 0.95},
         "breeders_common": {"value": breed_share, "need": 0.90, "passed": breed_share >= 0.90},
         "swift_winter_rare": {"value": swift_share, "need": 0.90, "passed": swift_share >= 0.90},
     }
 
 
-def calibrate(p: np.ndarray, species: list[str], su: set[str], base=BASE_THRESHOLDS, factors=None):
+def check_tiers(tiers: np.ndarray, species: list[str], su: set[str]) -> dict[str, dict]:
+    """All three checks on tiers [cells, 52, S]; the SU one is per species."""
+    cal = check_calibration(tiers, species)
+    return {"su_rare": check_su_per_species(tiers, species, su), **cal}
+
+
+def calibrate(p: np.ndarray, species: list[str], su: set[str] | None = None, base=BASE_THRESHOLDS,
+              factors=None):
     """(thresholds, factor, checks): the base thresholds scaled by the factor
-    closest to 1 (in log terms) for which every check passes."""
+    closest to 1 (in log terms) for which the breeders and swift checks pass.
+    SU species do not drive thresholds (they are forced rare); `su` is unused."""
     if factors is None:
         factors = [2.0 ** (k / 8) for k in range(-16, 17)]   # 0.25..4, exactly 1.0 and 2.0
     best = None
     for f in sorted(factors, key=lambda f: abs(math.log(f))):
         thresholds = [float(t * f) for t in base]
-        checks = check_tiers(tiers_from_p(p, thresholds), species, su)
+        checks = check_calibration(tiers_from_p(p, thresholds), species)
         if all(c["passed"] for c in checks.values()):
             return thresholds, float(f), checks
         if best is None:

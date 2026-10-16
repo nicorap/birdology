@@ -25,7 +25,8 @@ import pyarrow.parquet as pq
 
 from birdology.phase_d.birdnet3 import load_labels
 from birdology.prior.app_tiers import (
-    BASE_THRESHOLDS, CalibrationError, build_raster, calibrate, match_names, shares_from_counts,
+    BASE_THRESHOLDS, CalibrationError, build_raster, calibrate, check_su_per_species, force_su_rare,
+    match_names, shares_from_counts,
     species_names_from_parquet, synthetic_inputs, tiers_from_p, unmatched_names, write_asset,
 )
 from birdology.prior.su_list import load_su_species
@@ -76,20 +77,27 @@ def main(argv=None) -> int:
     su = load_su_species(args.su)
     try:
         thresholds, factor, checks = calibrate(p, species, su)
+        tiers, forced = force_su_rare(tiers_from_p(p, thresholds), species, su)
+        checks = {"su_rare": check_su_per_species(tiers, species, su), **checks}
     except CalibrationError as e:
         print(f"FAIL: {e}")
         return 1
     for k, c in checks.items():
         print(f"check {k}: {c['value']:.3f} (need {c['need']}) {'ok' if c['passed'] else 'FAIL'}")
-    print(f"thresholds {thresholds} (factor {factor:.3f})")
+    if not all(c["passed"] for c in checks.values()):
+        print("FAIL: a check did not pass")
+        return 1
+    print(f"thresholds {thresholds} (factor {factor:.3f}); {len(forced)} SU species forced rare")
     rmeta, raster = build_raster(cells, h3.get_resolution(cells[0]))
-    side = write_asset(args.out, species=species, cells=cells, tiers=tiers_from_p(p, thresholds),
+    side = write_asset(args.out, species=species, cells=cells, tiers=tiers,
                        raster_meta=rmeta, raster=raster, thresholds=thresholds,
                        calibration={"factor": factor, "checks": checks, "window": args.window,
-                                    "min_records": args.min_records, "source": "DOF counts"},
+                                    "min_records": args.min_records, "source": "DOF counts",
+                                    "su_forced_rare": forced},
                        gbif_doi=args.gbif_doi, licence="CC BY 4.0",
-                       attribution=f"Derived from DOFbasen records, GBIF occurrence download {args.gbif_doi}. "
-                                   "Released under CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/).",
+                       attribution=f"Derived from DOFbasen records (Dansk Ornitologisk Forening), GBIF occurrence "
+                                   f"download https://doi.org/{args.gbif_doi}. Released under CC BY 4.0 "
+                                   "(https://creativecommons.org/licenses/by/4.0/).",
                        export_date=dt.date.today().isoformat())
     sizes = {f.name: f.stat().st_size for f in args.out.iterdir()}
     print(json.dumps({"cells": len(side["cells"]), "species": len(side["species"]), "bytes": sizes}))
