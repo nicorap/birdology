@@ -139,6 +139,22 @@ Pelecanus rufescens). Checks: su_rare 0.972 (need 0.95), breeders_common 0.958
 0.001, 0.003, 0.01] at factor 1.000. 515 cells; dk_tiers.bin 1,977,184 bytes,
 dk_raster.bin 209,066 bytes, dk_tiers.json 34,715 bytes.
 
+### Amendment 2 (2026-10-16, after the final review)
+
+A record share counts reports, not birds: one twitched mega-rarity logged by
+hundreds of observers made its cell-weeks Common or Abundant (Dusky Thrush
+Abundant in Copenhagen in January). The pooled SU check (0.972) hid it; per
+species, 34 of 175 SU species were rare in under 95% of their cell-weeks. The
+user decided:
+
+- SU species are Rare, with the warning, in every Danish cell and week:
+  documentation is required wherever they turn up. The export sets their tiers
+  to rare after thresholding and lists them in the sidecar (`su_forced_rare`).
+- Calibration uses the breeders and swift checks; the SU check is per species
+  on the final tiers (each exported SU species rare in every cell-week).
+- The rare warning names DOFbasen only when the tier comes from the DOF data;
+  outside Denmark it reads "Rare here this week. Worth reporting if confirmed."
+
 ## 2. Lookup (fugle-dk)
 
 - `lib/features/inference/dk_commonness.dart`: `DkCommonness`, loading the
