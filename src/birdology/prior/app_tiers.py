@@ -181,3 +181,51 @@ def synthetic_inputs() -> tuple[list[str], list[str], np.ndarray]:
         p[c, 17:33, 0] = 0.005
         p[c, :, 1] = 1e-5
     return cells, species, p
+
+
+BREEDERS = ("Turdus merula", "Parus major", "Fringilla coelebs")
+SWIFT = "Apus apus"
+_SUMMER = np.arange(13, 30)                                   # weeks 14-30, 0-based
+_WINTER = np.r_[np.arange(0, 10), np.arange(44, 52)]          # weeks 1-10 and 45-52
+MIN_SU_SPECIES = 10
+
+
+class CalibrationError(Exception):
+    pass
+
+
+def check_tiers(tiers: np.ndarray, species: list[str], su: set[str]) -> dict[str, dict]:
+    """The spec's three checks on tiers [cells, 52, S]."""
+    col = {s: i for i, s in enumerate(species)}
+    missing = [s for s in (*BREEDERS, SWIFT) if s not in col]
+    if missing:
+        raise CalibrationError(f"check species not exported: {missing}")
+    su_cols = [col[s] for s in sorted(su) if s in col]
+    if len(su_cols) < MIN_SU_SPECIES:
+        raise CalibrationError(f"only {len(su_cols)} SU species exported; need {MIN_SU_SPECIES}")
+    rare, common = 0, 4
+    su_share = float((tiers[:, :, su_cols] == rare).mean())
+    breed_share = float((tiers[:, _SUMMER][:, :, [col[s] for s in BREEDERS]] >= common).mean())
+    swift_share = float((tiers[:, _WINTER, col[SWIFT]] == rare).mean())
+    return {
+        "su_rare": {"value": su_share, "need": 0.95, "passed": su_share >= 0.95},
+        "breeders_common": {"value": breed_share, "need": 0.90, "passed": breed_share >= 0.90},
+        "swift_winter_rare": {"value": swift_share, "need": 0.90, "passed": swift_share >= 0.90},
+    }
+
+
+def calibrate(p: np.ndarray, species: list[str], su: set[str], base=BASE_THRESHOLDS, factors=None):
+    """(thresholds, factor, checks): the base thresholds scaled by the factor
+    closest to 1 (in log terms) for which every check passes."""
+    if factors is None:
+        factors = [2.0 ** (k / 8) for k in range(-16, 17)]   # 0.25..4, exactly 1.0 and 2.0
+    best = None
+    for f in sorted(factors, key=lambda f: abs(math.log(f))):
+        thresholds = [float(t * f) for t in base]
+        checks = check_tiers(tiers_from_p(p, thresholds), species, su)
+        if all(c["passed"] for c in checks.values()):
+            return thresholds, float(f), checks
+        if best is None:
+            best = checks
+    failed = ", ".join(k for k, c in best.items() if not c["passed"])
+    raise CalibrationError(f"no threshold factor passes; at factor 1 failing: {failed} ({best})")
