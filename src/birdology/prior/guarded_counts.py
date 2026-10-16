@@ -49,12 +49,21 @@ KEYS = ["species_key", "cell", "week"]
 logger = logging.getLogger(__name__)
 
 
-def _cell_strings(cells: pa.Array) -> pa.Array:
-    """64-bit H3 indexes -> their canonical strings, once per distinct cell."""
+#: Rows per chunk of a decoded cell column. A plain ``pa.string`` chunk holds
+#: at most 2 GiB of characters; r5's 157M cells of ~15 characters would not fit
+#: in one ("Negative offsets in binary array", job 12601, as in job 5722).
+CELL_CHUNK_ROWS = 10_000_000
+
+
+def _cell_strings(cells, chunk_rows: int = CELL_CHUNK_ROWS) -> pa.ChunkedArray:
+    """64-bit H3 indexes -> their canonical strings, once per distinct cell,
+    as ``pa.string`` chunks of at most ``chunk_rows`` rows."""
     if isinstance(cells, pa.ChunkedArray):
         cells = cells.combine_chunks()
     d = cells.dictionary_encode()
-    return pa.array([h3.int_to_str(c) for c in d.dictionary.to_pylist()], pa.string()).take(d.indices)
+    values = pa.array([h3.int_to_str(c) for c in d.dictionary.to_pylist()], pa.string())
+    chunks = [values.take(d.indices.slice(i, chunk_rows)) for i in range(0, len(cells), chunk_rows)]
+    return pa.chunked_array(chunks, pa.string())
 
 
 def _count(t: pa.Table) -> pa.Table:

@@ -109,3 +109,16 @@ def test_worker_results_pickle_at_their_own_size(built, tmp_path):
     out = _reduce((str(d),))
     assert out.num_rows == 3 * n
     assert len(pickle.dumps(out)) < 2 * out.nbytes + (1 << 20)
+
+
+def test_cell_strings_are_chunked_below_the_offset_limit():
+    """One pa.string chunk holds at most 2 GiB; r5's cells overflowed it (job 12601)."""
+    import pyarrow as pa
+
+    from birdology.prior.guarded_counts import _cell_strings
+
+    cells = [h3.latlng_to_cell(55 + i / 100, 12, 5) for i in range(23)]
+    out = _cell_strings(pa.array([h3.str_to_int(c) for c in cells], pa.uint64()), chunk_rows=7)
+    assert out.type == pa.string()
+    assert [len(c) for c in out.chunks] == [7, 7, 7, 2]
+    assert out.to_pylist() == cells
