@@ -106,6 +106,31 @@ Three files in `assets/prior/` of the fork:
 Expected size: about 10 MB of tiers before compression, 1-2 MB after; about
 120 KB of raster.
 
+### Amendment (2026-10-16, after the first export run)
+
+The first export failed the seasonality check: Apus apus was rare in only 22.7%
+of winter cell-weeks (need 90%). The DOF prior is smoothed for classification:
+in sparse winter cell-weeks its backoff pulls each species toward the cell's
+year-round share, so the swift's national winter value is a flat 0.17% (Hirundo
+rustica 0.12%, Phylloscopus trochilus 0.06%). The user chose to compute
+commonness from the raw DOF counts instead:
+
+- Input: the guarded DOF counts at r5 (`species_key, cell, week, n`), built from
+  `data/prior/parquet/dof` by `scripts/prior_occurrence_counts.py --no-test-split`
+  (Xeno-canto rows removed).
+- p for (cell, week, species) = the species' share of ALL records in that cell,
+  pooled over weeks w-2..w+2 (circular). When the pooled cell total is under 500
+  records, p is the species' national share for the same pooled weeks.
+- The tiers, thresholds, three checks and asset layout are unchanged. The
+  sidecar's `calibration` records `window` and `min_records`; provenance is the
+  DOF download 10.15468/dl.3j4czw, CC BY 4.0.
+
+The first run also left 29 prior species unmatched, mostly genus moves and
+spellings (Sylvia communis -> Curruca communis, Phylloscopus sibillatrix ->
+sibilatrix, Porzana parva -> Zapornia parva). Name matching gains an explicit
+alias table (`APP_ALIASES`) for these; only aliases present in the app's labels
+are used.
+
 ## 2. Lookup (fugle-dk)
 
 - `lib/features/inference/dk_commonness.dart`: `DkCommonness`, loading the

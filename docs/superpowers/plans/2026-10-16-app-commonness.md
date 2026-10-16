@@ -850,6 +850,226 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ---
 
+### Task 4a: Commonness from raw DOF counts; name aliases (amendment)
+
+Added 2026-10-16 after Task 4's first run failed the swift check (spec section 1, "Amendment"). The user chose raw DOF counts over the smoothed prior.
+
+**Files:**
+- Modify: `src/birdology/prior/app_tiers.py` (add `APP_ALIASES`, use it in `match_names`; add `shares_from_counts`, `unmatched_names`)
+- Modify: `scripts/prior_app_export.py` (replace `--prior` with `--counts`, add `--gbif-doi`, `--window`, `--min-records`)
+- Test: `tests/prior/test_app_tiers_counts.py`
+
+**Interfaces:**
+- Consumes: Task 2/3 API (`match_names`, `calibrate`, `tiers_from_p`, `build_raster`, `write_asset`, `species_names_from_parquet`); the counts parquet written by `scripts/prior_occurrence_counts.py` (columns `species_key` int64, `cell` string, `week` int8 1..52, `n` int64).
+- Produces: `APP_ALIASES: dict[str, tuple[str, ...]]`; `shares_from_counts(counts: pa.Table, species_keys: list[int], window: int = 2, min_records: int = 500) -> tuple[list[str], np.ndarray]` (sorted cells, p `[cells, 52, len(species_keys)]`); `unmatched_names(names: dict[int, str], matched: dict[int, str]) -> list[str]`; CLI flags `--counts PATH --names DIR --labels CSV --su CSV --out DIR [--gbif-doi 10.15468/dl.3j4czw] [--window 2] [--min-records 500]`.
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+"""Commonness shares from raw counts, and the app's name aliases."""
+import sys
+from pathlib import Path
+
+import numpy as np
+import pyarrow as pa
+import pytest
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
+
+from birdology.prior.app_tiers import match_names, shares_from_counts, unmatched_names  # noqa: E402
+
+
+def counts(rows):
+    """rows: (species_key, cell, week, n)."""
+    k, c, w, n = zip(*rows)
+    return pa.table({"species_key": pa.array(k, pa.int64()), "cell": pa.array(c, pa.string()),
+                     "week": pa.array(w, pa.int8()), "n": pa.array(n, pa.int64())})
+
+
+def test_share_of_all_records_in_the_cell_week():
+    t = counts([(1, "a", 10, 60), (2, "a", 10, 40), (9, "a", 10, 100)])   # species 9 is not exported
+    cells, p = shares_from_counts(t, [1, 2], window=0, min_records=1)
+    assert cells == ["a"] and p.shape == (1, 52, 2)
+    assert p[0, 9, 0] == pytest.approx(0.3) and p[0, 9, 1] == pytest.approx(0.2)
+    assert p[0, 10, 0] == 0.0                                            # no records that week
+
+
+def test_pooling_over_neighbouring_weeks_wraps_around_the_year():
+    t = counts([(1, "a", 52, 10), (9, "a", 52, 10), (9, "a", 2, 20)])
+    _, p = shares_from_counts(t, [1], window=1, min_records=1)
+    assert p[0, 0, 0] == pytest.approx(10 / 40)    # week 1 pools weeks 52, 1, 2
+    assert p[0, 2, 0] == pytest.approx(0.0)        # week 3 pools weeks 2, 3, 4
+
+
+def test_sparse_cell_weeks_fall_back_to_the_national_share():
+    t = counts([(1, "a", 10, 90), (9, "a", 10, 10), (1, "b", 10, 0), (9, "b", 10, 5)])
+    cells, p = shares_from_counts(t, [1], window=0, min_records=50)
+    a, b = cells.index("a"), cells.index("b")
+    assert p[a, 9, 0] == pytest.approx(0.9)            # 100 records: local
+    assert p[b, 9, 0] == pytest.approx(90 / 105)       # 5 records: national
+
+
+def test_cells_are_sorted_and_unknown_species_are_zero():
+    t = counts([(9, "z", 1, 5), (9, "a", 1, 5)])
+    cells, p = shares_from_counts(t, [1], window=0, min_records=1)
+    assert cells == ["a", "z"] and not p.any()
+
+
+def test_aliases_cover_genus_moves_and_spellings_exact_still_wins():
+    app = ["Curruca communis", "Phylloscopus sibilatrix", "Zapornia parva", "Turdus merula"]
+    prior = {1: "Sylvia communis", 2: "Phylloscopus sibillatrix", 3: "Porzana parva", 4: "Turdus merula",
+             5: "Struthio camelus"}
+    assert match_names(prior, app) == {1: "Curruca communis", 2: "Phylloscopus sibilatrix",
+                                       3: "Zapornia parva", 4: "Turdus merula"}
+
+
+def test_unmatched_names_lists_only_keys_without_a_match():
+    names = {1: "Thinornis dubius", 2: "Struthio camelus"}
+    assert unmatched_names(names, {1: "Charadrius dubius"}) == ["Struthio camelus"]
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `uv run pytest tests/prior/test_app_tiers_counts.py -v`
+Expected: FAIL with `ImportError: cannot import name 'shares_from_counts'`
+
+- [ ] **Step 3: Implement in `src/birdology/prior/app_tiers.py`**
+
+Add `import pyarrow as pa` and `import pyarrow.compute as pc` to the imports. Add after `SYNONYMS` is imported (module level, before `match_names`):
+
+```python
+#: GBIF/DOF names -> the app's (BirdNET V3) names, for genus moves and
+#: spellings SYNONYMS (keyed by eBird codes) does not cover. Found by the first
+#: export run (29 unmatched). A candidate absent from the app's labels is never used.
+APP_ALIASES: dict[str, tuple[str, ...]] = {
+    "Sylvia communis": ("Curruca communis",),
+    "Sylvia curruca": ("Curruca curruca",),
+    "Sylvia nana": ("Curruca nana",),
+    "Sylvia nisoria": ("Curruca nisoria",),
+    "Sylvia ruppeli": ("Curruca ruppeli",),
+    "Sylvia sarda": ("Curruca sarda",),
+    "Phylloscopus sibillatrix": ("Phylloscopus sibilatrix",),
+    "Porzana parva": ("Zapornia parva",),
+    "Porzana pusilla": ("Zapornia pusilla",),
+    "Phalacrocorax aristotelis": ("Gulosus aristotelis",),
+    "Bubulcus ibis": ("Ardea ibis",),
+    "Oceanodroma leucorhoa": ("Hydrobates leucorhous",),
+    "Puffinus gravis": ("Ardenna gravis",),
+    "Puffinus griseus": ("Ardenna grisea",),
+    "Aquila clanga": ("Clanga clanga",),
+    "Aquila pomarina": ("Clanga pomarina",),
+    "Luscinia calliope": ("Calliope calliope",),
+    "Grus canadensis": ("Antigone canadensis",),
+    "Anthropoides virgo": ("Grus virgo",),
+    "Charadrius alexandrinus": ("Anarhynchus alexandrinus",),
+    "Charadrius asiaticus": ("Anarhynchus asiaticus",),
+    "Charadrius leschenaultii": ("Anarhynchus leschenaultii",),
+    "Charadrius morinellus": ("Eudromias morinellus",),
+    "Gyps rueppellii": ("Gyps rueppelli",),
+}
+```
+
+In `match_names`, change the candidate loop from `for cand in groups.get(name, ()):` to `for cand in (*groups.get(name, ()), *APP_ALIASES.get(name, ())):`.
+
+Add:
+
+```python
+def unmatched_names(names: dict[int, str], matched: dict[int, str]) -> list[str]:
+    """Names of keys that found no app name (a synonym match is a match)."""
+    return sorted(names[k] for k in names if k not in matched)
+
+
+def shares_from_counts(counts: pa.Table, species_keys: list[int], window: int = 2,
+                       min_records: int = 500) -> tuple[list[str], np.ndarray]:
+    """(sorted cells, p [cells, 52, S]): each listed species' share of ALL records
+    in its cell, pooled over weeks w-window..w+window (circular). A cell-week whose
+    pooled total is under min_records takes the national share for those weeks."""
+    cell_arr = counts.column("cell").combine_chunks()
+    cells = sorted(pc.unique(cell_arr).to_pylist())
+    ci = pc.index_in(cell_arr, value_set=pa.array(cells, pa.string())).to_numpy(zero_copy_only=False)
+    wi = counts.column("week").to_numpy().astype(np.int64) - 1
+    n = counts.column("n").to_numpy().astype(np.float64)
+    sk = counts.column("species_key").to_numpy()
+    C, S = len(cells), len(species_keys)
+    T = np.zeros((C, WEEKS))
+    np.add.at(T, (ci, wi), n)
+    col = {k: j for j, k in enumerate(species_keys)}
+    sel = np.isin(sk, np.asarray(species_keys, dtype=sk.dtype))
+    N = np.zeros((C, WEEKS, S))
+    np.add.at(N, (ci[sel], wi[sel], np.array([col[k] for k in sk[sel]], np.int64)), n[sel])
+
+    def pool(a):
+        return sum(np.roll(a, -d, axis=1) for d in range(-window, window + 1))
+
+    Np, Tp = pool(N), pool(T)
+    Nn, Tn = Np.sum(axis=0), Tp.sum(axis=0)
+    national = np.divide(Nn, Tn[:, None], out=np.zeros_like(Nn), where=Tn[:, None] > 0)
+    local = np.divide(Np, Tp[:, :, None], out=np.zeros_like(Np), where=Tp[:, :, None] > 0)
+    return cells, np.where((Tp >= min_records)[:, :, None], local, national[None])
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `uv run pytest tests/prior/test_app_tiers_counts.py tests/prior/test_app_tiers.py tests/prior/test_app_tiers_calibration.py -v`
+Expected: all PASS (6 new + 13 existing).
+
+- [ ] **Step 5: Switch the CLI to counts**
+
+In `scripts/prior_app_export.py`: replace the `--prior` argument with
+`--counts` (Path, the counts parquet), and add `--gbif-doi` (default `"10.15468/dl.3j4czw"`), `--window` (int, default 2), `--min-records` (int, default 500). Update the docstring's real-export example to `--counts data/prior/occurrences/dof/counts_r5.parquet` in place of `--prior ...`. Replace the real-export body (from `meta, grid = load_prior(...)` through `write_asset(...)`) with:
+
+```python
+    counts = pq.read_table(args.counts, columns=["species_key", "cell", "week", "n"])
+    names = species_names_from_parquet(args.names)
+    keys = sorted(set(counts.column("species_key").to_pylist()) & set(names))
+    count_names = {k: names[k] for k in keys}
+    app_species = load_labels(args.labels)
+    matched = match_names(count_names, app_species)
+    species = sorted(matched.values())
+    unmatched = unmatched_names(count_names, matched)
+    print(f"{len(keys)} species in the counts, {len(species)} matched to the app; "
+          f"{len(unmatched)} unmatched: {unmatched}")
+    key_of = {name: key for key, name in matched.items()}
+    cells, p = shares_from_counts(counts, [key_of[s] for s in species], args.window, args.min_records)
+    su = load_su_species(args.su)
+    try:
+        thresholds, factor, checks = calibrate(p, species, su)
+    except CalibrationError as e:
+        print(f"FAIL: {e}")
+        return 1
+    for k, c in checks.items():
+        print(f"check {k}: {c['value']:.3f} (need {c['need']}) {'ok' if c['passed'] else 'FAIL'}")
+    print(f"thresholds {thresholds} (factor {factor:.3f})")
+    rmeta, raster = build_raster(cells, h3.get_resolution(cells[0]))
+    side = write_asset(args.out, species=species, cells=cells, tiers=tiers_from_p(p, thresholds),
+                       raster_meta=rmeta, raster=raster, thresholds=thresholds,
+                       calibration={"factor": factor, "checks": checks, "window": args.window,
+                                    "min_records": args.min_records, "source": "DOF counts"},
+                       gbif_doi=args.gbif_doi, licence="CC BY 4.0",
+                       attribution=f"Derived from DOFbasen records, GBIF occurrence download {args.gbif_doi}. "
+                                   "Released under CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/).",
+                       export_date=dt.date.today().isoformat())
+```
+
+keeping the existing sizes print after it. Update the imports: add `import h3` and `import pyarrow.parquet as pq`; from `app_tiers` import `shares_from_counts` and `unmatched_names` and drop `load_prior` and `p_grid` (no longer used here). `--fixture` stays unchanged.
+
+Run: `PYTHONPATH=src uv run python scripts/prior_app_export.py --fixture /Users/nrapin/Documents/repo/birdology/.superpowers/sdd/fixture-check && uvx pyflakes scripts/prior_app_export.py src/birdology/prior/app_tiers.py`
+Expected: "fixture -> ..." and no pyflakes output. Delete the `fixture-check` directory afterwards.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/birdology/prior/app_tiers.py scripts/prior_app_export.py tests/prior/test_app_tiers_counts.py
+git commit -m "feat(prior): app commonness from raw DOF counts (pooled shares); name aliases
+
+The smoothed prior pulls sparse winter cell-weeks toward the year-round
+share (swift rare in 22.7% of winter cell-weeks, need 90%).
+
+Co-Authored-By: <your model>"
+```
+
+---
+
 ### Task 4: Real export on the fleet
 
 **Files:**
@@ -873,10 +1093,15 @@ tsh ssh --proxy=gimle.forsvaret.ai rapnic@slurm-login-01.infra.faic.dk 'cd /srv/
 ```
 Wait for the job; expected log line `... source rows = ... parquet + ... rejected`.
 
-- [ ] **Step 3: Run the export**
+- [ ] **Step 3: Build the DOF counts, then run the export** (amended 2026-10-16, see Task 4a)
 
 ```bash
-tsh ssh --proxy=gimle.forsvaret.ai rapnic@slurm-login-01.infra.faic.dk 'B=/srv/home/rapnic/birdology; cd $B && srun -p gpu -c 4 --mem=16G -t 00:30:00 env HOME=/tmp PYTHONPATH=$B/apps/birdology/src $B/apps/venvs/hf/bin/python apps/birdology/scripts/prior_app_export.py --prior data/prior/dof/prior_dof_r5_full --names data/prior/parquet/dof --labels apps/models/birdnet_v3/BirdNET+_V3.0-preview3.1_Global_10K-pruned_Labels.csv --su apps/birdology/src/birdology/prior/data/su_species.csv --out data/phase_d/app_commonness'
+tsh ssh --proxy=gimle.forsvaret.ai rapnic@slurm-login-01.infra.faic.dk 'B=/srv/home/rapnic/birdology; cd $B && mkdir -p data/prior/tmp/dof && srun -p gpu -c 16 --mem=64G -t 01:00:00 env HOME=/tmp TMPDIR=$B/data/prior/tmp/dof PYTHONPATH=$B/apps/birdology/src $B/apps/venvs/hf/bin/python apps/birdology/scripts/prior_occurrence_counts.py --parquet data/prior/parquet/dof --occ data/prior/occurrences/dof --resolutions 5 --no-test-split --workers 16; rm -rf data/prior/tmp/dof'
+```
+Expected: an "occurrence table: ... rows read" line and an "r5: ... counts rows" line; `data/prior/occurrences/dof/counts_r5.parquet` exists.
+
+```bash
+tsh ssh --proxy=gimle.forsvaret.ai rapnic@slurm-login-01.infra.faic.dk 'B=/srv/home/rapnic/birdology; cd $B && srun -p gpu -c 4 --mem=32G -t 00:30:00 env HOME=/tmp PYTHONPATH=$B/apps/birdology/src $B/apps/venvs/hf/bin/python apps/birdology/scripts/prior_app_export.py --counts data/prior/occurrences/dof/counts_r5.parquet --names data/prior/parquet/dof --labels apps/models/birdnet_v3/BirdNET+_V3.0-preview3.1_Global_10K-pruned_Labels.csv --su apps/birdology/src/birdology/prior/data/su_species.csv --out data/phase_d/app_commonness'
 ```
 Expected: three `check ... ok` lines, a thresholds line, and sizes with `dk_tiers.bin` under 3 MB. On `FAIL`, stop and report the check values to the user; do not edit thresholds by hand.
 
