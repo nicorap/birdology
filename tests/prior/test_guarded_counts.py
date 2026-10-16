@@ -82,3 +82,30 @@ def test_resolution_mismatch_raises(built):
         guarded_counts(occ, 5, _recordings(3, "x"), "placeholder", workers=1, buckets=2)
     with pytest.raises(ValueError, match="not resolution 4"):
         guarded_counts(occ, 4, [], "placeholder", workers=1, buckets=2)
+
+
+def test_worker_results_pickle_at_their_own_size(built, tmp_path):
+    """A result pickled back to the parent must not carry its parent buffers.
+
+    group_by output is many slices of shared buffers; pickling a slice sends
+    the whole buffer, so an r5 bucket of 68 MB pickled to 5.7 GB and the
+    parent ran out of 256 GB (job 12590). combine_chunks() prevents it.
+    """
+    import pickle
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from birdology.prior.guarded_counts import _reduce
+
+    d = tmp_path / "b000"
+    d.mkdir()
+    n = 400_000
+    for i in range(8):
+        pq.write_table(pa.table({"species_key": pa.array([i % 3] * n, pa.int64()),
+                                 "cell": pa.array(list(range(n)), pa.uint64()),
+                                 "week": pa.array([1] * n, pa.int8()),
+                                 "n": pa.array([1] * n, pa.int64())}), d / f"f{i}.parquet")
+    out = _reduce((str(d),))
+    assert out.num_rows == 3 * n
+    assert len(pickle.dumps(out)) < 2 * out.nbytes + (1 << 20)

@@ -83,7 +83,8 @@ def _map(payload) -> dict:
     aside = t.filter(hit)
     counts = _count(t.filter(pc.invert(hit)).select(KEYS))
     _write_buckets(counts, Path(work), Path(path).stem, buckets)
-    return {"xc_removed": int(pc.sum(xc).as_py() or 0), "rows_after_xc": rows_after_xc, "aside": aside}
+    return {"xc_removed": int(pc.sum(xc).as_py() or 0), "rows_after_xc": rows_after_xc,
+            "aside": aside.combine_chunks()}   # pickled to the parent: see _reduce
 
 
 def _reduce(payload) -> pa.Table:
@@ -95,7 +96,11 @@ def _reduce(payload) -> pa.Table:
                                 "week": pa.array([], pa.int8())}))
     t = pa.concat_tables(pq.read_table(f) for f in files)
     g = t.group_by(KEYS).aggregate([("n", "sum")])
-    return g.rename_columns(KEYS + ["n"])
+    # combine_chunks before the result is pickled back to the parent. group_by
+    # returns its columns as many slices of shared buffers, and pickling sends
+    # each slice's WHOLE buffer: a 68 MB r5 bucket pickled to 5.7 GB, and 64 of
+    # them ran the parent out of 256 GB (jobs 12580/12584/12590, diag 12599).
+    return g.rename_columns(KEYS + ["n"]).combine_chunks()
 
 
 def guarded_counts(
