@@ -7,6 +7,7 @@ build/
 .venv/
 venv/
 data/
+!src/birdology/prior/data/
 output/
 logs/
 .DS_Store
