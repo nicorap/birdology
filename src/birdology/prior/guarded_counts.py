@@ -13,7 +13,8 @@ built without ever holding the occurrences in one process:
   ITSELF, so the contributor guard, its normalisation and its banned / matched
   key counts are the original code's, not a re-implementation;
 * reduce, one bucket per worker, at most ``reducers`` at once: sum the
-  counts. Buckets hold disjoint species, so the buckets' results concatenate without another merge.
+  counts. Buckets hold disjoint species, so the buckets' results
+  concatenate without another merge.
 
 The reduce is a plain group-by over integer keys, the stage where a GPU
 (cuDF) can be compared with the CPU on equal terms.
@@ -21,6 +22,7 @@ The reduce is a plain group-by over integer keys, the stage where a GPU
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import tempfile
@@ -44,6 +46,7 @@ from .leakage import (
 from .occurrence_table import MANIFEST
 
 KEYS = ["species_key", "cell", "week"]
+logger = logging.getLogger(__name__)
 
 
 def _cell_strings(cells: pa.Array) -> pa.Array:
@@ -126,6 +129,8 @@ def guarded_counts(
     workers = workers or os.cpu_count() or 1
     timings = {}
     own_work = work_dir is None
+    # Scratch goes to TMPDIR. On the fleet's DGX nodes /tmp is tmpfs: scratch
+    # there is charged to the job's memory, so point TMPDIR at a disk.
     work = Path(tempfile.mkdtemp(prefix="guarded_counts_")) if own_work else Path(work_dir)
     try:
         for k in range(buckets):
@@ -137,6 +142,7 @@ def guarded_counts(
         with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
             mapped = list(pool.map(_map, tasks))
         timings["map_s"] = round(time.time() - t0, 1)
+        logger.info("r%d: map done in %.0f s (%d files)", resolution, timings["map_s"], len(tasks))
 
         t0 = time.time()
         aside = pa.concat_tables([m["aside"] for m in mapped]) if mapped else None
@@ -155,6 +161,7 @@ def guarded_counts(
         else:
             removed, banned_count, matched_count = 0, len(banned), 0
         timings["contributor_guard_s"] = round(time.time() - t0, 1)
+        logger.info("r%d: contributor guard done; reducing %d buckets", resolution, buckets)
 
         t0 = time.time()
         # Reducer memory is the bucket's share of the partial counts, all held at
@@ -162,6 +169,7 @@ def guarded_counts(
         with ProcessPoolExecutor(max_workers=min(workers, buckets, reducers), mp_context=ctx) as pool:
             reduced = list(pool.map(_reduce, [(str(work / f"b{k:03d}"),) for k in range(buckets)]))
         counts = pa.concat_tables(reduced)
+        logger.info("r%d: reduce done, %d counts rows", resolution, counts.num_rows)
         timings["reduce_s"] = round(time.time() - t0, 1)
     finally:
         if own_work:
