@@ -131,6 +131,14 @@ sibilatrix, Porzana parva -> Zapornia parva). Name matching gains an explicit
 alias table (`APP_ALIASES`) for these; only aliases present in the app's labels
 are used.
 
+Export result (2026-10-16, raw counts, birdology b064936): 532 species in the
+counts, 526 matched to the app, 6 unmatched (Acanthis hornemanni, Anas
+carolinensis, Charadrius asiaticus, Melanitta stejnegeri, Pelecanus crispus,
+Pelecanus rufescens). Checks: su_rare 0.972 (need 0.95), breeders_common 0.958
+(need 0.9), swift_winter_rare 0.995 (need 0.9); thresholds [5e-05, 0.0003,
+0.001, 0.003, 0.01] at factor 1.000. 515 cells; dk_tiers.bin 1,977,184 bytes,
+dk_raster.bin 209,066 bytes, dk_tiers.json 34,715 bytes.
+
 ## 2. Lookup (fugle-dk)
 
 - `lib/features/inference/dk_commonness.dart`: `DkCommonness`, loading the
