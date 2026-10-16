@@ -36,7 +36,13 @@ from birdology.prior.occurrence_table import MANIFEST, build_occurrence_table  #
 
 
 def _canonical(t: pa.Table) -> pa.Table:
-    t = pa.table({"species_key": pc.cast(t["species_key"], pa.int64()), "cell": pc.cast(t["cell"], pa.string()),
+    """Sorted, with the cell as its 64-bit H3 index: sorting a string column
+    gathers it into one chunk, and r5's 157M cells exceed 2 GiB (job 12605)."""
+    distinct = pc.unique(t["cell"])
+    as_int = pa.array([int(c, 16) for c in distinct.to_pylist()], pa.uint64())
+    cell = pa.chunked_array([as_int.take(pc.index_in(c, value_set=distinct)) for c in t["cell"].chunks],
+                            pa.uint64())
+    t = pa.table({"species_key": pc.cast(t["species_key"], pa.int64()), "cell": cell,
                   "week": pc.cast(t["week"], pa.int8()), "n": pc.cast(t["n"], pa.int64())})
     return t.sort_by([(k, "ascending") for k in KEYS])
 

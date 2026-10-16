@@ -122,3 +122,29 @@ def test_cell_strings_are_chunked_below_the_offset_limit():
     assert out.type == pa.string()
     assert [len(c) for c in out.chunks] == [7, 7, 7, 2]
     assert out.to_pylist() == cells
+
+
+def test_compare_against_a_checkpoint(built, tmp_path):
+    """scripts/prior_occurrence_counts.compare: equal tables pass in any row
+    order, one changed count fails, and cells are compared without sorting
+    strings (r5's 157M cells overflow one string chunk, job 12605)."""
+    import json
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    sys.path.insert(0, str(Path(__file__).parent.parent.parent / "scripts"))
+    from prior_occurrence_counts import compare
+
+    from birdology.prior.counts_checkpoint import METADATA_KEY
+
+    _, occ = built
+    counts, guard, _ = guarded_counts(occ, 5, [], "placeholder", workers=1, buckets=2)
+    path = tmp_path / "ck.parquet"
+    shuffled = counts.sort_by([("n", "descending"), ("week", "ascending")])
+    pq.write_table(shuffled.replace_schema_metadata({METADATA_KEY: json.dumps({"guard": guard}).encode()}), path)
+    assert compare(counts, guard, path)
+    n = counts["n"].to_pylist()
+    bad = counts.set_column(3, "n", pa.array([n[0] + 1] + n[1:], pa.int64()))
+    assert not compare(bad, guard, path)
+    assert not compare(counts, {**guard, "contributor_rows_removed": 1}, path)
