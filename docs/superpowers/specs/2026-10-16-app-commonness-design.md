@@ -155,6 +155,16 @@ user decided:
 - The rare warning names DOFbasen only when the tier comes from the DOF data;
   outside Denmark it reads "Rare here this week. Worth reporting if confirmed."
 
+Export result 2 (2026-10-16, birdology 85075d7): 532 species in the counts, 526
+matched, the same 6 unmatched. Checks: su_rare (per species, minimum) 1.000
+(need 1.0), breeders_common 0.958 (need 0.9), swift_winter_rare 0.995 (need
+0.9); thresholds [5e-05, 0.0003, 0.001, 0.003, 0.01] at factor 1.000. 175 SU
+species forced rare. 515 cells; dk_tiers.bin 1,888,219 bytes, dk_raster.bin
+209,066 bytes, dk_tiers.json 39,115 bytes. In the Copenhagen cell Turdus
+eunomus, T. atrogularis, Phylloscopus humei, Ardeola ralloides, Burhinus
+oedicnemus and Prunella montanella are rare in every week; Turdus merula is
+abundant in week 20; Apus apus is rare in week 2 and abundant in week 26.
+
 ## 2. Lookup (fugle-dk)
 
 - `lib/features/inference/dk_commonness.dart`: `DkCommonness`, loading the
