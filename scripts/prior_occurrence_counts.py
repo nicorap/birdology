@@ -71,7 +71,8 @@ def main(argv=None) -> int:
     split.add_argument("--no-test-split", action="store_true")
     ap.add_argument("--split-contributor-mode", choices=("match", "placeholder"), default="match")
     ap.add_argument("--workers", type=int, default=None)
-    ap.add_argument("--buckets", type=int, default=16)
+    ap.add_argument("--buckets", type=int, default=64)
+    ap.add_argument("--reducers", type=int, default=16)
     ap.add_argument("--out", type=Path, default=None, help="write counts_r<R>.parquet here (default: --occ)")
     ap.add_argument("--compare", type=Path, default=None, help="directory holding counts checkpoints")
     ap.add_argument("--source", default="eod", help="checkpoint source name, for --compare")
@@ -93,7 +94,7 @@ def main(argv=None) -> int:
         t0 = time.time()
         counts, guard, timings = guarded_counts(args.occ, r, recordings_at_resolution(rows, r),
                                                 args.split_contributor_mode, workers=args.workers,
-                                                buckets=args.buckets)
+                                                buckets=args.buckets, reducers=args.reducers)
         pq.write_table(counts, out / f"counts_r{r}.parquet", compression="zstd")
         print(f"r{r}: {counts.num_rows} counts rows, guard {guard}, {timings}, {time.time() - t0:.0f} s",
               flush=True)

@@ -12,8 +12,8 @@ built without ever holding the occurrences in one process:
   starts with the cell -- go through ``leakage._drop_test_contributor_cells``
   ITSELF, so the contributor guard, its normalisation and its banned / matched
   key counts are the original code's, not a re-implementation;
-* reduce, one worker per bucket: sum the counts. Buckets hold disjoint
-  species, so the buckets' results concatenate without another merge.
+* reduce, one bucket per worker, at most ``reducers`` at once: sum the
+  counts. Buckets hold disjoint species, so the buckets' results concatenate without another merge.
 
 The reduce is a plain group-by over integer keys, the stage where a GPU
 (cuDF) can be compared with the CPU on equal terms.
@@ -102,7 +102,8 @@ def guarded_counts(
     contributor_mode: str = "match",
     *,
     workers: int | None = None,
-    buckets: int = 16,
+    buckets: int = 64,
+    reducers: int = 16,
     work_dir: Path | None = None,
 ) -> tuple[pa.Table, dict, dict]:
     """(counts, guard record, timings): the counts checkpoint's table and guard, from occurrences."""
@@ -156,7 +157,9 @@ def guarded_counts(
         timings["contributor_guard_s"] = round(time.time() - t0, 1)
 
         t0 = time.time()
-        with ProcessPoolExecutor(max_workers=min(workers, buckets), mp_context=ctx) as pool:
+        # Reducer memory is the bucket's share of the partial counts, all held at
+        # once: at r4, 16 buckets x 16 reducers ran out of 256 GB (job 12556).
+        with ProcessPoolExecutor(max_workers=min(workers, buckets, reducers), mp_context=ctx) as pool:
             reduced = list(pool.map(_reduce, [(str(work / f"b{k:03d}"),) for k in range(buckets)]))
         counts = pa.concat_tables(reduced)
         timings["reduce_s"] = round(time.time() - t0, 1)
