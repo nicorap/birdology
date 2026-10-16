@@ -15,6 +15,8 @@ from pathlib import Path
 
 import h3
 import numpy as np
+import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from birdology.phase_d.taxonomy import SYNONYMS
@@ -65,6 +67,37 @@ def species_names_from_parquet(parquet_dir: Path) -> dict[int, str]:
     return {k: v[1] for k, v in best.items()}
 
 
+#: GBIF/DOF names -> the app's (BirdNET V3) names, for genus moves and
+#: spellings SYNONYMS (keyed by eBird codes) does not cover. Found by the first
+#: export run (29 unmatched). A candidate absent from the app's labels is never used.
+APP_ALIASES: dict[str, tuple[str, ...]] = {
+    "Sylvia communis": ("Curruca communis",),
+    "Sylvia curruca": ("Curruca curruca",),
+    "Sylvia nana": ("Curruca nana",),
+    "Sylvia nisoria": ("Curruca nisoria",),
+    "Sylvia ruppeli": ("Curruca ruppeli",),
+    "Sylvia sarda": ("Curruca sarda",),
+    "Phylloscopus sibillatrix": ("Phylloscopus sibilatrix",),
+    "Porzana parva": ("Zapornia parva",),
+    "Porzana pusilla": ("Zapornia pusilla",),
+    "Phalacrocorax aristotelis": ("Gulosus aristotelis",),
+    "Bubulcus ibis": ("Ardea ibis",),
+    "Oceanodroma leucorhoa": ("Hydrobates leucorhous",),
+    "Puffinus gravis": ("Ardenna gravis",),
+    "Puffinus griseus": ("Ardenna grisea",),
+    "Aquila clanga": ("Clanga clanga",),
+    "Aquila pomarina": ("Clanga pomarina",),
+    "Luscinia calliope": ("Calliope calliope",),
+    "Grus canadensis": ("Antigone canadensis",),
+    "Anthropoides virgo": ("Grus virgo",),
+    "Charadrius alexandrinus": ("Anarhynchus alexandrinus",),
+    "Charadrius asiaticus": ("Anarhynchus asiaticus",),
+    "Charadrius leschenaultii": ("Anarhynchus leschenaultii",),
+    "Charadrius morinellus": ("Eudromias morinellus",),
+    "Gyps rueppellii": ("Gyps rueppelli",),
+}
+
+
 def match_names(prior_names: dict[int, str], app_names: list[str]) -> dict[int, str]:
     """GBIF key -> app scientific name: exact, else through a SYNONYMS group.
     When two keys reach one app name, the exact match wins."""
@@ -75,7 +108,7 @@ def match_names(prior_names: dict[int, str], app_names: list[str]) -> dict[int, 
         if name in app:
             exact[key] = name
         else:
-            for cand in groups.get(name, ()):
+            for cand in (*groups.get(name, ()), *APP_ALIASES.get(name, ())):
                 if cand in app:
                     via[key] = cand
                     break
@@ -86,6 +119,40 @@ def match_names(prior_names: dict[int, str], app_names: list[str]) -> dict[int, 
             out[key] = name
             taken.add(name)
     return out
+
+
+def unmatched_names(names: dict[int, str], matched: dict[int, str]) -> list[str]:
+    """Names of keys that found no app name (a synonym match is a match)."""
+    return sorted(names[k] for k in names if k not in matched)
+
+
+def shares_from_counts(counts: pa.Table, species_keys: list[int], window: int = 2,
+                       min_records: int = 500) -> tuple[list[str], np.ndarray]:
+    """(sorted cells, p [cells, 52, S]): each listed species' share of ALL records
+    in its cell, pooled over weeks w-window..w+window (circular). A cell-week whose
+    pooled total is under min_records takes the national share for those weeks."""
+    cell_arr = counts.column("cell").combine_chunks()
+    cells = sorted(pc.unique(cell_arr).to_pylist())
+    ci = pc.index_in(cell_arr, value_set=pa.array(cells, pa.string())).to_numpy(zero_copy_only=False)
+    wi = counts.column("week").to_numpy().astype(np.int64) - 1
+    n = counts.column("n").to_numpy().astype(np.float64)
+    sk = counts.column("species_key").to_numpy()
+    C, S = len(cells), len(species_keys)
+    T = np.zeros((C, WEEKS))
+    np.add.at(T, (ci, wi), n)
+    col = {k: j for j, k in enumerate(species_keys)}
+    sel = np.isin(sk, np.asarray(species_keys, dtype=sk.dtype))
+    N = np.zeros((C, WEEKS, S))
+    np.add.at(N, (ci[sel], wi[sel], np.array([col[k] for k in sk[sel]], np.int64)), n[sel])
+
+    def pool(a):
+        return sum(np.roll(a, -d, axis=1) for d in range(-window, window + 1))
+
+    Np, Tp = pool(N), pool(T)
+    Nn, Tn = Np.sum(axis=0), Tp.sum(axis=0)
+    national = np.divide(Nn, Tn[:, None], out=np.zeros_like(Nn), where=Tn[:, None] > 0)
+    local = np.divide(Np, Tp[:, :, None], out=np.zeros_like(Np), where=Tp[:, :, None] > 0)
+    return cells, np.where((Tp >= min_records)[:, :, None], local, national[None])
 
 
 def p_grid(meta: dict, grid: np.ndarray, matched: dict[int, str], species: list[str]) -> np.ndarray:

@@ -3,7 +3,7 @@
 
 Real export (on the fleet):
     python scripts/prior_app_export.py \\
-        --prior data/prior/dof/prior_dof_r5_full \\
+        --counts data/prior/occurrences/dof/counts_r5.parquet \\
         --names data/prior/parquet/dof \\
         --labels apps/models/birdnet_v3/BirdNET+_V3.0-preview3.1_Global_10K-pruned_Labels.csv \\
         --su src/birdology/prior/data/su_species.csv \\
@@ -20,10 +20,13 @@ import json
 import sys
 from pathlib import Path
 
+import h3
+import pyarrow.parquet as pq
+
 from birdology.phase_d.birdnet3 import load_labels
 from birdology.prior.app_tiers import (
-    BASE_THRESHOLDS, CalibrationError, build_raster, calibrate, load_prior, match_names, p_grid,
-    species_names_from_parquet, synthetic_inputs, tiers_from_p, write_asset,
+    BASE_THRESHOLDS, CalibrationError, build_raster, calibrate, match_names, shares_from_counts,
+    species_names_from_parquet, synthetic_inputs, tiers_from_p, unmatched_names, write_asset,
 )
 from birdology.prior.su_list import load_su_species
 
@@ -42,7 +45,11 @@ def fixture(out: Path) -> int:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--fixture", type=Path)
-    ap.add_argument("--prior", type=Path, help="prior path without .npz/.json")
+    ap.add_argument("--counts", type=Path, help="DOF counts parquet (species_key, cell, week, n)")
+    ap.add_argument("--gbif-doi", default="10.15468/dl.3j4czw", help="GBIF download DOI for attribution")
+    ap.add_argument("--window", type=int, default=2, help="weeks either side pooled into a share")
+    ap.add_argument("--min-records", type=int, default=500,
+                    help="pooled cell-week records below which the national share is used")
     ap.add_argument("--names", type=Path, help="archive_parquet copy of the prior's source archive")
     ap.add_argument("--labels", type=Path, help="the app's audio labels CSV")
     ap.add_argument("--su", type=Path)
@@ -50,20 +57,22 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     if args.fixture:
         return fixture(args.fixture)
-    for name in ("prior", "names", "labels", "su", "out"):
+    for name in ("counts", "names", "labels", "su", "out"):
         if getattr(args, name) is None:
             ap.error(f"--{name} is required for a real export")
 
-    meta, grid = load_prior(args.prior.with_suffix(".npz"), args.prior.with_suffix(".json"))
+    counts = pq.read_table(args.counts, columns=["species_key", "cell", "week", "n"])
     names = species_names_from_parquet(args.names)
-    prior_names = {k: names[k] for k in meta["species_keys"] if k in names}
+    keys = sorted(set(counts.column("species_key").to_pylist()) & set(names))
+    count_names = {k: names[k] for k in keys}
     app_species = load_labels(args.labels)
-    matched = match_names(prior_names, app_species)
+    matched = match_names(count_names, app_species)
     species = sorted(matched.values())
-    unmatched = sorted(set(prior_names.values()) - set(matched.values()))
-    print(f"{len(meta['species_keys'])} prior species, {len(prior_names)} named, {len(species)} matched "
-          f"to the app; {len(unmatched)} unmatched: {unmatched[:30]}{' ...' if len(unmatched) > 30 else ''}")
-    p = p_grid(meta, grid, matched, species)
+    unmatched = unmatched_names(count_names, matched)
+    print(f"{len(keys)} species in the counts, {len(species)} matched to the app; "
+          f"{len(unmatched)} unmatched: {unmatched}")
+    key_of = {name: key for key, name in matched.items()}
+    cells, p = shares_from_counts(counts, [key_of[s] for s in species], args.window, args.min_records)
     su = load_su_species(args.su)
     try:
         thresholds, factor, checks = calibrate(p, species, su)
@@ -73,11 +82,14 @@ def main(argv=None) -> int:
     for k, c in checks.items():
         print(f"check {k}: {c['value']:.3f} (need {c['need']}) {'ok' if c['passed'] else 'FAIL'}")
     print(f"thresholds {thresholds} (factor {factor:.3f})")
-    rmeta, raster = build_raster(meta["cells"], meta["spec"]["resolution"] if "spec" in meta else 5)
-    side = write_asset(args.out, species=species, cells=meta["cells"], tiers=tiers_from_p(p, thresholds),
+    rmeta, raster = build_raster(cells, h3.get_resolution(cells[0]))
+    side = write_asset(args.out, species=species, cells=cells, tiers=tiers_from_p(p, thresholds),
                        raster_meta=rmeta, raster=raster, thresholds=thresholds,
-                       calibration={"factor": factor, "checks": checks},
-                       gbif_doi=meta["gbif_doi"], licence=meta["licence"], attribution=meta["attribution"],
+                       calibration={"factor": factor, "checks": checks, "window": args.window,
+                                    "min_records": args.min_records, "source": "DOF counts"},
+                       gbif_doi=args.gbif_doi, licence="CC BY 4.0",
+                       attribution=f"Derived from DOFbasen records, GBIF occurrence download {args.gbif_doi}. "
+                                   "Released under CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/).",
                        export_date=dt.date.today().isoformat())
     sizes = {f.name: f.stat().st_size for f in args.out.iterdir()}
     print(json.dumps({"cells": len(side["cells"]), "species": len(side["species"]), "bytes": sizes}))
